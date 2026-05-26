@@ -12,6 +12,12 @@ pub struct SessionParser {
     pub current_model: Option<String>,
     pub file_path: PathBuf,
     pub archived: bool,
+    /// True once we've seen a token_count event with non-null `info` in this
+    /// parser's lifetime. Used to seed per-model attribution from
+    /// `total_token_usage` on the first event so that *resumed* sessions
+    /// (whose first event's total already includes carry-over from a previous
+    /// rollout file) don't undercount their per-model totals.
+    seen_token_count: bool,
 }
 
 impl SessionParser {
@@ -22,6 +28,7 @@ impl SessionParser {
             current_model: None,
             file_path,
             archived,
+            seen_token_count: false,
         }
     }
 
@@ -244,12 +251,15 @@ impl SessionParser {
             _ => return Ok(()),
         };
 
+        let total_usage = info.get("total_token_usage").map(parse_token_totals);
+        let last_usage = info.get("last_token_usage").map(parse_token_totals);
+
         if let Some(s) = self.session.as_mut() {
-            if let Some(total) = info.get("total_token_usage") {
-                s.tokens_total = parse_token_totals(total);
+            if let Some(total) = &total_usage {
+                s.tokens_total = total.clone();
                 s.tokens_history.push(TokenHistoryPoint {
                     timestamp: event_ts,
-                    total_tokens: s.tokens_total.total_tokens,
+                    total_tokens: total.total_tokens,
                 });
             }
 
@@ -257,16 +267,27 @@ impl SessionParser {
                 s.context_window = Some(cw as u32);
             }
 
-            // last_token_usage is the delta for the most recent API call, used for per-model attribution.
-            if let (Some(last), Some(model)) = (
-                info.get("last_token_usage"),
-                self.current_model.as_ref(),
-            ) {
-                let delta = parse_token_totals(last);
-                let entry = s.tokens_by_model.entry(model.clone()).or_default();
-                add_token_totals(entry, &delta);
+            // Per-model attribution. On the FIRST non-null token_count event we
+            // see in this parser's lifetime, add `total_token_usage` to the
+            // current model's bucket so that sessions resumed from a previous
+            // rollout file inherit the carry-over total (for a fresh session,
+            // total == last on the first event so the result is identical).
+            // On every subsequent event we add only `last_token_usage`, which
+            // is the delta for the most recent API call.
+            if let Some(model) = self.current_model.as_ref() {
+                let contribution = if !self.seen_token_count {
+                    total_usage.as_ref()
+                } else {
+                    last_usage.as_ref()
+                };
+                if let Some(delta) = contribution {
+                    let entry = s.tokens_by_model.entry(model.clone()).or_default();
+                    add_token_totals(entry, delta);
+                }
             }
         }
+
+        self.seen_token_count = true;
 
         if let Some(rate_limits) = payload.get("rate_limits") {
             if let Some(s) = self.session.as_mut() {

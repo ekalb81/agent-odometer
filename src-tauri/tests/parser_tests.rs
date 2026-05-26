@@ -131,3 +131,39 @@ fn populates_tokens_history_from_token_count_events() {
     let ts: Vec<_> = s.tokens_history.iter().map(|p| p.timestamp).collect();
     assert!(ts.windows(2).all(|w| w[0] < w[1]), "timestamps not strictly increasing");
 }
+
+#[test]
+fn resumed_session_attributes_carryover_total_to_active_model() {
+    // Simulate a Codex rollout file that resumed from a prior session: the
+    // first non-null token_count event's `total_token_usage` already includes
+    // significant carry-over from the previous file, while `last_token_usage`
+    // is just the latest API call's delta.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resumed.jsonl");
+
+    let lines = [
+        r#"{"timestamp":"2026-05-26T11:33:00.000Z","type":"session_meta","payload":{"id":"019e64eb-aaaa-bbbb-cccc-000000000001","timestamp":"2026-05-26T11:33:00.000Z","cwd":"C:\\Projects\\canopy","originator":"Codex Desktop","cli_version":"0.130.0","source":"vscode","model_provider":"openai"}}"#,
+        r#"{"timestamp":"2026-05-26T11:33:01.000Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.5","effort":"high","approval_policy":"never","sandbox_policy":{"type":"danger-full-access"},"personality":"pragmatic","collaboration_mode":{"mode":"default"}}}"#,
+        // First non-null token_count: total already at ~23M (carried over),
+        // last is only ~100K (the most recent API call in this file).
+        r#"{"timestamp":"2026-05-26T11:33:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":23000000,"cached_input_tokens":20000000,"output_tokens":80000,"reasoning_output_tokens":40000,"total_tokens":23080000},"last_token_usage":{"input_tokens":100000,"cached_input_tokens":80000,"output_tokens":1000,"reasoning_output_tokens":500,"total_tokens":101000},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":true,"balance":null}}}}"#,
+        // Second token_count: total grew by `last`'s amount.
+        r#"{"timestamp":"2026-05-26T11:33:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":23187732,"cached_input_tokens":20105344,"output_tokens":90479,"reasoning_output_tokens":46811,"total_tokens":23278211},"last_token_usage":{"input_tokens":187732,"cached_input_tokens":105344,"output_tokens":10479,"reasoning_output_tokens":6811,"total_tokens":198211},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":true,"balance":null}}}}"#,
+    ];
+
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let s = parser::parse_file(&path, false).unwrap().unwrap();
+
+    // tokens_total = latest total_token_usage (latest-wins).
+    assert_eq!(s.tokens_total.total_tokens, 23_278_211);
+
+    // tokens_by_model must include the carry-over so the per-model bucket
+    // matches the session total (single-model session).
+    let per = s.tokens_by_model.get("gpt-5.5").expect("gpt-5.5 bucket present");
+    assert_eq!(per.input_tokens,            23_187_732);
+    assert_eq!(per.cached_input_tokens,     20_105_344);
+    assert_eq!(per.output_tokens,                90_479);
+    assert_eq!(per.reasoning_output_tokens,      46_811);
+    assert_eq!(per.total_tokens,            23_278_211);
+}
