@@ -3,7 +3,7 @@
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
   import { listSessions, onSessionUpdated, onSessionRemoved, getRates, onRatesUpdated, onConfigUpdated } from './lib/ipc';
-  import { sessionsStore } from './lib/stores/sessions';
+  import { sessionsStore } from './lib/stores/sessions.svelte';
   import { rates } from './lib/stores/rates';
   import { config } from './lib/stores/config';
   import type { UnlistenFn } from '@tauri-apps/api/event';

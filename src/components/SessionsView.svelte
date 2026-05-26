@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { sessionsStore } from '../lib/stores/sessions';
+  import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { rates } from '../lib/stores/rates';
   import { computeSessionCredits, formatCredits } from '../lib/credits';
   import Filters from './Filters.svelte';
