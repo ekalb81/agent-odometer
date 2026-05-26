@@ -155,7 +155,19 @@ fn is_remove(kind: &EventKind) -> bool {
 
 /// Path equality that's robust against separator differences (notify produces
 /// backslash paths on Windows; our config paths may carry forward slashes from
-/// string literals joined onto the home directory).
+/// string literals joined onto the home directory) and against Windows
+/// verbatim prefixes (`\\?\`) that notify may add when long-path support is
+/// active. Operates only on path components after the prefix is stripped, so
+/// it doesn't require the files to exist on disk.
 fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
-    a.components().eq(b.components())
+    strip_verbatim_prefix(a).components().eq(strip_verbatim_prefix(b).components())
+}
+
+fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {
+    if let Some(s) = p.to_str() {
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return std::path::Path::new(rest);
+        }
+    }
+    p
 }

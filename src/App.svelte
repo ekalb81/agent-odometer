@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, onRatesUpdated, onConfigUpdated } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { rates } from './lib/stores/rates';
   import { config } from './lib/stores/config';
@@ -29,6 +29,13 @@
       rates.set(card);
     } catch (e) {
       console.error('getRates failed:', e);
+    }
+
+    try {
+      const cfg = await getConfig();
+      config.set(cfg);
+    } catch (e) {
+      console.error('getConfig failed:', e);
     }
 
     unlistenUpdated = await onSessionUpdated((s) => sessionsStore.upsert(s));

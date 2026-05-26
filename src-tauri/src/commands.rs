@@ -103,24 +103,29 @@ pub fn set_rates(app: tauri::AppHandle, rates: RateCard) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens the parent directory of the given path in the system file manager.
-/// Uses xdg-open on Linux, open on macOS, and explorer on Windows.
-/// Errors are logged but not propagated — the UI treats this as best-effort.
+/// Reveals the given file in the system file manager, highlighting it where
+/// possible. macOS uses `open -R`; Windows uses `explorer /select,<file>`;
+/// Linux falls back to opening the parent directory since `xdg-open` has no
+/// portable file-select equivalent across desktop environments.
+/// Errors are returned to the UI but treated as best-effort.
 #[tauri::command]
 pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
-    let target = std::path::Path::new(&path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or(path);
-
     #[cfg(target_os = "linux")]
-    let cmd = std::process::Command::new("xdg-open").arg(&target).spawn();
+    let cmd = {
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        std::process::Command::new("xdg-open").arg(&parent).spawn()
+    };
 
     #[cfg(target_os = "macos")]
-    let cmd = std::process::Command::new("open").arg(&target).spawn();
+    let cmd = std::process::Command::new("open").arg("-R").arg(&path).spawn();
 
     #[cfg(target_os = "windows")]
-    let cmd = std::process::Command::new("explorer").arg(&target).spawn();
+    let cmd = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path))
+        .spawn();
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     let cmd: Result<_, std::io::Error> = Err(std::io::Error::new(
