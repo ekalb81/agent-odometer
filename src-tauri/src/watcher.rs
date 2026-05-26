@@ -56,7 +56,10 @@ pub fn start(
                 for path in &event.paths {
                     // The session index lives next to the per-session files; handle it first
                     // so we don't try to parse it as a rollout JSONL.
-                    if path == session_index_path_cb.as_path() {
+                    // Use component-wise equality so mixed separators (notify on Windows
+                    // delivers backslash paths; PathBuf::join from a slash literal does not
+                    // normalize) still match.
+                    if paths_equivalent(path, session_index_path_cb.as_path()) {
                         let names = crate::session_index::read(path);
                         let changed = crate::session_index::apply(&state_cb.sessions, &names);
                         for id in changed {
@@ -99,7 +102,7 @@ pub fn start(
                             Ok(_) => {}
                             Err(e) => {
                                 tracing::warn!("parse error for {:?}: {}", path, e);
-                                return;
+                                continue;
                             }
                         }
 
@@ -148,4 +151,11 @@ pub fn start(
 
 fn is_remove(kind: &EventKind) -> bool {
     matches!(kind, EventKind::Remove(_))
+}
+
+/// Path equality that's robust against separator differences (notify produces
+/// backslash paths on Windows; our config paths may carry forward slashes from
+/// string literals joined onto the home directory).
+fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.components().eq(b.components())
 }

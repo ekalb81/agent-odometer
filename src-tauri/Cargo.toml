@@ -22,10 +22,8 @@ serde_json     = "1"
 chrono         = { version = "0.4", features = ["serde"] }
 notify         = "8"
 notify-debouncer-full = "0.6"   # pairs with notify 8.x
-tokio          = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util"] }
 dashmap        = "6"
 anyhow         = "1"
-thiserror      = "2"
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs           = "5"

@@ -237,9 +237,10 @@
   }
 
   function removeRow(index: number) {
+    // Capture the name before filtering — afterwards rows[index] is a different row.
+    const removedName = rows[index]?.name;
     rows = rows.filter((_, i) => i !== index);
-    // If the deleted model was the fallback, clear fallback selection.
-    if (fallbackModel === rows[index]?.name) fallbackModel = '';
+    if (fallbackModel === removedName) fallbackModel = '';
     markDirty();
   }
 

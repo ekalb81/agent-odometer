@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { Session } from '../lib/types';
 
   export type FilterState = {
@@ -56,6 +57,10 @@
     localSearch = '';
     onchange(defaultFilters());
   }
+
+  onDestroy(() => {
+    if (searchTimer !== null) clearTimeout(searchTimer);
+  });
 
   // Collect distinct model values reactively from the full session list.
   const distinctModels = $derived(
