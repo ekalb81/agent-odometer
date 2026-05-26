@@ -3,7 +3,7 @@ use crate::model::Session;
 use crate::rates::RateCard;
 use crate::store::AppState;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 /// Returns the list of all known sessions.
 /// Sessions are populated at startup by the initial scan + file watcher;
@@ -32,9 +32,24 @@ pub fn set_config(config: Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns the bundled rate card. Phase 5 will return a live-fetched card.
+/// Returns the rate card, preferring the user's on-disk copy over the bundled defaults.
 #[tauri::command]
 pub fn get_rates() -> RateCard {
+    RateCard::load_from_disk().unwrap_or_else(|_| RateCard {
+        version: 1,
+        currency: "USD".into(),
+        unit: "per_1m_tokens".into(),
+        source_url: String::new(),
+        fetched_at: None,
+        models: std::collections::HashMap::new(),
+        fallback_model: "codex-mini-latest".into(),
+    })
+}
+
+/// Returns the bundled (shipped) rate card, ignoring any on-disk overrides.
+/// Used by the "Reset to shipped defaults" button in the rates editor.
+#[tauri::command]
+pub fn get_bundled_rates() -> RateCard {
     RateCard::load_bundled().unwrap_or_else(|_| RateCard {
         version: 1,
         currency: "USD".into(),
@@ -42,13 +57,16 @@ pub fn get_rates() -> RateCard {
         source_url: String::new(),
         fetched_at: None,
         models: std::collections::HashMap::new(),
-        fallback_model: "gpt-5-codex".into(),
+        fallback_model: "codex-mini-latest".into(),
     })
 }
 
-/// Persists an updated rate card. Phase 5 will implement persistence.
+/// Persists an updated rate card to disk and emits a rates-updated event so all
+/// frontend subscribers can refresh their computed credits immediately.
 #[tauri::command]
-pub fn set_rates(_rates: RateCard) -> Result<(), String> {
+pub fn set_rates(app: tauri::AppHandle, rates: RateCard) -> Result<(), String> {
+    rates.save().map_err(|e| e.to_string())?;
+    app.emit("rates-updated", &rates).map_err(|e| e.to_string())?;
     Ok(())
 }
 

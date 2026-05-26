@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import type { Session } from '../lib/types';
+  import { rates } from '../lib/stores/rates';
+  import { computeSessionCredits } from '../lib/credits';
   import { revealInFileManager } from '../lib/ipc';
 
   interface Props {
@@ -12,6 +14,12 @@
 
   const numFmt = new Intl.NumberFormat();
   const pctFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
+  const creditFmt = new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  });
 
   function fmt(n: number): string {
     return numFmt.format(n);
@@ -51,6 +59,11 @@
   );
 
   const ctxBarWidth = $derived(ctxPercent !== null ? Math.min(ctxPercent, 100) : 0);
+
+  // Credit computation for the open session.
+  const sessionCredits = $derived(
+    session && $rates ? computeSessionCredits(session, $rates) : null,
+  );
 
   // Escape-key handler — attached only while drawer is open.
   function handleKeydown(e: KeyboardEvent) {
@@ -216,7 +229,7 @@
         </section>
       {/if}
 
-      <!-- Token table -->
+      <!-- Token table with credit breakdown -->
       <section>
         <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3">Tokens by model</h3>
         <div class="overflow-x-auto">
@@ -229,10 +242,13 @@
                 <th class="text-right py-1.5 px-2 text-slate-400 font-medium">Output</th>
                 <th class="text-right py-1.5 px-2 text-slate-400 font-medium">Reasoning</th>
                 <th class="text-right py-1.5 pl-2 text-slate-400 font-medium">Total</th>
+                <th class="text-right py-1.5 pl-2 text-slate-400 font-medium">Rate source</th>
+                <th class="text-right py-1.5 pl-2 text-slate-400 font-medium">Cost</th>
               </tr>
             </thead>
             <tbody>
               {#each Object.entries(session.tokens_by_model) as [modelName, t]}
+                {@const modelCredit = sessionCredits?.byModel.find((mc) => mc.model === modelName)}
                 <tr class="border-b border-slate-700/50">
                   <td class="py-1.5 pr-3 font-mono text-slate-300 max-w-[120px] truncate" title={modelName}>{modelName}</td>
                   <td class="py-1.5 px-2 text-right tabular-nums text-slate-300">{fmt(t.input_tokens)}</td>
@@ -240,6 +256,20 @@
                   <td class="py-1.5 px-2 text-right tabular-nums text-slate-300">{fmt(t.output_tokens)}</td>
                   <td class="py-1.5 px-2 text-right tabular-nums text-slate-400">{fmt(t.reasoning_output_tokens)}</td>
                   <td class="py-1.5 pl-2 text-right tabular-nums font-medium text-slate-100">{fmt(t.total_tokens)}</td>
+                  <!-- Rate source: show fallback model name when fallback was used -->
+                  <td class="py-1.5 pl-2 text-right font-mono text-slate-400 max-w-[100px]">
+                    {#if modelCredit?.fallbackUsed}
+                      <span class="text-amber-400" title="Fallback rate used — model not in rate card">
+                        → {$rates?.fallback_model ?? '—'}
+                      </span>
+                    {:else}
+                      <span class="text-slate-400">{modelName}</span>
+                    {/if}
+                  </td>
+                  <!-- Per-model cost -->
+                  <td class="py-1.5 pl-2 text-right tabular-nums text-slate-300">
+                    {modelCredit ? creditFmt.format(modelCredit.cost) : '—'}
+                  </td>
                 </tr>
               {/each}
               <!-- Totals row -->
@@ -250,10 +280,26 @@
                 <td class="py-1.5 px-2 text-right tabular-nums text-slate-200">{fmt(session.tokens_total.output_tokens)}</td>
                 <td class="py-1.5 px-2 text-right tabular-nums text-slate-300">{fmt(session.tokens_total.reasoning_output_tokens)}</td>
                 <td class="py-1.5 pl-2 text-right tabular-nums text-slate-100">{fmt(session.tokens_total.total_tokens)}</td>
+                <td class="py-1.5 pl-2"></td>
+                <!-- Total cost cell: dash for unlimited, dollar amount otherwise -->
+                <td class="py-1.5 pl-2 text-right tabular-nums text-slate-100">
+                  {#if session.credits_unlimited === true}
+                    —
+                  {:else}
+                    {sessionCredits ? creditFmt.format(sessionCredits.total) : '—'}
+                  {/if}
+                </td>
               </tr>
             </tbody>
           </table>
         </div>
+
+        <!-- Reference cost line for unlimited sessions -->
+        {#if session.credits_unlimited === true && sessionCredits}
+          <p class="mt-2 text-xs text-slate-500">
+            Reference: {creditFmt.format(sessionCredits.total)} à-la-carte equivalent
+          </p>
+        {/if}
       </section>
 
       <!-- Context usage -->

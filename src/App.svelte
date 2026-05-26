@@ -2,8 +2,9 @@
   import { onMount, onDestroy } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
-  import { listSessions, onSessionUpdated, onSessionRemoved } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, onRatesUpdated } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions';
+  import { rates } from './lib/stores/rates';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
   type View = 'sessions' | 'settings';
@@ -11,6 +12,7 @@
 
   let unlistenUpdated: UnlistenFn | null = null;
   let unlistenRemoved: UnlistenFn | null = null;
+  let unlistenRates: UnlistenFn | null = null;
 
   onMount(async () => {
     try {
@@ -20,13 +22,22 @@
       console.error('listSessions failed:', e);
     }
 
+    try {
+      const card = await getRates();
+      rates.set(card);
+    } catch (e) {
+      console.error('getRates failed:', e);
+    }
+
     unlistenUpdated = await onSessionUpdated((s) => sessionsStore.upsert(s));
     unlistenRemoved = await onSessionRemoved((id) => sessionsStore.remove(id));
+    unlistenRates = await onRatesUpdated((card) => rates.set(card));
   });
 
   onDestroy(() => {
     unlistenUpdated?.();
     unlistenRemoved?.();
+    unlistenRates?.();
   });
 </script>
 

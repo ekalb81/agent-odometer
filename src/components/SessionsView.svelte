@@ -1,9 +1,18 @@
 <script lang="ts">
   import { sessionsStore } from '../lib/stores/sessions';
+  import { rates } from '../lib/stores/rates';
+  import { computeSessionCredits } from '../lib/credits';
   import Filters from './Filters.svelte';
   import type { FilterState } from './Filters.svelte';
   import RowDrawer from './RowDrawer.svelte';
+
   const fmt = new Intl.NumberFormat();
+  const creditFmt = new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4,
+  });
 
   function fmtTokens(n: number): string {
     return fmt.format(n);
@@ -62,7 +71,7 @@
   // ---------------------------------------------------------------------------
   // Sort state
   // ---------------------------------------------------------------------------
-  type SortKey = 'name' | 'started' | 'model' | 'input' | 'cached' | 'output' | 'reasoning' | 'total' | null;
+  type SortKey = 'name' | 'started' | 'model' | 'input' | 'cached' | 'output' | 'reasoning' | 'total' | 'credit' | null;
   type SortDir = 'asc' | 'desc';
 
   let sortKey = $state<SortKey>(null);
@@ -118,6 +127,21 @@
     });
   })());
 
+  // Per-session credit computation; reactively recomputes when rates change.
+  const sessionCreditsMap = $derived((() => {
+    const r = $rates;
+    const out = new Map<string, { total: number; missingModels: string[]; refCost: number }>();
+    for (const s of filtered) {
+      if (!r) {
+        out.set(s.id, { total: 0, missingModels: [], refCost: 0 });
+        continue;
+      }
+      const credits = computeSessionCredits(s, r);
+      out.set(s.id, { total: credits.total, missingModels: credits.missingModels, refCost: credits.total });
+    }
+    return out;
+  })());
+
   function compareSession(a: (typeof allSessions)[number], b: (typeof allSessions)[number]): number {
     if (sortKey === null) {
       // Default: last_event_at desc.
@@ -149,6 +173,12 @@
       case 'total':
         cmp = a.tokens_total.total_tokens - b.tokens_total.total_tokens;
         break;
+      case 'credit': {
+        const aCredits = sessionCreditsMap.get(a.id)?.total ?? 0;
+        const bCredits = sessionCreditsMap.get(b.id)?.total ?? 0;
+        cmp = aCredits - bCredits;
+        break;
+      }
     }
     return sortDir === 'asc' ? cmp : -cmp;
   }
@@ -158,6 +188,22 @@
   const filteredTotal = $derived(
     filtered.reduce((sum, s) => sum + s.tokens_total.total_tokens, 0),
   );
+
+  // Credit totals: only count sessions that are NOT on unlimited plans.
+  const creditSummary = $derived((() => {
+    let billedTotal = 0;
+    let unlimitedCount = 0;
+    for (const s of filtered) {
+      const c = sessionCreditsMap.get(s.id);
+      if (!c) continue;
+      if (s.credits_unlimited === true) {
+        unlimitedCount++;
+      } else {
+        billedTotal += c.total;
+      }
+    }
+    return { billedTotal, unlimitedCount };
+  })());
 
   // ---------------------------------------------------------------------------
   // Drawer state — tracked by session id only (lookup from the map).
@@ -199,7 +245,7 @@
   />
 
   <!-- Summary header -->
-  <div class="flex items-center gap-6 px-4 py-2 bg-slate-800 border-b border-slate-700 flex-shrink-0 text-sm text-slate-400">
+  <div class="flex flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2 bg-slate-800 border-b border-slate-700 flex-shrink-0 text-sm text-slate-400">
     <span>
       Showing
       <span class="font-semibold text-slate-200">{displayed.length}</span>
@@ -210,6 +256,13 @@
     <span>
       <span class="font-semibold text-slate-200">{fmtTokens(filteredTotal)}</span>
       total tokens
+    </span>
+    <span>
+      <span class="font-semibold text-slate-200">{creditFmt.format(creditSummary.billedTotal)}</span>
+      total credits
+      {#if creditSummary.unlimitedCount > 0}
+        <span class="text-slate-500 text-xs ml-1">({creditSummary.unlimitedCount} unlimited excluded)</span>
+      {/if}
     </span>
   </div>
 
@@ -234,7 +287,7 @@
       <table class="w-full text-sm text-left border-collapse">
         <thead class="sticky top-0 bg-slate-800 z-10">
           <tr class="border-b border-slate-700">
-            <!-- Sortable: Name — aria-sort belongs on <th> (columnheader role) -->
+            <!-- Sortable: Name -->
             <th class="px-3 py-2 font-medium text-slate-300 whitespace-nowrap" aria-sort={ariaSortAttr('name')}>
               <button class="hover:text-white transition-colors" onclick={() => toggleSort('name')}>
                 Name{caretFor('name')}
@@ -292,11 +345,19 @@
                 Total{caretFor('total')}
               </button>
             </th>
+
+            <!-- Sortable: Credit -->
+            <th class="px-3 py-2 font-medium text-slate-300 text-right whitespace-nowrap" aria-sort={ariaSortAttr('credit')}>
+              <button class="hover:text-white transition-colors" onclick={() => toggleSort('credit')}>
+                Credit{caretFor('credit')}
+              </button>
+            </th>
           </tr>
         </thead>
         <tbody>
           {#each displayed as session (session.id)}
             {@const name = sessionName(session)}
+            {@const sessionCredit = sessionCreditsMap.get(session.id)}
             <!-- svelte-ignore a11y_interactive_supports_focus -->
             <tr
               role="button"
@@ -352,6 +413,27 @@
               </td>
               <td class="px-3 py-2 text-right tabular-nums font-medium text-slate-100">
                 {fmtTokens(session.tokens_total.total_tokens)}
+              </td>
+
+              <!-- Credit column -->
+              <td class="px-3 py-2 text-right tabular-nums whitespace-nowrap">
+                {#if session.credits_unlimited === true}
+                  <span
+                    class="text-slate-400"
+                    title="Reference cost on à-la-carte: {creditFmt.format(sessionCredit?.refCost ?? 0)} ({session.plan_type ?? 'unlimited'} · unlimited)"
+                  >—</span>
+                {:else}
+                  <span class="text-emerald-400 font-medium">
+                    {creditFmt.format(sessionCredit?.total ?? 0)}
+                  </span>
+                {/if}
+                {#if sessionCredit && sessionCredit.missingModels.length > 0}
+                  <span
+                    class="ml-1 text-amber-400 cursor-help"
+                    title="Fallback rate used for: {sessionCredit.missingModels.join(', ')}"
+                    aria-label="Warning: fallback rate used"
+                  >⚠</span>
+                {/if}
               </td>
             </tr>
           {/each}

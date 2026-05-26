@@ -7,7 +7,7 @@ pub mod scanner;
 pub mod store;
 pub mod watcher;
 
-use commands::{get_config, get_rates, list_sessions, reveal_in_file_manager, set_config, set_rates};
+use commands::{get_bundled_rates, get_config, get_rates, list_sessions, reveal_in_file_manager, set_config, set_rates};
 use config::Config;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -31,6 +31,7 @@ pub fn run() {
             get_config,
             set_config,
             get_rates,
+            get_bundled_rates,
             set_rates,
             reveal_in_file_manager,
         ])

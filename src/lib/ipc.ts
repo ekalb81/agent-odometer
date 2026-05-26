@@ -25,6 +25,10 @@ export function getRates(): Promise<RateCard> {
   return invoke<RateCard>('get_rates');
 }
 
+export function getBundledRates(): Promise<RateCard> {
+  return invoke<RateCard>('get_bundled_rates');
+}
+
 export function setRates(rates: RateCard): Promise<void> {
   return invoke<void>('set_rates', { rates });
 }
