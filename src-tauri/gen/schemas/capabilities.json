@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"Default capability for the main window: core APIs + event listener for our session/config/rates push events.","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:event:allow-listen","core:event:allow-unlisten","core:webview:allow-internal-toggle-devtools"]}}

@@ -13,6 +13,7 @@
     "withGlobalTauri": false,
     "windows": [
       {
+        "label": "main",
         "title": "Codex Data Viewer",
         "width": 1200,
         "height": 800,
