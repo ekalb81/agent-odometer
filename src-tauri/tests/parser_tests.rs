@@ -167,3 +167,51 @@ fn resumed_session_attributes_carryover_total_to_active_model() {
     assert_eq!(per.reasoning_output_tokens,      46_811);
     assert_eq!(per.total_tokens,            23_278_211);
 }
+
+#[test]
+fn mid_session_model_switch_attributes_each_phase_correctly() {
+    // Simulate a session that starts on gpt-5.4 for the bulk of the work,
+    // then switches to gpt-5.5 for the final turns. Per-model buckets must
+    // sum to tokens_total, with the gpt-5.4 phase getting the heavy share.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("switch.jsonl");
+
+    let lines = [
+        r#"{"timestamp":"2026-05-26T15:33:42.000Z","type":"session_meta","payload":{"id":"019e64eb-aaaa-bbbb-cccc-000000000002","timestamp":"2026-05-26T15:33:42.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.133.0","source":"vscode","model_provider":"openai"}}"#,
+        r#"{"timestamp":"2026-05-26T15:33:45.000Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.4"}}"#,
+        // First token_count under gpt-5.4: fresh, total == last.
+        r#"{"timestamp":"2026-05-26T15:33:50.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100000,"cached_input_tokens":80000,"output_tokens":500,"reasoning_output_tokens":300,"total_tokens":100500},"last_token_usage":{"input_tokens":100000,"cached_input_tokens":80000,"output_tokens":500,"reasoning_output_tokens":300,"total_tokens":100500},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":true,"balance":null}}}}"#,
+        // Second token_count under gpt-5.4: total grew, delta in last.
+        r#"{"timestamp":"2026-05-26T15:34:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900000,"cached_input_tokens":800000,"output_tokens":3000,"reasoning_output_tokens":1000,"total_tokens":903000},"last_token_usage":{"input_tokens":800000,"cached_input_tokens":720000,"output_tokens":2500,"reasoning_output_tokens":700,"total_tokens":802500},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":true,"balance":null}}}}"#,
+        // User switches model.
+        r#"{"timestamp":"2026-05-26T15:34:30.000Z","type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5.5"}}"#,
+        // First token_count under gpt-5.5: total grew by 50k input, last==delta.
+        r#"{"timestamp":"2026-05-26T15:34:35.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":950000,"cached_input_tokens":830000,"output_tokens":3500,"reasoning_output_tokens":1200,"total_tokens":953500},"last_token_usage":{"input_tokens":50000,"cached_input_tokens":30000,"output_tokens":500,"reasoning_output_tokens":200,"total_tokens":50500},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":true,"balance":null}}}}"#,
+    ];
+
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let s = parser::parse_file(&path, false).unwrap().unwrap();
+
+    assert_eq!(s.tokens_total.total_tokens, 953_500);
+
+    // gpt-5.4 phase: 100,500 + 802,500 = 903,000 tokens total
+    let p54 = s.tokens_by_model.get("gpt-5.4").expect("gpt-5.4 bucket present");
+    assert_eq!(p54.input_tokens,            900_000);
+    assert_eq!(p54.cached_input_tokens,     800_000);
+    assert_eq!(p54.output_tokens,             3_000);
+    assert_eq!(p54.reasoning_output_tokens,   1_000);
+    assert_eq!(p54.total_tokens,            903_000);
+
+    // gpt-5.5 phase: 50,500 tokens (the post-switch delta)
+    let p55 = s.tokens_by_model.get("gpt-5.5").expect("gpt-5.5 bucket present");
+    assert_eq!(p55.input_tokens,             50_000);
+    assert_eq!(p55.cached_input_tokens,      30_000);
+    assert_eq!(p55.output_tokens,               500);
+    assert_eq!(p55.reasoning_output_tokens,     200);
+    assert_eq!(p55.total_tokens,             50_500);
+
+    // Invariant: sum of buckets equals session total.
+    let sum_input = p54.input_tokens + p55.input_tokens;
+    assert_eq!(sum_input, s.tokens_total.input_tokens);
+}

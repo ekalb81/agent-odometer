@@ -12,12 +12,6 @@ pub struct SessionParser {
     pub current_model: Option<String>,
     pub file_path: PathBuf,
     pub archived: bool,
-    /// True once we've seen a token_count event with non-null `info` in this
-    /// parser's lifetime. Used to seed per-model attribution from
-    /// `total_token_usage` on the first event so that *resumed* sessions
-    /// (whose first event's total already includes carry-over from a previous
-    /// rollout file) don't undercount their per-model totals.
-    seen_token_count: bool,
 }
 
 impl SessionParser {
@@ -28,7 +22,6 @@ impl SessionParser {
             current_model: None,
             file_path,
             archived,
-            seen_token_count: false,
         }
     }
 
@@ -267,27 +260,29 @@ impl SessionParser {
                 s.context_window = Some(cw as u32);
             }
 
-            // Per-model attribution. On the FIRST non-null token_count event we
-            // see in this parser's lifetime, add `total_token_usage` to the
-            // current model's bucket so that sessions resumed from a previous
-            // rollout file inherit the carry-over total (for a fresh session,
-            // total == last on the first event so the result is identical).
-            // On every subsequent event we add only `last_token_usage`, which
-            // is the delta for the most recent API call.
+            // Per-model attribution proceeds in two phases:
+            // 1. Add `last_token_usage` (the most recent API call's tokens) to
+            //    the active model's bucket. This is the per-call delta in
+            //    fresh sessions.
+            // 2. Reconcile: enforce sum(tokens_by_model) == tokens_total. Any
+            //    positive remainder (carry-over from a prior rollout file, or
+            //    an early event that arrived before current_model was known)
+            //    is added to the active model. This converges to the right
+            //    answer for resumed sessions and mid-session model switches.
+            if let (Some(model), Some(last)) = (self.current_model.as_ref(), last_usage.as_ref()) {
+                let entry = s.tokens_by_model.entry(model.clone()).or_default();
+                add_token_totals(entry, last);
+            }
+
             if let Some(model) = self.current_model.as_ref() {
-                let contribution = if !self.seen_token_count {
-                    total_usage.as_ref()
-                } else {
-                    last_usage.as_ref()
-                };
-                if let Some(delta) = contribution {
+                let bucket_sum = sum_bucket_totals(&s.tokens_by_model);
+                let remainder = subtract_totals_saturating(&s.tokens_total, &bucket_sum);
+                if totals_any_positive(&remainder) {
                     let entry = s.tokens_by_model.entry(model.clone()).or_default();
-                    add_token_totals(entry, delta);
+                    add_token_totals(entry, &remainder);
                 }
             }
         }
-
-        self.seen_token_count = true;
 
         if let Some(rate_limits) = payload.get("rate_limits") {
             if let Some(s) = self.session.as_mut() {
@@ -330,6 +325,32 @@ fn add_token_totals(dst: &mut TokenTotals, src: &TokenTotals) {
     dst.output_tokens += src.output_tokens;
     dst.reasoning_output_tokens += src.reasoning_output_tokens;
     dst.total_tokens += src.total_tokens;
+}
+
+fn sum_bucket_totals(buckets: &HashMap<String, TokenTotals>) -> TokenTotals {
+    let mut acc = TokenTotals::default();
+    for t in buckets.values() {
+        add_token_totals(&mut acc, t);
+    }
+    acc
+}
+
+fn subtract_totals_saturating(a: &TokenTotals, b: &TokenTotals) -> TokenTotals {
+    TokenTotals {
+        input_tokens:            a.input_tokens.saturating_sub(b.input_tokens),
+        cached_input_tokens:     a.cached_input_tokens.saturating_sub(b.cached_input_tokens),
+        output_tokens:           a.output_tokens.saturating_sub(b.output_tokens),
+        reasoning_output_tokens: a.reasoning_output_tokens.saturating_sub(b.reasoning_output_tokens),
+        total_tokens:            a.total_tokens.saturating_sub(b.total_tokens),
+    }
+}
+
+fn totals_any_positive(t: &TokenTotals) -> bool {
+    t.input_tokens > 0
+        || t.cached_input_tokens > 0
+        || t.output_tokens > 0
+        || t.reasoning_output_tokens > 0
+        || t.total_tokens > 0
 }
 
 pub fn parse_file(path: &Path, archived: bool) -> anyhow::Result<Option<Session>> {
