@@ -4,6 +4,7 @@ pub mod model;
 pub mod parser;
 pub mod rates;
 pub mod scanner;
+pub mod session_index;
 pub mod store;
 pub mod watcher;
 
@@ -45,11 +46,17 @@ pub fn run() {
             for (id, session) in found {
                 state_for_setup.sessions.insert(id, session);
             }
+
+            // Overlay thread names from the session index, if present.
+            let names = session_index::read(&config.session_index_path);
+            session_index::apply(&state_for_setup.sessions, &names);
+
             state_for_setup.scanned.store(true, Ordering::Release);
 
             tracing::info!(
-                "initial scan complete: {} sessions loaded",
-                state_for_setup.sessions.len()
+                "initial scan complete: {} sessions loaded, {} thread names from index",
+                state_for_setup.sessions.len(),
+                names.len()
             );
 
             // Start the live watcher and store the handle in state so set_config can restart it.
@@ -58,6 +65,7 @@ pub fn run() {
                 state_for_setup.clone(),
                 config.session_roots.clone(),
                 config.archive_roots.clone(),
+                config.session_index_path.clone(),
             )?;
             *state_for_setup.watcher.lock().unwrap() = Some(handle);
 

@@ -44,6 +44,10 @@ pub fn set_config(
     for (id, session) in found {
         state.sessions.insert(id, session);
     }
+
+    let names = crate::session_index::read(&config.session_index_path);
+    crate::session_index::apply(&state.sessions, &names);
+
     state.scanned.store(true, Ordering::Release);
 
     let handle = crate::watcher::start(
@@ -51,6 +55,7 @@ pub fn set_config(
         state.inner().clone(),
         config.session_roots.clone(),
         config.archive_roots.clone(),
+        config.session_index_path.clone(),
     )
     .map_err(|e| e.to_string())?;
     *state.watcher.lock().unwrap() = Some(handle);

@@ -37,6 +37,7 @@ export interface Session {
 export interface Config {
   session_roots: string[];
   archive_roots: string[];
+  session_index_path: string;
 }
 
 export interface ModelRate {

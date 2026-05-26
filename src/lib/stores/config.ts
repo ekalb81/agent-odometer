@@ -5,4 +5,5 @@ import type { Config } from '../types';
 export const config = writable<Config>({
   session_roots: [],
   archive_roots: [],
+  session_index_path: '',
 });

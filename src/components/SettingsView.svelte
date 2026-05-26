@@ -10,6 +10,7 @@
 
   let editedSessionRoots = $state<string[]>([]);
   let editedArchiveRoots = $state<string[]>([]);
+  let editedIndexPath = $state('');
   let newSessionRoot = $state('');
   let newArchiveRoot = $state('');
 
@@ -25,6 +26,7 @@
     if (!rootsDirty) {
       editedSessionRoots = [...c.session_roots];
       editedArchiveRoots = [...c.archive_roots];
+      editedIndexPath = c.session_index_path ?? '';
     }
   });
 
@@ -79,6 +81,7 @@
       await setConfig({
         session_roots: editedSessionRoots,
         archive_roots: editedArchiveRoots,
+        session_index_path: editedIndexPath.trim(),
       });
       rootsDirty = false;
       rootsSavedAt = new Date().toLocaleTimeString();
@@ -362,6 +365,20 @@
         >Add</button>
       </li>
     </ul>
+
+    <!-- Session index file -->
+    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Session index file</h3>
+    <p class="text-xs text-slate-500 mb-1">
+      JSONL file mapping session ids to thread names. Codex writes this at
+      <span class="font-mono">~/.codex/session_index.jsonl</span> by default.
+    </p>
+    <input
+      type="text"
+      placeholder="/absolute/path/to/session_index.jsonl"
+      bind:value={editedIndexPath}
+      oninput={markRootsDirty}
+      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono mb-2"
+    />
 
     {#if hasDuplicateRoots}
       <p class="text-xs text-amber-400">Warning: duplicate paths detected in the lists above.</p>

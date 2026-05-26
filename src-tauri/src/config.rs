@@ -5,6 +5,13 @@ use std::path::PathBuf;
 pub struct Config {
     pub session_roots: Vec<PathBuf>,
     pub archive_roots: Vec<PathBuf>,
+    #[serde(default = "default_session_index_path")]
+    pub session_index_path: PathBuf,
+}
+
+fn default_session_index_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".codex/session_index.jsonl")
 }
 
 impl Default for Config {
@@ -13,6 +20,7 @@ impl Default for Config {
         Self {
             session_roots: vec![home.join(".codex/sessions")],
             archive_roots: vec![home.join(".codex/archived_sessions")],
+            session_index_path: home.join(".codex/session_index.jsonl"),
         }
     }
 }
@@ -82,6 +90,7 @@ mod tests {
         let cfg = Config {
             session_roots: vec![dir.path().join("sessions")],
             archive_roots: vec![dir.path().join("archived")],
+            session_index_path: dir.path().join("session_index.jsonl"),
         };
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -91,6 +100,17 @@ mod tests {
         let loaded: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.session_roots, cfg.session_roots);
         assert_eq!(loaded.archive_roots, cfg.archive_roots);
+    }
+
+    #[test]
+    fn legacy_config_without_session_index_path_loads_with_default() {
+        // Pre-existing on-disk configs from before this field was added must still parse.
+        let raw = r#"{"session_roots":["/x"],"archive_roots":["/y"]}"#;
+        let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.session_roots, vec![PathBuf::from("/x")]);
+        assert_eq!(cfg.archive_roots, vec![PathBuf::from("/y")]);
+        // session_index_path should fall back to the home-dir default, never empty.
+        assert!(cfg.session_index_path.ends_with("session_index.jsonl"));
     }
 
     #[test]

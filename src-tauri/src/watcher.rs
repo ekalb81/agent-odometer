@@ -25,12 +25,15 @@ pub fn start(
     state: Arc<AppState>,
     session_roots: Vec<PathBuf>,
     archive_roots: Vec<PathBuf>,
+    session_index_path: PathBuf,
 ) -> anyhow::Result<WatcherHandle> {
     let parsers: Arc<DashMap<PathBuf, SessionParser>> = Arc::new(DashMap::new());
     let archive_roots_arc: Arc<Vec<PathBuf>> = Arc::new(archive_roots.clone());
+    let session_index_path_arc: Arc<PathBuf> = Arc::new(session_index_path.clone());
 
     let parsers_cb = parsers.clone();
     let archive_roots_cb = archive_roots_arc.clone();
+    let session_index_path_cb = session_index_path_arc.clone();
     let state_cb = state.clone();
     let app_cb = app.clone();
 
@@ -51,6 +54,21 @@ pub fn start(
             for event in events {
                 let kind = event.kind;
                 for path in &event.paths {
+                    // The session index lives next to the per-session files; handle it first
+                    // so we don't try to parse it as a rollout JSONL.
+                    if path == session_index_path_cb.as_path() {
+                        let names = crate::session_index::read(path);
+                        let changed = crate::session_index::apply(&state_cb.sessions, &names);
+                        for id in changed {
+                            if let Some(session) = state_cb.sessions.get(&id) {
+                                if let Err(e) = app_cb.emit("session-updated", session.value()) {
+                                    tracing::warn!("emit session-updated failed: {}", e);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
                     // Only process .jsonl files.
                     if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                         continue;
@@ -109,6 +127,17 @@ pub fn start(
         }
         if let Err(e) = debouncer.watch(root, RecursiveMode::Recursive) {
             tracing::warn!("could not watch {:?}: {}", root, e);
+        }
+    }
+
+    // Watch the directory containing the session index non-recursively. We can't
+    // watch a single file directly across platforms — atomic renames replace the
+    // inode and the watch is lost — so we watch the parent and filter in the callback.
+    if let Some(index_parent) = session_index_path.parent() {
+        if index_parent.exists() {
+            if let Err(e) = debouncer.watch(index_parent, RecursiveMode::NonRecursive) {
+                tracing::warn!("could not watch session-index parent {:?}: {}", index_parent, e);
+            }
         }
     }
 
