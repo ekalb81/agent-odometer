@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use crate::model::Session;
 
 /// Shared application state managed by Tauri.

@@ -2,22 +2,14 @@ use crate::config::Config;
 use crate::model::Session;
 use crate::rates::RateCard;
 use crate::store::AppState;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tauri::State;
 
 /// Returns the list of all known sessions.
-/// On the first call, runs an initial scan against the current config.
-/// Phase 3 will replace the scan trigger with a file watcher.
+/// Sessions are populated at startup by the initial scan + file watcher;
+/// this command just reads the in-memory map.
 #[tauri::command]
-pub fn list_sessions(state: State<'_, AppState>) -> Vec<Session> {
-    if state.scanned.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-        let config = Config::load().unwrap_or_default();
-        let found = crate::scanner::initial_scan(&config.session_roots, &config.archive_roots);
-        for (id, session) in found {
-            state.sessions.insert(id, session);
-        }
-    }
-
+pub fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<Session> {
     state
         .sessions
         .iter()
@@ -25,15 +17,18 @@ pub fn list_sessions(state: State<'_, AppState>) -> Vec<Session> {
         .collect()
 }
 
-/// Returns the current configuration. Phase 3 will persist and reload config.
+/// Returns the current configuration.
 #[tauri::command]
-pub fn get_config() -> Config {
-    Config::default()
+pub fn get_config() -> Result<Config, String> {
+    Config::load().map_err(|e| e.to_string())
 }
 
-/// Persists a new configuration. Phase 3 will implement persistence.
+/// Persists a new configuration and logs that a restart is needed
+/// for the watcher to pick up the new roots (live re-watching is Phase 6).
 #[tauri::command]
-pub fn set_config(_config: Config) -> Result<(), String> {
+pub fn set_config(config: Config) -> Result<(), String> {
+    config.save().map_err(|e| e.to_string())?;
+    tracing::info!("config saved; restart the app for the new roots to take effect");
     Ok(())
 }
 
