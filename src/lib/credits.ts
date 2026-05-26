@@ -40,10 +40,15 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
       continue;
     }
 
+    // OpenAI billing semantics: cached_input_tokens is a SUBSET of input_tokens,
+    // and reasoning_output_tokens is a SUBSET of output_tokens. Apply each rate
+    // to the disjoint portion so cached/reasoning aren't counted twice.
+    const nonCachedInput = Math.max(0, totals.input_tokens - totals.cached_input_tokens);
+    const nonReasoningOutput = Math.max(0, totals.output_tokens - totals.reasoning_output_tokens);
     const cost =
-      (totals.input_tokens * rate.input +
+      (nonCachedInput * rate.input +
         totals.cached_input_tokens * rate.cached_input +
-        totals.output_tokens * rate.output +
+        nonReasoningOutput * rate.output +
         totals.reasoning_output_tokens * rate.reasoning) /
       1_000_000;
 
