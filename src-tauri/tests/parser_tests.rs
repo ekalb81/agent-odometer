@@ -215,3 +215,48 @@ fn mid_session_model_switch_attributes_each_phase_correctly() {
     let sum_input = p54.input_tokens + p55.input_tokens;
     assert_eq!(sum_input, s.tokens_total.input_tokens);
 }
+
+#[test]
+fn duplicate_session_meta_does_not_wipe_accumulated_buckets() {
+    // Codex Desktop emits session_meta a second time when a session is
+    // resumed / re-opened in the same rollout file. The parser must not
+    // treat that as a brand-new session and wipe tokens_by_model.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("doublemeta.jsonl");
+
+    let lines = [
+        // First session_meta + work on gpt-5.4
+        r#"{"timestamp":"2026-05-26T15:33:43.000Z","type":"session_meta","payload":{"id":"019e64eb-aaaa-bbbb-cccc-000000000003","timestamp":"2026-05-26T15:33:43.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.133.0","source":"vscode","model_provider":"openai"}}"#,
+        r#"{"timestamp":"2026-05-26T15:33:45.000Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.4"}}"#,
+        r#"{"timestamp":"2026-05-26T16:22:49.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15263176,"cached_input_tokens":12731392,"output_tokens":63434,"reasoning_output_tokens":34004,"total_tokens":15326610},"last_token_usage":{"input_tokens":15263176,"cached_input_tokens":12731392,"output_tokens":63434,"reasoning_output_tokens":34004,"total_tokens":15326610},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":false,"balance":null}}}}"#,
+        // Second session_meta (the resume marker) — must NOT wipe state
+        r#"{"timestamp":"2026-05-26T16:25:00.000Z","type":"session_meta","payload":{"id":"019e64eb-aaaa-bbbb-cccc-000000000003","timestamp":"2026-05-26T16:25:00.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.133.0","source":"vscode","model_provider":"openai"}}"#,
+        // Switch to gpt-5.5 and do more work
+        r#"{"timestamp":"2026-05-26T16:25:14.000Z","type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5.5"}}"#,
+        r#"{"timestamp":"2026-05-26T17:15:37.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":23187732,"cached_input_tokens":20105344,"output_tokens":90479,"reasoning_output_tokens":46811,"total_tokens":23278211},"last_token_usage":{"input_tokens":7924556,"cached_input_tokens":7373952,"output_tokens":27045,"reasoning_output_tokens":12807,"total_tokens":7951601},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":false,"balance":null}}}}"#,
+    ];
+
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let s = parser::parse_file(&path, false).unwrap().unwrap();
+
+    // Identity is preserved from the first session_meta.
+    assert_eq!(s.id, "019e64eb-aaaa-bbbb-cccc-000000000003");
+    assert_eq!(s.tokens_total.total_tokens, 23_278_211);
+
+    // Both buckets must be present — the second session_meta did NOT wipe gpt-5.4.
+    let p54 = s.tokens_by_model.get("gpt-5.4").expect("gpt-5.4 bucket present");
+    assert_eq!(p54.input_tokens,            15_263_176);
+    assert_eq!(p54.cached_input_tokens,     12_731_392);
+    assert_eq!(p54.total_tokens,            15_326_610);
+
+    let p55 = s.tokens_by_model.get("gpt-5.5").expect("gpt-5.5 bucket present");
+    assert_eq!(p55.input_tokens,             7_924_556);
+    assert_eq!(p55.cached_input_tokens,      7_373_952);
+    assert_eq!(p55.total_tokens,             7_951_601);
+
+    // Sum-of-buckets invariant.
+    assert_eq!(
+        p54.input_tokens + p55.input_tokens,
+        s.tokens_total.input_tokens
+    );
+}

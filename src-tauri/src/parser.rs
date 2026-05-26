@@ -113,6 +113,31 @@ impl SessionParser {
             .unwrap_or_default()
             .to_owned();
 
+        // If we've already built a Session from a prior session_meta event in
+        // this file, do NOT recreate it — Codex Desktop emits session_meta
+        // again on resume / re-open within the same rollout file, and
+        // recreating the Session here would wipe tokens_by_model,
+        // tokens_history, total_turns, etc. that we've accumulated. Refresh
+        // only the identity/metadata fields that can legitimately change.
+        if let Some(s) = self.session.as_mut() {
+            if !id.is_empty() && s.id != id {
+                tracing::warn!(
+                    "session_meta id changed mid-file (was {}, now {}); keeping prior session state",
+                    s.id, id
+                );
+            }
+            if let Some(name) = payload.get("thread_name").and_then(Value::as_str) {
+                s.thread_name = Some(name.to_owned());
+            }
+            if let Some(cli) = payload.get("cli_version").and_then(Value::as_str) {
+                s.cli_version = Some(cli.to_owned());
+            }
+            if last_event_at > s.last_event_at {
+                s.last_event_at = last_event_at;
+            }
+            return Ok(());
+        }
+
         let started_at: DateTime<Utc> = payload
             .get("timestamp")
             .and_then(Value::as_str)
