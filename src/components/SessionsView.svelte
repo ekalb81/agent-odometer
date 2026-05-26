@@ -1,18 +1,13 @@
 <script lang="ts">
   import { sessionsStore } from '../lib/stores/sessions';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits } from '../lib/credits';
+  import { computeSessionCredits, formatCredits } from '../lib/credits';
   import Filters from './Filters.svelte';
   import type { FilterState } from './Filters.svelte';
   import RowDrawer from './RowDrawer.svelte';
 
   const fmt = new Intl.NumberFormat();
-  const creditFmt = new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 4,
-  });
+  const fmtCredit = (amount: number) => formatCredits(amount, $rates?.currency ?? 'credits');
 
   function fmtTokens(n: number): string {
     return fmt.format(n);
@@ -258,7 +253,7 @@
       total tokens
     </span>
     <span>
-      <span class="font-semibold text-slate-200">{creditFmt.format(creditSummary.billedTotal)}</span>
+      <span class="font-semibold text-slate-200">{fmtCredit(creditSummary.billedTotal)}</span>
       total credits
       {#if creditSummary.unlimitedCount > 0}
         <span class="text-slate-500 text-xs ml-1">({creditSummary.unlimitedCount} unlimited excluded)</span>
@@ -420,11 +415,11 @@
                 {#if session.credits_unlimited === true}
                   <span
                     class="text-slate-400"
-                    title="Reference cost on à-la-carte: {creditFmt.format(sessionCredit?.refCost ?? 0)} ({session.plan_type ?? 'unlimited'} · unlimited)"
+                    title="Reference cost on à-la-carte: {fmtCredit(sessionCredit?.refCost ?? 0)} ({session.plan_type ?? 'unlimited'} · unlimited)"
                   >—</span>
                 {:else}
                   <span class="text-emerald-400 font-medium">
-                    {creditFmt.format(sessionCredit?.total ?? 0)}
+                    {fmtCredit(sessionCredit?.total ?? 0)}
                   </span>
                 {/if}
                 {#if sessionCredit && sessionCredit.missingModels.length > 0}

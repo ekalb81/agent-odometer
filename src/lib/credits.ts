@@ -53,3 +53,26 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
 
   return { total, byModel, missingModels };
 }
+
+const ISO_CURRENCY = /^[A-Z]{3}$/;
+
+/**
+ * Formats a credit amount per the rate card's `currency` field. If `currency`
+ * looks like an ISO 4217 code (e.g. "USD"), uses Intl currency formatting.
+ * Otherwise (e.g. "credits"), formats as a plain decimal with the unit suffix.
+ */
+export function formatCredits(amount: number, currency: string): string {
+  if (ISO_CURRENCY.test(currency)) {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency,
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4,
+    }).format(amount);
+  }
+  const num = new Intl.NumberFormat('en-US', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  }).format(amount);
+  return `${num} ${currency}`;
+}

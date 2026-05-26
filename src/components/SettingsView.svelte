@@ -110,6 +110,8 @@
   let sourceUrl = $state('');
   let fetchedAt = $state<string | null>(null);
   let ratesVersion = $state(1);
+  let ratesCurrency = $state('credits');
+  let ratesUnit = $state('per_1m_tokens');
 
   // New-model form.
   let newName = $state('');
@@ -140,6 +142,8 @@
     sourceUrl = r.source_url;
     fetchedAt = r.fetched_at;
     ratesVersion = r.version;
+    ratesCurrency = r.currency;
+    ratesUnit = r.unit;
     dirty = false;
   });
 
@@ -186,8 +190,8 @@
     validationError = null;
     return {
       version: ratesVersion,
-      currency: 'USD',
-      unit: 'per_1m_tokens',
+      currency: ratesCurrency,
+      unit: ratesUnit,
       source_url: sourceUrl,
       fetched_at: fetchedAt,
       models,
@@ -392,7 +396,7 @@
 
       <!-- Metadata row -->
       <div class="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 text-xs text-slate-500">
-        <span>v{ratesVersion} · USD · per_1m_tokens</span>
+        <span>v{ratesVersion} · {ratesCurrency} · {ratesUnit}</span>
         {#if fetchedAt}
           <span>fetched {fetchedAt}</span>
         {/if}

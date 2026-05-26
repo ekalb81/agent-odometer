@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte';
   import type { Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits } from '../lib/credits';
+  import { computeSessionCredits, formatCredits } from '../lib/credits';
   import { revealInFileManager } from '../lib/ipc';
   import Sparkline from './Sparkline.svelte';
 
@@ -15,12 +15,7 @@
 
   const numFmt = new Intl.NumberFormat();
   const pctFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
-  const creditFmt = new Intl.NumberFormat('en-US', {
-    style: 'currency',
-    currency: 'USD',
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 4,
-  });
+  const fmtCredit = (amount: number) => formatCredits(amount, $rates?.currency ?? 'credits');
 
   function fmt(n: number): string {
     return numFmt.format(n);
@@ -269,7 +264,7 @@
                   </td>
                   <!-- Per-model cost -->
                   <td class="py-1.5 pl-2 text-right tabular-nums text-slate-300">
-                    {modelCredit ? creditFmt.format(modelCredit.cost) : '—'}
+                    {modelCredit ? fmtCredit(modelCredit.cost) : '—'}
                   </td>
                 </tr>
               {/each}
@@ -287,7 +282,7 @@
                   {#if session.credits_unlimited === true}
                     —
                   {:else}
-                    {sessionCredits ? creditFmt.format(sessionCredits.total) : '—'}
+                    {sessionCredits ? fmtCredit(sessionCredits.total) : '—'}
                   {/if}
                 </td>
               </tr>
@@ -298,7 +293,7 @@
         <!-- Reference cost line for unlimited sessions -->
         {#if session.credits_unlimited === true && sessionCredits}
           <p class="mt-2 text-xs text-slate-500">
-            Reference: {creditFmt.format(sessionCredits.total)} à-la-carte equivalent
+            Reference: {fmtCredit(sessionCredits.total)} à-la-carte equivalent
           </p>
         {/if}
       </section>

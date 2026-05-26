@@ -1,14 +1,16 @@
 {
-  "version": 1,
-  "currency": "USD",
+  "version": 2,
+  "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
-  "fetched_at": null,
-  "_note": "FETCH FAILED on 2026-05-26: HTTP 403 Forbidden from help.openai.com. Edit this file or use the in-app rates editor before relying on credit calculations.",
+  "fetched_at": "2026-05-26",
+  "_note": "Values transcribed by user on fetched_at. Reasoning is billed at the output rate. Research-preview models and GPT-Image-2.0 modalities are omitted (not Codex coding sessions); add via the in-app editor if needed.",
   "models": {
-    "codex-mini-latest": { "input": 0.0, "cached_input": 0.0, "output": 0.0, "reasoning": 0.0 },
-    "o4-mini":           { "input": 0.0, "cached_input": 0.0, "output": 0.0, "reasoning": 0.0 },
-    "o3":                { "input": 0.0, "cached_input": 0.0, "output": 0.0, "reasoning": 0.0 }
+    "gpt-5.5":        { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
+    "gpt-5.4":        { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
+    "gpt-5.4-mini":   { "input":  18.75, "cached_input":  1.875, "output": 113.0, "reasoning": 113.0 },
+    "gpt-5.3-codex":  { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
+    "gpt-5.2":        { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 }
   },
-  "fallback_model": "codex-mini-latest"
+  "fallback_model": "gpt-5.5"
 }
