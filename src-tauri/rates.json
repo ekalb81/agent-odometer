@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "currency": "USD",
+  "unit": "per_1m_tokens",
+  "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+  "fetched_at": null,
+  "_note": "PLACEHOLDER VALUES — Phase 5 will populate from source_url. Do not ship as real prices.",
+  "models": {
+    "gpt-5-codex": { "input": 0.0, "cached_input": 0.0, "output": 0.0, "reasoning": 0.0 },
+    "gpt-5":       { "input": 0.0, "cached_input": 0.0, "output": 0.0, "reasoning": 0.0 },
+    "gpt-5.5":     { "input": 0.0, "cached_input": 0.0, "output": 0.0, "reasoning": 0.0 }
+  },
+  "fallback_model": "gpt-5-codex"
+}

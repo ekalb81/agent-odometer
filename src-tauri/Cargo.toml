@@ -1,0 +1,41 @@
+[package]
+name = "codex-data-viewer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "codex_data_viewer_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "codex-data-viewer"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri          = { version = "2", features = [] }
+serde          = { version = "1", features = ["derive"] }
+serde_json     = "1"
+chrono         = { version = "0.4", features = ["serde"] }
+notify         = "8"
+notify-debouncer-full = "0.6"   # pairs with notify 8.x
+tokio          = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", "io-util"] }
+dashmap        = "6"
+anyhow         = "1"
+thiserror      = "2"
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs           = "5"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto           = true
+opt-level     = "s"
+panic         = "abort"
+strip         = true

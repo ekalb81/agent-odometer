@@ -1,0 +1,19 @@
+node_modules/
+dist/
+.svelte-kit/
+.DS_Store
+
+# Rust / Tauri
+target/
+src-tauri/target/
+*.lock.bak
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
