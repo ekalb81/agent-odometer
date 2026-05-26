@@ -29,6 +29,10 @@ thiserror      = "2"
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs           = "5"
+walkdir        = "2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.dev]
 incremental = true

@@ -2,11 +2,22 @@ use crate::config::Config;
 use crate::model::Session;
 use crate::rates::RateCard;
 use crate::store::AppState;
+use std::sync::atomic::Ordering;
 use tauri::State;
 
-/// Returns the list of all known sessions. Phase 3 will populate AppState via the watcher.
+/// Returns the list of all known sessions.
+/// On the first call, runs an initial scan against the current config.
+/// Phase 3 will replace the scan trigger with a file watcher.
 #[tauri::command]
 pub fn list_sessions(state: State<'_, AppState>) -> Vec<Session> {
+    if state.scanned.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+        let config = Config::load().unwrap_or_default();
+        let found = crate::scanner::initial_scan(&config.session_roots, &config.archive_roots);
+        for (id, session) in found {
+            state.sessions.insert(id, session);
+        }
+    }
+
     state
         .sessions
         .iter()
