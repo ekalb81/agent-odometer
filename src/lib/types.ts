@@ -31,6 +31,7 @@ export interface Session {
   first_user_message: string | null;
   tokens_total: TokenTotals;
   tokens_by_model: Record<string, TokenTotals>;
+  tokens_history: { timestamp: string; total_tokens: number }[];
 }
 
 export interface Config {

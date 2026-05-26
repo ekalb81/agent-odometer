@@ -2,6 +2,7 @@ use codex_data_viewer_lib::parser;
 use codex_data_viewer_lib::model::TokenTotals;
 use std::path::PathBuf;
 
+
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-session.jsonl")
 }
@@ -114,4 +115,19 @@ fn incremental_parsing_matches_full_parse() {
     assert_eq!(incr.tokens_total.total_tokens, full.tokens_total.total_tokens);
     assert_eq!(incr.tokens_by_model, full.tokens_by_model);
     assert_eq!(incr.total_turns, full.total_turns);
+}
+
+#[test]
+fn populates_tokens_history_from_token_count_events() {
+    let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
+    // The fixture has 8 token_count events; the first has info: null, so 7 history points.
+    assert_eq!(s.tokens_history.len(), 7);
+    // Monotonic non-decreasing total_tokens.
+    let totals: Vec<u64> = s.tokens_history.iter().map(|p| p.total_tokens).collect();
+    assert!(totals.windows(2).all(|w| w[0] <= w[1]), "history not monotonic: {:?}", totals);
+    // Last point matches tokens_total.
+    assert_eq!(s.tokens_history.last().unwrap().total_tokens, s.tokens_total.total_tokens);
+    // Timestamps are strictly increasing.
+    let ts: Vec<_> = s.tokens_history.iter().map(|p| p.timestamp).collect();
+    assert!(ts.windows(2).all(|w| w[0] < w[1]), "timestamps not strictly increasing");
 }

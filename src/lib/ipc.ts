@@ -52,3 +52,7 @@ export function onSessionRemoved(cb: (sessionId: string) => void): Promise<Unlis
 export function onRatesUpdated(cb: (rates: RateCard) => void): Promise<UnlistenFn> {
   return listen<RateCard>('rates-updated', (event) => cb(event.payload));
 }
+
+export function onConfigUpdated(cb: (config: Config) => void): Promise<UnlistenFn> {
+  return listen<Config>('config-updated', (event) => cb(event.payload));
+}

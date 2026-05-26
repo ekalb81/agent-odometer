@@ -2,9 +2,10 @@
   import { onMount, onDestroy } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, onRatesUpdated } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, onRatesUpdated, onConfigUpdated } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions';
   import { rates } from './lib/stores/rates';
+  import { config } from './lib/stores/config';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
   type View = 'sessions' | 'settings';
@@ -13,6 +14,7 @@
   let unlistenUpdated: UnlistenFn | null = null;
   let unlistenRemoved: UnlistenFn | null = null;
   let unlistenRates: UnlistenFn | null = null;
+  let unlistenConfig: UnlistenFn | null = null;
 
   onMount(async () => {
     try {
@@ -32,12 +34,22 @@
     unlistenUpdated = await onSessionUpdated((s) => sessionsStore.upsert(s));
     unlistenRemoved = await onSessionRemoved((id) => sessionsStore.remove(id));
     unlistenRates = await onRatesUpdated((card) => rates.set(card));
+    unlistenConfig = await onConfigUpdated(async (newConfig) => {
+      config.set(newConfig);
+      try {
+        const sessions = await listSessions();
+        sessionsStore.replaceAll(sessions);
+      } catch (e) {
+        console.error('listSessions after config-updated failed:', e);
+      }
+    });
   });
 
   onDestroy(() => {
     unlistenUpdated?.();
     unlistenRemoved?.();
     unlistenRates?.();
+    unlistenConfig?.();
   });
 </script>
 

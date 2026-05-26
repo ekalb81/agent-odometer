@@ -2,8 +2,9 @@ use crate::config::Config;
 use crate::model::Session;
 use crate::rates::RateCard;
 use crate::store::AppState;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::{AppHandle, Emitter, State};
 
 /// Returns the list of all known sessions.
 /// Sessions are populated at startup by the initial scan + file watcher;
@@ -23,12 +24,39 @@ pub fn get_config() -> Result<Config, String> {
     Config::load().map_err(|e| e.to_string())
 }
 
-/// Persists a new configuration and logs that a restart is needed
-/// for the watcher to pick up the new roots (live re-watching is Phase 6).
+/// Persists a new configuration, clears the session cache, re-scans with the
+/// new roots, restarts the file watcher, and emits a "config-updated" event.
 #[tauri::command]
-pub fn set_config(config: Config) -> Result<(), String> {
+pub fn set_config(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    config: Config,
+) -> Result<(), String> {
     config.save().map_err(|e| e.to_string())?;
-    tracing::info!("config saved; restart the app for the new roots to take effect");
+
+    // Stop the old watcher before clearing sessions so no stale events arrive.
+    state.watcher.lock().unwrap().take();
+
+    state.sessions.clear();
+    state.scanned.store(false, Ordering::Release);
+
+    let found = crate::scanner::initial_scan(&config.session_roots, &config.archive_roots);
+    for (id, session) in found {
+        state.sessions.insert(id, session);
+    }
+    state.scanned.store(true, Ordering::Release);
+
+    let handle = crate::watcher::start(
+        app.clone(),
+        state.inner().clone(),
+        config.session_roots.clone(),
+        config.archive_roots.clone(),
+    )
+    .map_err(|e| e.to_string())?;
+    *state.watcher.lock().unwrap() = Some(handle);
+
+    app.emit("config-updated", &config).map_err(|e| e.to_string())?;
+
     Ok(())
 }
 

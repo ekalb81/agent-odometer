@@ -10,6 +10,12 @@ pub struct TokenTotals {
     pub total_tokens: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TokenHistoryPoint {
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub total_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -34,4 +40,5 @@ pub struct Session {
     pub first_user_message: Option<String>,
     pub tokens_total: TokenTotals,
     pub tokens_by_model: HashMap<String, TokenTotals>,
+    pub tokens_history: Vec<TokenHistoryPoint>,
 }

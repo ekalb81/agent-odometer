@@ -12,7 +12,6 @@ use config::Config;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use store::AppState;
-use tauri::Manager;
 use tracing_subscriber::EnvFilter;
 
 pub fn run() {
@@ -53,14 +52,14 @@ pub fn run() {
                 state_for_setup.sessions.len()
             );
 
-            // Start the live watcher and keep the handle alive for the app's lifetime.
+            // Start the live watcher and store the handle in state so set_config can restart it.
             let handle = watcher::start(
                 app.handle().clone(),
                 state_for_setup.clone(),
                 config.session_roots.clone(),
                 config.archive_roots.clone(),
             )?;
-            app.manage(handle);
+            *state_for_setup.watcher.lock().unwrap() = Some(handle);
 
             Ok(())
         })

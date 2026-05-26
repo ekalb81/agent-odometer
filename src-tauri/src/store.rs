@@ -1,12 +1,13 @@
 use dashmap::DashMap;
 use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 use crate::model::Session;
+use crate::watcher::WatcherHandle;
 
-/// Shared application state managed by Tauri.
-/// Phase 3 will populate sessions via the file watcher.
 pub struct AppState {
     pub sessions: DashMap<String, Session>,
     pub scanned: AtomicBool,
+    pub watcher: Mutex<Option<WatcherHandle>>,
 }
 
 impl AppState {
@@ -14,6 +15,7 @@ impl AppState {
         Self {
             sessions: DashMap::new(),
             scanned: AtomicBool::new(false),
+            watcher: Mutex::new(None),
         }
     }
 }

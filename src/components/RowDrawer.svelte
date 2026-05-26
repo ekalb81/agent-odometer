@@ -4,6 +4,7 @@
   import { rates } from '../lib/stores/rates';
   import { computeSessionCredits } from '../lib/credits';
   import { revealInFileManager } from '../lib/ipc';
+  import Sparkline from './Sparkline.svelte';
 
   interface Props {
     session: Session | null;
@@ -319,6 +320,20 @@
                 style="width: {ctxBarWidth}%"
               ></div>
             </div>
+          </div>
+        </section>
+      {/if}
+
+      <!-- Tokens over time sparkline -->
+      {#if session.tokens_history && session.tokens_history.length > 0}
+        <section>
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3">Tokens over time</h3>
+          <div class="text-slate-400">
+            <Sparkline points={session.tokens_history} width={432} height={56} />
+          </div>
+          <div class="flex justify-between text-xs text-slate-500 mt-1">
+            <span>{new Date(session.tokens_history[0].timestamp).toLocaleTimeString()}</span>
+            <span>{new Date(session.tokens_history[session.tokens_history.length - 1].timestamp).toLocaleTimeString()}</span>
           </div>
         </section>
       {/if}

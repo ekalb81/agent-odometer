@@ -1,4 +1,4 @@
-use crate::model::{Session, TokenTotals};
+use crate::model::{Session, TokenHistoryPoint, TokenTotals};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -99,7 +99,7 @@ impl SessionParser {
         match event_type.as_str() {
             "session_meta" => self.handle_session_meta(payload, last_event_at)?,
             "turn_context" => self.handle_turn_context(payload)?,
-            "event_msg" => self.handle_event_msg(payload)?,
+            "event_msg" => self.handle_event_msg(payload, last_event_at)?,
             _ => {}
         }
 
@@ -172,6 +172,7 @@ impl SessionParser {
             first_user_message: None,
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
+            tokens_history: Vec::new(),
         });
 
         Ok(())
@@ -196,7 +197,7 @@ impl SessionParser {
         Ok(())
     }
 
-    fn handle_event_msg(&mut self, payload: Value) -> anyhow::Result<()> {
+    fn handle_event_msg(&mut self, payload: Value, event_ts: DateTime<Utc>) -> anyhow::Result<()> {
         let msg_type = payload
             .get("type")
             .and_then(Value::as_str)
@@ -223,7 +224,7 @@ impl SessionParser {
                 }
             }
             "token_count" => {
-                self.handle_token_count(payload)?;
+                self.handle_token_count(payload, event_ts)?;
             }
             "task_complete" => {
                 if let Some(s) = self.session.as_mut() {
@@ -236,7 +237,7 @@ impl SessionParser {
         Ok(())
     }
 
-    fn handle_token_count(&mut self, payload: Value) -> anyhow::Result<()> {
+    fn handle_token_count(&mut self, payload: Value, event_ts: DateTime<Utc>) -> anyhow::Result<()> {
         let info = match payload.get("info") {
             Some(v) if !v.is_null() => v,
             // The first token_count event in a session commonly has info: null.
@@ -246,6 +247,10 @@ impl SessionParser {
         if let Some(s) = self.session.as_mut() {
             if let Some(total) = info.get("total_token_usage") {
                 s.tokens_total = parse_token_totals(total);
+                s.tokens_history.push(TokenHistoryPoint {
+                    timestamp: event_ts,
+                    total_tokens: s.tokens_total.total_tokens,
+                });
             }
 
             if let Some(cw) = info.get("model_context_window").and_then(Value::as_u64) {

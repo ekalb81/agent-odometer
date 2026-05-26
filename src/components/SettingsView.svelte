@@ -1,8 +1,93 @@
 <script lang="ts">
   import { config } from '../lib/stores/config';
   import { rates } from '../lib/stores/rates';
-  import { setRates, getBundledRates } from '../lib/ipc';
+  import { setConfig, setRates, getBundledRates } from '../lib/ipc';
   import type { RateCard, ModelRate } from '../lib/types';
+
+  // ---------------------------------------------------------------------------
+  // Editable watched roots — local copies diverge from the store until saved.
+  // ---------------------------------------------------------------------------
+
+  let editedSessionRoots = $state<string[]>([]);
+  let editedArchiveRoots = $state<string[]>([]);
+  let newSessionRoot = $state('');
+  let newArchiveRoot = $state('');
+
+  let rootsDirty = $state(false);
+  let rootsSaving = $state(false);
+  let rootsSavedAt = $state<string | null>(null);
+  let rootsSaveError = $state<string | null>(null);
+
+  // Sync editable roots from the config store whenever config changes, but
+  // only when there are no pending edits (don't clobber user's in-progress work).
+  $effect(() => {
+    const c = $config;
+    if (!rootsDirty) {
+      editedSessionRoots = [...c.session_roots];
+      editedArchiveRoots = [...c.archive_roots];
+    }
+  });
+
+  const hasDuplicateRoots = $derived(
+    new Set(editedSessionRoots).size !== editedSessionRoots.length ||
+    new Set(editedArchiveRoots).size !== editedArchiveRoots.length,
+  );
+
+  function markRootsDirty() {
+    rootsDirty = true;
+    rootsSavedAt = null;
+    rootsSaveError = null;
+  }
+
+  function addSessionRoot() {
+    const v = newSessionRoot.trim();
+    if (!v) return;
+    editedSessionRoots = [...editedSessionRoots, v];
+    newSessionRoot = '';
+    markRootsDirty();
+  }
+
+  function removeSessionRoot(i: number) {
+    editedSessionRoots = editedSessionRoots.filter((_, idx) => idx !== i);
+    markRootsDirty();
+  }
+
+  function addArchiveRoot() {
+    const v = newArchiveRoot.trim();
+    if (!v) return;
+    editedArchiveRoots = [...editedArchiveRoots, v];
+    newArchiveRoot = '';
+    markRootsDirty();
+  }
+
+  function removeArchiveRoot(i: number) {
+    editedArchiveRoots = editedArchiveRoots.filter((_, idx) => idx !== i);
+    markRootsDirty();
+  }
+
+  function resetRoots() {
+    rootsDirty = false;
+    rootsSavedAt = null;
+    rootsSaveError = null;
+    // Let the $effect above re-sync from the store.
+  }
+
+  async function saveRoots() {
+    rootsSaving = true;
+    rootsSaveError = null;
+    try {
+      await setConfig({
+        session_roots: editedSessionRoots,
+        archive_roots: editedArchiveRoots,
+      });
+      rootsDirty = false;
+      rootsSavedAt = new Date().toLocaleTimeString();
+    } catch (e) {
+      rootsSaveError = String(e);
+    } finally {
+      rootsSaving = false;
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Local editable copy of the rate card, kept in sync with the store on mount.
@@ -184,32 +269,103 @@
 
 <div class="flex flex-col gap-6 p-6 overflow-auto h-full">
 
-  <!-- Watched session roots -->
+  <!-- Editable watched roots -->
   <section>
-    <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">Watched session roots</h2>
-    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden">
-      {#if $config.session_roots.length === 0}
-        <li class="px-4 py-2 text-xs text-slate-500 italic">None configured</li>
-      {:else}
-        {#each $config.session_roots as root}
-          <li class="px-4 py-2 font-mono text-xs text-slate-300 break-all">{root}</li>
-        {/each}
-      {/if}
-    </ul>
-  </section>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-3">Watched roots</h2>
 
-  <!-- Watched archive roots -->
-  <section>
-    <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">Watched archive roots</h2>
-    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden">
-      {#if $config.archive_roots.length === 0}
+    <!-- Action bar -->
+    <div class="flex items-center gap-3 mb-3 flex-wrap">
+      <button
+        onclick={saveRoots}
+        disabled={!rootsDirty || rootsSaving}
+        class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
+      >
+        {rootsSaving ? 'Saving…' : 'Save changes'}
+      </button>
+      <button
+        onclick={resetRoots}
+        disabled={!rootsDirty || rootsSaving}
+        class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 transition-colors"
+      >
+        Reset
+      </button>
+      {#if rootsSavedAt && !rootsDirty}
+        <span class="text-xs text-emerald-400">Saved at {rootsSavedAt} · scanning…</span>
+      {/if}
+      {#if rootsSaveError}
+        <span class="text-xs text-red-400">{rootsSaveError}</span>
+      {/if}
+    </div>
+
+    <!-- Session roots -->
+    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Session roots</h3>
+    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden mb-2">
+      {#if editedSessionRoots.length === 0}
         <li class="px-4 py-2 text-xs text-slate-500 italic">None configured</li>
       {:else}
-        {#each $config.archive_roots as root}
-          <li class="px-4 py-2 font-mono text-xs text-slate-300 break-all">{root}</li>
+        {#each editedSessionRoots as root, i}
+          <li class="flex items-center justify-between gap-2 px-4 py-2">
+            <span class="font-mono text-xs text-slate-300 break-all">{root}</span>
+            <button
+              onclick={() => removeSessionRoot(i)}
+              class="flex-shrink-0 text-slate-500 hover:text-red-400 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-slate-700"
+              aria-label="Remove {root}"
+              title="Remove"
+            >Remove</button>
+          </li>
         {/each}
       {/if}
+      <li class="flex items-center gap-2 px-4 py-2">
+        <input
+          type="text"
+          placeholder="/absolute/path/to/sessions"
+          bind:value={newSessionRoot}
+          onkeydown={(e) => { if (e.key === 'Enter') addSessionRoot(); }}
+          class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+        />
+        <button
+          onclick={addSessionRoot}
+          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+        >Add</button>
+      </li>
     </ul>
+
+    <!-- Archive roots -->
+    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Archive roots</h3>
+    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden mb-2">
+      {#if editedArchiveRoots.length === 0}
+        <li class="px-4 py-2 text-xs text-slate-500 italic">None configured</li>
+      {:else}
+        {#each editedArchiveRoots as root, i}
+          <li class="flex items-center justify-between gap-2 px-4 py-2">
+            <span class="font-mono text-xs text-slate-300 break-all">{root}</span>
+            <button
+              onclick={() => removeArchiveRoot(i)}
+              class="flex-shrink-0 text-slate-500 hover:text-red-400 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-slate-700"
+              aria-label="Remove {root}"
+              title="Remove"
+            >Remove</button>
+          </li>
+        {/each}
+      {/if}
+      <li class="flex items-center gap-2 px-4 py-2">
+        <input
+          type="text"
+          placeholder="/absolute/path/to/archives"
+          bind:value={newArchiveRoot}
+          onkeydown={(e) => { if (e.key === 'Enter') addArchiveRoot(); }}
+          class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+        />
+        <button
+          onclick={addArchiveRoot}
+          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+        >Add</button>
+      </li>
+    </ul>
+
+    {#if hasDuplicateRoots}
+      <p class="text-xs text-amber-400">Warning: duplicate paths detected in the lists above.</p>
+    {/if}
   </section>
 
   <!-- Rate card editor -->
