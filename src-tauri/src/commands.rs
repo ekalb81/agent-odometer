@@ -52,8 +52,30 @@ pub fn set_rates(_rates: RateCard) -> Result<(), String> {
     Ok(())
 }
 
-/// Opens the given path in the system file manager. Phase 4 will implement this fully.
+/// Opens the parent directory of the given path in the system file manager.
+/// Uses xdg-open on Linux, open on macOS, and explorer on Windows.
+/// Errors are logged but not propagated — the UI treats this as best-effort.
 #[tauri::command]
-pub fn reveal_in_file_manager(_path: String) -> Result<(), String> {
-    Ok(())
+pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    let target = std::path::Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(path);
+
+    #[cfg(target_os = "linux")]
+    let cmd = std::process::Command::new("xdg-open").arg(&target).spawn();
+
+    #[cfg(target_os = "macos")]
+    let cmd = std::process::Command::new("open").arg(&target).spawn();
+
+    #[cfg(target_os = "windows")]
+    let cmd = std::process::Command::new("explorer").arg(&target).spawn();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let cmd: Result<_, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ));
+
+    cmd.map(|_| ()).map_err(|e| e.to_string())
 }
