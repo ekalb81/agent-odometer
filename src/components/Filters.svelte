@@ -67,6 +67,25 @@
     [...new Set(sessions.map((s) => s.model).filter((m): m is string => m !== null))].sort(),
   );
 
+  // Quick-range presets — stored as `datetime-local` strings (local time).
+  // Empty bound = open-ended.
+  function pad(n: number): string { return n.toString().padStart(2, '0'); }
+  function toLocalInputValue(d: Date): string {
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  function presetToday() {
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    onchange({ ...filters, dateFrom: toLocalInputValue(start), dateTo: '' });
+  }
+  function presetLast24h() {
+    const from = new Date(Date.now() - 24 * 3600 * 1000);
+    onchange({ ...filters, dateFrom: toLocalInputValue(from), dateTo: '' });
+  }
+  function presetLast7d() {
+    const from = new Date(Date.now() - 7 * 24 * 3600 * 1000);
+    onchange({ ...filters, dateFrom: toLocalInputValue(from), dateTo: '' });
+  }
+
   const isDefault = $derived(
     filters.search === '' &&
       filters.dateFrom === '' &&
@@ -99,29 +118,48 @@
     />
   </div>
 
-  <!-- Date from -->
+  <!-- Date/time from -->
   <label class="flex items-center gap-1.5 text-xs text-slate-400 whitespace-nowrap">
     <span>From</span>
     <input
-      type="date"
+      type="datetime-local"
       value={filters.dateFrom}
       onchange={(e) => emit({ dateFrom: (e.target as HTMLInputElement).value })}
       class="py-1.5 px-2 text-sm bg-slate-700 border border-slate-600 rounded-md text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 [color-scheme:dark]"
-      aria-label="Start date from"
+      aria-label="Start datetime from"
     />
   </label>
 
-  <!-- Date to -->
+  <!-- Date/time to -->
   <label class="flex items-center gap-1.5 text-xs text-slate-400 whitespace-nowrap">
     <span>To</span>
     <input
-      type="date"
+      type="datetime-local"
       value={filters.dateTo}
       onchange={(e) => emit({ dateTo: (e.target as HTMLInputElement).value })}
       class="py-1.5 px-2 text-sm bg-slate-700 border border-slate-600 rounded-md text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 [color-scheme:dark]"
-      aria-label="Start date to"
+      aria-label="Start datetime to"
     />
   </label>
+
+  <!-- Quick range presets -->
+  <div class="flex items-center gap-1">
+    <button
+      type="button"
+      onclick={presetToday}
+      class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
+    >Today</button>
+    <button
+      type="button"
+      onclick={presetLast24h}
+      class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
+    >Last 24h</button>
+    <button
+      type="button"
+      onclick={presetLast7d}
+      class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
+    >Last 7d</button>
+  </div>
 
   <!-- Model select -->
   <select

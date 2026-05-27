@@ -93,6 +93,17 @@
   // ---------------------------------------------------------------------------
   const allSessions = $derived([...sessionsStore.map.values()]);
 
+  // Convert datetime-local strings (local time) to UTC ISO once, so the rest
+  // of the pipeline can do lexical comparison against the UTC ISO timestamps
+  // we store on sessions and history points.
+  function toUtcIso(local: string): string | null {
+    if (!local) return null;
+    const d = new Date(local);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  const fromUtc = $derived(toUtcIso(filters.dateFrom));
+  const toUtc = $derived(toUtcIso(filters.dateTo));
+
   const filtered = $derived((() => {
     const lc = filters.search.toLowerCase();
     return allSessions.filter((s) => {
@@ -100,13 +111,11 @@
       if (s.archived && !filters.showArchived) return false;
       if (!s.archived && !filters.showActive) return false;
 
-      // Date range — overlap semantics: include any session whose
+      // Datetime range — overlap semantics: include any session whose
       // [started_at, last_event_at] window intersects the filter range.
-      // A session started yesterday but used today should match "today".
-      const startedDate = s.started_at.slice(0, 10);
-      const lastDate = s.last_event_at.slice(0, 10);
-      if (filters.dateFrom && lastDate < filters.dateFrom) return false;
-      if (filters.dateTo && startedDate > filters.dateTo) return false;
+      // Comparison is lexical on UTC ISO strings, which sorts chronologically.
+      if (fromUtc && s.last_event_at < fromUtc) return false;
+      if (toUtc && s.started_at > toUtc) return false;
 
       // Model filter.
       if (filters.model && s.model !== filters.model) return false;
@@ -134,20 +143,18 @@
   // filter when one is active so the row numbers add up to the header.
   const sessionDisplayMap = $derived((() => {
     const r = $rates;
-    const from = filters.dateFrom || null;
-    const to = filters.dateTo || null;
     const out = new Map<
       string,
       { tokens: TokenTotals; total: number; refCost: number; missingModels: string[] }
     >();
     for (const s of filtered) {
-      const tokens = dateScoped ? tokensInRange(s, from, to) : s.tokens_total;
+      const tokens = dateScoped ? tokensInRange(s, fromUtc, toUtc) : s.tokens_total;
       if (!r) {
         out.set(s.id, { tokens, total: 0, refCost: 0, missingModels: [] });
         continue;
       }
       const credits = dateScoped
-        ? computeSessionCreditsInRange(s, r, from, to)
+        ? computeSessionCreditsInRange(s, r, fromUtc, toUtc)
         : computeSessionCredits(s, r);
       // Reference cost (à-la-carte equivalent) is always all-time for the
       // unlimited-plan tooltip — that's the figure people compare against.

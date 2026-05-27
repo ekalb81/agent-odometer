@@ -31,9 +31,14 @@ function addTokens(acc: TokenTotals, src: TokenTotals): void {
 }
 
 /**
- * Sums the per-event deltas from `tokens_history` whose date falls within
- * [fromIso, toIso] (inclusive). When both bounds are null, returns the
- * cumulative `tokens_total` directly — same number as the session header.
+ * Sums the per-event deltas from `tokens_history` whose timestamp falls
+ * within [fromIso, toIso] (inclusive). Pass null for an open bound. When
+ * both bounds are null, returns the cumulative `tokens_total` directly —
+ * same number as the session header.
+ *
+ * Both bounds and event timestamps are expected to be full UTC ISO 8601
+ * strings (e.g. "2026-05-26T19:30:00.000Z"); lexical comparison on this
+ * format sorts chronologically.
  */
 export function tokensInRange(
   session: Session,
@@ -43,9 +48,8 @@ export function tokensInRange(
   if (!fromIso && !toIso) return session.tokens_total;
   const acc = emptyTotals();
   for (const ev of session.tokens_history) {
-    const date = ev.timestamp.slice(0, 10);
-    if (fromIso && date < fromIso) continue;
-    if (toIso && date > toIso) continue;
+    if (fromIso && ev.timestamp < fromIso) continue;
+    if (toIso && ev.timestamp > toIso) continue;
     addTokens(acc, ev.delta);
   }
   return acc;
@@ -102,14 +106,11 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
 }
 
 /**
- * Computes credits for a session restricted to events whose date is within
- * [fromIso, toIso] (inclusive, "YYYY-MM-DD"; pass null for an open bound).
- * Walks tokens_history rather than the per-model buckets, so it can scope
- * the math to any sub-period of the session's lifetime.
- *
- * The date comparison uses each event's UTC date (timestamp.slice(0,10)) to
- * stay consistent with how the table's date filter compares started_at /
- * last_event_at.
+ * Computes credits for a session restricted to events whose timestamp is
+ * within [fromIso, toIso] (inclusive, full UTC ISO 8601; pass null for an
+ * open bound). Walks tokens_history rather than the per-model buckets, so
+ * it can scope the math to any sub-period of the session's lifetime —
+ * down to the minute.
  */
 export function computeSessionCreditsInRange(
   session: Session,
@@ -128,9 +129,8 @@ export function computeSessionCreditsInRange(
   const fallbackRate = rates.models[rates.fallback_model];
 
   for (const ev of session.tokens_history) {
-    const date = ev.timestamp.slice(0, 10);
-    if (fromIso && date < fromIso) continue;
-    if (toIso && date > toIso) continue;
+    if (fromIso && ev.timestamp < fromIso) continue;
+    if (toIso && ev.timestamp > toIso) continue;
     if (!ev.model) continue;
 
     const directRate = rates.models[ev.model];
