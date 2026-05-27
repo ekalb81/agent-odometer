@@ -1,4 +1,4 @@
-import type { RateCard, Session } from './types';
+import type { ModelRate, RateCard, Session, TokenTotals } from './types';
 
 export interface ModelCredit {
   model: string;
@@ -10,6 +10,58 @@ export interface SessionCredits {
   total: number;
   byModel: ModelCredit[];
   missingModels: string[];
+}
+
+function emptyTotals(): TokenTotals {
+  return {
+    input_tokens: 0,
+    cached_input_tokens: 0,
+    output_tokens: 0,
+    reasoning_output_tokens: 0,
+    total_tokens: 0,
+  };
+}
+
+function addTokens(acc: TokenTotals, src: TokenTotals): void {
+  acc.input_tokens += src.input_tokens;
+  acc.cached_input_tokens += src.cached_input_tokens;
+  acc.output_tokens += src.output_tokens;
+  acc.reasoning_output_tokens += src.reasoning_output_tokens;
+  acc.total_tokens += src.total_tokens;
+}
+
+/**
+ * Sums the per-event deltas from `tokens_history` whose date falls within
+ * [fromIso, toIso] (inclusive). When both bounds are null, returns the
+ * cumulative `tokens_total` directly — same number as the session header.
+ */
+export function tokensInRange(
+  session: Session,
+  fromIso: string | null,
+  toIso: string | null,
+): TokenTotals {
+  if (!fromIso && !toIso) return session.tokens_total;
+  const acc = emptyTotals();
+  for (const ev of session.tokens_history) {
+    const date = ev.timestamp.slice(0, 10);
+    if (fromIso && date < fromIso) continue;
+    if (toIso && date > toIso) continue;
+    addTokens(acc, ev.delta);
+  }
+  return acc;
+}
+
+/** Cost of one event's token delta under a given rate, with OpenAI subset semantics. */
+function eventCost(delta: TokenTotals, rate: ModelRate): number {
+  const nonCachedInput = Math.max(0, delta.input_tokens - delta.cached_input_tokens);
+  const nonReasoningOutput = Math.max(0, delta.output_tokens - delta.reasoning_output_tokens);
+  return (
+    (nonCachedInput * rate.input +
+      delta.cached_input_tokens * rate.cached_input +
+      nonReasoningOutput * rate.output +
+      delta.reasoning_output_tokens * rate.reasoning) /
+    1_000_000
+  );
 }
 
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {
@@ -40,23 +92,67 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
       continue;
     }
 
-    // OpenAI billing semantics: cached_input_tokens is a SUBSET of input_tokens,
-    // and reasoning_output_tokens is a SUBSET of output_tokens. Apply each rate
-    // to the disjoint portion so cached/reasoning aren't counted twice.
-    const nonCachedInput = Math.max(0, totals.input_tokens - totals.cached_input_tokens);
-    const nonReasoningOutput = Math.max(0, totals.output_tokens - totals.reasoning_output_tokens);
-    const cost =
-      (nonCachedInput * rate.input +
-        totals.cached_input_tokens * rate.cached_input +
-        nonReasoningOutput * rate.output +
-        totals.reasoning_output_tokens * rate.reasoning) /
-      1_000_000;
+    const cost = eventCost(totals, rate);
 
     total += cost;
     byModel.push({ model, cost, fallbackUsed });
   }
 
   return { total, byModel, missingModels };
+}
+
+/**
+ * Computes credits for a session restricted to events whose date is within
+ * [fromIso, toIso] (inclusive, "YYYY-MM-DD"; pass null for an open bound).
+ * Walks tokens_history rather than the per-model buckets, so it can scope
+ * the math to any sub-period of the session's lifetime.
+ *
+ * The date comparison uses each event's UTC date (timestamp.slice(0,10)) to
+ * stay consistent with how the table's date filter compares started_at /
+ * last_event_at.
+ */
+export function computeSessionCreditsInRange(
+  session: Session,
+  rates: RateCard,
+  fromIso: string | null,
+  toIso: string | null,
+): SessionCredits {
+  if (!fromIso && !toIso) {
+    return computeSessionCredits(session, rates);
+  }
+
+  const byModelMap = new Map<string, number>();
+  const missingModels = new Set<string>();
+  let total = 0;
+
+  const fallbackRate = rates.models[rates.fallback_model];
+
+  for (const ev of session.tokens_history) {
+    const date = ev.timestamp.slice(0, 10);
+    if (fromIso && date < fromIso) continue;
+    if (toIso && date > toIso) continue;
+    if (!ev.model) continue;
+
+    const directRate = rates.models[ev.model];
+    const fallbackUsed = directRate === undefined;
+    if (fallbackUsed) missingModels.add(ev.model);
+    const rate = directRate ?? fallbackRate;
+    if (!rate) continue;
+
+    const cost = eventCost(ev.delta, rate);
+    total += cost;
+    byModelMap.set(ev.model, (byModelMap.get(ev.model) ?? 0) + cost);
+  }
+
+  return {
+    total,
+    byModel: Array.from(byModelMap, ([model, cost]) => ({
+      model,
+      cost,
+      fallbackUsed: rates.models[model] === undefined,
+    })),
+    missingModels: Array.from(missingModels),
+  };
 }
 
 const ISO_CURRENCY = /^[A-Z]{3}$/;

@@ -277,7 +277,9 @@ impl SessionParser {
                 s.tokens_total = total.clone();
                 s.tokens_history.push(TokenHistoryPoint {
                     timestamp: event_ts,
+                    model: self.current_model.clone(),
                     total_tokens: total.total_tokens,
+                    delta: last_usage.clone().unwrap_or_default(),
                 });
             }
 

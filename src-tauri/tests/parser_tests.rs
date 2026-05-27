@@ -260,3 +260,22 @@ fn duplicate_session_meta_does_not_wipe_accumulated_buckets() {
         s.tokens_total.input_tokens
     );
 }
+
+#[test]
+fn tokens_history_captures_model_and_delta_per_event() {
+    // Each history point should carry the active model at the time of the
+    // event and the per-call delta, so the frontend can roll up credit
+    // spend by date with the correct rate.
+    let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
+    assert_eq!(s.tokens_history.len(), 7);
+
+    // The fixture's session is entirely under gpt-5.5.
+    assert!(s.tokens_history.iter().all(|p| p.model.as_deref() == Some("gpt-5.5")));
+
+    // Per-event deltas should sum to the cumulative total_token_usage.
+    let summed: u64 = s.tokens_history.iter().map(|p| p.delta.total_tokens).sum();
+    assert_eq!(summed, s.tokens_total.total_tokens);
+
+    // First event: total == last == 29196 in this fixture.
+    assert_eq!(s.tokens_history[0].delta.total_tokens, 29_196);
+}

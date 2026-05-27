@@ -13,7 +13,13 @@ pub struct TokenTotals {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenHistoryPoint {
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Active model at the moment of this event (for per-period credit math).
+    /// None only if no turn_context had set a model yet.
+    pub model: Option<String>,
+    /// Cumulative total_tokens at this event — drives the sparkline.
     pub total_tokens: u64,
+    /// last_token_usage for this event — the per-call delta. All zeros if absent.
+    pub delta: TokenTotals,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

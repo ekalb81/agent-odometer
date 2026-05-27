@@ -1,7 +1,8 @@
 <script lang="ts">
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits, formatCredits } from '../lib/credits';
+  import { computeSessionCredits, computeSessionCreditsInRange, formatCredits, tokensInRange } from '../lib/credits';
+  import type { TokenTotals } from '../lib/types';
   import Filters from './Filters.svelte';
   import type { FilterState } from './Filters.svelte';
   import RowDrawer from './RowDrawer.svelte';
@@ -99,9 +100,12 @@
       if (s.archived && !filters.showArchived) return false;
       if (!s.archived && !filters.showActive) return false;
 
-      // Date range — compare against local date portion of started_at.
+      // Date range — overlap semantics: include any session whose
+      // [started_at, last_event_at] window intersects the filter range.
+      // A session started yesterday but used today should match "today".
       const startedDate = s.started_at.slice(0, 10);
-      if (filters.dateFrom && startedDate < filters.dateFrom) return false;
+      const lastDate = s.last_event_at.slice(0, 10);
+      if (filters.dateFrom && lastDate < filters.dateFrom) return false;
       if (filters.dateTo && startedDate > filters.dateTo) return false;
 
       // Model filter.
@@ -122,17 +126,38 @@
     });
   })());
 
-  // Per-session credit computation; reactively recomputes when rates change.
-  const sessionCreditsMap = $derived((() => {
+  // True when the user has narrowed by date — drives whether per-session
+  // tokens and credits are "all-time" or scoped to the visible window.
+  const dateScoped = $derived(Boolean(filters.dateFrom || filters.dateTo));
+
+  // Per-session display values: tokens AND credits, both scoped to the date
+  // filter when one is active so the row numbers add up to the header.
+  const sessionDisplayMap = $derived((() => {
     const r = $rates;
-    const out = new Map<string, { total: number; missingModels: string[]; refCost: number }>();
+    const from = filters.dateFrom || null;
+    const to = filters.dateTo || null;
+    const out = new Map<
+      string,
+      { tokens: TokenTotals; total: number; refCost: number; missingModels: string[] }
+    >();
     for (const s of filtered) {
+      const tokens = dateScoped ? tokensInRange(s, from, to) : s.tokens_total;
       if (!r) {
-        out.set(s.id, { total: 0, missingModels: [], refCost: 0 });
+        out.set(s.id, { tokens, total: 0, refCost: 0, missingModels: [] });
         continue;
       }
-      const credits = computeSessionCredits(s, r);
-      out.set(s.id, { total: credits.total, missingModels: credits.missingModels, refCost: credits.total });
+      const credits = dateScoped
+        ? computeSessionCreditsInRange(s, r, from, to)
+        : computeSessionCredits(s, r);
+      // Reference cost (à-la-carte equivalent) is always all-time for the
+      // unlimited-plan tooltip — that's the figure people compare against.
+      const refCost = computeSessionCredits(s, r).total;
+      out.set(s.id, {
+        tokens,
+        total: credits.total,
+        refCost,
+        missingModels: credits.missingModels,
+      });
     }
     return out;
   })());
@@ -142,6 +167,8 @@
       // Default: last_event_at desc.
       return new Date(b.last_event_at).getTime() - new Date(a.last_event_at).getTime();
     }
+    const aTokens = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
+    const bTokens = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
     let cmp = 0;
     switch (sortKey) {
       case 'name':
@@ -154,23 +181,23 @@
         cmp = (a.model ?? '').localeCompare(b.model ?? '');
         break;
       case 'input':
-        cmp = a.tokens_total.input_tokens - b.tokens_total.input_tokens;
+        cmp = aTokens.input_tokens - bTokens.input_tokens;
         break;
       case 'cached':
-        cmp = a.tokens_total.cached_input_tokens - b.tokens_total.cached_input_tokens;
+        cmp = aTokens.cached_input_tokens - bTokens.cached_input_tokens;
         break;
       case 'output':
-        cmp = a.tokens_total.output_tokens - b.tokens_total.output_tokens;
+        cmp = aTokens.output_tokens - bTokens.output_tokens;
         break;
       case 'reasoning':
-        cmp = a.tokens_total.reasoning_output_tokens - b.tokens_total.reasoning_output_tokens;
+        cmp = aTokens.reasoning_output_tokens - bTokens.reasoning_output_tokens;
         break;
       case 'total':
-        cmp = a.tokens_total.total_tokens - b.tokens_total.total_tokens;
+        cmp = aTokens.total_tokens - bTokens.total_tokens;
         break;
       case 'credit': {
-        const aCredits = sessionCreditsMap.get(a.id)?.total ?? 0;
-        const bCredits = sessionCreditsMap.get(b.id)?.total ?? 0;
+        const aCredits = sessionDisplayMap.get(a.id)?.total ?? 0;
+        const bCredits = sessionDisplayMap.get(b.id)?.total ?? 0;
         cmp = aCredits - bCredits;
         break;
       }
@@ -181,7 +208,7 @@
   const displayed = $derived([...filtered].sort(compareSession));
 
   const filteredTotal = $derived(
-    filtered.reduce((sum, s) => sum + s.tokens_total.total_tokens, 0),
+    filtered.reduce((sum, s) => sum + (sessionDisplayMap.get(s.id)?.tokens.total_tokens ?? 0), 0),
   );
 
   // Credit totals: only count sessions that are NOT on unlimited plans.
@@ -189,7 +216,7 @@
     let billedTotal = 0;
     let unlimitedCount = 0;
     for (const s of filtered) {
-      const c = sessionCreditsMap.get(s.id);
+      const c = sessionDisplayMap.get(s.id);
       if (!c) continue;
       if (s.credits_unlimited === true) {
         unlimitedCount++;
@@ -250,15 +277,21 @@
     </span>
     <span>
       <span class="font-semibold text-slate-200">{fmtTokens(filteredTotal)}</span>
-      total tokens
+      {dateScoped ? 'tokens in range' : 'total tokens'}
     </span>
     <span>
       <span class="font-semibold text-slate-200">{fmtCredit(creditSummary.billedTotal)}</span>
-      total credits
+      {dateScoped ? 'credits in range' : 'total credits'}
       {#if creditSummary.unlimitedCount > 0}
         <span class="text-slate-500 text-xs ml-1">({creditSummary.unlimitedCount} unlimited excluded)</span>
       {/if}
     </span>
+    {#if dateScoped}
+      <span class="text-xs text-slate-500">
+        Token & credit columns scoped to
+        {filters.dateFrom || '…'} – {filters.dateTo || '…'}
+      </span>
+    {/if}
   </div>
 
   <!-- Table -->
@@ -352,7 +385,8 @@
         <tbody>
           {#each displayed as session (session.id)}
             {@const name = sessionName(session)}
-            {@const sessionCredit = sessionCreditsMap.get(session.id)}
+            {@const sessionCredit = sessionDisplayMap.get(session.id)}
+            {@const rowTokens = sessionCredit?.tokens ?? session.tokens_total}
             <!-- svelte-ignore a11y_interactive_supports_focus -->
             <tr
               role="button"
@@ -393,21 +427,21 @@
                 </span>
               </td>
 
-              <!-- Token columns -->
+              <!-- Token columns (scoped to date range when set, else all-time) -->
               <td class="px-3 py-2 text-right tabular-nums text-slate-300">
-                {fmtTokens(session.tokens_total.input_tokens)}
+                {fmtTokens(rowTokens.input_tokens)}
               </td>
               <td class="px-3 py-2 text-right tabular-nums text-slate-300">
-                {fmtTokens(session.tokens_total.cached_input_tokens)}
+                {fmtTokens(rowTokens.cached_input_tokens)}
               </td>
               <td class="px-3 py-2 text-right tabular-nums text-slate-300">
-                {fmtTokens(session.tokens_total.output_tokens)}
+                {fmtTokens(rowTokens.output_tokens)}
               </td>
               <td class="px-3 py-2 text-right tabular-nums text-slate-300">
-                {fmtTokens(session.tokens_total.reasoning_output_tokens)}
+                {fmtTokens(rowTokens.reasoning_output_tokens)}
               </td>
               <td class="px-3 py-2 text-right tabular-nums font-medium text-slate-100">
-                {fmtTokens(session.tokens_total.total_tokens)}
+                {fmtTokens(rowTokens.total_tokens)}
               </td>
 
               <!-- Credit column -->
