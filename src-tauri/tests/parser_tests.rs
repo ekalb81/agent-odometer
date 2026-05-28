@@ -1,7 +1,5 @@
 use codex_data_viewer_lib::parser;
-use codex_data_viewer_lib::model::TokenTotals;
 use std::path::PathBuf;
-
 
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-session.jsonl")
@@ -15,7 +13,11 @@ fn parses_session_identity() {
     assert_eq!(s.source.as_deref(), Some("vscode"));
     assert_eq!(s.cli_version.as_deref(), Some("0.130.0-alpha.5"));
     assert_eq!(s.model_provider.as_deref(), Some("openai"));
-    assert!(s.working_directory.as_deref().unwrap().contains("summarize-my-codex-usage-for-may"));
+    assert!(s
+        .working_directory
+        .as_deref()
+        .unwrap()
+        .contains("summarize-my-codex-usage-for-may"));
     assert_eq!(s.started_at.to_rfc3339(), "2026-05-15T12:39:58.142+00:00");
     assert_eq!(s.thread_name, None); // not present in this fixture
 }
@@ -31,7 +33,7 @@ fn parses_first_user_message_truncated() {
     let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
     let m = s.first_user_message.unwrap();
     assert!(m.starts_with("Summarize my codex usage for May 7th"));
-    assert!(!m.ends_with('\n'));   // trailing whitespace trimmed
+    assert!(!m.ends_with('\n')); // trailing whitespace trimmed
     assert!(m.chars().count() <= 200);
 }
 
@@ -39,11 +41,11 @@ fn parses_first_user_message_truncated() {
 fn parses_tokens_total_from_latest_token_count() {
     let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
     let t = &s.tokens_total;
-    assert_eq!(t.input_tokens,            547_081);
-    assert_eq!(t.cached_input_tokens,     429_696);
-    assert_eq!(t.output_tokens,             5_812);
-    assert_eq!(t.reasoning_output_tokens,   2_018);
-    assert_eq!(t.total_tokens,            552_893);
+    assert_eq!(t.input_tokens, 547_081);
+    assert_eq!(t.cached_input_tokens, 429_696);
+    assert_eq!(t.output_tokens, 5_812);
+    assert_eq!(t.reasoning_output_tokens, 2_018);
+    assert_eq!(t.total_tokens, 552_893);
 }
 
 #[test]
@@ -53,11 +55,11 @@ fn attributes_tokens_to_active_model() {
     assert!(s.tokens_by_model.contains_key("gpt-5.5"));
     let per_model = &s.tokens_by_model["gpt-5.5"];
     // Sum of last_token_usage deltas should match total_token_usage exactly.
-    assert_eq!(per_model.input_tokens,            547_081);
-    assert_eq!(per_model.cached_input_tokens,     429_696);
-    assert_eq!(per_model.output_tokens,             5_812);
-    assert_eq!(per_model.reasoning_output_tokens,   2_018);
-    assert_eq!(per_model.total_tokens,            552_893);
+    assert_eq!(per_model.input_tokens, 547_081);
+    assert_eq!(per_model.cached_input_tokens, 429_696);
+    assert_eq!(per_model.output_tokens, 5_812);
+    assert_eq!(per_model.reasoning_output_tokens, 2_018);
+    assert_eq!(per_model.total_tokens, 552_893);
 }
 
 #[test]
@@ -97,7 +99,11 @@ fn incremental_parsing_matches_full_parse() {
     let bytes = std::fs::read(&path).unwrap();
     let half = bytes.len() / 2;
     // Find the next newline AT OR AFTER the halfway point to split on a line boundary.
-    let split = bytes[half..].iter().position(|&b| b == b'\n').map(|p| half + p + 1).unwrap();
+    let split = bytes[half..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| half + p + 1)
+        .unwrap();
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(tmp.path(), &bytes[..split]).unwrap();
@@ -112,7 +118,10 @@ fn incremental_parsing_matches_full_parse() {
 
     let full = parser::parse_file(&path, false).unwrap().unwrap();
     let incr = p.session.unwrap();
-    assert_eq!(incr.tokens_total.total_tokens, full.tokens_total.total_tokens);
+    assert_eq!(
+        incr.tokens_total.total_tokens,
+        full.tokens_total.total_tokens
+    );
     assert_eq!(incr.tokens_by_model, full.tokens_by_model);
     assert_eq!(incr.total_turns, full.total_turns);
 }
@@ -124,12 +133,22 @@ fn populates_tokens_history_from_token_count_events() {
     assert_eq!(s.tokens_history.len(), 7);
     // Monotonic non-decreasing total_tokens.
     let totals: Vec<u64> = s.tokens_history.iter().map(|p| p.total_tokens).collect();
-    assert!(totals.windows(2).all(|w| w[0] <= w[1]), "history not monotonic: {:?}", totals);
+    assert!(
+        totals.windows(2).all(|w| w[0] <= w[1]),
+        "history not monotonic: {:?}",
+        totals
+    );
     // Last point matches tokens_total.
-    assert_eq!(s.tokens_history.last().unwrap().total_tokens, s.tokens_total.total_tokens);
+    assert_eq!(
+        s.tokens_history.last().unwrap().total_tokens,
+        s.tokens_total.total_tokens
+    );
     // Timestamps are strictly increasing.
     let ts: Vec<_> = s.tokens_history.iter().map(|p| p.timestamp).collect();
-    assert!(ts.windows(2).all(|w| w[0] < w[1]), "timestamps not strictly increasing");
+    assert!(
+        ts.windows(2).all(|w| w[0] < w[1]),
+        "timestamps not strictly increasing"
+    );
 }
 
 #[test]
@@ -160,12 +179,15 @@ fn resumed_session_attributes_carryover_total_to_active_model() {
 
     // tokens_by_model must include the carry-over so the per-model bucket
     // matches the session total (single-model session).
-    let per = s.tokens_by_model.get("gpt-5.5").expect("gpt-5.5 bucket present");
-    assert_eq!(per.input_tokens,            23_187_732);
-    assert_eq!(per.cached_input_tokens,     20_105_344);
-    assert_eq!(per.output_tokens,                90_479);
-    assert_eq!(per.reasoning_output_tokens,      46_811);
-    assert_eq!(per.total_tokens,            23_278_211);
+    let per = s
+        .tokens_by_model
+        .get("gpt-5.5")
+        .expect("gpt-5.5 bucket present");
+    assert_eq!(per.input_tokens, 23_187_732);
+    assert_eq!(per.cached_input_tokens, 20_105_344);
+    assert_eq!(per.output_tokens, 90_479);
+    assert_eq!(per.reasoning_output_tokens, 46_811);
+    assert_eq!(per.total_tokens, 23_278_211);
 }
 
 #[test]
@@ -196,20 +218,26 @@ fn mid_session_model_switch_attributes_each_phase_correctly() {
     assert_eq!(s.tokens_total.total_tokens, 953_500);
 
     // gpt-5.4 phase: 100,500 + 802,500 = 903,000 tokens total
-    let p54 = s.tokens_by_model.get("gpt-5.4").expect("gpt-5.4 bucket present");
-    assert_eq!(p54.input_tokens,            900_000);
-    assert_eq!(p54.cached_input_tokens,     800_000);
-    assert_eq!(p54.output_tokens,             3_000);
-    assert_eq!(p54.reasoning_output_tokens,   1_000);
-    assert_eq!(p54.total_tokens,            903_000);
+    let p54 = s
+        .tokens_by_model
+        .get("gpt-5.4")
+        .expect("gpt-5.4 bucket present");
+    assert_eq!(p54.input_tokens, 900_000);
+    assert_eq!(p54.cached_input_tokens, 800_000);
+    assert_eq!(p54.output_tokens, 3_000);
+    assert_eq!(p54.reasoning_output_tokens, 1_000);
+    assert_eq!(p54.total_tokens, 903_000);
 
     // gpt-5.5 phase: 50,500 tokens (the post-switch delta)
-    let p55 = s.tokens_by_model.get("gpt-5.5").expect("gpt-5.5 bucket present");
-    assert_eq!(p55.input_tokens,             50_000);
-    assert_eq!(p55.cached_input_tokens,      30_000);
-    assert_eq!(p55.output_tokens,               500);
-    assert_eq!(p55.reasoning_output_tokens,     200);
-    assert_eq!(p55.total_tokens,             50_500);
+    let p55 = s
+        .tokens_by_model
+        .get("gpt-5.5")
+        .expect("gpt-5.5 bucket present");
+    assert_eq!(p55.input_tokens, 50_000);
+    assert_eq!(p55.cached_input_tokens, 30_000);
+    assert_eq!(p55.output_tokens, 500);
+    assert_eq!(p55.reasoning_output_tokens, 200);
+    assert_eq!(p55.total_tokens, 50_500);
 
     // Invariant: sum of buckets equals session total.
     let sum_input = p54.input_tokens + p55.input_tokens;
@@ -244,15 +272,21 @@ fn duplicate_session_meta_does_not_wipe_accumulated_buckets() {
     assert_eq!(s.tokens_total.total_tokens, 23_278_211);
 
     // Both buckets must be present — the second session_meta did NOT wipe gpt-5.4.
-    let p54 = s.tokens_by_model.get("gpt-5.4").expect("gpt-5.4 bucket present");
-    assert_eq!(p54.input_tokens,            15_263_176);
-    assert_eq!(p54.cached_input_tokens,     12_731_392);
-    assert_eq!(p54.total_tokens,            15_326_610);
+    let p54 = s
+        .tokens_by_model
+        .get("gpt-5.4")
+        .expect("gpt-5.4 bucket present");
+    assert_eq!(p54.input_tokens, 15_263_176);
+    assert_eq!(p54.cached_input_tokens, 12_731_392);
+    assert_eq!(p54.total_tokens, 15_326_610);
 
-    let p55 = s.tokens_by_model.get("gpt-5.5").expect("gpt-5.5 bucket present");
-    assert_eq!(p55.input_tokens,             7_924_556);
-    assert_eq!(p55.cached_input_tokens,      7_373_952);
-    assert_eq!(p55.total_tokens,             7_951_601);
+    let p55 = s
+        .tokens_by_model
+        .get("gpt-5.5")
+        .expect("gpt-5.5 bucket present");
+    assert_eq!(p55.input_tokens, 7_924_556);
+    assert_eq!(p55.cached_input_tokens, 7_373_952);
+    assert_eq!(p55.total_tokens, 7_951_601);
 
     // Sum-of-buckets invariant.
     assert_eq!(
@@ -270,7 +304,10 @@ fn tokens_history_captures_model_and_delta_per_event() {
     assert_eq!(s.tokens_history.len(), 7);
 
     // The fixture's session is entirely under gpt-5.5.
-    assert!(s.tokens_history.iter().all(|p| p.model.as_deref() == Some("gpt-5.5")));
+    assert!(s
+        .tokens_history
+        .iter()
+        .all(|p| p.model.as_deref() == Some("gpt-5.5")));
 
     // Per-event deltas should sum to the cumulative total_token_usage.
     let summed: u64 = s.tokens_history.iter().map(|p| p.delta.total_tokens).sum();
@@ -278,4 +315,82 @@ fn tokens_history_captures_model_and_delta_per_event() {
 
     // First event: total == last == 29196 in this fixture.
     assert_eq!(s.tokens_history[0].delta.total_tokens, 29_196);
+}
+
+#[test]
+fn builds_turn_details_from_fixture() {
+    let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
+
+    // The fixture is a single-turn session.
+    assert_eq!(s.turns.len(), 1);
+    let t = &s.turns[0];
+
+    assert_eq!(t.index, 1);
+    assert_eq!(t.turn_id, "019e2ba6-9637-7682-9b6d-7838b0c2e0e5");
+    assert_eq!(t.model.as_deref(), Some("gpt-5.5"));
+
+    // Prompt + final agent message captured.
+    assert!(t
+        .user_message
+        .as_deref()
+        .unwrap()
+        .starts_with("Summarize my codex usage"));
+    assert!(t.last_agent_message.as_deref().unwrap().contains("May 7"));
+
+    // Lifecycle from task_complete.
+    assert_eq!(t.duration_ms, Some(106_663));
+    assert_eq!(t.time_to_first_token_ms, Some(21_311));
+    assert!(t.started_at.is_some());
+    assert!(t.completed_at.is_some());
+
+    // All session tokens belong to this single turn.
+    assert_eq!(t.tokens.total_tokens, s.tokens_total.total_tokens);
+    assert_eq!(t.tokens.total_tokens, 552_893);
+}
+
+#[test]
+fn model_switch_produces_two_turns_with_scoped_tokens() {
+    // Two turns: gpt-5.4 then gpt-5.5. Each turn's tokens should reflect only
+    // its own deltas, and the per-turn totals should sum to tokens_total.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("turns.jsonl");
+
+    let lines = [
+        r#"{"timestamp":"2026-05-26T15:33:42.000Z","type":"session_meta","payload":{"id":"019eaaaa-bbbb-cccc-dddd-000000000010","timestamp":"2026-05-26T15:33:42.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.133.0","source":"vscode","model_provider":"openai"}}"#,
+        r#"{"timestamp":"2026-05-26T15:33:45.000Z","type":"turn_context","payload":{"turn_id":"turn-A","model":"gpt-5.4"}}"#,
+        r#"{"timestamp":"2026-05-26T15:33:46.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-A","model_context_window":258400}}"#,
+        r#"{"timestamp":"2026-05-26T15:33:47.000Z","type":"event_msg","payload":{"type":"user_message","message":"Do the first thing"}}"#,
+        r#"{"timestamp":"2026-05-26T15:34:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":900000,"cached_input_tokens":800000,"output_tokens":3000,"reasoning_output_tokens":1000,"total_tokens":903000},"last_token_usage":{"input_tokens":900000,"cached_input_tokens":800000,"output_tokens":3000,"reasoning_output_tokens":1000,"total_tokens":903000},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":false,"balance":null}}}}"#,
+        r#"{"timestamp":"2026-05-26T15:34:05.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-A","duration_ms":19000,"time_to_first_token_ms":2000,"last_agent_message":"Done with first."}}"#,
+        r#"{"timestamp":"2026-05-26T15:34:30.000Z","type":"turn_context","payload":{"turn_id":"turn-B","model":"gpt-5.5"}}"#,
+        r#"{"timestamp":"2026-05-26T15:34:31.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-B","model_context_window":258400}}"#,
+        r#"{"timestamp":"2026-05-26T15:34:32.000Z","type":"event_msg","payload":{"type":"user_message","message":"Do the second thing"}}"#,
+        r#"{"timestamp":"2026-05-26T15:34:40.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":950000,"cached_input_tokens":830000,"output_tokens":3500,"reasoning_output_tokens":1200,"total_tokens":953500},"last_token_usage":{"input_tokens":50000,"cached_input_tokens":30000,"output_tokens":500,"reasoning_output_tokens":200,"total_tokens":50500},"model_context_window":258400},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":false,"balance":null}}}}"#,
+        r#"{"timestamp":"2026-05-26T15:34:45.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-B","duration_ms":13000,"time_to_first_token_ms":1500,"last_agent_message":"Done with second."}}"#,
+    ];
+
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let s = parser::parse_file(&path, false).unwrap().unwrap();
+
+    assert_eq!(s.turns.len(), 2);
+
+    let a = &s.turns[0];
+    assert_eq!(a.index, 1);
+    assert_eq!(a.turn_id, "turn-A");
+    assert_eq!(a.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(a.user_message.as_deref(), Some("Do the first thing"));
+    assert_eq!(a.last_agent_message.as_deref(), Some("Done with first."));
+    assert_eq!(a.tokens.total_tokens, 903_000);
+
+    let b = &s.turns[1];
+    assert_eq!(b.index, 2);
+    assert_eq!(b.turn_id, "turn-B");
+    assert_eq!(b.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(b.tokens.total_tokens, 50_500);
+
+    // Per-turn totals sum to the session total.
+    assert_eq!(
+        a.tokens.total_tokens + b.tokens.total_tokens,
+        s.tokens_total.total_tokens
+    );
 }

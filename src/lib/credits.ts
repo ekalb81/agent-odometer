@@ -68,6 +68,24 @@ function eventCost(delta: TokenTotals, rate: ModelRate): number {
   );
 }
 
+/**
+ * Cost of an arbitrary token bucket attributed to a single model, e.g. one
+ * turn's tokens. Falls back to the rate card's fallback model when the model
+ * isn't listed; returns 0 if neither resolves. Returns `fallbackUsed` so the
+ * UI can flag it.
+ */
+export function tokensCost(
+  tokens: TokenTotals,
+  model: string | null,
+  rates: RateCard,
+): { cost: number; fallbackUsed: boolean } {
+  const directRate = model ? rates.models[model] : undefined;
+  const fallbackUsed = directRate === undefined;
+  const rate = directRate ?? rates.models[rates.fallback_model];
+  if (!rate) return { cost: 0, fallbackUsed };
+  return { cost: eventCost(tokens, rate), fallbackUsed };
+}
+
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {
   const entries = Object.entries(session.tokens_by_model);
 

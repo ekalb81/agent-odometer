@@ -55,12 +55,20 @@ impl RateCard {
             Ok(raw) => match serde_json::from_str::<Self>(&raw) {
                 Ok(card) => Ok(card),
                 Err(e) => {
-                    tracing::warn!("rates.json at {:?} is malformed ({}); falling back to bundled", path, e);
+                    tracing::warn!(
+                        "rates.json at {:?} is malformed ({}); falling back to bundled",
+                        path,
+                        e
+                    );
                     Self::load_bundled()
                 }
             },
             Err(e) => {
-                tracing::warn!("could not read rates.json at {:?} ({}); falling back to bundled", path, e);
+                tracing::warn!(
+                    "could not read rates.json at {:?} ({}); falling back to bundled",
+                    path,
+                    e
+                );
                 Self::load_bundled()
             }
         }

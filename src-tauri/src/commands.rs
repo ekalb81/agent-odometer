@@ -60,7 +60,8 @@ pub fn set_config(
     .map_err(|e| e.to_string())?;
     *state.watcher.lock().unwrap() = Some(handle);
 
-    app.emit("config-updated", &config).map_err(|e| e.to_string())?;
+    app.emit("config-updated", &config)
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -99,7 +100,8 @@ pub fn get_bundled_rates() -> RateCard {
 #[tauri::command]
 pub fn set_rates(app: tauri::AppHandle, rates: RateCard) -> Result<(), String> {
     rates.save().map_err(|e| e.to_string())?;
-    app.emit("rates-updated", &rates).map_err(|e| e.to_string())?;
+    app.emit("rates-updated", &rates)
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -120,7 +122,10 @@ pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
     };
 
     #[cfg(target_os = "macos")]
-    let cmd = std::process::Command::new("open").arg("-R").arg(&path).spawn();
+    let cmd = std::process::Command::new("open")
+        .arg("-R")
+        .arg(&path)
+        .spawn();
 
     #[cfg(target_os = "windows")]
     let cmd = std::process::Command::new("explorer")

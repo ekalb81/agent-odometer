@@ -10,9 +10,13 @@ pub struct SessionParser {
     pub session: Option<Session>,
     pub byte_offset: u64,
     pub current_model: Option<String>,
+    pub current_turn_id: Option<String>,
     pub file_path: PathBuf,
     pub archived: bool,
 }
+
+/// Max characters retained for per-turn prompt / agent-message previews.
+const TURN_MESSAGE_LIMIT: usize = 500;
 
 impl SessionParser {
     pub fn new(file_path: PathBuf, archived: bool) -> Self {
@@ -20,6 +24,7 @@ impl SessionParser {
             session: None,
             byte_offset: 0,
             current_model: None,
+            current_turn_id: None,
             file_path,
             archived,
         }
@@ -70,9 +75,7 @@ impl SessionParser {
             .get("timestamp")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let last_event_at: DateTime<Utc> = timestamp_str
-            .parse()
-            .unwrap_or_else(|_| Utc::now());
+        let last_event_at: DateTime<Utc> = timestamp_str.parse().unwrap_or_else(|_| Utc::now());
 
         if let Some(s) = self.session.as_mut() {
             if last_event_at > s.last_event_at {
@@ -106,7 +109,11 @@ impl SessionParser {
         Ok(())
     }
 
-    fn handle_session_meta(&mut self, payload: Value, last_event_at: DateTime<Utc>) -> anyhow::Result<()> {
+    fn handle_session_meta(
+        &mut self,
+        payload: Value,
+        last_event_at: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
         let id = payload
             .get("id")
             .and_then(Value::as_str)
@@ -198,6 +205,7 @@ impl SessionParser {
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
             tokens_history: Vec::new(),
+            turns: Vec::new(),
         });
 
         Ok(())
@@ -208,14 +216,27 @@ impl SessionParser {
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let turn_id = payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
 
         if let Some(m) = &model {
             self.current_model = Some(m.clone());
         }
+        if let Some(t) = &turn_id {
+            self.current_turn_id = Some(t.clone());
+        }
 
         if let Some(s) = self.session.as_mut() {
-            if let Some(m) = model {
-                s.model = Some(m);
+            if let Some(m) = &model {
+                s.model = Some(m.clone());
+            }
+            if let Some(tid) = &turn_id {
+                let idx = ensure_turn_index(s, tid);
+                if model.is_some() {
+                    s.turns[idx].model = model;
+                }
             }
         }
 
@@ -231,19 +252,42 @@ impl SessionParser {
 
         match msg_type.as_str() {
             "task_started" => {
-                if let Some(cw) = payload.get("model_context_window").and_then(Value::as_u64) {
-                    if let Some(s) = self.session.as_mut() {
+                let turn_id = payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(t) = &turn_id {
+                    self.current_turn_id = Some(t.clone());
+                }
+                let cw = payload.get("model_context_window").and_then(Value::as_u64);
+                if let Some(s) = self.session.as_mut() {
+                    if let Some(cw) = cw {
                         s.context_window = Some(cw as u32);
+                    }
+                    if let Some(tid) = &turn_id {
+                        let idx = ensure_turn_index(s, tid);
+                        if s.turns[idx].started_at.is_none() {
+                            s.turns[idx].started_at = Some(event_ts);
+                        }
                     }
                 }
             }
             "user_message" => {
+                let msg = payload.get("message").and_then(Value::as_str).map(|m| {
+                    let trimmed = m.trim_end();
+                    trimmed.chars().take(TURN_MESSAGE_LIMIT).collect::<String>()
+                });
+                let turn_id = self.current_turn_id.clone();
                 if let Some(s) = self.session.as_mut() {
                     if s.first_user_message.is_none() {
-                        if let Some(msg) = payload.get("message").and_then(Value::as_str) {
-                            let trimmed = msg.trim_end();
-                            let truncated: String = trimmed.chars().take(200).collect();
-                            s.first_user_message = Some(truncated);
+                        if let Some(m) = &msg {
+                            s.first_user_message = Some(m.chars().take(200).collect());
+                        }
+                    }
+                    if let Some(tid) = &turn_id {
+                        let idx = ensure_turn_index(s, tid);
+                        if s.turns[idx].user_message.is_none() {
+                            s.turns[idx].user_message = msg;
                         }
                     }
                 }
@@ -252,8 +296,36 @@ impl SessionParser {
                 self.handle_token_count(payload, event_ts)?;
             }
             "task_complete" => {
+                let turn_id = payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| self.current_turn_id.clone());
+                let duration_ms = payload.get("duration_ms").and_then(Value::as_u64);
+                let ttft = payload
+                    .get("time_to_first_token_ms")
+                    .and_then(Value::as_u64);
+                let last_agent = payload
+                    .get("last_agent_message")
+                    .and_then(Value::as_str)
+                    .map(|m| {
+                        m.trim()
+                            .chars()
+                            .take(TURN_MESSAGE_LIMIT)
+                            .collect::<String>()
+                    });
                 if let Some(s) = self.session.as_mut() {
                     s.total_turns += 1;
+                    if let Some(tid) = &turn_id {
+                        let idx = ensure_turn_index(s, tid);
+                        let turn = &mut s.turns[idx];
+                        turn.completed_at = Some(event_ts);
+                        turn.duration_ms = duration_ms;
+                        turn.time_to_first_token_ms = ttft;
+                        if turn.last_agent_message.is_none() {
+                            turn.last_agent_message = last_agent;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -262,7 +334,11 @@ impl SessionParser {
         Ok(())
     }
 
-    fn handle_token_count(&mut self, payload: Value, event_ts: DateTime<Utc>) -> anyhow::Result<()> {
+    fn handle_token_count(
+        &mut self,
+        payload: Value,
+        event_ts: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
         let info = match payload.get("info") {
             Some(v) if !v.is_null() => v,
             // The first token_count event in a session commonly has info: null.
@@ -271,42 +347,57 @@ impl SessionParser {
 
         let total_usage = info.get("total_token_usage").map(parse_token_totals);
         let last_usage = info.get("last_token_usage").map(parse_token_totals);
+        let context_window = info
+            .get("model_context_window")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
+        let model = self.current_model.clone();
+        let turn_id = self.current_turn_id.clone();
 
         if let Some(s) = self.session.as_mut() {
             if let Some(total) = &total_usage {
                 s.tokens_total = total.clone();
-                s.tokens_history.push(TokenHistoryPoint {
-                    timestamp: event_ts,
-                    model: self.current_model.clone(),
-                    total_tokens: total.total_tokens,
-                    delta: last_usage.clone().unwrap_or_default(),
-                });
+            }
+            if let Some(cw) = context_window {
+                s.context_window = Some(cw);
             }
 
-            if let Some(cw) = info.get("model_context_window").and_then(Value::as_u64) {
-                s.context_window = Some(cw as u32);
-            }
-
-            // Per-model attribution proceeds in two phases:
-            // 1. Add `last_token_usage` (the most recent API call's tokens) to
-            //    the active model's bucket. This is the per-call delta in
-            //    fresh sessions.
-            // 2. Reconcile: enforce sum(tokens_by_model) == tokens_total. Any
-            //    positive remainder (carry-over from a prior rollout file, or
-            //    an early event that arrived before current_model was known)
-            //    is added to the active model. This converges to the right
-            //    answer for resumed sessions and mid-session model switches.
-            if let (Some(model), Some(last)) = (self.current_model.as_ref(), last_usage.as_ref()) {
+            // Compute the per-event contribution once, then attribute it
+            // identically to the model bucket, the history point, and the
+            // current turn so all three stay consistent with tokens_total.
+            //
+            // Start from `last_token_usage` (the most recent API call's
+            // tokens). Then reconcile: enforce sum(tokens_by_model) ==
+            // tokens_total and fold any positive remainder (carry-over from a
+            // prior rollout file, or an early event before current_model was
+            // known) into the contribution. This converges for fresh, resumed,
+            // and mid-session model-switch cases.
+            let mut contribution = last_usage.clone().unwrap_or_default();
+            if let Some(model) = &model {
                 let entry = s.tokens_by_model.entry(model.clone()).or_default();
-                add_token_totals(entry, last);
-            }
+                add_token_totals(entry, &contribution);
 
-            if let Some(model) = self.current_model.as_ref() {
                 let bucket_sum = sum_bucket_totals(&s.tokens_by_model);
                 let remainder = subtract_totals_saturating(&s.tokens_total, &bucket_sum);
                 if totals_any_positive(&remainder) {
                     let entry = s.tokens_by_model.entry(model.clone()).or_default();
                     add_token_totals(entry, &remainder);
+                    add_token_totals(&mut contribution, &remainder);
+                }
+            }
+
+            if let Some(total) = &total_usage {
+                s.tokens_history.push(TokenHistoryPoint {
+                    timestamp: event_ts,
+                    model: model.clone(),
+                    total_tokens: total.total_tokens,
+                    delta: contribution.clone(),
+                });
+            }
+
+            if let Some(tid) = &turn_id {
+                if let Some(turn) = s.turns.iter_mut().find(|t| &t.turn_id == tid) {
+                    add_token_totals(&mut turn.tokens, &contribution);
                 }
             }
         }
@@ -336,12 +427,33 @@ impl SessionParser {
     }
 }
 
+/// Finds the index of the turn with the given id, creating it (with the next
+/// 1-based ordinal) if absent.
+fn ensure_turn_index(s: &mut Session, turn_id: &str) -> usize {
+    if let Some(pos) = s.turns.iter().position(|t| t.turn_id == turn_id) {
+        return pos;
+    }
+    let index = s.turns.len() as u32 + 1;
+    s.turns.push(crate::model::TurnInfo {
+        turn_id: turn_id.to_owned(),
+        index,
+        ..Default::default()
+    });
+    s.turns.len() - 1
+}
+
 fn parse_token_totals(v: &Value) -> TokenTotals {
     TokenTotals {
         input_tokens: v.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-        cached_input_tokens: v.get("cached_input_tokens").and_then(Value::as_u64).unwrap_or(0),
+        cached_input_tokens: v
+            .get("cached_input_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         output_tokens: v.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
-        reasoning_output_tokens: v.get("reasoning_output_tokens").and_then(Value::as_u64).unwrap_or(0),
+        reasoning_output_tokens: v
+            .get("reasoning_output_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         total_tokens: v.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
     }
 }
@@ -364,11 +476,13 @@ fn sum_bucket_totals(buckets: &HashMap<String, TokenTotals>) -> TokenTotals {
 
 fn subtract_totals_saturating(a: &TokenTotals, b: &TokenTotals) -> TokenTotals {
     TokenTotals {
-        input_tokens:            a.input_tokens.saturating_sub(b.input_tokens),
-        cached_input_tokens:     a.cached_input_tokens.saturating_sub(b.cached_input_tokens),
-        output_tokens:           a.output_tokens.saturating_sub(b.output_tokens),
-        reasoning_output_tokens: a.reasoning_output_tokens.saturating_sub(b.reasoning_output_tokens),
-        total_tokens:            a.total_tokens.saturating_sub(b.total_tokens),
+        input_tokens: a.input_tokens.saturating_sub(b.input_tokens),
+        cached_input_tokens: a.cached_input_tokens.saturating_sub(b.cached_input_tokens),
+        output_tokens: a.output_tokens.saturating_sub(b.output_tokens),
+        reasoning_output_tokens: a
+            .reasoning_output_tokens
+            .saturating_sub(b.reasoning_output_tokens),
+        total_tokens: a.total_tokens.saturating_sub(b.total_tokens),
     }
 }
 

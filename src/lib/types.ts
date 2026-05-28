@@ -9,6 +9,19 @@ export interface TokenTotals {
   total_tokens: number;
 }
 
+export interface TurnInfo {
+  turn_id: string;
+  index: number;
+  model: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_ms: number | null;
+  time_to_first_token_ms: number | null;
+  user_message: string | null;
+  last_agent_message: string | null;
+  tokens: TokenTotals;
+}
+
 export interface Session {
   id: string;
   thread_name: string | null;
@@ -37,6 +50,7 @@ export interface Session {
     total_tokens: number;
     delta: TokenTotals;
   }[];
+  turns: TurnInfo[];
 }
 
 export interface Config {

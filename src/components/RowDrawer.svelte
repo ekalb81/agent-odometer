@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte';
   import type { Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits, formatCredits } from '../lib/credits';
+  import { computeSessionCredits, formatCredits, tokensCost } from '../lib/credits';
   import { revealInFileManager } from '../lib/ipc';
   import Sparkline from './Sparkline.svelte';
 
@@ -24,6 +24,32 @@
   function fmtDatetime(iso: string): string {
     return new Date(iso).toLocaleString();
   }
+
+  function fmtTime(iso: string | null): string {
+    return iso ? new Date(iso).toLocaleTimeString() : '—';
+  }
+
+  function fmtDuration(ms: number | null): string {
+    if (ms == null) return '—';
+    if (ms < 1000) return `${ms} ms`;
+    const s = ms / 1000;
+    if (s < 60) return `${s.toFixed(1)}s`;
+    const m = Math.floor(s / 60);
+    const rem = Math.round(s % 60);
+    return `${m}m ${rem}s`;
+  }
+
+  // Newest turn first.
+  const turnsDesc = $derived(session ? [...session.turns].sort((a, b) => b.index - a.index) : []);
+
+  let expandedTurn = $state<string | null>(null);
+  function toggleTurn(id: string) {
+    expandedTurn = expandedTurn === id ? null : id;
+  }
+  // Collapse expanded turn when switching sessions.
+  $effect(() => {
+    if (session) expandedTurn = null;
+  });
 
   let copied = $state(false);
   function copyId() {
@@ -359,6 +385,90 @@
           {/if}
         </dl>
       </section>
+
+      <!-- Turns -->
+      {#if session.turns && session.turns.length > 0}
+        <section>
+          <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3">
+            Turns ({session.turns.length})
+          </h3>
+          <ul class="space-y-2">
+            {#each turnsDesc as turn (turn.turn_id)}
+              {@const credit = $rates ? tokensCost(turn.tokens, turn.model, $rates) : null}
+              {@const isOpen = expandedTurn === turn.turn_id}
+              <li class="bg-slate-800 rounded-lg border border-slate-700/60 overflow-hidden">
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <button
+                  type="button"
+                  class="w-full text-left px-3 py-2 hover:bg-slate-700/40 transition-colors"
+                  onclick={() => toggleTurn(turn.turn_id)}
+                  aria-expanded={isOpen}
+                >
+                  <div class="flex items-center justify-between gap-2">
+                    <span class="text-xs font-medium text-slate-300">
+                      #{turn.index}
+                      <span class="text-slate-500 font-normal">· {fmtTime(turn.started_at)}</span>
+                    </span>
+                    <span class="flex items-center gap-2 flex-shrink-0">
+                      {#if turn.model}
+                        <span class="text-xs font-mono text-slate-400">{turn.model}</span>
+                      {/if}
+                      <span class="text-xs tabular-nums text-slate-300">{fmt(turn.tokens.total_tokens)} tok</span>
+                      {#if credit}
+                        <span class="text-xs tabular-nums text-emerald-400">{fmtCredit(credit.cost)}</span>
+                        {#if credit.fallbackUsed}
+                          <span class="text-amber-400" title="Fallback rate used (model not in rate card)">⚠</span>
+                        {/if}
+                      {/if}
+                    </span>
+                  </div>
+                  {#if turn.user_message}
+                    <p class="text-xs text-slate-400 truncate mt-1" title={turn.user_message}>
+                      {turn.user_message}
+                    </p>
+                  {/if}
+                </button>
+
+                {#if isOpen}
+                  <div class="px-3 py-2 border-t border-slate-700/60 space-y-2 text-xs">
+                    <!-- Token breakdown -->
+                    <div class="grid grid-cols-2 gap-x-4 gap-y-0.5 text-slate-400">
+                      <span>Input <span class="text-slate-300 tabular-nums float-right">{fmt(turn.tokens.input_tokens)}</span></span>
+                      <span>Cached <span class="text-slate-300 tabular-nums float-right">{fmt(turn.tokens.cached_input_tokens)}</span></span>
+                      <span>Output <span class="text-slate-300 tabular-nums float-right">{fmt(turn.tokens.output_tokens)}</span></span>
+                      <span>Reasoning <span class="text-slate-300 tabular-nums float-right">{fmt(turn.tokens.reasoning_output_tokens)}</span></span>
+                    </div>
+                    <!-- Timing -->
+                    <div class="flex flex-wrap gap-x-4 gap-y-0.5 text-slate-400">
+                      <span>Duration <span class="text-slate-300">{fmtDuration(turn.duration_ms)}</span></span>
+                      {#if turn.time_to_first_token_ms != null}
+                        <span>TTFT <span class="text-slate-300">{fmtDuration(turn.time_to_first_token_ms)}</span></span>
+                      {/if}
+                      {#if turn.completed_at}
+                        <span>Ended <span class="text-slate-300">{fmtTime(turn.completed_at)}</span></span>
+                      {/if}
+                    </div>
+                    <!-- Full prompt -->
+                    {#if turn.user_message}
+                      <div>
+                        <div class="text-slate-500 mb-0.5">Prompt</div>
+                        <p class="whitespace-pre-wrap text-slate-300 bg-slate-900/50 rounded px-2 py-1.5">{turn.user_message}</p>
+                      </div>
+                    {/if}
+                    <!-- Agent reply -->
+                    {#if turn.last_agent_message}
+                      <div>
+                        <div class="text-slate-500 mb-0.5">Final reply</div>
+                        <p class="whitespace-pre-wrap text-slate-300 bg-slate-900/50 rounded px-2 py-1.5">{turn.last_agent_message}</p>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
 
       <!-- First prompt -->
       {#if session.first_user_message}

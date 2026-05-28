@@ -90,9 +90,7 @@ pub fn start(
                         }
                     } else {
                         // Create or Modify — parse incrementally.
-                        let archived = archive_roots_cb
-                            .iter()
-                            .any(|root| path.starts_with(root));
+                        let archived = archive_roots_cb.iter().any(|root| path.starts_with(root));
 
                         let mut entry = parsers_cb
                             .entry(path.clone())
@@ -139,7 +137,11 @@ pub fn start(
     if let Some(index_parent) = session_index_path.parent() {
         if index_parent.exists() {
             if let Err(e) = debouncer.watch(index_parent, RecursiveMode::NonRecursive) {
-                tracing::warn!("could not watch session-index parent {:?}: {}", index_parent, e);
+                tracing::warn!(
+                    "could not watch session-index parent {:?}: {}",
+                    index_parent,
+                    e
+                );
             }
         }
     }
@@ -160,7 +162,9 @@ fn is_remove(kind: &EventKind) -> bool {
 /// active. Operates only on path components after the prefix is stripped, so
 /// it doesn't require the files to exist on disk.
 fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
-    strip_verbatim_prefix(a).components().eq(strip_verbatim_prefix(b).components())
+    strip_verbatim_prefix(a)
+        .components()
+        .eq(strip_verbatim_prefix(b).components())
 }
 
 fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {

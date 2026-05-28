@@ -63,8 +63,8 @@ impl Config {
     /// Persists config to `<config_dir>/codex-data-viewer/config.json`.
     /// Uses a `.tmp` → rename dance for an atomic-ish write.
     pub fn save(&self) -> anyhow::Result<()> {
-        let path = config_path()
-            .ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
+        let path =
+            config_path().ok_or_else(|| anyhow::anyhow!("could not determine config directory"))?;
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -97,7 +97,8 @@ mod tests {
         let path = dir.path().join("config.json");
         std::fs::write(&path, &json).unwrap();
 
-        let loaded: Config = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let loaded: Config =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.session_roots, cfg.session_roots);
         assert_eq!(loaded.archive_roots, cfg.archive_roots);
     }
