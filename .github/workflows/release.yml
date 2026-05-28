@@ -1,0 +1,104 @@
+name: Release
+
+# Triggers a cross-platform Tauri build when you push a tag like `v0.1.0`.
+# Produces installers for Windows (MSI + NSIS), macOS arm64 (DMG), and Linux
+# (deb + AppImage), and attaches them to a DRAFT GitHub Release that you
+# review and publish manually.
+#
+# Manual trigger (workflow_dispatch) is also wired up so you can do a dry
+# run from the Actions tab without cutting a tag.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }} — ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            label: macOS (Apple Silicon)
+            args: --target aarch64-apple-darwin
+            rust_target: aarch64-apple-darwin
+          - platform: ubuntu-22.04
+            label: Linux (x86_64)
+            args: ''
+            rust_target: ''
+          - platform: windows-latest
+            label: Windows (x86_64)
+            args: ''
+            rust_target: ''
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          # Make sure caches are scoped per OS+target.
+          key: ${{ matrix.platform }}-${{ matrix.rust_target }}
+
+      - name: Install Linux system deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            build-essential \
+            pkg-config \
+            patchelf \
+            file
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Build, bundle, and upload to draft release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'Codex Data Viewer ${{ github.ref_name }}'
+          releaseBody: |
+            ## Installation
+
+            Download the installer for your platform:
+
+            - **Windows**: the `.msi` (recommended) or `.exe`.
+            - **macOS (Apple Silicon)**: the `.dmg`. Right-click → Open on first launch (the app isn't notarized yet).
+            - **Linux**: the `.AppImage` (single file, no install) or `.deb` (Debian/Ubuntu).
+
+            ## Changes
+
+            <!-- Fill in release notes before publishing. -->
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
