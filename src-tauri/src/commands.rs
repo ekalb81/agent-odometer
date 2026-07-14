@@ -140,3 +140,51 @@ pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
 
     cmd.map(|_| ()).map_err(|e| e.to_string())
 }
+
+/// Opens a local task in the current ChatGPT desktop app through its retained
+/// `codex://threads/<id>` compatibility deep link.
+#[tauri::command]
+pub fn open_task_in_chatgpt(session_id: String) -> Result<(), String> {
+    if !valid_session_id(&session_id) {
+        return Err("invalid session id".into());
+    }
+    let url = format!("codex://threads/{session_id}");
+
+    #[cfg(target_os = "linux")]
+    let cmd = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+    #[cfg(target_os = "macos")]
+    let cmd = std::process::Command::new("open").arg(&url).spawn();
+
+    #[cfg(target_os = "windows")]
+    let cmd = std::process::Command::new("explorer").arg(&url).spawn();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let cmd: Result<_, std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ));
+
+    cmd.map(|_| ()).map_err(|e| e.to_string())
+}
+
+fn valid_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_session_id;
+
+    #[test]
+    fn validates_deep_link_session_ids() {
+        assert!(valid_session_id("019f5d3b-6b2f-75f1-aed9-723e7c488e66"));
+        assert!(!valid_session_id(""));
+        assert!(!valid_session_id("task/id"));
+        assert!(!valid_session_id("task?id=1"));
+    }
+}

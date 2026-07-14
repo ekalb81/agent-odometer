@@ -1,4 +1,4 @@
-use crate::model::{Session, TokenHistoryPoint, TokenTotals};
+use crate::model::{Session, TokenHistoryPoint, TokenTotals, TurnStatus};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -10,6 +10,7 @@ pub struct SessionParser {
     pub session: Option<Session>,
     pub byte_offset: u64,
     pub current_model: Option<String>,
+    pub current_service_tier: Option<String>,
     pub current_turn_id: Option<String>,
     pub file_path: PathBuf,
     pub archived: bool,
@@ -24,6 +25,7 @@ impl SessionParser {
             session: None,
             byte_offset: 0,
             current_model: None,
+            current_service_tier: None,
             current_turn_id: None,
             file_path,
             archived,
@@ -139,6 +141,27 @@ impl SessionParser {
             if let Some(cli) = payload.get("cli_version").and_then(Value::as_str) {
                 s.cli_version = Some(cli.to_owned());
             }
+            if let Some(value) = payload.get("forked_from_id").and_then(Value::as_str) {
+                s.forked_from_id = Some(value.to_owned());
+            }
+            if let Some(value) = payload.get("parent_thread_id").and_then(Value::as_str) {
+                s.parent_thread_id = Some(value.to_owned());
+            }
+            if let Some(value) = payload.get("agent_path").and_then(Value::as_str) {
+                s.agent_path = Some(value.to_owned());
+            }
+            if let Some(value) = payload.get("agent_nickname").and_then(Value::as_str) {
+                s.agent_nickname = Some(value.to_owned());
+            }
+            if let Some(value) = parse_session_source(&payload) {
+                s.source = Some(value);
+            }
+            if let Some(value) = payload.get("history_mode").and_then(Value::as_str) {
+                s.history_mode = Some(value.to_owned());
+            }
+            if let Some(value) = payload.get("memory_mode").and_then(Value::as_str) {
+                s.memory_mode = Some(value.to_owned());
+            }
             if last_event_at > s.last_event_at {
                 s.last_event_at = last_event_at;
             }
@@ -162,10 +185,7 @@ impl SessionParser {
             .and_then(Value::as_str)
             .map(str::to_owned);
 
-        let source = payload
-            .get("source")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let source = parse_session_source(&payload);
 
         let cli_version = payload
             .get("cli_version")
@@ -182,10 +202,38 @@ impl SessionParser {
             .and_then(Value::as_str)
             .map(str::to_owned);
 
+        let forked_from_id = payload
+            .get("forked_from_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let parent_thread_id = payload
+            .get("parent_thread_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let agent_path = payload
+            .get("agent_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let agent_nickname = payload
+            .get("agent_nickname")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let history_mode = payload
+            .get("history_mode")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let memory_mode = payload
+            .get("memory_mode")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
         self.session = Some(Session {
             id,
             thread_name,
-            forked_from_id: None,
+            forked_from_id,
+            parent_thread_id,
+            agent_path,
+            agent_nickname,
             file_path: self.file_path.to_string_lossy().into_owned(),
             archived: self.archived,
             started_at,
@@ -193,9 +241,12 @@ impl SessionParser {
             working_directory: cwd,
             originator,
             source,
+            history_mode,
+            memory_mode,
             cli_version,
             model_provider,
             model: None,
+            service_tier: None,
             plan_type: None,
             credits_unlimited: None,
             credits_balance: None,
@@ -220,6 +271,22 @@ impl SessionParser {
             .get("turn_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let reasoning_effort = payload
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let collaboration_mode = payload
+            .get("collaboration_mode")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("mode").and_then(Value::as_str))
+            })
+            .map(str::to_owned);
+        let explicit_service_tier = payload
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
 
         if let Some(m) = &model {
             self.current_model = Some(m.clone());
@@ -227,20 +294,84 @@ impl SessionParser {
         if let Some(t) = &turn_id {
             self.current_turn_id = Some(t.clone());
         }
+        if let Some(tier) = &explicit_service_tier {
+            self.current_service_tier = Some(tier.clone());
+        }
+        let service_tier = self.current_service_tier.clone();
 
         if let Some(s) = self.session.as_mut() {
             if let Some(m) = &model {
                 s.model = Some(m.clone());
+            }
+            if service_tier.is_some() {
+                s.service_tier = service_tier.clone();
             }
             if let Some(tid) = &turn_id {
                 let idx = ensure_turn_index(s, tid);
                 if model.is_some() {
                     s.turns[idx].model = model;
                 }
+                if reasoning_effort.is_some() {
+                    s.turns[idx].reasoning_effort = reasoning_effort;
+                }
+                if collaboration_mode.is_some() {
+                    s.turns[idx].collaboration_mode = collaboration_mode;
+                }
+                if service_tier.is_some() {
+                    s.turns[idx].service_tier = service_tier;
+                }
             }
         }
 
         Ok(())
+    }
+
+    fn handle_thread_settings(&mut self, payload: &Value) {
+        let Some(settings) = payload.get("thread_settings") else {
+            return;
+        };
+        let model = settings
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let service_tier = settings
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let reasoning_effort = settings
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let collaboration_mode = settings
+            .get("collaboration_mode")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .or_else(|| value.get("mode").and_then(Value::as_str))
+            })
+            .map(str::to_owned);
+
+        if let Some(value) = &model {
+            self.current_model = Some(value.clone());
+        }
+        self.current_service_tier = service_tier.clone();
+
+        if let Some(session) = self.session.as_mut() {
+            if model.is_some() {
+                session.model = model;
+            }
+            session.service_tier = service_tier.clone();
+            if let Some(turn_id) = &self.current_turn_id {
+                let idx = ensure_turn_index(session, turn_id);
+                session.turns[idx].service_tier = service_tier;
+                if reasoning_effort.is_some() {
+                    session.turns[idx].reasoning_effort = reasoning_effort;
+                }
+                if collaboration_mode.is_some() {
+                    session.turns[idx].collaboration_mode = collaboration_mode;
+                }
+            }
+        }
     }
 
     fn handle_event_msg(&mut self, payload: Value, event_ts: DateTime<Utc>) -> anyhow::Result<()> {
@@ -260,6 +391,11 @@ impl SessionParser {
                     self.current_turn_id = Some(t.clone());
                 }
                 let cw = payload.get("model_context_window").and_then(Value::as_u64);
+                let started_at = timestamp_field(&payload, "started_at").unwrap_or(event_ts);
+                let collaboration_mode = payload
+                    .get("collaboration_mode_kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 if let Some(s) = self.session.as_mut() {
                     if let Some(cw) = cw {
                         s.context_window = Some(cw as u32);
@@ -267,7 +403,10 @@ impl SessionParser {
                     if let Some(tid) = &turn_id {
                         let idx = ensure_turn_index(s, tid);
                         if s.turns[idx].started_at.is_none() {
-                            s.turns[idx].started_at = Some(event_ts);
+                            s.turns[idx].started_at = Some(started_at);
+                        }
+                        if collaboration_mode.is_some() {
+                            s.turns[idx].collaboration_mode = collaboration_mode;
                         }
                     }
                 }
@@ -295,6 +434,9 @@ impl SessionParser {
             "token_count" => {
                 self.handle_token_count(payload, event_ts)?;
             }
+            "thread_settings_applied" => {
+                self.handle_thread_settings(&payload);
+            }
             "task_complete" => {
                 let turn_id = payload
                     .get("turn_id")
@@ -314,17 +456,59 @@ impl SessionParser {
                             .take(TURN_MESSAGE_LIMIT)
                             .collect::<String>()
                     });
+                let completed_at = timestamp_field(&payload, "completed_at").unwrap_or(event_ts);
                 if let Some(s) = self.session.as_mut() {
                     s.total_turns += 1;
                     if let Some(tid) = &turn_id {
                         let idx = ensure_turn_index(s, tid);
                         let turn = &mut s.turns[idx];
-                        turn.completed_at = Some(event_ts);
+                        turn.completed_at = Some(completed_at);
                         turn.duration_ms = duration_ms;
                         turn.time_to_first_token_ms = ttft;
+                        turn.status = TurnStatus::Completed;
                         if turn.last_agent_message.is_none() {
                             turn.last_agent_message = last_agent;
                         }
+                    }
+                }
+                self.current_turn_id = None;
+            }
+            "turn_aborted" => {
+                let turn_id = payload
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| self.current_turn_id.clone());
+                let completed_at = timestamp_field(&payload, "completed_at").unwrap_or(event_ts);
+                let duration_ms = payload.get("duration_ms").and_then(Value::as_u64);
+                let reason = payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let (Some(s), Some(tid)) = (self.session.as_mut(), turn_id.as_deref()) {
+                    let idx = ensure_turn_index(s, tid);
+                    let turn = &mut s.turns[idx];
+                    turn.completed_at = Some(completed_at);
+                    turn.duration_ms = duration_ms;
+                    turn.status = TurnStatus::Aborted;
+                    turn.abort_reason = reason;
+                }
+                self.current_turn_id = None;
+            }
+            "thread_rolled_back" => {
+                let count = payload
+                    .get("num_turns")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                if let Some(s) = self.session.as_mut() {
+                    for turn in s
+                        .turns
+                        .iter_mut()
+                        .rev()
+                        .filter(|turn| turn.status != TurnStatus::RolledBack)
+                        .take(count)
+                    {
+                        turn.status = TurnStatus::RolledBack;
                     }
                 }
             }
@@ -352,6 +536,7 @@ impl SessionParser {
             .and_then(Value::as_u64)
             .map(|v| v as u32);
         let model = self.current_model.clone();
+        let service_tier = self.current_service_tier.clone();
         let turn_id = self.current_turn_id.clone();
 
         if let Some(s) = self.session.as_mut() {
@@ -390,6 +575,7 @@ impl SessionParser {
                 s.tokens_history.push(TokenHistoryPoint {
                     timestamp: event_ts,
                     model: model.clone(),
+                    service_tier: service_tier.clone(),
                     total_tokens: total.total_tokens,
                     delta: contribution.clone(),
                 });
@@ -398,6 +584,9 @@ impl SessionParser {
             if let Some(tid) = &turn_id {
                 if let Some(turn) = s.turns.iter_mut().find(|t| &t.turn_id == tid) {
                     add_token_totals(&mut turn.tokens, &contribution);
+                    if service_tier.is_some() {
+                        turn.service_tier = service_tier;
+                    }
                 }
             }
         }
@@ -425,6 +614,21 @@ impl SessionParser {
 
         Ok(())
     }
+}
+
+fn parse_session_source(payload: &Value) -> Option<String> {
+    match payload.get("source") {
+        Some(Value::String(source)) => Some(source.clone()),
+        Some(Value::Object(source)) if source.contains_key("subagent") => Some("subagent".into()),
+        _ => payload
+            .get("thread_source")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn timestamp_field(payload: &Value, key: &str) -> Option<DateTime<Utc>> {
+    payload.get(key).and_then(Value::as_str)?.parse().ok()
 }
 
 /// Finds the index of the turn with the given id, creating it (with the next

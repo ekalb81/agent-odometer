@@ -11,7 +11,7 @@ pub struct ModelRate {
     pub reasoning: f64,
 }
 
-/// Rate card shipped with the binary. Phase 5 will fetch live values from source_url.
+/// Rate card shipped with the binary or customized by the user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateCard {
     pub version: u32,
@@ -53,7 +53,10 @@ impl RateCard {
         }
         match std::fs::read_to_string(&path) {
             Ok(raw) => match serde_json::from_str::<Self>(&raw) {
-                Ok(card) => Ok(card),
+                Ok(card) => {
+                    let bundled = Self::load_bundled()?;
+                    Ok(merge_older_override(card, bundled))
+                }
                 Err(e) => {
                     tracing::warn!(
                         "rates.json at {:?} is malformed ({}); falling back to bundled",
@@ -86,5 +89,64 @@ impl RateCard {
         std::fs::write(&tmp, &serialized)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
+    }
+}
+
+/// Add models introduced by a newer bundled card without overwriting any
+/// user-edited model, currency, unit, or fallback choices.
+fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
+    if disk.version >= bundled.version {
+        return disk;
+    }
+    for (model, rate) in bundled.models {
+        disk.models.entry(model).or_insert(rate);
+    }
+    disk.version = bundled.version;
+    disk.source_url = bundled.source_url;
+    disk.fetched_at = bundled.fetched_at;
+    disk
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rate(value: f64) -> ModelRate {
+        ModelRate {
+            input: value,
+            cached_input: value,
+            output: value,
+            reasoning: value,
+        }
+    }
+
+    #[test]
+    fn older_override_inherits_new_models_but_preserves_edits() {
+        let disk = RateCard {
+            version: 2,
+            currency: "custom".into(),
+            unit: "per_1m_tokens".into(),
+            source_url: "old".into(),
+            fetched_at: Some("old".into()),
+            models: HashMap::from([("gpt-old".into(), rate(99.0))]),
+            fallback_model: "gpt-old".into(),
+        };
+        let bundled = RateCard {
+            version: 3,
+            currency: "credits".into(),
+            unit: "per_1m_tokens".into(),
+            source_url: "current".into(),
+            fetched_at: Some("current".into()),
+            models: HashMap::from([("gpt-old".into(), rate(1.0)), ("gpt-new".into(), rate(2.0))]),
+            fallback_model: "gpt-new".into(),
+        };
+
+        let merged = merge_older_override(disk, bundled);
+        assert_eq!(merged.version, 3);
+        assert_eq!(merged.currency, "custom");
+        assert_eq!(merged.fallback_model, "gpt-old");
+        assert_eq!(merged.models["gpt-old"].input, 99.0);
+        assert_eq!(merged.models["gpt-new"].input, 2.0);
+        assert_eq!(merged.source_url, "current");
     }
 }

@@ -13,6 +13,11 @@ export interface TurnInfo {
   turn_id: string;
   index: number;
   model: string | null;
+  reasoning_effort: string | null;
+  collaboration_mode: string | null;
+  service_tier: string | null;
+  status: 'in_progress' | 'completed' | 'aborted' | 'rolled_back';
+  abort_reason: string | null;
   started_at: string | null;
   completed_at: string | null;
   duration_ms: number | null;
@@ -26,6 +31,9 @@ export interface Session {
   id: string;
   thread_name: string | null;
   forked_from_id: string | null;
+  parent_thread_id: string | null;
+  agent_path: string | null;
+  agent_nickname: string | null;
   file_path: string;
   archived: boolean;
   started_at: string; // ISO8601
@@ -33,9 +41,12 @@ export interface Session {
   working_directory: string | null;
   originator: string | null;
   source: string | null;
+  history_mode: string | null;
+  memory_mode: string | null;
   cli_version: string | null;
   model_provider: string | null;
   model: string | null;
+  service_tier: string | null;
   plan_type: string | null;
   credits_unlimited: boolean | null;
   credits_balance: number | null;
@@ -47,6 +58,7 @@ export interface Session {
   tokens_history: {
     timestamp: string;
     model: string | null;
+    service_tier: string | null;
     total_tokens: number;
     delta: TokenTotals;
   }[];

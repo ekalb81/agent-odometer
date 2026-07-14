@@ -1,16 +1,21 @@
 {
-  "version": 2,
+  "version": 3,
   "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
-  "fetched_at": "2026-05-26",
-  "_note": "Values transcribed by user on fetched_at. Reasoning is billed at the output rate. Research-preview models and GPT-Image-2.0 modalities are omitted (not Codex coding sessions); add via the in-app editor if needed.",
+  "fetched_at": "2026-07-13",
+  "_note": "Verified against the OpenAI Codex token-based rate card on fetched_at. Reasoning is billed at the output rate. codex-auto-review follows the documented GPT-5.3-Codex code-review rate. Research-preview and image modalities are omitted; add them in Settings if needed.",
   "models": {
+    "gpt-5.6-sol":    { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
+    "gpt-5.6-terra":  { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
+    "gpt-5.6-luna":   { "input":  25.0,  "cached_input":  2.500, "output": 150.0, "reasoning": 150.0 },
+    "gpt-5.5-cyber":  { "input": 500.0,  "cached_input": 50.000, "output": 3000.0, "reasoning": 3000.0 },
     "gpt-5.5":        { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
     "gpt-5.4":        { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
     "gpt-5.4-mini":   { "input":  18.75, "cached_input":  1.875, "output": 113.0, "reasoning": 113.0 },
     "gpt-5.3-codex":  { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
-    "gpt-5.2":        { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 }
+    "gpt-5.2":        { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
+    "codex-auto-review": { "input": 43.75, "cached_input": 4.375, "output": 350.0, "reasoning": 350.0 }
   },
-  "fallback_model": "gpt-5.5"
+  "fallback_model": "gpt-5.6-sol"
 }

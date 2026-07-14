@@ -9,6 +9,7 @@
     model: string;
     showActive: boolean;
     showArchived: boolean;
+    showSubagents: boolean;
   };
 
   interface Props {
@@ -26,6 +27,7 @@
     model: '',
     showActive: true,
     showArchived: true,
+    showSubagents: true,
   });
 
   // Debounce timer for the search input.
@@ -92,7 +94,8 @@
       filters.dateTo === '' &&
       filters.model === '' &&
       filters.showActive &&
-      filters.showArchived,
+      filters.showArchived &&
+      filters.showSubagents,
   );
 </script>
 
@@ -211,6 +214,17 @@
       Archived
     </label>
   </fieldset>
+
+  <label class="flex items-center gap-1.5 cursor-pointer select-none text-sm text-slate-300">
+    <input
+      type="checkbox"
+      checked={filters.showSubagents}
+      onchange={(e) => emit({ showSubagents: (e.target as HTMLInputElement).checked })}
+      class="accent-blue-500"
+      aria-label="Show subagent tasks"
+    />
+    Subagents
+  </label>
 
   <!-- Clear button — only visible when filters differ from defaults -->
   {#if !isDefault}

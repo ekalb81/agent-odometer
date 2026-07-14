@@ -16,10 +16,21 @@ pub struct TokenHistoryPoint {
     /// Active model at the moment of this event (for per-period credit math).
     /// None only if no turn_context had set a model yet.
     pub model: Option<String>,
+    pub service_tier: Option<String>,
     /// Cumulative total_tokens at this event — drives the sparkline.
     pub total_tokens: u64,
     /// last_token_usage for this event — the per-call delta. All zeros if absent.
     pub delta: TokenTotals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    #[default]
+    InProgress,
+    Completed,
+    Aborted,
+    RolledBack,
 }
 
 /// One turn = one user prompt and the agent's work until task_complete.
@@ -31,6 +42,11 @@ pub struct TurnInfo {
     /// 1-based ordinal in the session.
     pub index: u32,
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub collaboration_mode: Option<String>,
+    pub service_tier: Option<String>,
+    pub status: TurnStatus,
+    pub abort_reason: Option<String>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub duration_ms: Option<u64>,
@@ -48,6 +64,9 @@ pub struct Session {
     pub id: String,
     pub thread_name: Option<String>,
     pub forked_from_id: Option<String>,
+    pub parent_thread_id: Option<String>,
+    pub agent_path: Option<String>,
+    pub agent_nickname: Option<String>,
     pub file_path: String,
     pub archived: bool,
     pub started_at: chrono::DateTime<chrono::Utc>,
@@ -55,9 +74,12 @@ pub struct Session {
     pub working_directory: Option<String>,
     pub originator: Option<String>,
     pub source: Option<String>,
+    pub history_mode: Option<String>,
+    pub memory_mode: Option<String>,
     pub cli_version: Option<String>,
     pub model_provider: Option<String>,
     pub model: Option<String>,
+    pub service_tier: Option<String>,
     pub plan_type: Option<String>,
     pub credits_unlimited: Option<bool>,
     pub credits_balance: Option<f64>,

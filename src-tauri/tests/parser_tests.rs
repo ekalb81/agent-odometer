@@ -1,3 +1,4 @@
+use codex_data_viewer_lib::model::TurnStatus;
 use codex_data_viewer_lib::parser;
 use std::path::PathBuf;
 
@@ -328,6 +329,7 @@ fn builds_turn_details_from_fixture() {
     assert_eq!(t.index, 1);
     assert_eq!(t.turn_id, "019e2ba6-9637-7682-9b6d-7838b0c2e0e5");
     assert_eq!(t.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(t.status, TurnStatus::Completed);
 
     // Prompt + final agent message captured.
     assert!(t
@@ -378,6 +380,7 @@ fn model_switch_produces_two_turns_with_scoped_tokens() {
     assert_eq!(a.index, 1);
     assert_eq!(a.turn_id, "turn-A");
     assert_eq!(a.model.as_deref(), Some("gpt-5.4"));
+    assert_eq!(a.status, TurnStatus::Completed);
     assert_eq!(a.user_message.as_deref(), Some("Do the first thing"));
     assert_eq!(a.last_agent_message.as_deref(), Some("Done with first."));
     assert_eq!(a.tokens.total_tokens, 903_000);
@@ -386,11 +389,61 @@ fn model_switch_produces_two_turns_with_scoped_tokens() {
     assert_eq!(b.index, 2);
     assert_eq!(b.turn_id, "turn-B");
     assert_eq!(b.model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(b.status, TurnStatus::Completed);
     assert_eq!(b.tokens.total_tokens, 50_500);
 
     // Per-turn totals sum to the session total.
     assert_eq!(
         a.tokens.total_tokens + b.tokens.total_tokens,
         s.tokens_total.total_tokens
+    );
+}
+
+#[test]
+fn parses_current_chatgpt_subagent_and_rollback_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("current.jsonl");
+    let lines = [
+        r#"{"timestamp":"2026-07-13T12:00:00.000Z","type":"session_meta","payload":{"id":"019f-current-subagent","timestamp":"2026-07-13T12:00:00.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.144.2","source":{"subagent":{"thread_spawn":{"depth":1}}},"model_provider":"openai","forked_from_id":"fork-source","parent_thread_id":"parent-task","agent_path":"/root/reviewer","agent_nickname":"Reviewer","history_mode":"save-all","memory_mode":"enabled"}}"#,
+        r#"{"timestamp":"2026-07-13T12:00:00.500Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-5.6-sol","reasoning_effort":"high","collaboration_mode":{"mode":"default"},"service_tier":"standard"}}}"#,
+        r#"{"timestamp":"2026-07-13T12:00:01.000Z","type":"turn_context","payload":{"turn_id":"turn-current","model":"gpt-5.6-sol","effort":"high","collaboration_mode":{"mode":"default"}}}"#,
+        r#"{"timestamp":"2026-07-13T12:00:02.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-current","started_at":"2026-07-13T12:00:01.500Z","model_context_window":272000,"collaboration_mode_kind":"default"}}"#,
+        r#"{"timestamp":"2026-07-13T12:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"Review the current behavior"}}"#,
+        r#"{"timestamp":"2026-07-13T12:00:03.250Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":5,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":5,"total_tokens":110},"model_context_window":272000},"rate_limits":{"plan_type":"business","credits":{"has_credits":true,"unlimited":false,"balance":1000}}}}"#,
+        r#"{"timestamp":"2026-07-13T12:00:04.000Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-current","completed_at":"2026-07-13T12:00:03.500Z","duration_ms":2000,"reason":"user_interrupt"}}"#,
+        r#"{"timestamp":"2026-07-13T12:00:05.000Z","type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}"#,
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let session = parser::parse_file(&path, false).unwrap().unwrap();
+    assert_eq!(session.source.as_deref(), Some("subagent"));
+    assert_eq!(session.forked_from_id.as_deref(), Some("fork-source"));
+    assert_eq!(session.parent_thread_id.as_deref(), Some("parent-task"));
+    assert_eq!(session.agent_path.as_deref(), Some("/root/reviewer"));
+    assert_eq!(session.agent_nickname.as_deref(), Some("Reviewer"));
+    assert_eq!(session.history_mode.as_deref(), Some("save-all"));
+    assert_eq!(session.memory_mode.as_deref(), Some("enabled"));
+    assert_eq!(session.context_window, Some(272_000));
+    assert_eq!(session.service_tier.as_deref(), Some("standard"));
+    assert_eq!(
+        session.tokens_history[0].service_tier.as_deref(),
+        Some("standard")
+    );
+
+    let turn = &session.turns[0];
+    assert_eq!(turn.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(turn.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(turn.collaboration_mode.as_deref(), Some("default"));
+    assert_eq!(turn.service_tier.as_deref(), Some("standard"));
+    assert_eq!(turn.status, TurnStatus::RolledBack);
+    assert_eq!(turn.abort_reason.as_deref(), Some("user_interrupt"));
+    assert_eq!(turn.duration_ms, Some(2_000));
+    assert_eq!(
+        turn.started_at.unwrap().to_rfc3339(),
+        "2026-07-13T12:00:01.500+00:00"
+    );
+    assert_eq!(
+        turn.completed_at.unwrap().to_rfc3339(),
+        "2026-07-13T12:00:03.500+00:00"
     );
 }

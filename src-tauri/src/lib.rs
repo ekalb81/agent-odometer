@@ -9,8 +9,8 @@ pub mod store;
 pub mod watcher;
 
 use commands::{
-    get_bundled_rates, get_config, get_rates, list_sessions, reveal_in_file_manager, set_config,
-    set_rates,
+    get_bundled_rates, get_config, get_rates, list_sessions, open_task_in_chatgpt,
+    reveal_in_file_manager, set_config, set_rates,
 };
 use config::Config;
 use std::sync::atomic::Ordering;
@@ -37,6 +37,7 @@ pub fn run() {
             get_bundled_rates,
             set_rates,
             reveal_in_file_manager,
+            open_task_in_chatgpt,
         ])
         .setup(move |app| {
             let config = Config::load().unwrap_or_else(|e| {

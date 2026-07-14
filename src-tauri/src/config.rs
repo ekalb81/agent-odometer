@@ -10,17 +10,27 @@ pub struct Config {
 }
 
 fn default_session_index_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".codex/session_index.jsonl")
+    codex_home_dir().join("session_index.jsonl")
+}
+
+fn codex_home_dir() -> PathBuf {
+    let configured = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    resolve_codex_home(configured, dirs::home_dir())
+}
+
+fn resolve_codex_home(configured: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    configured.unwrap_or_else(|| home.unwrap_or_else(|| PathBuf::from(".")).join(".codex"))
 }
 
 impl Default for Config {
     fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let codex_home = codex_home_dir();
         Self {
-            session_roots: vec![home.join(".codex/sessions")],
-            archive_roots: vec![home.join(".codex/archived_sessions")],
-            session_index_path: home.join(".codex/session_index.jsonl"),
+            session_roots: vec![codex_home.join("sessions")],
+            archive_roots: vec![codex_home.join("archived_sessions")],
+            session_index_path: codex_home.join("session_index.jsonl"),
         }
     }
 }
@@ -128,5 +138,20 @@ mod tests {
         let cfg = result.unwrap_or_else(|_| Config::default());
         // Falls back to default — session_roots should contain the .codex/sessions path.
         assert!(!cfg.session_roots.is_empty());
+    }
+
+    #[test]
+    fn codex_home_override_takes_precedence() {
+        let resolved = resolve_codex_home(
+            Some(PathBuf::from("/custom/codex")),
+            Some(PathBuf::from("/home/user")),
+        );
+        assert_eq!(resolved, PathBuf::from("/custom/codex"));
+    }
+
+    #[test]
+    fn codex_home_defaults_below_user_home() {
+        let resolved = resolve_codex_home(None, Some(PathBuf::from("/home/user")));
+        assert_eq!(resolved, PathBuf::from("/home/user/.codex"));
     }
 }

@@ -58,10 +58,19 @@
     model: '',
     showActive: true,
     showArchived: true,
+    showSubagents: true,
   });
 
   function defaultFilters(): FilterState {
-    return { search: '', dateFrom: '', dateTo: '', model: '', showActive: true, showArchived: true };
+    return {
+      search: '',
+      dateFrom: '',
+      dateTo: '',
+      model: '',
+      showActive: true,
+      showArchived: true,
+      showSubagents: true,
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -110,6 +119,9 @@
       // Status filter.
       if (s.archived && !filters.showArchived) return false;
       if (!s.archived && !filters.showActive) return false;
+      if (!filters.showSubagents && (s.parent_thread_id || s.agent_path || s.source === 'subagent')) {
+        return false;
+      }
 
       // Datetime range — overlap semantics: include any session whose
       // [started_at, last_event_at] window intersects the filter range.
@@ -127,6 +139,8 @@
           s.id,
           s.first_user_message ?? '',
           s.working_directory ?? '',
+          s.agent_path ?? '',
+          s.agent_nickname ?? '',
         ].join('\0').toLowerCase();
         if (!haystack.includes(lc)) return false;
       }
@@ -280,7 +294,7 @@
       <span class="font-semibold text-slate-200">{displayed.length}</span>
       of
       <span class="font-semibold text-slate-200">{allSessions.length}</span>
-      {allSessions.length === 1 ? 'session' : 'sessions'}
+      {allSessions.length === 1 ? 'task' : 'tasks'}
     </span>
     <span>
       <span class="font-semibold text-slate-200">{fmtTokens(filteredTotal)}</span>
@@ -305,12 +319,12 @@
   <div class="flex-1 overflow-auto">
     {#if allSessions.length === 0}
       <div class="flex flex-col items-center justify-center h-full gap-3 text-slate-500">
-        <p class="text-lg">No sessions found</p>
-        <p class="text-sm">Start a Codex session or check your config roots.</p>
+        <p class="text-lg">No tasks found</p>
+        <p class="text-sm">Start a Codex task in ChatGPT or check your config roots.</p>
       </div>
     {:else if displayed.length === 0}
       <div class="flex flex-col items-center justify-center h-full gap-3 text-slate-500">
-        <p class="text-lg">No sessions match the current filters.</p>
+        <p class="text-lg">No tasks match the current filters.</p>
         <button
           onclick={() => { filters = defaultFilters(); }}
           class="text-sm text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors"
@@ -403,7 +417,7 @@
               onclick={() => openDrawer(session.id)}
               onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') openDrawer(session.id); }}
               tabindex="0"
-              aria-label="Open session {name}"
+              aria-label="Open task {name}"
             >
               <!-- Name -->
               <td class="px-3 py-2 max-w-xs" title={name}>
@@ -412,6 +426,11 @@
                   {#if session.archived}
                     <span class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-slate-600 text-slate-300">
                       archived
+                    </span>
+                  {/if}
+                  {#if session.parent_thread_id || session.agent_path || session.source === 'subagent'}
+                    <span class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-violet-900/60 text-violet-300">
+                      subagent
                     </span>
                   {/if}
                 </div>

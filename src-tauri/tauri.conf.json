@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Codex Data Viewer",
+  "productName": "Codex Activity Viewer",
   "version": "0.1.0",
   "identifier": "com.codex-data-viewer.app",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Codex Data Viewer",
+        "title": "Codex Activity Viewer",
         "width": 1200,
         "height": 800,
         "minWidth": 800,

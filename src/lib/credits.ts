@@ -55,8 +55,15 @@ export function tokensInRange(
   return acc;
 }
 
+function serviceTierMultiplier(model: string | null, serviceTier: string | null): number {
+  if (serviceTier !== 'fast') return 1;
+  if (model === 'gpt-5.5') return 2.5;
+  if (model === 'gpt-5.4') return 2;
+  return 1;
+}
+
 /** Cost of one event's token delta under a given rate, with OpenAI subset semantics. */
-function eventCost(delta: TokenTotals, rate: ModelRate): number {
+function eventCost(delta: TokenTotals, rate: ModelRate, multiplier = 1): number {
   const nonCachedInput = Math.max(0, delta.input_tokens - delta.cached_input_tokens);
   const nonReasoningOutput = Math.max(0, delta.output_tokens - delta.reasoning_output_tokens);
   return (
@@ -65,7 +72,7 @@ function eventCost(delta: TokenTotals, rate: ModelRate): number {
       nonReasoningOutput * rate.output +
       delta.reasoning_output_tokens * rate.reasoning) /
     1_000_000
-  );
+  ) * multiplier;
 }
 
 /**
@@ -78,15 +85,22 @@ export function tokensCost(
   tokens: TokenTotals,
   model: string | null,
   rates: RateCard,
+  serviceTier: string | null = null,
 ): { cost: number; fallbackUsed: boolean } {
   const directRate = model ? rates.models[model] : undefined;
   const fallbackUsed = directRate === undefined;
   const rate = directRate ?? rates.models[rates.fallback_model];
   if (!rate) return { cost: 0, fallbackUsed };
-  return { cost: eventCost(tokens, rate), fallbackUsed };
+  return {
+    cost: eventCost(tokens, rate, serviceTierMultiplier(model, serviceTier)),
+    fallbackUsed,
+  };
 }
 
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {
+  if (session.tokens_history.length > 0) {
+    return computeHistoryCredits(session, rates, null, null);
+  }
   const entries = Object.entries(session.tokens_by_model);
 
   if (entries.length === 0) {
@@ -140,6 +154,16 @@ export function computeSessionCreditsInRange(
     return computeSessionCredits(session, rates);
   }
 
+  return computeHistoryCredits(session, rates, fromIso, toIso);
+}
+
+function computeHistoryCredits(
+  session: Session,
+  rates: RateCard,
+  fromIso: string | null,
+  toIso: string | null,
+): SessionCredits {
+
   const byModelMap = new Map<string, number>();
   const missingModels = new Set<string>();
   let total = 0;
@@ -157,7 +181,11 @@ export function computeSessionCreditsInRange(
     const rate = directRate ?? fallbackRate;
     if (!rate) continue;
 
-    const cost = eventCost(ev.delta, rate);
+    const cost = eventCost(
+      ev.delta,
+      rate,
+      serviceTierMultiplier(ev.model, ev.service_tier),
+    );
     total += cost;
     byModelMap.set(ev.model, (byModelMap.get(ev.model) ?? 0) + cost);
   }

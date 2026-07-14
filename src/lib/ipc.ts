@@ -37,6 +37,10 @@ export function revealInFileManager(path: string): Promise<void> {
   return invoke<void>('reveal_in_file_manager', { path });
 }
 
+export function openTaskInChatGPT(sessionId: string): Promise<void> {
+  return invoke<void>('open_task_in_chatgpt', { sessionId });
+}
+
 // ---------------------------------------------------------------------------
 // Events  (Phase 3 will emit these from the watcher)
 // ---------------------------------------------------------------------------

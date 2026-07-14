@@ -3,7 +3,7 @@
   import type { Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
   import { computeSessionCredits, formatCredits, tokensCost } from '../lib/credits';
-  import { revealInFileManager } from '../lib/ipc';
+  import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
   import Sparkline from './Sparkline.svelte';
 
   interface Props {
@@ -68,9 +68,19 @@
     if (session) promptExpanded = false;
   });
 
-  function handleReveal() {
+  function handleRevealWorkspace() {
+    if (!session?.working_directory) return;
+    revealInFileManager(session.working_directory).catch(() => {});
+  }
+
+  function handleRevealTranscript() {
     if (!session) return;
     revealInFileManager(session.file_path).catch(() => {});
+  }
+
+  function handleOpenTask() {
+    if (!session) return;
+    openTaskInChatGPT(session.parent_thread_id ?? session.id).catch(() => {});
   }
 
   // Context window usage.
@@ -137,6 +147,9 @@
           {#if session.archived}
             <span class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-slate-600 text-slate-300">archived</span>
           {/if}
+          {#if session.parent_thread_id || session.agent_path || session.source === 'subagent'}
+            <span class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-violet-900/60 text-violet-300">subagent</span>
+          {/if}
         </div>
         <div class="flex items-center gap-1.5 mt-1">
           <span class="font-mono text-xs text-slate-400 break-all">{session.id}</span>
@@ -147,6 +160,13 @@
             title={copied ? 'Copied!' : 'Copy ID'}
           >
             {copied ? '✓' : 'Copy'}
+          </button>
+          <button
+            onclick={handleOpenTask}
+            class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-blue-700 hover:bg-blue-600 text-white transition-colors"
+            aria-label={session.parent_thread_id ? 'Open parent task in ChatGPT' : 'Open task in ChatGPT'}
+          >
+            {session.parent_thread_id ? 'Open parent' : 'Open in ChatGPT'}
           </button>
         </div>
       </div>
@@ -174,13 +194,39 @@
               <dd class="flex items-center gap-2 mt-0.5">
                 <span class="font-mono text-xs text-slate-300 break-all">{session.working_directory}</span>
                 <button
-                  onclick={handleReveal}
+                  onclick={handleRevealWorkspace}
                   class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors whitespace-nowrap"
                   title="Open in file manager"
                   aria-label="Reveal in file manager"
                 >
                   Reveal
                 </button>
+              </dd>
+            </div>
+          {/if}
+
+          <div>
+            <dt class="text-xs text-slate-500">Transcript</dt>
+            <dd class="flex items-center gap-2 mt-0.5">
+              <span class="font-mono text-xs text-slate-400 break-all">{session.file_path}</span>
+              <button
+                onclick={handleRevealTranscript}
+                class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors"
+                aria-label="Reveal transcript in file manager"
+              >
+                Reveal
+              </button>
+            </dd>
+          </div>
+
+          {#if session.agent_path || session.agent_nickname || session.parent_thread_id}
+            <div>
+              <dt class="text-xs text-slate-500">Agent</dt>
+              <dd class="text-slate-300">
+                {session.agent_nickname ?? session.agent_path ?? 'Subagent'}
+                {#if session.agent_path && session.agent_nickname}
+                  <span class="font-mono text-xs text-slate-500 ml-1">{session.agent_path}</span>
+                {/if}
               </dd>
             </div>
           {/if}
@@ -219,7 +265,12 @@
               {#if session.model}
                 <div>
                   <dt class="text-xs text-slate-500">Model</dt>
-                  <dd class="text-slate-300 font-mono">{session.model}</dd>
+                  <dd class="text-slate-300 font-mono">
+                    {session.model}
+                    {#if session.service_tier}
+                      <span class="text-slate-500">· {session.service_tier}</span>
+                    {/if}
+                  </dd>
                 </div>
               {/if}
             </div>
@@ -374,7 +425,7 @@
             </div>
           </div>
           <div>
-            <dt class="text-xs text-slate-500">Total turns</dt>
+              <dt class="text-xs text-slate-500">Completed turns</dt>
             <dd class="text-slate-300">{session.total_turns}</dd>
           </div>
           {#if session.forked_from_id}
@@ -394,7 +445,7 @@
           </h3>
           <ul class="space-y-2">
             {#each turnsDesc as turn (turn.turn_id)}
-              {@const credit = $rates ? tokensCost(turn.tokens, turn.model, $rates) : null}
+              {@const credit = $rates ? tokensCost(turn.tokens, turn.model, $rates, turn.service_tier) : null}
               {@const isOpen = expandedTurn === turn.turn_id}
               <li class="bg-slate-800 rounded-lg border border-slate-700/60 overflow-hidden">
                 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -414,6 +465,15 @@
                         <span class="text-xs font-mono text-slate-400">{turn.model}</span>
                       {/if}
                       <span class="text-xs tabular-nums text-slate-300">{fmt(turn.tokens.total_tokens)} tok</span>
+                      {#if turn.status !== 'completed'}
+                        <span class="text-xs px-1.5 py-0.5 rounded {turn.status === 'aborted'
+                          ? 'bg-amber-900/60 text-amber-300'
+                          : turn.status === 'rolled_back'
+                            ? 'bg-slate-700 text-slate-400'
+                            : 'bg-blue-900/60 text-blue-300'}">
+                          {turn.status.replace('_', ' ')}
+                        </span>
+                      {/if}
                       {#if credit}
                         <span class="text-xs tabular-nums text-emerald-400">{fmtCredit(credit.cost)}</span>
                         {#if credit.fallbackUsed}
@@ -447,7 +507,19 @@
                       {#if turn.completed_at}
                         <span>Ended <span class="text-slate-300">{fmtTime(turn.completed_at)}</span></span>
                       {/if}
+                      {#if turn.reasoning_effort}
+                        <span>Effort <span class="text-slate-300">{turn.reasoning_effort}</span></span>
+                      {/if}
+                      {#if turn.collaboration_mode}
+                        <span>Mode <span class="text-slate-300">{turn.collaboration_mode}</span></span>
+                      {/if}
+                      {#if turn.service_tier}
+                        <span>Tier <span class="text-slate-300">{turn.service_tier}</span></span>
+                      {/if}
                     </div>
+                    {#if turn.abort_reason}
+                      <p class="text-amber-300">Stopped: {turn.abort_reason}</p>
+                    {/if}
                     <!-- Full prompt -->
                     {#if turn.user_message}
                       <div>
