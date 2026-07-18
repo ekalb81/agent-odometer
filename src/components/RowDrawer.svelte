@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte';
   import type { Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits, formatCredits, tokensCost } from '../lib/credits';
+  import { computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
   import Sparkline from './Sparkline.svelte';
 
@@ -15,7 +15,11 @@
 
   const numFmt = new Intl.NumberFormat();
   const pctFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
-  const fmtCredit = (amount: number) => formatCredits(amount, $rates?.currency ?? 'credits');
+  const fmtCredit = (amount: number) =>
+    formatCredits(
+      amount,
+      session && $rates ? harnessCurrency($rates, session.harness) : ($rates?.currency ?? 'credits'),
+    );
 
   function fmt(n: number): string {
     return numFmt.format(n);
@@ -161,13 +165,15 @@
           >
             {copied ? '✓' : 'Copy'}
           </button>
-          <button
-            onclick={handleOpenTask}
-            class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-blue-700 hover:bg-blue-600 text-white transition-colors"
-            aria-label={session.parent_thread_id ? 'Open parent task in ChatGPT' : 'Open task in ChatGPT'}
-          >
-            {session.parent_thread_id ? 'Open parent' : 'Open in ChatGPT'}
-          </button>
+          {#if session.harness !== 'claude_code'}
+            <button
+              onclick={handleOpenTask}
+              class="flex-shrink-0 text-xs px-1.5 py-0.5 rounded bg-blue-700 hover:bg-blue-600 text-white transition-colors"
+              aria-label={session.parent_thread_id ? 'Open parent task in ChatGPT' : 'Open task in ChatGPT'}
+            >
+              {session.parent_thread_id ? 'Open parent' : 'Open in ChatGPT'}
+            </button>
+          {/if}
         </div>
       </div>
       <button
@@ -333,7 +339,7 @@
                   <td class="py-1.5 pl-2 text-right font-mono text-slate-400 max-w-[100px]">
                     {#if modelCredit?.fallbackUsed}
                       <span class="text-amber-400" title="Fallback rate used — model not in rate card">
-                        → {$rates?.fallback_model ?? '—'}
+                        → {$rates ? fallbackModelName($rates, session.harness) : '—'}
                       </span>
                     {:else}
                       <span class="text-slate-400">{modelName}</span>
@@ -445,7 +451,7 @@
           </h3>
           <ul class="space-y-2">
             {#each turnsDesc as turn (turn.turn_id)}
-              {@const credit = $rates ? tokensCost(turn.tokens, turn.model, $rates, turn.service_tier) : null}
+              {@const credit = $rates ? tokensCost(turn.tokens, turn.model, $rates, turn.service_tier, session.harness) : null}
               {@const isOpen = expandedTurn === turn.turn_id}
               <li class="bg-slate-800 rounded-lg border border-slate-700/60 overflow-hidden">
                 <!-- svelte-ignore a11y_no_static_element_interactions -->

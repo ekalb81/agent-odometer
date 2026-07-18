@@ -1,3 +1,4 @@
+pub mod claude_parser;
 pub mod commands;
 pub mod config;
 pub mod model;
@@ -46,7 +47,11 @@ pub fn run() {
             });
 
             // Bulk-load existing sessions before the watcher starts.
-            let found = scanner::initial_scan(&config.session_roots, &config.archive_roots);
+            let found = scanner::initial_scan(
+                &config.session_roots,
+                &config.archive_roots,
+                &config.claude_session_roots,
+            );
             for (id, session) in found {
                 state_for_setup.sessions.insert(id, session);
             }
@@ -69,6 +74,7 @@ pub fn run() {
                 state_for_setup.clone(),
                 config.session_roots.clone(),
                 config.archive_roots.clone(),
+                config.claude_session_roots.clone(),
                 config.session_index_path.clone(),
             )?;
             *state_for_setup.watcher.lock().unwrap() = Some(handle);

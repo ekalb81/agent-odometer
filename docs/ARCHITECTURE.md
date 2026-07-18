@@ -2,20 +2,22 @@
 
 ## System overview
 
-Codex Activity Viewer is a local companion to the ChatGPT desktop app's Codex experience, with two halves:
+Codex Activity Viewer is a local companion to agent CLI harnesses — the ChatGPT desktop app's Codex experience and Claude Code — with two halves:
 
 - `src-tauri/`: Rust/Tauri backend for discovery, incremental JSONL parsing, filesystem watching, persistence, and native commands.
-- `src/`: Svelte 5/TypeScript frontend for reactive state, filtering, tables, details, settings, and credit calculations.
+- `src/`: Svelte 5/TypeScript frontend for reactive state, per-harness tabs, filtering, tables, details, settings, and credit calculations.
+
+Every session carries a `harness` tag (`codex` | `claude_code`). The UI shows one tab per harness; both tabs share the same session store, table, drawer, and filter components.
 
 The frontend starts at `src/main.ts` and `src/App.svelte`. The native process starts at `src-tauri/src/main.rs`, which calls `src-tauri/src/lib.rs::run`.
 
 ## Startup and live-update flow
 
 1. `Config::load` reads the platform config file or creates defaults.
-2. `scanner::initial_scan` recursively finds JSONL files under active and archive roots.
-3. `parser::parse_file` builds a `Session` for each rollout and stores it in `AppState.sessions`, keyed by session ID.
+2. `scanner::initial_scan` recursively finds JSONL files under active/archive Codex roots and Claude Code roots.
+3. `parser::parse_file` (Codex) or `claude_parser::parse_file` (Claude Code) builds a `Session` for each file and stores it in `AppState.sessions`, keyed by session ID.
 4. `session_index::read` overlays current thread names from Codex's session index.
-5. `watcher::start` watches the configured roots and the session-index parent directory.
+5. `watcher::start` watches all configured roots and the session-index parent directory; each changed file gets the parser matching the root it lives under.
 6. `App.svelte` invokes `list_sessions`, `get_config`, and `get_rates`, then subscribes to update/removal events.
 7. The watcher debounces filesystem activity, incrementally parses complete appended records, updates the `DashMap`, and emits Tauri events.
 
@@ -26,10 +28,11 @@ Saving settings persists the new config, stops the old watcher, clears and resca
 | Path | Responsibility |
 | --- | --- |
 | `src-tauri/src/lib.rs` | Tauri setup, shared state, command registration, initial scan, watcher lifetime |
-| `src-tauri/src/model.rs` | Serialized session, turn-status, and token wire models |
-| `src-tauri/src/parser.rs` | Full and incremental rollout JSONL parsing |
+| `src-tauri/src/model.rs` | Serialized session, harness, turn-status, and token wire models |
+| `src-tauri/src/parser.rs` | Full and incremental Codex rollout JSONL parsing |
+| `src-tauri/src/claude_parser.rs` | Full and incremental Claude Code session JSONL parsing |
 | `src-tauri/src/scanner.rs` | Recursive JSONL discovery and initial parse |
-| `src-tauri/src/watcher.rs` | Debounced file watching and frontend events |
+| `src-tauri/src/watcher.rs` | Debounced file watching, per-harness parser dispatch, frontend events |
 | `src-tauri/src/session_index.rs` | Thread-name overlay from `session_index.jsonl` |
 | `src-tauri/src/commands.rs` | Tauri command boundary |
 | `src-tauri/src/config.rs` | Session-root configuration and persistence |
@@ -57,6 +60,18 @@ Cached input and reasoning output are included within input and output respectiv
 
 Credit history also records `service_tier`. Current documented Fast mode multipliers are applied event-by-event for GPT-5.5 and GPT-5.4; models without a documented Fast rate remain at the standard multiplier.
 
+## Claude Code parser model
+
+Claude Code sessions (`~/.claude/projects/<project>/<uuid>.jsonl`) have no `session_meta` envelope; every line is a self-describing record. The aggregate parser cares about:
+
+- `user`: real human prompts open turns. Tool results, `isMeta` records, sidechain (subagent) prompts, `<command-…>` echoes, and interruption markers are excluded.
+- `assistant`: carries the Anthropic API message with `message.usage` and `message.model`. Streamed messages repeat one `message.id` across several lines with identical usage, so usage is counted once per message ID. `<synthetic>` messages are skipped.
+- `custom-title` / `summary`: thread-name sources (custom titles win).
+
+Anthropic usage reports `input_tokens` excluding cache traffic, while the viewer's `TokenTotals` treats cached input as a subset of input. The mapping is `input = input + cache_read + cache_creation`, `cached = cache_read`, `reasoning = 0` (thinking is billed as ordinary output). Cache writes are priced at the plain input rate, a slight underestimate of the 1.25x write premium. There is no cumulative counter in the file; totals accumulate from per-message deltas, and sidechain usage counts toward the enclosing turn.
+
+The rate card prices Codex models in credits and Claude models in USD; `currencies` and `fallback_models` on the card map each harness to its display currency and fallback rate so the two never mix.
+
 ## IPC and frontend state
 
 `src/lib/ipc.ts` is the only frontend Tauri boundary. It mirrors commands from `src-tauri/src/commands.rs` and listeners for these string contracts:
@@ -70,9 +85,9 @@ Credit history also records `service_tier`. Current documented Fast mode multipl
 
 `src/lib/types.ts` manually mirrors Rust's serialized structs. Rust field or serialization changes therefore require an explicit TypeScript update.
 
-`sessionsStore` is the canonical reactive session collection. `SessionsView.svelte` derives filters, ordering, range-scoped totals, and the open drawer. `SettingsView.svelte` edits roots and rate cards; `RowDrawer.svelte` presents one session; `Sparkline.svelte` is presentation-only.
+`sessionsStore` is the canonical reactive session collection. `SessionsView.svelte` (one instance per harness tab) derives filters, ordering, range-scoped totals, and the open drawer. `SettingsView.svelte` edits roots and rate cards; `RowDrawer.svelte` presents one session; `Sparkline.svelte` is presentation-only.
 
-The `open_task_in_chatgpt` command launches the supported `codex://threads/<id>` deep link. For a subagent rollout, the UI opens its parent task because subagents are not ordinary sidebar tasks.
+The `open_task_in_chatgpt` command launches the supported `codex://threads/<id>` deep link. For a subagent rollout, the UI opens its parent task because subagents are not ordinary sidebar tasks. Claude Code sessions have no deep link; the button is hidden for them.
 
 ## Dates and ranges
 
@@ -91,6 +106,10 @@ Default inputs are resolved below `$CODEX_HOME`, falling back to `~/.codex`:
 - `$CODEX_HOME/sessions`
 - `$CODEX_HOME/archived_sessions`
 - `$CODEX_HOME/session_index.jsonl`
+
+Claude Code sessions are resolved below `$CLAUDE_CONFIG_DIR`, falling back to `~/.claude`:
+
+- `$CLAUDE_CONFIG_DIR/projects`
 
 User-owned app data is stored under the platform configuration directory in `codex-data-viewer/config.json` and, after rate edits, `codex-data-viewer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`.
 

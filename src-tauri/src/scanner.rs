@@ -22,6 +22,7 @@ pub fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
 pub fn initial_scan(
     session_roots: &[PathBuf],
     archive_roots: &[PathBuf],
+    claude_session_roots: &[PathBuf],
 ) -> HashMap<String, crate::model::Session> {
     let mut map = HashMap::new();
 
@@ -34,6 +35,20 @@ pub fn initial_scan(
     for (root, archived) in roots_with_flag {
         for path in scan_jsonl_files(root) {
             match crate::parser::parse_file(&path, archived) {
+                Ok(Some(session)) => {
+                    map.insert(session.id.clone(), session);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("failed to parse {:?}: {}", path, e);
+                }
+            }
+        }
+    }
+
+    for root in claude_session_roots {
+        for path in scan_jsonl_files(root) {
+            match crate::claude_parser::parse_file(&path) {
                 Ok(Some(session)) => {
                     map.insert(session.id.clone(), session);
                 }

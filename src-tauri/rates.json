@@ -1,10 +1,18 @@
 {
-  "version": 3,
+  "version": 4,
   "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
-  "fetched_at": "2026-07-13",
-  "_note": "Verified against the OpenAI Codex token-based rate card on fetched_at. Reasoning is billed at the output rate. codex-auto-review follows the documented GPT-5.3-Codex code-review rate. Research-preview and image modalities are omitted; add them in Settings if needed.",
+  "fetched_at": "2026-07-18",
+  "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. Claude models are priced in USD per the Anthropic API price list (input/output per 1M tokens; cached_input is the 0.1x cache-read rate; Anthropic bills thinking as ordinary output). Cache writes (1.25x) are not modeled, so Claude costs are a slight underestimate. codex-auto-review follows the documented GPT-5.3-Codex code-review rate. Research-preview and image modalities are omitted; add them in Settings if needed.",
+  "currencies": {
+    "codex": "credits",
+    "claude_code": "USD"
+  },
+  "fallback_models": {
+    "codex": "gpt-5.6-sol",
+    "claude_code": "claude-opus-4-8"
+  },
   "models": {
     "gpt-5.6-sol":    { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
     "gpt-5.6-terra":  { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
@@ -15,7 +23,15 @@
     "gpt-5.4-mini":   { "input":  18.75, "cached_input":  1.875, "output": 113.0, "reasoning": 113.0 },
     "gpt-5.3-codex":  { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
     "gpt-5.2":        { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
-    "codex-auto-review": { "input": 43.75, "cached_input": 4.375, "output": 350.0, "reasoning": 350.0 }
+    "codex-auto-review": { "input": 43.75, "cached_input": 4.375, "output": 350.0, "reasoning": 350.0 },
+
+    "claude-fable-5":    { "input": 10.0, "cached_input": 1.00, "output": 50.0, "reasoning": 50.0 },
+    "claude-opus-4-8":   { "input":  5.0, "cached_input": 0.50, "output": 25.0, "reasoning": 25.0 },
+    "claude-opus-4-7":   { "input":  5.0, "cached_input": 0.50, "output": 25.0, "reasoning": 25.0 },
+    "claude-opus-4-6":   { "input":  5.0, "cached_input": 0.50, "output": 25.0, "reasoning": 25.0 },
+    "claude-sonnet-5":   { "input":  3.0, "cached_input": 0.30, "output": 15.0, "reasoning": 15.0 },
+    "claude-sonnet-4-6": { "input":  3.0, "cached_input": 0.30, "output": 15.0, "reasoning": 15.0 },
+    "claude-haiku-4-5":  { "input":  1.0, "cached_input": 0.10, "output":  5.0, "reasoning":  5.0 }
   },
   "fallback_model": "gpt-5.6-sol"
 }

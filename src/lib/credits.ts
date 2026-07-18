@@ -1,4 +1,4 @@
-import type { ModelRate, RateCard, Session, TokenTotals } from './types';
+import type { Harness, ModelRate, RateCard, Session, TokenTotals } from './types';
 
 export interface ModelCredit {
   model: string;
@@ -55,6 +55,20 @@ export function tokensInRange(
   return acc;
 }
 
+/** Currency label for a harness, falling back to the card-wide currency. */
+export function harnessCurrency(rates: RateCard, harness: Harness): string {
+  return rates.currencies?.[harness] ?? rates.currency;
+}
+
+/** Fallback model for a harness, falling back to the card-wide fallback. */
+function fallbackModelFor(rates: RateCard, harness: Harness): string {
+  return rates.fallback_models?.[harness] ?? rates.fallback_model;
+}
+
+export function fallbackModelName(rates: RateCard, harness: Harness): string {
+  return fallbackModelFor(rates, harness);
+}
+
 function serviceTierMultiplier(model: string | null, serviceTier: string | null): number {
   if (serviceTier !== 'fast') return 1;
   if (model === 'gpt-5.5') return 2.5;
@@ -86,10 +100,11 @@ export function tokensCost(
   model: string | null,
   rates: RateCard,
   serviceTier: string | null = null,
+  harness: Harness = 'codex',
 ): { cost: number; fallbackUsed: boolean } {
   const directRate = model ? rates.models[model] : undefined;
   const fallbackUsed = directRate === undefined;
-  const rate = directRate ?? rates.models[rates.fallback_model];
+  const rate = directRate ?? rates.models[fallbackModelFor(rates, harness)];
   if (!rate) return { cost: 0, fallbackUsed };
   return {
     cost: eventCost(tokens, rate, serviceTierMultiplier(model, serviceTier)),
@@ -113,7 +128,7 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
 
   for (const [model, totals] of entries) {
     const directRate = rates.models[model];
-    const fallbackRate = rates.models[rates.fallback_model];
+    const fallbackRate = rates.models[fallbackModelFor(rates, session.harness)];
     const fallbackUsed = directRate === undefined;
 
     if (fallbackUsed) {
@@ -168,7 +183,7 @@ function computeHistoryCredits(
   const missingModels = new Set<string>();
   let total = 0;
 
-  const fallbackRate = rates.models[rates.fallback_model];
+  const fallbackRate = rates.models[fallbackModelFor(rates, session.harness)];
 
   for (const ev of session.tokens_history) {
     if (fromIso && ev.timestamp < fromIso) continue;

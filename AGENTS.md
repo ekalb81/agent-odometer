@@ -4,7 +4,7 @@ These instructions apply to the entire repository.
 
 ## Project purpose
 
-Codex Activity Viewer is a local Tauri companion to the ChatGPT desktop app's Codex experience. It reads Codex rollout JSONL files and presents searchable task, turn, token, subagent, and estimated credit data. Rust owns filesystem access, parsing, persistence, and Tauri IPC; Svelte owns filtering, presentation, and credit calculations.
+Codex Activity Viewer is a local Tauri companion to agent CLI harnesses: the ChatGPT desktop app's Codex experience and Claude Code. It reads each harness's session JSONL files and presents searchable task, turn, token, subagent, and estimated cost data in per-harness tabs. Rust owns filesystem access, parsing, persistence, and Tauri IPC; Svelte owns filtering, presentation, and credit calculations.
 
 Start with [README.md](README.md) for commands and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the data flow, contracts, invariants, and known limitations.
 
@@ -39,6 +39,14 @@ Parser and credit changes are high risk. Preserve these behaviors and add focuse
 - Unknown models use the configured fallback rate. Rates are expressed per one million tokens.
 - `thread_settings_applied.service_tier` affects credit math. Fast GPT-5.5 uses 2.5x the standard rate and fast GPT-5.4 uses 2x; do not apply a multiplier to unsupported models.
 
+Claude Code sessions (`claude_parser.rs`) have their own invariants:
+
+- Streamed assistant messages repeat one `message.id` across lines with identical usage; count usage once per message ID.
+- Anthropic `input_tokens` excludes cache traffic. Map to the viewer's subset convention: input = input + cache_read + cache_creation, cached = cache_read, reasoning = 0.
+- Turns open on real human prompts only — never on tool results, `isMeta` records, sidechain prompts, `<command-…>` echoes, or interruption markers. Sidechain usage still counts toward the enclosing turn.
+- Skip `<synthetic>` assistant messages. Records without timestamps (e.g. `custom-title`) must not move `last_event_at`.
+- Sessions carry `harness: claude_code`; the per-harness `currencies`/`fallback_models` maps on the rate card keep Codex credits and Claude USD estimates separate.
+
 Parser integration tests and fixtures live in `src-tauri/tests/`; small Rust unit tests live beside their modules. There is currently no frontend unit-test runner, so do not invent an `npm test` command.
 
 ## Validation
@@ -60,6 +68,6 @@ For runtime or UI changes, also exercise the affected flow with `npm run tauri d
 - Parser/model change: update Rust structs, TypeScript mirrors, synthetic fixtures, parser tests, and credit/date rollups as applicable.
 - IPC change: update command implementation, registration, TypeScript wrapper, payload type, capability (only if required), and event listeners.
 - Watcher/config change: verify startup scan, incremental append, removal, archive status, session-index overlay, and watcher restart after settings changes.
-- Default-path change: honor `$CODEX_HOME` before falling back to `~/.codex`.
+- Default-path change: honor `$CODEX_HOME` before falling back to `~/.codex`, and `$CLAUDE_CONFIG_DIR` before falling back to `~/.claude` for Claude Code roots.
 - UI change: verify empty/loading/error states, active and archived sessions, narrow-window behavior, keyboard behavior, and date/time-zone conversion.
 - Rate change: update `src-tauri/rates.json` deliberately and test direct, fallback, unlimited, cached-input, and reasoning-output cases.

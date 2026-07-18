@@ -1,6 +1,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Which agent harness produced a session's transcript. Serialized as
+/// snake_case strings; defaults to Codex so previously-serialized sessions
+/// and frontends without the field keep working.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Harness {
+    #[default]
+    Codex,
+    ClaudeCode,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TokenTotals {
     pub input_tokens: u64,
@@ -62,6 +73,8 @@ pub struct TurnInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    #[serde(default)]
+    pub harness: Harness,
     pub thread_name: Option<String>,
     pub forked_from_id: Option<String>,
     pub parent_thread_id: Option<String>,

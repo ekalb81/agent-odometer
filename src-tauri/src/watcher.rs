@@ -1,3 +1,5 @@
+use crate::claude_parser::ClaudeSessionParser;
+use crate::model::Session;
 use crate::parser::SessionParser;
 use crate::store::AppState;
 use dashmap::DashMap;
@@ -13,11 +15,34 @@ pub struct WatcherHandle {
     _inner: Box<dyn std::any::Any + Send + Sync>,
 }
 
+/// Per-file incremental parser, dispatching on the harness that owns the root
+/// the file lives under.
+enum AnyParser {
+    Codex(SessionParser),
+    Claude(ClaudeSessionParser),
+}
+
+impl AnyParser {
+    fn parse_to_end(&mut self) -> anyhow::Result<bool> {
+        match self {
+            AnyParser::Codex(p) => p.parse_to_end(),
+            AnyParser::Claude(p) => p.parse_to_end(),
+        }
+    }
+
+    fn session(&self) -> Option<&Session> {
+        match self {
+            AnyParser::Codex(p) => p.session.as_ref(),
+            AnyParser::Claude(p) => p.session.as_ref(),
+        }
+    }
+}
+
 /// Starts a debounced recursive watcher on the given roots.
 ///
-/// On Create/Modify of a *.jsonl file: get-or-insert a SessionParser, call
-/// parse_to_end(), and if the session is Some upsert it into state and emit
-/// "session-updated".
+/// On Create/Modify of a *.jsonl file: get-or-insert a parser for the file's
+/// harness, call parse_to_end(), and if the session is Some upsert it into
+/// state and emit "session-updated".
 ///
 /// On Remove: drop the parser, remove from state, and emit "session-removed".
 pub fn start(
@@ -25,14 +50,17 @@ pub fn start(
     state: Arc<AppState>,
     session_roots: Vec<PathBuf>,
     archive_roots: Vec<PathBuf>,
+    claude_session_roots: Vec<PathBuf>,
     session_index_path: PathBuf,
 ) -> anyhow::Result<WatcherHandle> {
-    let parsers: Arc<DashMap<PathBuf, SessionParser>> = Arc::new(DashMap::new());
+    let parsers: Arc<DashMap<PathBuf, AnyParser>> = Arc::new(DashMap::new());
     let archive_roots_arc: Arc<Vec<PathBuf>> = Arc::new(archive_roots.clone());
+    let claude_roots_arc: Arc<Vec<PathBuf>> = Arc::new(claude_session_roots.clone());
     let session_index_path_arc: Arc<PathBuf> = Arc::new(session_index_path.clone());
 
     let parsers_cb = parsers.clone();
     let archive_roots_cb = archive_roots_arc.clone();
+    let claude_roots_cb = claude_roots_arc.clone();
     let session_index_path_cb = session_index_path_arc.clone();
     let state_cb = state.clone();
     let app_cb = app.clone();
@@ -80,7 +108,7 @@ pub fn start(
                     if is_remove(&kind) {
                         // Look up the session id before dropping the parser.
                         if let Some((_, parser)) = parsers_cb.remove(path) {
-                            if let Some(session) = &parser.session {
+                            if let Some(session) = parser.session() {
                                 let id = session.id.clone();
                                 state_cb.sessions.remove(&id);
                                 if let Err(e) = app_cb.emit("session-removed", &id) {
@@ -90,11 +118,16 @@ pub fn start(
                         }
                     } else {
                         // Create or Modify — parse incrementally.
+                        let is_claude = claude_roots_cb.iter().any(|root| path.starts_with(root));
                         let archived = archive_roots_cb.iter().any(|root| path.starts_with(root));
 
-                        let mut entry = parsers_cb
-                            .entry(path.clone())
-                            .or_insert_with(|| SessionParser::new(path.clone(), archived));
+                        let mut entry = parsers_cb.entry(path.clone()).or_insert_with(|| {
+                            if is_claude {
+                                AnyParser::Claude(ClaudeSessionParser::new(path.clone()))
+                            } else {
+                                AnyParser::Codex(SessionParser::new(path.clone(), archived))
+                            }
+                        });
 
                         match entry.parse_to_end() {
                             Ok(_) => {}
@@ -104,7 +137,7 @@ pub fn start(
                             }
                         }
 
-                        if let Some(session) = &entry.session {
+                        if let Some(session) = entry.session() {
                             state_cb
                                 .sessions
                                 .insert(session.id.clone(), session.clone());
@@ -121,7 +154,11 @@ pub fn start(
 
     // Watch all roots recursively. Skip roots that don't exist yet — the user
     // may not have Codex installed, or the directory will be created later.
-    for root in session_roots.iter().chain(archive_roots.iter()) {
+    for root in session_roots
+        .iter()
+        .chain(archive_roots.iter())
+        .chain(claude_session_roots.iter())
+    {
         if !root.exists() {
             tracing::info!("watch root {:?} does not exist yet, skipping", root);
             continue;

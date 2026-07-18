@@ -10,9 +10,11 @@
 
   let editedSessionRoots = $state<string[]>([]);
   let editedArchiveRoots = $state<string[]>([]);
+  let editedClaudeRoots = $state<string[]>([]);
   let editedIndexPath = $state('');
   let newSessionRoot = $state('');
   let newArchiveRoot = $state('');
+  let newClaudeRoot = $state('');
 
   let rootsDirty = $state(false);
   let rootsSaving = $state(false);
@@ -26,13 +28,15 @@
     if (!rootsDirty) {
       editedSessionRoots = [...c.session_roots];
       editedArchiveRoots = [...c.archive_roots];
+      editedClaudeRoots = [...(c.claude_session_roots ?? [])];
       editedIndexPath = c.session_index_path ?? '';
     }
   });
 
   const hasDuplicateRoots = $derived(
     new Set(editedSessionRoots).size !== editedSessionRoots.length ||
-    new Set(editedArchiveRoots).size !== editedArchiveRoots.length,
+    new Set(editedArchiveRoots).size !== editedArchiveRoots.length ||
+    new Set(editedClaudeRoots).size !== editedClaudeRoots.length,
   );
 
   function markRootsDirty() {
@@ -67,6 +71,19 @@
     markRootsDirty();
   }
 
+  function addClaudeRoot() {
+    const v = newClaudeRoot.trim();
+    if (!v) return;
+    editedClaudeRoots = [...editedClaudeRoots, v];
+    newClaudeRoot = '';
+    markRootsDirty();
+  }
+
+  function removeClaudeRoot(i: number) {
+    editedClaudeRoots = editedClaudeRoots.filter((_, idx) => idx !== i);
+    markRootsDirty();
+  }
+
   function resetRoots() {
     rootsDirty = false;
     rootsSavedAt = null;
@@ -82,6 +99,7 @@
         session_roots: editedSessionRoots,
         archive_roots: editedArchiveRoots,
         session_index_path: editedIndexPath.trim(),
+        claude_session_roots: editedClaudeRoots,
       });
       rootsDirty = false;
       rootsSavedAt = new Date().toLocaleTimeString();
@@ -112,6 +130,9 @@
   let ratesVersion = $state(1);
   let ratesCurrency = $state('credits');
   let ratesUnit = $state('per_1m_tokens');
+  // Per-harness maps are not editable here yet; carry them through saves.
+  let ratesCurrencies = $state<Record<string, string>>({});
+  let ratesFallbackModels = $state<Record<string, string>>({});
 
   // New-model form.
   let newName = $state('');
@@ -144,6 +165,8 @@
     ratesVersion = r.version;
     ratesCurrency = r.currency;
     ratesUnit = r.unit;
+    ratesCurrencies = { ...(r.currencies ?? {}) };
+    ratesFallbackModels = { ...(r.fallback_models ?? {}) };
     dirty = false;
   });
 
@@ -196,6 +219,8 @@
       fetched_at: fetchedAt,
       models,
       fallback_model: fallbackModel,
+      currencies: ratesCurrencies,
+      fallback_models: ratesFallbackModels,
     };
   }
 
@@ -366,6 +391,43 @@
         />
         <button
           onclick={addArchiveRoot}
+          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+        >Add</button>
+      </li>
+    </ul>
+
+    <!-- Claude Code session roots -->
+    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Claude Code session roots</h3>
+    <p class="text-xs text-slate-500 mb-1">
+      Directories containing Claude Code session files. Claude Code writes them under
+      <span class="font-mono">~/.claude/projects</span> by default.
+    </p>
+    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden mb-2">
+      {#if editedClaudeRoots.length === 0}
+        <li class="px-4 py-2 text-xs text-slate-500 italic">None configured</li>
+      {:else}
+        {#each editedClaudeRoots as root, i}
+          <li class="flex items-center justify-between gap-2 px-4 py-2">
+            <span class="font-mono text-xs text-slate-300 break-all">{root}</span>
+            <button
+              onclick={() => removeClaudeRoot(i)}
+              class="flex-shrink-0 text-slate-500 hover:text-red-400 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-slate-700"
+              aria-label="Remove {root}"
+              title="Remove"
+            >Remove</button>
+          </li>
+        {/each}
+      {/if}
+      <li class="flex items-center gap-2 px-4 py-2">
+        <input
+          type="text"
+          placeholder="/absolute/path/to/.claude/projects"
+          bind:value={newClaudeRoot}
+          onkeydown={(e) => { if (e.key === 'Enter') addClaudeRoot(); }}
+          class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+        />
+        <button
+          onclick={addClaudeRoot}
           class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
         >Add</button>
       </li>

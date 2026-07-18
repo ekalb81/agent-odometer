@@ -1,14 +1,19 @@
 <script lang="ts">
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits, computeSessionCreditsInRange, formatCredits, tokensInRange } from '../lib/credits';
-  import type { TokenTotals } from '../lib/types';
+  import { computeSessionCredits, computeSessionCreditsInRange, formatCredits, harnessCurrency, tokensInRange } from '../lib/credits';
+  import type { Harness, TokenTotals } from '../lib/types';
   import Filters from './Filters.svelte';
   import type { FilterState } from './Filters.svelte';
   import RowDrawer from './RowDrawer.svelte';
 
+  let { harness = 'codex' as Harness }: { harness?: Harness } = $props();
+
   const fmt = new Intl.NumberFormat();
-  const fmtCredit = (amount: number) => formatCredits(amount, $rates?.currency ?? 'credits');
+  const fmtCredit = (amount: number) =>
+    formatCredits(amount, $rates ? harnessCurrency($rates, harness) : 'credits');
+  // Codex bills in plan credits; other harnesses show an API-equivalent cost.
+  const costNoun = $derived(harness === 'codex' ? 'credits' : 'est. cost');
 
   function fmtTokens(n: number): string {
     return fmt.format(n);
@@ -100,7 +105,9 @@
   // ---------------------------------------------------------------------------
   // Filtered + sorted list
   // ---------------------------------------------------------------------------
-  const allSessions = $derived([...sessionsStore.map.values()]);
+  const allSessions = $derived(
+    [...sessionsStore.map.values()].filter((s) => s.harness === harness),
+  );
 
   // Convert datetime-local strings (local time) to UTC ISO once, so the rest
   // of the pipeline can do lexical comparison against the UTC ISO timestamps
@@ -302,7 +309,7 @@
     </span>
     <span>
       <span class="font-semibold text-slate-200">{fmtCredit(creditSummary.billedTotal)}</span>
-      {dateScoped ? 'credits in range' : 'total credits'}
+      {dateScoped ? `${costNoun} in range` : `total ${costNoun}`}
       {#if creditSummary.unlimitedCount > 0}
         <span class="text-slate-500 text-xs ml-1">({creditSummary.unlimitedCount} unlimited excluded)</span>
       {/if}
@@ -320,7 +327,11 @@
     {#if allSessions.length === 0}
       <div class="flex flex-col items-center justify-center h-full gap-3 text-slate-500">
         <p class="text-lg">No tasks found</p>
-        <p class="text-sm">Start a Codex task in ChatGPT or check your config roots.</p>
+        {#if harness === 'claude_code'}
+          <p class="text-sm">Start a Claude Code session or check your Claude session roots in Settings.</p>
+        {:else}
+          <p class="text-sm">Start a Codex task in ChatGPT or check your config roots.</p>
+        {/if}
       </div>
     {:else if displayed.length === 0}
       <div class="flex flex-col items-center justify-center h-full gap-3 text-slate-500">
@@ -398,7 +409,7 @@
             <!-- Sortable: Credit -->
             <th class="px-3 py-2 font-medium text-slate-300 text-right whitespace-nowrap" aria-sort={ariaSortAttr('credit')}>
               <button class="hover:text-white transition-colors" onclick={() => toggleSort('credit')}>
-                Credit{caretFor('credit')}
+                {harness === 'codex' ? 'Credit' : 'Cost'}{caretFor('credit')}
               </button>
             </th>
           </tr>

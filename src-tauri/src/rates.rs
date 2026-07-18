@@ -26,6 +26,14 @@ pub struct RateCard {
     pub models: HashMap<String, ModelRate>,
     /// Model key to use when a session's model is not found in `models`.
     pub fallback_model: String,
+    /// Per-harness currency labels (e.g. codex -> "credits", claude_code -> "USD").
+    /// Falls back to `currency` when a harness is absent.
+    #[serde(default)]
+    pub currencies: HashMap<String, String>,
+    /// Per-harness fallback models, so an unknown Claude model doesn't fall
+    /// back to a Codex credit rate. Falls back to `fallback_model` when absent.
+    #[serde(default)]
+    pub fallback_models: HashMap<String, String>,
 }
 
 fn rates_path() -> Option<PathBuf> {
@@ -101,6 +109,12 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     for (model, rate) in bundled.models {
         disk.models.entry(model).or_insert(rate);
     }
+    for (harness, currency) in bundled.currencies {
+        disk.currencies.entry(harness).or_insert(currency);
+    }
+    for (harness, model) in bundled.fallback_models {
+        disk.fallback_models.entry(harness).or_insert(model);
+    }
     disk.version = bundled.version;
     disk.source_url = bundled.source_url;
     disk.fetched_at = bundled.fetched_at;
@@ -130,6 +144,8 @@ mod tests {
             fetched_at: Some("old".into()),
             models: HashMap::from([("gpt-old".into(), rate(99.0))]),
             fallback_model: "gpt-old".into(),
+            currencies: HashMap::new(),
+            fallback_models: HashMap::new(),
         };
         let bundled = RateCard {
             version: 3,
@@ -139,6 +155,8 @@ mod tests {
             fetched_at: Some("current".into()),
             models: HashMap::from([("gpt-old".into(), rate(1.0)), ("gpt-new".into(), rate(2.0))]),
             fallback_model: "gpt-new".into(),
+            currencies: HashMap::from([("claude_code".into(), "USD".into())]),
+            fallback_models: HashMap::from([("claude_code".into(), "claude-new".into())]),
         };
 
         let merged = merge_older_override(disk, bundled);
@@ -148,5 +166,8 @@ mod tests {
         assert_eq!(merged.models["gpt-old"].input, 99.0);
         assert_eq!(merged.models["gpt-new"].input, 2.0);
         assert_eq!(merged.source_url, "current");
+        // Per-harness maps introduced by a newer bundled card are inherited.
+        assert_eq!(merged.currencies["claude_code"], "USD");
+        assert_eq!(merged.fallback_models["claude_code"], "claude-new");
     }
 }

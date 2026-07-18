@@ -229,6 +229,7 @@ impl SessionParser {
 
         self.session = Some(Session {
             id,
+            harness: crate::model::Harness::Codex,
             thread_name,
             forked_from_id,
             parent_thread_id,

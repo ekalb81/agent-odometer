@@ -40,7 +40,11 @@ pub fn set_config(
     state.sessions.clear();
     state.scanned.store(false, Ordering::Release);
 
-    let found = crate::scanner::initial_scan(&config.session_roots, &config.archive_roots);
+    let found = crate::scanner::initial_scan(
+        &config.session_roots,
+        &config.archive_roots,
+        &config.claude_session_roots,
+    );
     for (id, session) in found {
         state.sessions.insert(id, session);
     }
@@ -55,6 +59,7 @@ pub fn set_config(
         state.inner().clone(),
         config.session_roots.clone(),
         config.archive_roots.clone(),
+        config.claude_session_roots.clone(),
         config.session_index_path.clone(),
     )
     .map_err(|e| e.to_string())?;
@@ -77,6 +82,8 @@ pub fn get_rates() -> RateCard {
         fetched_at: None,
         models: std::collections::HashMap::new(),
         fallback_model: "codex-mini-latest".into(),
+        currencies: std::collections::HashMap::new(),
+        fallback_models: std::collections::HashMap::new(),
     })
 }
 
@@ -92,6 +99,8 @@ pub fn get_bundled_rates() -> RateCard {
         fetched_at: None,
         models: std::collections::HashMap::new(),
         fallback_model: "codex-mini-latest".into(),
+        currencies: std::collections::HashMap::new(),
+        fallback_models: std::collections::HashMap::new(),
     })
 }
 

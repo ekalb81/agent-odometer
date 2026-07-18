@@ -7,10 +7,28 @@ pub struct Config {
     pub archive_roots: Vec<PathBuf>,
     #[serde(default = "default_session_index_path")]
     pub session_index_path: PathBuf,
+    /// Roots containing Claude Code session JSONL files (~/.claude/projects).
+    #[serde(default = "default_claude_session_roots")]
+    pub claude_session_roots: Vec<PathBuf>,
 }
 
 fn default_session_index_path() -> PathBuf {
     codex_home_dir().join("session_index.jsonl")
+}
+
+fn default_claude_session_roots() -> Vec<PathBuf> {
+    vec![claude_config_dir().join("projects")]
+}
+
+fn claude_config_dir() -> PathBuf {
+    let configured = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty());
+    resolve_claude_config_dir(configured, dirs::home_dir())
+}
+
+fn resolve_claude_config_dir(configured: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    configured.unwrap_or_else(|| home.unwrap_or_else(|| PathBuf::from(".")).join(".claude"))
 }
 
 fn codex_home_dir() -> PathBuf {
@@ -31,6 +49,7 @@ impl Default for Config {
             session_roots: vec![codex_home.join("sessions")],
             archive_roots: vec![codex_home.join("archived_sessions")],
             session_index_path: codex_home.join("session_index.jsonl"),
+            claude_session_roots: default_claude_session_roots(),
         }
     }
 }
@@ -101,6 +120,7 @@ mod tests {
             session_roots: vec![dir.path().join("sessions")],
             archive_roots: vec![dir.path().join("archived")],
             session_index_path: dir.path().join("session_index.jsonl"),
+            claude_session_roots: vec![dir.path().join("claude-projects")],
         };
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -111,6 +131,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.session_roots, cfg.session_roots);
         assert_eq!(loaded.archive_roots, cfg.archive_roots);
+        assert_eq!(loaded.claude_session_roots, cfg.claude_session_roots);
     }
 
     #[test]
@@ -122,6 +143,9 @@ mod tests {
         assert_eq!(cfg.archive_roots, vec![PathBuf::from("/y")]);
         // session_index_path should fall back to the home-dir default, never empty.
         assert!(cfg.session_index_path.ends_with("session_index.jsonl"));
+        // claude_session_roots should fall back to <claude config dir>/projects.
+        assert_eq!(cfg.claude_session_roots.len(), 1);
+        assert!(cfg.claude_session_roots[0].ends_with("projects"));
     }
 
     #[test]
@@ -153,5 +177,20 @@ mod tests {
     fn codex_home_defaults_below_user_home() {
         let resolved = resolve_codex_home(None, Some(PathBuf::from("/home/user")));
         assert_eq!(resolved, PathBuf::from("/home/user/.codex"));
+    }
+
+    #[test]
+    fn claude_config_dir_override_takes_precedence() {
+        let resolved = resolve_claude_config_dir(
+            Some(PathBuf::from("/custom/claude")),
+            Some(PathBuf::from("/home/user")),
+        );
+        assert_eq!(resolved, PathBuf::from("/custom/claude"));
+    }
+
+    #[test]
+    fn claude_config_dir_defaults_below_user_home() {
+        let resolved = resolve_claude_config_dir(None, Some(PathBuf::from("/home/user")));
+        assert_eq!(resolved, PathBuf::from("/home/user/.claude"));
     }
 }

@@ -1,6 +1,8 @@
 // TypeScript types mirroring Rust structs in src-tauri/src/model.rs, config.rs, and rates.rs.
 // Keep in sync when Rust types change.
 
+export type Harness = 'codex' | 'claude_code';
+
 export interface TokenTotals {
   input_tokens: number;
   cached_input_tokens: number;
@@ -29,6 +31,7 @@ export interface TurnInfo {
 
 export interface Session {
   id: string;
+  harness: Harness;
   thread_name: string | null;
   forked_from_id: string | null;
   parent_thread_id: string | null;
@@ -69,6 +72,7 @@ export interface Config {
   session_roots: string[];
   archive_roots: string[];
   session_index_path: string;
+  claude_session_roots: string[];
 }
 
 export interface ModelRate {
@@ -86,4 +90,8 @@ export interface RateCard {
   fetched_at: string | null;
   models: Record<string, ModelRate>;
   fallback_model: string;
+  /** Per-harness currency labels (e.g. codex -> "credits", claude_code -> "USD"). */
+  currencies: Record<string, string>;
+  /** Per-harness fallback models; falls back to fallback_model when absent. */
+  fallback_models: Record<string, string>;
 }
