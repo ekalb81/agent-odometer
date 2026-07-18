@@ -1,5 +1,6 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Which agent harness produced a session's transcript. Serialized as
 /// snake_case strings; defaults to Codex so previously-serialized sessions
@@ -104,4 +105,307 @@ pub struct Session {
     pub tokens_by_model: HashMap<String, TokenTotals>,
     pub tokens_history: Vec<TokenHistoryPoint>,
     pub turns: Vec<TurnInfo>,
+}
+
+/// Token usage grouped by (model, service_tier). Credit math is linear per
+/// (model, tier), so these buckets price usage exactly without shipping the
+/// full event history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TierBucket {
+    pub model: String,
+    pub service_tier: Option<String>,
+    pub tokens: TokenTotals,
+}
+
+/// Date-scoped rollup of one session's usage, returned by the
+/// `sessions_in_range` command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RangeTotals {
+    /// Sum of all event deltas in range (including events with no model yet).
+    pub tokens: TokenTotals,
+    /// Priceable usage in range, grouped by (model, tier). Events without a
+    /// model are excluded here — their usage is reconciled into a model
+    /// bucket by a later event, mirroring the credit math the frontend has
+    /// always used.
+    pub buckets: Vec<TierBucket>,
+}
+
+/// Lightweight wire form of a Session for the list view and live update
+/// events. Excludes `turns` and `tokens_history`, which dominate payload
+/// size (a large session serializes to ~2 MB; its summary to ~1 KB). The
+/// full Session is fetched on demand via `get_session_details`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub id: String,
+    pub harness: Harness,
+    pub thread_name: Option<String>,
+    pub forked_from_id: Option<String>,
+    pub parent_thread_id: Option<String>,
+    pub agent_path: Option<String>,
+    pub agent_nickname: Option<String>,
+    pub file_path: String,
+    pub archived: bool,
+    pub started_at: DateTime<Utc>,
+    pub last_event_at: DateTime<Utc>,
+    pub working_directory: Option<String>,
+    pub originator: Option<String>,
+    pub source: Option<String>,
+    pub cli_version: Option<String>,
+    pub model: Option<String>,
+    pub service_tier: Option<String>,
+    pub plan_type: Option<String>,
+    pub credits_unlimited: Option<bool>,
+    pub credits_balance: Option<f64>,
+    pub context_window: Option<u32>,
+    pub total_turns: u32,
+    pub first_user_message: Option<String>,
+    pub tokens_total: TokenTotals,
+    pub buckets: Vec<TierBucket>,
+}
+
+impl SessionSummary {
+    pub fn of(s: &Session) -> Self {
+        Self {
+            id: s.id.clone(),
+            harness: s.harness,
+            thread_name: s.thread_name.clone(),
+            forked_from_id: s.forked_from_id.clone(),
+            parent_thread_id: s.parent_thread_id.clone(),
+            agent_path: s.agent_path.clone(),
+            agent_nickname: s.agent_nickname.clone(),
+            file_path: s.file_path.clone(),
+            archived: s.archived,
+            started_at: s.started_at,
+            last_event_at: s.last_event_at,
+            working_directory: s.working_directory.clone(),
+            originator: s.originator.clone(),
+            source: s.source.clone(),
+            cli_version: s.cli_version.clone(),
+            model: s.model.clone(),
+            service_tier: s.service_tier.clone(),
+            plan_type: s.plan_type.clone(),
+            credits_unlimited: s.credits_unlimited,
+            credits_balance: s.credits_balance,
+            context_window: s.context_window,
+            total_turns: s.total_turns,
+            first_user_message: s.first_user_message.clone(),
+            tokens_total: s.tokens_total.clone(),
+            buckets: s.tier_buckets(),
+        }
+    }
+}
+
+fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
+    dst.input_tokens += src.input_tokens;
+    dst.cached_input_tokens += src.cached_input_tokens;
+    dst.output_tokens += src.output_tokens;
+    dst.reasoning_output_tokens += src.reasoning_output_tokens;
+    dst.total_tokens += src.total_tokens;
+}
+
+/// Groups history deltas by (model, tier), skipping events that had no model
+/// attributed yet (their usage is folded into a model bucket by the parser's
+/// reconciliation on a later event).
+fn bucket_history<'a, I>(events: I) -> Vec<TierBucket>
+where
+    I: Iterator<Item = &'a TokenHistoryPoint>,
+{
+    let mut map: BTreeMap<(String, Option<String>), TokenTotals> = BTreeMap::new();
+    for ev in events {
+        let Some(model) = &ev.model else { continue };
+        let entry = map
+            .entry((model.clone(), ev.service_tier.clone()))
+            .or_default();
+        add_totals(entry, &ev.delta);
+    }
+    map.into_iter()
+        .map(|((model, service_tier), tokens)| TierBucket {
+            model,
+            service_tier,
+            tokens,
+        })
+        .collect()
+}
+
+impl Session {
+    /// All-time (model, tier) usage buckets. Derived from history when
+    /// present (which preserves per-event service tiers for fast-mode
+    /// pricing); falls back to the per-model buckets for sessions without
+    /// history events.
+    pub fn tier_buckets(&self) -> Vec<TierBucket> {
+        if self.tokens_history.is_empty() {
+            let mut buckets: Vec<TierBucket> = self
+                .tokens_by_model
+                .iter()
+                .map(|(model, tokens)| TierBucket {
+                    model: model.clone(),
+                    service_tier: None,
+                    tokens: tokens.clone(),
+                })
+                .collect();
+            buckets.sort_by(|a, b| a.model.cmp(&b.model));
+            return buckets;
+        }
+        bucket_history(self.tokens_history.iter())
+    }
+
+    /// Usage restricted to history events inside [from, to] (inclusive;
+    /// None = open bound). `tokens` sums every delta in range; `buckets`
+    /// holds only model-attributed usage, for credit math.
+    pub fn range_totals(
+        &self,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> RangeTotals {
+        let in_range = |ev: &&TokenHistoryPoint| {
+            from.is_none_or(|f| ev.timestamp >= f) && to.is_none_or(|t| ev.timestamp <= t)
+        };
+        let mut tokens = TokenTotals::default();
+        for ev in self.tokens_history.iter().filter(in_range) {
+            add_totals(&mut tokens, &ev.delta);
+        }
+        RangeTotals {
+            tokens,
+            buckets: bucket_history(self.tokens_history.iter().filter(in_range)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn delta(n: u64) -> TokenTotals {
+        TokenTotals {
+            input_tokens: n,
+            cached_input_tokens: 0,
+            output_tokens: n / 2,
+            reasoning_output_tokens: 0,
+            total_tokens: n + n / 2,
+        }
+    }
+
+    fn point(ts: &str, model: Option<&str>, tier: Option<&str>, n: u64) -> TokenHistoryPoint {
+        TokenHistoryPoint {
+            timestamp: ts.parse().unwrap(),
+            model: model.map(str::to_owned),
+            service_tier: tier.map(str::to_owned),
+            total_tokens: 0,
+            delta: delta(n),
+        }
+    }
+
+    fn session_with_history(history: Vec<TokenHistoryPoint>) -> Session {
+        Session {
+            id: "s".into(),
+            harness: Harness::Codex,
+            thread_name: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            file_path: String::new(),
+            archived: false,
+            started_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            last_event_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            working_directory: None,
+            originator: None,
+            source: None,
+            history_mode: None,
+            memory_mode: None,
+            cli_version: None,
+            model_provider: None,
+            model: None,
+            service_tier: None,
+            plan_type: None,
+            credits_unlimited: None,
+            credits_balance: None,
+            context_window: None,
+            total_turns: 0,
+            first_user_message: None,
+            tokens_total: TokenTotals::default(),
+            tokens_by_model: HashMap::new(),
+            tokens_history: history,
+            turns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tier_buckets_group_by_model_and_tier_and_skip_unattributed() {
+        let s = session_with_history(vec![
+            point("2026-01-01T00:00:01Z", None, None, 10),
+            point("2026-01-01T00:00:02Z", Some("m1"), None, 100),
+            point("2026-01-01T00:00:03Z", Some("m1"), Some("fast"), 50),
+            point("2026-01-01T00:00:04Z", Some("m1"), None, 100),
+            point("2026-01-01T00:00:05Z", Some("m2"), None, 7),
+        ]);
+        let buckets = s.tier_buckets();
+        assert_eq!(buckets.len(), 3);
+        let m1_std = buckets
+            .iter()
+            .find(|b| b.model == "m1" && b.service_tier.is_none())
+            .unwrap();
+        assert_eq!(m1_std.tokens.input_tokens, 200);
+        let m1_fast = buckets
+            .iter()
+            .find(|b| b.model == "m1" && b.service_tier.as_deref() == Some("fast"))
+            .unwrap();
+        assert_eq!(m1_fast.tokens.input_tokens, 50);
+        let m2 = buckets.iter().find(|b| b.model == "m2").unwrap();
+        assert_eq!(m2.tokens.input_tokens, 7);
+    }
+
+    #[test]
+    fn tier_buckets_fall_back_to_model_buckets_without_history() {
+        let mut s = session_with_history(vec![]);
+        s.tokens_by_model.insert("m1".into(), delta(42));
+        let buckets = s.tier_buckets();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].model, "m1");
+        assert_eq!(buckets[0].service_tier, None);
+        assert_eq!(buckets[0].tokens.input_tokens, 42);
+    }
+
+    #[test]
+    fn range_totals_respect_inclusive_bounds() {
+        let s = session_with_history(vec![
+            point("2026-01-01T00:00:01Z", Some("m1"), None, 1),
+            point("2026-01-01T00:00:02Z", Some("m1"), None, 2),
+            point("2026-01-01T00:00:03Z", Some("m1"), None, 4),
+        ]);
+        let rt = s.range_totals(
+            Some("2026-01-01T00:00:02Z".parse().unwrap()),
+            Some("2026-01-01T00:00:03Z".parse().unwrap()),
+        );
+        assert_eq!(rt.tokens.input_tokens, 6);
+        assert_eq!(rt.buckets.len(), 1);
+        assert_eq!(rt.buckets[0].tokens.input_tokens, 6);
+
+        let all = s.range_totals(None, None);
+        assert_eq!(all.tokens.input_tokens, 7);
+    }
+
+    #[test]
+    fn range_tokens_include_unattributed_but_buckets_exclude_them() {
+        let s = session_with_history(vec![
+            point("2026-01-01T00:00:01Z", None, None, 10),
+            point("2026-01-01T00:00:02Z", Some("m1"), None, 5),
+        ]);
+        let rt = s.range_totals(None, None);
+        assert_eq!(rt.tokens.input_tokens, 15);
+        assert_eq!(rt.buckets.len(), 1);
+        assert_eq!(rt.buckets[0].tokens.input_tokens, 5);
+    }
+
+    #[test]
+    fn summary_carries_metadata_and_buckets() {
+        let mut s =
+            session_with_history(vec![point("2026-01-01T00:00:02Z", Some("m1"), None, 100)]);
+        s.thread_name = Some("t".into());
+        let summary = SessionSummary::of(&s);
+        assert_eq!(summary.id, "s");
+        assert_eq!(summary.thread_name.as_deref(), Some("t"));
+        assert_eq!(summary.buckets.len(), 1);
+        assert_eq!(summary.buckets[0].tokens.input_tokens, 100);
+    }
 }

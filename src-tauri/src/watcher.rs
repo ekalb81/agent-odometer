@@ -1,5 +1,5 @@
 use crate::claude_parser::ClaudeSessionParser;
-use crate::model::Session;
+use crate::model::{Session, SessionSummary};
 use crate::parser::SessionParser;
 use crate::store::AppState;
 use dashmap::DashMap;
@@ -92,7 +92,9 @@ pub fn start(
                         let changed = crate::session_index::apply(&state_cb.sessions, &names);
                         for id in changed {
                             if let Some(session) = state_cb.sessions.get(&id) {
-                                if let Err(e) = app_cb.emit("session-updated", session.value()) {
+                                if let Err(e) = app_cb
+                                    .emit("session-updated", &SessionSummary::of(session.value()))
+                                {
                                     tracing::warn!("emit session-updated failed: {}", e);
                                 }
                             }
@@ -138,10 +140,11 @@ pub fn start(
                         }
 
                         if let Some(session) = entry.session() {
+                            let summary = SessionSummary::of(session);
                             state_cb
                                 .sessions
                                 .insert(session.id.clone(), session.clone());
-                            if let Err(e) = app_cb.emit("session-updated", session) {
+                            if let Err(e) = app_cb.emit("session-updated", &summary) {
                                 tracing::warn!("emit session-updated failed: {}", e);
                             }
                         }

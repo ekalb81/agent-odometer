@@ -10,7 +10,22 @@
     height?: number;
   }
 
-  let { points, width = 320, height = 56 }: Props = $props();
+  let { points: rawPoints, width = 320, height = 56 }: Props = $props();
+
+  // Large sessions carry thousands of history points; a polyline that dense
+  // is visually identical to a few hundred points but far more expensive to
+  // build and render. Stride-sample, always keeping the first and last point.
+  const MAX_POINTS = 240;
+  const points = $derived((() => {
+    if (rawPoints.length <= MAX_POINTS) return rawPoints;
+    const stride = (rawPoints.length - 1) / (MAX_POINTS - 1);
+    const sampled: TokenHistoryPoint[] = [];
+    for (let i = 0; i < MAX_POINTS - 1; i++) {
+      sampled.push(rawPoints[Math.round(i * stride)]);
+    }
+    sampled.push(rawPoints[rawPoints.length - 1]);
+    return sampled;
+  })());
 
   const PAD_X = 6;
   const PAD_Y = 8;

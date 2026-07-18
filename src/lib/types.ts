@@ -68,6 +68,48 @@ export interface Session {
   turns: TurnInfo[];
 }
 
+/** Token usage grouped by (model, service_tier); prices usage exactly without the full event history. */
+export interface TierBucket {
+  model: string;
+  service_tier: string | null;
+  tokens: TokenTotals;
+}
+
+/** Date-scoped rollup returned by sessions_in_range. */
+export interface RangeTotals {
+  tokens: TokenTotals;
+  buckets: TierBucket[];
+}
+
+/** Lightweight wire form of a Session for the list view and live updates. */
+export interface SessionSummary {
+  id: string;
+  harness: Harness;
+  thread_name: string | null;
+  forked_from_id: string | null;
+  parent_thread_id: string | null;
+  agent_path: string | null;
+  agent_nickname: string | null;
+  file_path: string;
+  archived: boolean;
+  started_at: string; // ISO8601
+  last_event_at: string; // ISO8601
+  working_directory: string | null;
+  originator: string | null;
+  source: string | null;
+  cli_version: string | null;
+  model: string | null;
+  service_tier: string | null;
+  plan_type: string | null;
+  credits_unlimited: boolean | null;
+  credits_balance: number | null;
+  context_window: number | null;
+  total_turns: number;
+  first_user_message: string | null;
+  tokens_total: TokenTotals;
+  buckets: TierBucket[];
+}
+
 export interface Config {
   session_roots: string[];
   archive_roots: string[];

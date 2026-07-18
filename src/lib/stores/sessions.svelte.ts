@@ -1,6 +1,6 @@
-import type { Session } from '../types';
+import type { SessionSummary } from '../types';
 
-interface TrackedSession extends Session {
+interface TrackedSession extends SessionSummary {
   /** Epoch ms of the last upsert — used to drive the pulse animation. */
   lastUpdatedAt: number;
 }
@@ -9,7 +9,7 @@ function createSessionsStore() {
   let map = $state<Map<string, TrackedSession>>(new Map());
 
   /** Replace the entire collection (used at startup after listSessions). */
-  function replaceAll(list: Session[]): void {
+  function replaceAll(list: SessionSummary[]): void {
     const next = new Map<string, TrackedSession>();
     for (const s of list) {
       next.set(s.id, { ...s, lastUpdatedAt: 0 });
@@ -18,7 +18,7 @@ function createSessionsStore() {
   }
 
   /** Insert or update a single session (called on session-updated events). */
-  function upsert(s: Session): void {
+  function upsert(s: SessionSummary): void {
     const next = new Map(map);
     next.set(s.id, { ...s, lastUpdatedAt: Date.now() });
     map = next;

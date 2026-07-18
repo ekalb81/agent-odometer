@@ -1,8 +1,9 @@
 <script lang="ts">
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits, computeSessionCreditsInRange, formatCredits, harnessCurrency, tokensInRange } from '../lib/credits';
-  import type { Harness, TokenTotals } from '../lib/types';
+  import { computeSummaryCredits, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
+  import { getSessionDetails, sessionsInRange } from '../lib/ipc';
+  import type { Harness, RangeTotals, Session, TokenTotals } from '../lib/types';
   import Filters from './Filters.svelte';
   import type { FilterState } from './Filters.svelte';
   import RowDrawer from './RowDrawer.svelte';
@@ -160,6 +161,46 @@
   // tokens and credits are "all-time" or scoped to the visible window.
   const dateScoped = $derived(Boolean(filters.dateFrom || filters.dateTo));
 
+  // ---------------------------------------------------------------------------
+  // Date-scoped rollups come from the backend (summaries don't carry event
+  // histories). Refetched, debounced, when the range or the session set changes.
+  // ---------------------------------------------------------------------------
+  let rangeTotals = $state<Record<string, RangeTotals>>({});
+  let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  $effect(() => {
+    const from = fromUtc;
+    const to = toUtc;
+    // Depend on the session map so live session updates refresh range data.
+    void sessionsStore.map;
+    if (!from && !to) {
+      rangeTotals = {};
+      return;
+    }
+    if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
+    rangeFetchTimer = setTimeout(() => {
+      sessionsInRange(from, to)
+        .then((result) => {
+          // Drop stale responses if the filter moved on meanwhile.
+          if (fromUtc === from && toUtc === to) rangeTotals = result;
+        })
+        .catch((e) => console.error('sessions_in_range failed:', e));
+    }, 250);
+    return () => {
+      if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
+    };
+  });
+
+  function zeroTotals(): TokenTotals {
+    return {
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      output_tokens: 0,
+      reasoning_output_tokens: 0,
+      total_tokens: 0,
+    };
+  }
+
   // Per-session display values: tokens AND credits, both scoped to the date
   // filter when one is active so the row numbers add up to the header.
   const sessionDisplayMap = $derived((() => {
@@ -169,21 +210,20 @@
       { tokens: TokenTotals; total: number; refCost: number; missingModels: string[] }
     >();
     for (const s of filtered) {
-      const tokens = dateScoped ? tokensInRange(s, fromUtc, toUtc) : s.tokens_total;
+      const rt = dateScoped ? rangeTotals[s.id] : undefined;
+      const tokens = dateScoped ? (rt?.tokens ?? zeroTotals()) : s.tokens_total;
       if (!r) {
         out.set(s.id, { tokens, total: 0, refCost: 0, missingModels: [] });
         continue;
       }
-      const credits = dateScoped
-        ? computeSessionCreditsInRange(s, r, fromUtc, toUtc)
-        : computeSessionCredits(s, r);
       // Reference cost (à-la-carte equivalent) is always all-time for the
       // unlimited-plan tooltip — that's the figure people compare against.
-      const refCost = computeSessionCredits(s, r).total;
+      const allTime = computeSummaryCredits(s, r);
+      const credits = dateScoped ? creditsFromBuckets(rt?.buckets ?? [], r, s.harness) : allTime;
       out.set(s.id, {
         tokens,
         total: credits.total,
-        refCost,
+        refCost: allTime.total,
         missingModels: credits.missingModels,
       });
     }
@@ -256,13 +296,31 @@
   })());
 
   // ---------------------------------------------------------------------------
-  // Drawer state — tracked by session id only (lookup from the map).
+  // Drawer state — the table only holds summaries, so the full session
+  // (turns, token history) is fetched on open and refreshed when the
+  // session's summary is upserted by a live event.
   // ---------------------------------------------------------------------------
   let openSessionId = $state<string | null>(null);
+  let openSession = $state<Session | null>(null);
 
-  const openSession = $derived(
-    openSessionId !== null ? (sessionsStore.map.get(openSessionId) ?? null) : null,
-  );
+  $effect(() => {
+    const id = openSessionId;
+    // Reactive dep: refetch details when this session's summary updates.
+    void (id !== null ? sessionsStore.map.get(id)?.lastUpdatedAt : undefined);
+    if (id === null) {
+      openSession = null;
+      return;
+    }
+    let cancelled = false;
+    getSessionDetails(id)
+      .then((s) => {
+        if (!cancelled && openSessionId === id) openSession = s;
+      })
+      .catch((e) => console.error('get_session_details failed:', e));
+    return () => {
+      cancelled = true;
+    };
+  });
 
   function openDrawer(id: string) {
     openSessionId = id;
@@ -270,6 +328,7 @@
 
   function closeDrawer() {
     openSessionId = null;
+    openSession = null;
   }
 
   // ---------------------------------------------------------------------------

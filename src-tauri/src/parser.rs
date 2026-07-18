@@ -71,6 +71,21 @@ impl SessionParser {
     }
 
     pub fn apply_line(&mut self, line: &str) -> anyhow::Result<()> {
+        // Fast path: record types we discard wholesale (response_item, compacted)
+        // account for the vast majority of bytes in a rollout file. When the line
+        // has the exact leading shape Codex writes — {"timestamp":"<ts>","type":"<t>"
+        // — we can extract the timestamp and skip the full JSON parse entirely.
+        // These lines must still advance last_event_at, hence the extraction.
+        if let Some(ts) = fast_skip_timestamp(line) {
+            let last_event_at: DateTime<Utc> = ts.parse().unwrap_or_else(|_| Utc::now());
+            if let Some(s) = self.session.as_mut() {
+                if last_event_at > s.last_event_at {
+                    s.last_event_at = last_event_at;
+                }
+            }
+            return Ok(());
+        }
+
         let mut root: Value = serde_json::from_str(line)?;
 
         let timestamp_str = root
@@ -614,6 +629,31 @@ impl SessionParser {
         }
 
         Ok(())
+    }
+}
+
+/// If `line` starts with the exact shape `{"timestamp":"<ts>","type":"<t>"` and
+/// `<t>` is a record type the parser discards without inspecting its payload,
+/// returns the raw timestamp string so the caller can skip full JSON parsing.
+///
+/// Returns `None` — falling back to the full parse — the moment the structure
+/// deviates: no prefix match, a backslash escape inside the timestamp value, a
+/// missing `","type":"` separator, or any other record type. Correctness over
+/// cleverness: the fast path only fires when the line shape is unambiguous.
+fn fast_skip_timestamp(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("{\"timestamp\":\"")?;
+    let ts_end = rest.find('"')?;
+    let ts = &rest[..ts_end];
+    // Codex timestamps contain no escapes; a backslash means the closing quote
+    // we found may be escaped, so bail to the full parse.
+    if ts.contains('\\') {
+        return None;
+    }
+    let after = rest[ts_end + 1..].strip_prefix(",\"type\":\"")?;
+    let ty_end = after.find('"')?;
+    match &after[..ty_end] {
+        "response_item" | "compacted" => Some(ts),
+        _ => None,
     }
 }
 

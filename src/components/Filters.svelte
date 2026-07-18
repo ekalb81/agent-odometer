@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import type { Session } from '../lib/types';
+  import type { SessionSummary } from '../lib/types';
 
   export type FilterState = {
     search: string;
@@ -14,7 +14,7 @@
 
   interface Props {
     filters: FilterState;
-    sessions: Session[];
+    sessions: SessionSummary[];
     onchange: (f: FilterState) => void;
   }
 

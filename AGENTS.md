@@ -20,7 +20,7 @@ Start with [README.md](README.md) for commands and [docs/ARCHITECTURE.md](docs/A
 - Keep filesystem access and JSONL parsing in Rust. The frontend should receive typed data through Tauri commands/events, not read session files directly.
 - Put Rust commands in `src-tauri/src/commands.rs`, register them in `src-tauri/src/lib.rs`, and expose typed frontend wrappers in `src/lib/ipc.ts`.
 - Keep Rust serialized structs and `src/lib/types.ts` synchronized. Add backward-compatible Serde defaults when persisted or historical data may omit a new field.
-- Event names are contracts: `session-updated`, `session-removed`, `config-updated`, and `rates-updated`. Update every producer and listener together.
+- Event names are contracts: `session-updated` (payload: `SessionSummary`), `session-removed`, `config-updated`, and `rates-updated`. Update every producer and listener together. Full sessions travel only through `get_session_details`; keep `SessionSummary` free of `turns`/`tokens_history` — the split exists because full sessions measured ~200 MB across a real corpus.
 - Use the established Svelte 5 rune style (`$state`, `$derived`, `$effect`). Module-level rune state belongs in `*.svelte.ts` files.
 - Keep Tauri capabilities minimal. Do not add remote content, network access, shell execution, or broader capabilities without an explicit requirement and a security review.
 
@@ -34,6 +34,7 @@ Parser and credit changes are high risk. Preserve these behaviors and add focuse
 - Current ChatGPT app rollouts can encode `source` as an object for subagents and expose `parent_thread_id`, `agent_path`, `agent_nickname`, `forked_from_id`, `history_mode`, and `memory_mode` directly.
 - Preserve explicit `task_started.started_at`, `task_complete.completed_at`, `turn_aborted`, and `thread_rolled_back` semantics. Rollback changes turn state but does not erase already-consumed token usage.
 - `total_token_usage` is cumulative; `last_token_usage` is the per-call delta. Per-model buckets must reconcile to the latest cumulative total, including resumes and model switches.
+- The `apply_line` fast path may skip full JSON parsing only for structurally unambiguous `response_item`/`compacted` lines, and must still advance `last_event_at` from their timestamps. When in doubt it must fall through to the full parse.
 - Cached input is a subset of input, and reasoning output is a subset of output. Never add either subset twice when computing credits.
 - All-time summaries use cumulative totals. Date-scoped summaries use event deltas inside inclusive UTC bounds. Session date filtering uses interval overlap.
 - Unknown models use the configured fallback rate. Rates are expressed per one million tokens.

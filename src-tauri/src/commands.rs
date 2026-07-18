@@ -1,21 +1,55 @@
 use crate::config::Config;
-use crate::model::Session;
+use crate::model::{RangeTotals, Session, SessionSummary};
 use crate::rates::RateCard;
 use crate::store::AppState;
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
-/// Returns the list of all known sessions.
-/// Sessions are populated at startup by the initial scan + file watcher;
-/// this command just reads the in-memory map.
+/// Returns lightweight summaries of all known sessions. Full sessions
+/// (turns, token history) are fetched per-id via `get_session_details` —
+/// shipping them all here measured ~200 MB of JSON on a real corpus.
 #[tauri::command]
-pub fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<Session> {
+pub fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<SessionSummary> {
     state
         .sessions
         .iter()
-        .map(|entry| entry.value().clone())
+        .map(|entry| SessionSummary::of(entry.value()))
         .collect()
+}
+
+/// Returns one full session (turns and token history included), for the
+/// detail drawer.
+#[tauri::command]
+pub fn get_session_details(state: State<'_, Arc<AppState>>, session_id: String) -> Option<Session> {
+    state
+        .sessions
+        .get(&session_id)
+        .map(|entry| entry.value().clone())
+}
+
+/// Date-scoped token/credit rollups for every session, computed from the
+/// in-memory event histories. Bounds are inclusive RFC3339 instants; None is
+/// an open bound.
+#[tauri::command]
+pub fn sessions_in_range(
+    state: State<'_, Arc<AppState>>,
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<HashMap<String, RangeTotals>, String> {
+    let parse = |v: Option<String>| -> Result<Option<DateTime<Utc>>, String> {
+        v.map(|s| s.parse().map_err(|e| format!("invalid timestamp: {e}")))
+            .transpose()
+    };
+    let from = parse(from)?;
+    let to = parse(to)?;
+    Ok(state
+        .sessions
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().range_totals(from, to)))
+        .collect())
 }
 
 /// Returns the current configuration.
@@ -24,8 +58,10 @@ pub fn get_config() -> Result<Config, String> {
     Config::load().map_err(|e| e.to_string())
 }
 
-/// Persists a new configuration, clears the session cache, re-scans with the
-/// new roots, restarts the file watcher, and emits a "config-updated" event.
+/// Persists a new configuration, clears the session cache, restarts the file
+/// watcher, and emits "config-updated". The rescan itself runs on a
+/// background thread, emitting a "session-updated" summary per parsed file
+/// so the UI repopulates progressively instead of freezing.
 #[tauri::command]
 pub fn set_config(
     app: AppHandle,
@@ -40,20 +76,8 @@ pub fn set_config(
     state.sessions.clear();
     state.scanned.store(false, Ordering::Release);
 
-    let found = crate::scanner::initial_scan(
-        &config.session_roots,
-        &config.archive_roots,
-        &config.claude_session_roots,
-    );
-    for (id, session) in found {
-        state.sessions.insert(id, session);
-    }
-
-    let names = crate::session_index::read(&config.session_index_path);
-    crate::session_index::apply(&state.sessions, &names);
-
-    state.scanned.store(true, Ordering::Release);
-
+    // Start the new watcher immediately; the background scan fills in
+    // existing files while the watcher covers live changes.
     let handle = crate::watcher::start(
         app.clone(),
         state.inner().clone(),
@@ -65,10 +89,51 @@ pub fn set_config(
     .map_err(|e| e.to_string())?;
     *state.watcher.lock().unwrap() = Some(handle);
 
+    spawn_scan(app.clone(), state.inner().clone(), config.clone());
+
     app.emit("config-updated", &config)
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Scans all configured roots on a background thread, inserting sessions
+/// into state and emitting a "session-updated" summary for each as it
+/// parses. Applies the session-index name overlay and sets `scanned` when
+/// done. Shared by startup (lib.rs) and set_config.
+pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
+    std::thread::spawn(move || {
+        crate::scanner::scan_all(
+            &config.session_roots,
+            &config.archive_roots,
+            &config.claude_session_roots,
+            |session| {
+                let summary = SessionSummary::of(&session);
+                state.sessions.insert(session.id.clone(), session);
+                if let Err(e) = app.emit("session-updated", &summary) {
+                    tracing::warn!("emit session-updated failed: {}", e);
+                }
+            },
+        );
+
+        // Overlay thread names from the session index, if present.
+        let names = crate::session_index::read(&config.session_index_path);
+        let changed = crate::session_index::apply(&state.sessions, &names);
+        for id in changed {
+            if let Some(session) = state.sessions.get(&id) {
+                if let Err(e) = app.emit("session-updated", &SessionSummary::of(session.value())) {
+                    tracing::warn!("emit session-updated failed: {}", e);
+                }
+            }
+        }
+
+        state.scanned.store(true, Ordering::Release);
+        tracing::info!(
+            "scan complete: {} sessions loaded, {} thread names from index",
+            state.sessions.len(),
+            names.len()
+        );
+    });
 }
 
 /// Returns the rate card, preferring the user's on-disk copy over the bundled defaults.

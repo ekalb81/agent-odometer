@@ -400,6 +400,80 @@ fn model_switch_produces_two_turns_with_scoped_tokens() {
 }
 
 #[test]
+fn trailing_response_item_advances_last_event_at() {
+    // response_item records are skipped without a full parse, but they must
+    // still advance last_event_at — a session whose final records are all
+    // response_item lines would otherwise report a stale last-activity time.
+    let mut p = parser::SessionParser::new(PathBuf::from("unused.jsonl"), false);
+    p.apply_line(
+        r#"{"timestamp":"2026-05-26T11:33:00.000Z","type":"session_meta","payload":{"id":"019e64eb-aaaa-bbbb-cccc-000000000020","timestamp":"2026-05-26T11:33:00.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.133.0","source":"vscode","model_provider":"openai"}}"#,
+    )
+    .unwrap();
+    let before = p.session.as_ref().unwrap().last_event_at;
+
+    p.apply_line(
+        r#"{"timestamp":"2026-05-26T11:40:00.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}"#,
+    )
+    .unwrap();
+
+    let after = p.session.as_ref().unwrap().last_event_at;
+    assert!(after > before, "response_item must advance last_event_at");
+    assert_eq!(after.to_rfc3339(), "2026-05-26T11:40:00+00:00");
+
+    // compacted records take the same fast-skip path and must behave the same.
+    p.apply_line(
+        r#"{"timestamp":"2026-05-26T11:45:00.000Z","type":"compacted","payload":{"message":"summary of earlier turns"}}"#,
+    )
+    .unwrap();
+    let final_ts = p.session.as_ref().unwrap().last_event_at;
+    assert_eq!(final_ts.to_rfc3339(), "2026-05-26T11:45:00+00:00");
+}
+
+#[test]
+fn fast_skip_does_not_misfire_on_payload_containing_response_item_text() {
+    // This event_msg's payload CONTAINS the literal text "type":"response_item"
+    // (and even a leading {"timestamp":"..." inside the message string), but its
+    // real record type is event_msg — it must still be fully processed.
+    let mut p = parser::SessionParser::new(PathBuf::from("unused.jsonl"), false);
+    p.apply_line(
+        r#"{"timestamp":"2026-05-26T11:33:00.000Z","type":"session_meta","payload":{"id":"019e64eb-aaaa-bbbb-cccc-000000000021","timestamp":"2026-05-26T11:33:00.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.133.0","source":"vscode","model_provider":"openai"}}"#,
+    )
+    .unwrap();
+    p.apply_line(
+        r#"{"timestamp":"2026-05-26T11:33:05.000Z","type":"event_msg","payload":{"type":"user_message","message":"look at this line: {\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"response_item\"} please"}}"#,
+    )
+    .unwrap();
+
+    let s = p.session.as_ref().unwrap();
+    assert_eq!(
+        s.first_user_message.as_deref(),
+        Some(
+            r#"look at this line: {"timestamp":"2026-01-01T00:00:00Z","type":"response_item"} please"#
+        ),
+        "event_msg containing response_item text must be fully processed"
+    );
+}
+
+#[test]
+fn response_item_with_reordered_keys_still_advances_last_event_at() {
+    // A response_item line that doesn't match the fast-path shape (type before
+    // timestamp) must fall through to the full parse and behave identically.
+    let mut p = parser::SessionParser::new(PathBuf::from("unused.jsonl"), false);
+    p.apply_line(
+        r#"{"timestamp":"2026-05-26T11:33:00.000Z","type":"session_meta","payload":{"id":"019e64eb-aaaa-bbbb-cccc-000000000022","timestamp":"2026-05-26T11:33:00.000Z","cwd":"E:\\Projects","originator":"Codex Desktop","cli_version":"0.133.0","source":"vscode","model_provider":"openai"}}"#,
+    )
+    .unwrap();
+    p.apply_line(
+        r#"{"type":"response_item","timestamp":"2026-05-26T11:50:00.000Z","payload":{"type":"message"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        p.session.as_ref().unwrap().last_event_at.to_rfc3339(),
+        "2026-05-26T11:50:00+00:00"
+    );
+}
+
+#[test]
 fn parses_current_chatgpt_subagent_and_rollback_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("current.jsonl");

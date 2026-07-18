@@ -3,14 +3,27 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, Config, RateCard } from './types';
+import type { Session, SessionSummary, RangeTotals, Config, RateCard } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
-export function listSessions(): Promise<Session[]> {
-  return invoke<Session[]>('list_sessions');
+export function listSessions(): Promise<SessionSummary[]> {
+  return invoke<SessionSummary[]>('list_sessions');
+}
+
+/** Full session (turns + token history) for the detail drawer. */
+export function getSessionDetails(sessionId: string): Promise<Session | null> {
+  return invoke<Session | null>('get_session_details', { sessionId });
+}
+
+/** Date-scoped rollups for all sessions; bounds are inclusive UTC ISO strings. */
+export function sessionsInRange(
+  from: string | null,
+  to: string | null,
+): Promise<Record<string, RangeTotals>> {
+  return invoke<Record<string, RangeTotals>>('sessions_in_range', { from, to });
 }
 
 export function getConfig(): Promise<Config> {
@@ -45,8 +58,8 @@ export function openTaskInChatGPT(sessionId: string): Promise<void> {
 // Events  (Phase 3 will emit these from the watcher)
 // ---------------------------------------------------------------------------
 
-export function onSessionUpdated(cb: (session: Session) => void): Promise<UnlistenFn> {
-  return listen<Session>('session-updated', (event) => cb(event.payload));
+export function onSessionUpdated(cb: (session: SessionSummary) => void): Promise<UnlistenFn> {
+  return listen<SessionSummary>('session-updated', (event) => cb(event.payload));
 }
 
 export function onSessionRemoved(cb: (sessionId: string) => void): Promise<UnlistenFn> {

@@ -1,4 +1,12 @@
-import type { Harness, ModelRate, RateCard, Session, TokenTotals } from './types';
+import type {
+  Harness,
+  ModelRate,
+  RateCard,
+  Session,
+  SessionSummary,
+  TierBucket,
+  TokenTotals,
+} from './types';
 
 export interface ModelCredit {
   model: string;
@@ -10,49 +18,6 @@ export interface SessionCredits {
   total: number;
   byModel: ModelCredit[];
   missingModels: string[];
-}
-
-function emptyTotals(): TokenTotals {
-  return {
-    input_tokens: 0,
-    cached_input_tokens: 0,
-    output_tokens: 0,
-    reasoning_output_tokens: 0,
-    total_tokens: 0,
-  };
-}
-
-function addTokens(acc: TokenTotals, src: TokenTotals): void {
-  acc.input_tokens += src.input_tokens;
-  acc.cached_input_tokens += src.cached_input_tokens;
-  acc.output_tokens += src.output_tokens;
-  acc.reasoning_output_tokens += src.reasoning_output_tokens;
-  acc.total_tokens += src.total_tokens;
-}
-
-/**
- * Sums the per-event deltas from `tokens_history` whose timestamp falls
- * within [fromIso, toIso] (inclusive). Pass null for an open bound. When
- * both bounds are null, returns the cumulative `tokens_total` directly —
- * same number as the session header.
- *
- * Both bounds and event timestamps are expected to be full UTC ISO 8601
- * strings (e.g. "2026-05-26T19:30:00.000Z"); lexical comparison on this
- * format sorts chronologically.
- */
-export function tokensInRange(
-  session: Session,
-  fromIso: string | null,
-  toIso: string | null,
-): TokenTotals {
-  if (!fromIso && !toIso) return session.tokens_total;
-  const acc = emptyTotals();
-  for (const ev of session.tokens_history) {
-    if (fromIso && ev.timestamp < fromIso) continue;
-    if (toIso && ev.timestamp > toIso) continue;
-    addTokens(acc, ev.delta);
-  }
-  return acc;
 }
 
 /** Currency label for a harness, falling back to the card-wide currency. */
@@ -112,6 +77,49 @@ export function tokensCost(
   };
 }
 
+/**
+ * Prices (model, service_tier) usage buckets — the summary/range wire form.
+ * Credit math is linear per (model, tier), so this matches the per-event
+ * history computation exactly.
+ */
+export function creditsFromBuckets(
+  buckets: TierBucket[],
+  rates: RateCard,
+  harness: Harness,
+): SessionCredits {
+  const byModelMap = new Map<string, number>();
+  const missingModels = new Set<string>();
+  let total = 0;
+
+  const fallbackRate = rates.models[fallbackModelFor(rates, harness)];
+
+  for (const b of buckets) {
+    const directRate = rates.models[b.model];
+    if (directRate === undefined) missingModels.add(b.model);
+    const rate = directRate ?? fallbackRate;
+    if (!rate) continue;
+
+    const cost = eventCost(b.tokens, rate, serviceTierMultiplier(b.model, b.service_tier));
+    total += cost;
+    byModelMap.set(b.model, (byModelMap.get(b.model) ?? 0) + cost);
+  }
+
+  return {
+    total,
+    byModel: Array.from(byModelMap, ([model, cost]) => ({
+      model,
+      cost,
+      fallbackUsed: rates.models[model] === undefined,
+    })),
+    missingModels: Array.from(missingModels),
+  };
+}
+
+/** All-time credits for a list-view summary. */
+export function computeSummaryCredits(summary: SessionSummary, rates: RateCard): SessionCredits {
+  return creditsFromBuckets(summary.buckets, rates, summary.harness);
+}
+
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {
   if (session.tokens_history.length > 0) {
     return computeHistoryCredits(session, rates, null, null);
@@ -150,26 +158,6 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
   }
 
   return { total, byModel, missingModels };
-}
-
-/**
- * Computes credits for a session restricted to events whose timestamp is
- * within [fromIso, toIso] (inclusive, full UTC ISO 8601; pass null for an
- * open bound). Walks tokens_history rather than the per-model buckets, so
- * it can scope the math to any sub-period of the session's lifetime —
- * down to the minute.
- */
-export function computeSessionCreditsInRange(
-  session: Session,
-  rates: RateCard,
-  fromIso: string | null,
-  toIso: string | null,
-): SessionCredits {
-  if (!fromIso && !toIso) {
-    return computeSessionCredits(session, rates);
-  }
-
-  return computeHistoryCredits(session, rates, fromIso, toIso);
 }
 
 function computeHistoryCredits(

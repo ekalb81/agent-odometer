@@ -10,11 +10,10 @@ pub mod store;
 pub mod watcher;
 
 use commands::{
-    get_bundled_rates, get_config, get_rates, list_sessions, open_task_in_chatgpt,
-    reveal_in_file_manager, set_config, set_rates,
+    get_bundled_rates, get_config, get_rates, get_session_details, list_sessions,
+    open_task_in_chatgpt, reveal_in_file_manager, sessions_in_range, set_config, set_rates,
 };
 use config::Config;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use store::AppState;
 use tracing_subscriber::EnvFilter;
@@ -32,6 +31,8 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            get_session_details,
+            sessions_in_range,
             get_config,
             set_config,
             get_rates,
@@ -46,29 +47,8 @@ pub fn run() {
                 Config::default()
             });
 
-            // Bulk-load existing sessions before the watcher starts.
-            let found = scanner::initial_scan(
-                &config.session_roots,
-                &config.archive_roots,
-                &config.claude_session_roots,
-            );
-            for (id, session) in found {
-                state_for_setup.sessions.insert(id, session);
-            }
-
-            // Overlay thread names from the session index, if present.
-            let names = session_index::read(&config.session_index_path);
-            session_index::apply(&state_for_setup.sessions, &names);
-
-            state_for_setup.scanned.store(true, Ordering::Release);
-
-            tracing::info!(
-                "initial scan complete: {} sessions loaded, {} thread names from index",
-                state_for_setup.sessions.len(),
-                names.len()
-            );
-
-            // Start the live watcher and store the handle in state so set_config can restart it.
+            // Start the live watcher first so changes made during the initial
+            // scan are not missed; store the handle so set_config can restart it.
             let handle = watcher::start(
                 app.handle().clone(),
                 state_for_setup.clone(),
@@ -78,6 +58,12 @@ pub fn run() {
                 config.session_index_path.clone(),
             )?;
             *state_for_setup.watcher.lock().unwrap() = Some(handle);
+
+            // Bulk-load existing sessions on a background thread, emitting a
+            // summary per parsed file. Keeping this out of setup means the
+            // window is interactive immediately instead of after ~10s of
+            // parsing on a large corpus.
+            commands::spawn_scan(app.handle().clone(), state_for_setup.clone(), config);
 
             Ok(())
         })
