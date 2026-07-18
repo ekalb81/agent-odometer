@@ -257,8 +257,9 @@ impl Session {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> RangeTotals {
+        // map_or rather than is_none_or: the crate's MSRV (1.77) predates it.
         let in_range = |ev: &&TokenHistoryPoint| {
-            from.is_none_or(|f| ev.timestamp >= f) && to.is_none_or(|t| ev.timestamp <= t)
+            from.map_or(true, |f| ev.timestamp >= f) && to.map_or(true, |t| ev.timestamp <= t)
         };
         let mut tokens = TokenTotals::default();
         for ev in self.tokens_history.iter().filter(in_range) {
