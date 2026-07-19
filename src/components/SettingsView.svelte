@@ -133,6 +133,8 @@
   // Per-harness maps are not editable here yet; carry them through saves.
   let ratesCurrencies = $state<Record<string, string>>({});
   let ratesFallbackModels = $state<Record<string, string>>({});
+  // API USD rates for Codex models; not editable here yet, carried through.
+  let ratesApiModels = $state<Record<string, ModelRate>>({});
 
   // New-model form.
   let newName = $state('');
@@ -167,6 +169,7 @@
     ratesUnit = r.unit;
     ratesCurrencies = { ...(r.currencies ?? {}) };
     ratesFallbackModels = { ...(r.fallback_models ?? {}) };
+    ratesApiModels = { ...(r.api_models ?? {}) };
     dirty = false;
   });
 
@@ -221,6 +224,7 @@
       fallback_model: fallbackModel,
       currencies: ratesCurrencies,
       fallback_models: ratesFallbackModels,
+      api_models: ratesApiModels,
     };
   }
 

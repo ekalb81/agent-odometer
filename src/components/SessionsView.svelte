@@ -1,7 +1,7 @@
 <script lang="ts">
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { rates } from '../lib/stores/rates';
-  import { computeSummaryCredits, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
+  import { apiCostFromBuckets, computeSummaryCredits, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
   import { getSessionDetails, sessionsInRange } from '../lib/ipc';
   import type { Harness, RangeTotals, Session, TokenTotals } from '../lib/types';
   import Filters from './Filters.svelte';
@@ -13,8 +13,11 @@
   const fmt = new Intl.NumberFormat();
   const fmtCredit = (amount: number) =>
     formatCredits(amount, $rates ? harnessCurrency($rates, harness) : 'credits');
+  const fmtUsd = (amount: number) => formatCredits(amount, 'USD');
   // Codex bills in plan credits; other harnesses show an API-equivalent cost.
   const costNoun = $derived(harness === 'codex' ? 'credits' : 'est. cost');
+  // Codex additionally shows what the usage would cost at OpenAI API rates.
+  const showApiCost = $derived(harness === 'codex' && Object.keys($rates?.api_models ?? {}).length > 0);
 
   function fmtTokens(n: number): string {
     return fmt.format(n);
@@ -82,7 +85,7 @@
   // ---------------------------------------------------------------------------
   // Sort state
   // ---------------------------------------------------------------------------
-  type SortKey = 'name' | 'started' | 'model' | 'input' | 'cached' | 'output' | 'reasoning' | 'total' | 'credit' | null;
+  type SortKey = 'name' | 'started' | 'model' | 'input' | 'cached' | 'output' | 'reasoning' | 'total' | 'credit' | 'api' | null;
   type SortDir = 'asc' | 'desc';
 
   let sortKey = $state<SortKey>(null);
@@ -207,23 +210,26 @@
     const r = $rates;
     const out = new Map<
       string,
-      { tokens: TokenTotals; total: number; refCost: number; missingModels: string[] }
+      { tokens: TokenTotals; total: number; refCost: number; apiTotal: number; missingModels: string[] }
     >();
     for (const s of filtered) {
       const rt = dateScoped ? rangeTotals[s.id] : undefined;
       const tokens = dateScoped ? (rt?.tokens ?? zeroTotals()) : s.tokens_total;
       if (!r) {
-        out.set(s.id, { tokens, total: 0, refCost: 0, missingModels: [] });
+        out.set(s.id, { tokens, total: 0, refCost: 0, apiTotal: 0, missingModels: [] });
         continue;
       }
       // Reference cost (à-la-carte equivalent) is always all-time for the
       // unlimited-plan tooltip — that's the figure people compare against.
       const allTime = computeSummaryCredits(s, r);
       const credits = dateScoped ? creditsFromBuckets(rt?.buckets ?? [], r, s.harness) : allTime;
+      const buckets = dateScoped ? (rt?.buckets ?? []) : s.buckets;
+      const apiTotal = apiCostFromBuckets(buckets, r, s.harness)?.total ?? 0;
       out.set(s.id, {
         tokens,
         total: credits.total,
         refCost: allTime.total,
+        apiTotal,
         missingModels: credits.missingModels,
       });
     }
@@ -269,6 +275,12 @@
         cmp = aCredits - bCredits;
         break;
       }
+      case 'api': {
+        const aApi = sessionDisplayMap.get(a.id)?.apiTotal ?? 0;
+        const bApi = sessionDisplayMap.get(b.id)?.apiTotal ?? 0;
+        cmp = aApi - bApi;
+        break;
+      }
     }
     return sortDir === 'asc' ? cmp : -cmp;
   }
@@ -294,6 +306,12 @@
     }
     return { billedTotal, unlimitedCount };
   })());
+
+  // Hypothetical à-la-carte total at OpenAI API rates — includes every
+  // session (unlimited plans too; that's the point of the comparison).
+  const apiCostTotal = $derived(
+    filtered.reduce((sum, s) => sum + (sessionDisplayMap.get(s.id)?.apiTotal ?? 0), 0),
+  );
 
   // ---------------------------------------------------------------------------
   // Drawer state — the table only holds summaries, so the full session
@@ -373,6 +391,12 @@
         <span class="text-slate-500 text-xs ml-1">({creditSummary.unlimitedCount} unlimited excluded)</span>
       {/if}
     </span>
+    {#if showApiCost}
+      <span title="What this usage would cost à la carte at OpenAI API rates — informational if you're on a subscription">
+        <span class="font-semibold text-slate-200">{fmtUsd(apiCostTotal)}</span>
+        {dateScoped ? 'est. API cost in range' : 'est. API cost'}
+      </span>
+    {/if}
     {#if dateScoped}
       <span class="text-xs text-slate-500">
         Token & credit columns scoped to
@@ -471,6 +495,15 @@
                 {harness === 'codex' ? 'Credit' : 'Cost'}{caretFor('credit')}
               </button>
             </th>
+
+            {#if showApiCost}
+              <!-- Sortable: Est. API cost -->
+              <th class="px-3 py-2 font-medium text-slate-300 text-right whitespace-nowrap" aria-sort={ariaSortAttr('api')}>
+                <button class="hover:text-white transition-colors" title="Estimated cost at OpenAI API rates" onclick={() => toggleSort('api')}>
+                  Est. ${caretFor('api')}
+                </button>
+              </th>
+            {/if}
           </tr>
         </thead>
         <tbody>
@@ -560,6 +593,13 @@
                   >⚠</span>
                 {/if}
               </td>
+
+              {#if showApiCost}
+                <!-- Est. API cost column (hypothetical à-la-carte) -->
+                <td class="px-3 py-2 text-right tabular-nums whitespace-nowrap text-sky-400">
+                  {fmtUsd(sessionCredit?.apiTotal ?? 0)}
+                </td>
+              {/if}
             </tr>
           {/each}
         </tbody>

@@ -34,6 +34,10 @@ pub struct RateCard {
     /// back to a Codex credit rate. Falls back to `fallback_model` when absent.
     #[serde(default)]
     pub fallback_models: HashMap<String, String>,
+    /// OpenAI API USD rates for Codex models — powers the est.-cost column
+    /// alongside the plan-credit rates in `models`.
+    #[serde(default)]
+    pub api_models: HashMap<String, ModelRate>,
 }
 
 fn rates_path() -> Option<PathBuf> {
@@ -115,6 +119,9 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     for (harness, model) in bundled.fallback_models {
         disk.fallback_models.entry(harness).or_insert(model);
     }
+    for (model, rate) in bundled.api_models {
+        disk.api_models.entry(model).or_insert(rate);
+    }
     disk.version = bundled.version;
     disk.source_url = bundled.source_url;
     disk.fetched_at = bundled.fetched_at;
@@ -146,6 +153,7 @@ mod tests {
             fallback_model: "gpt-old".into(),
             currencies: HashMap::new(),
             fallback_models: HashMap::new(),
+            api_models: HashMap::new(),
         };
         let bundled = RateCard {
             version: 3,
@@ -157,6 +165,7 @@ mod tests {
             fallback_model: "gpt-new".into(),
             currencies: HashMap::from([("claude_code".into(), "USD".into())]),
             fallback_models: HashMap::from([("claude_code".into(), "claude-new".into())]),
+            api_models: HashMap::from([("gpt-old".into(), rate(0.04))]),
         };
 
         let merged = merge_older_override(disk, bundled);
@@ -169,5 +178,6 @@ mod tests {
         // Per-harness maps introduced by a newer bundled card are inherited.
         assert_eq!(merged.currencies["claude_code"], "USD");
         assert_eq!(merged.fallback_models["claude_code"], "claude-new");
+        assert_eq!(merged.api_models["gpt-old"].input, 0.04);
     }
 }

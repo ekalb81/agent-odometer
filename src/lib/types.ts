@@ -138,4 +138,6 @@ export interface RateCard {
   currencies: Record<string, string>;
   /** Per-harness fallback models; falls back to fallback_model when absent. */
   fallback_models: Record<string, string>;
+  /** OpenAI API USD rates for Codex models — powers the est.-cost column. */
+  api_models: Record<string, ModelRate>;
 }

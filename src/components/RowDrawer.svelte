@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte';
   import type { Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
+  import { computeSessionApiCost, computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
   import Sparkline from './Sparkline.svelte';
 
@@ -101,6 +101,14 @@
   // Credit computation for the open session.
   const sessionCredits = $derived(
     session && $rates ? computeSessionCredits(session, $rates) : null,
+  );
+
+  // What the same usage would cost à la carte at OpenAI API rates —
+  // informational for subscription users; codex sessions only.
+  const sessionApiCost = $derived(
+    session && session.harness === 'codex' && $rates
+      ? computeSessionApiCost(session, $rates)
+      : null,
   );
 
   // Escape-key handler — attached only while drawer is open.
@@ -379,6 +387,13 @@
         {#if session.credits_unlimited === true && sessionCredits}
           <p class="mt-2 text-xs text-slate-500">
             Reference: {fmtCredit(sessionCredits.total)} à-la-carte equivalent
+          </p>
+        {/if}
+
+        {#if sessionApiCost}
+          <p class="mt-2 text-xs text-slate-500">
+            Est. API cost: <span class="text-sky-400">{formatCredits(sessionApiCost.total, 'USD')}</span>
+            at OpenAI API rates{#if session.plan_type} — informational on the {session.plan_type} plan{/if}
           </p>
         {/if}
       </section>

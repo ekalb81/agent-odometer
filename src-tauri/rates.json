@@ -1,10 +1,10 @@
 {
-  "version": 4,
+  "version": 5,
   "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
-  "fetched_at": "2026-07-18",
-  "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. Claude models are priced in USD per the Anthropic API price list (input/output per 1M tokens; cached_input is the 0.1x cache-read rate; Anthropic bills thinking as ordinary output). Cache writes (1.25x) are not modeled, so Claude costs are a slight underestimate. codex-auto-review follows the documented GPT-5.3-Codex code-review rate. Research-preview and image modalities are omitted; add them in Settings if needed.",
+  "fetched_at": "2026-07-19",
+  "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. api_models holds the same Codex models at OpenAI API USD prices (developers.openai.com/api/docs/pricing, fetched 2026-07-19) for the est.-cost column; gpt-5.5-cyber, gpt-5.2, and codex-auto-review are not on the public API page and are derived via the exact 25-credits-per-USD ratio the rest of the card follows. Claude models are priced in USD per the Anthropic API price list (cached_input is the 0.1x cache-read rate; thinking is billed as ordinary output). Cache writes (1.25x) are not modeled, so USD estimates are slight underestimates. api_models is not editable in the Settings UI yet; edit this file or the on-disk rates.json override.",
   "currencies": {
     "codex": "credits",
     "claude_code": "USD"
@@ -32,6 +32,18 @@
     "claude-sonnet-5":   { "input":  3.0, "cached_input": 0.30, "output": 15.0, "reasoning": 15.0 },
     "claude-sonnet-4-6": { "input":  3.0, "cached_input": 0.30, "output": 15.0, "reasoning": 15.0 },
     "claude-haiku-4-5":  { "input":  1.0, "cached_input": 0.10, "output":  5.0, "reasoning":  5.0 }
+  },
+  "api_models": {
+    "gpt-5.6-sol":    { "input": 5.00, "cached_input": 0.500, "output": 30.0, "reasoning": 30.0 },
+    "gpt-5.6-terra":  { "input": 2.50, "cached_input": 0.250, "output": 15.0, "reasoning": 15.0 },
+    "gpt-5.6-luna":   { "input": 1.00, "cached_input": 0.100, "output":  6.0, "reasoning":  6.0 },
+    "gpt-5.5-cyber":  { "input": 20.00, "cached_input": 2.000, "output": 120.0, "reasoning": 120.0 },
+    "gpt-5.5":        { "input": 5.00, "cached_input": 0.500, "output": 30.0, "reasoning": 30.0 },
+    "gpt-5.4":        { "input": 2.50, "cached_input": 0.250, "output": 15.0, "reasoning": 15.0 },
+    "gpt-5.4-mini":   { "input": 0.75, "cached_input": 0.075, "output":  4.5, "reasoning":  4.5 },
+    "gpt-5.3-codex":  { "input": 1.75, "cached_input": 0.175, "output": 14.0, "reasoning": 14.0 },
+    "gpt-5.2":        { "input": 1.75, "cached_input": 0.175, "output": 14.0, "reasoning": 14.0 },
+    "codex-auto-review": { "input": 1.75, "cached_input": 0.175, "output": 14.0, "reasoning": 14.0 }
   },
   "fallback_model": "gpt-5.6-sol"
 }

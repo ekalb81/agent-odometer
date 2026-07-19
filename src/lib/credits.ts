@@ -87,14 +87,36 @@ export function creditsFromBuckets(
   rates: RateCard,
   harness: Harness,
 ): SessionCredits {
+  return bucketsCost(buckets, rates.models, fallbackModelFor(rates, harness));
+}
+
+/**
+ * The same usage priced at OpenAI API USD rates (rates.api_models) instead
+ * of plan credits. Returns null when no API rate table is configured, so
+ * callers can hide the column rather than show zeros.
+ */
+export function apiCostFromBuckets(
+  buckets: TierBucket[],
+  rates: RateCard,
+  harness: Harness,
+): SessionCredits | null {
+  if (Object.keys(rates.api_models ?? {}).length === 0) return null;
+  return bucketsCost(buckets, rates.api_models, fallbackModelFor(rates, harness));
+}
+
+function bucketsCost(
+  buckets: TierBucket[],
+  table: Record<string, ModelRate>,
+  fallbackName: string,
+): SessionCredits {
   const byModelMap = new Map<string, number>();
   const missingModels = new Set<string>();
   let total = 0;
 
-  const fallbackRate = rates.models[fallbackModelFor(rates, harness)];
+  const fallbackRate = table[fallbackName];
 
   for (const b of buckets) {
-    const directRate = rates.models[b.model];
+    const directRate = table[b.model];
     if (directRate === undefined) missingModels.add(b.model);
     const rate = directRate ?? fallbackRate;
     if (!rate) continue;
@@ -109,7 +131,7 @@ export function creditsFromBuckets(
     byModel: Array.from(byModelMap, ([model, cost]) => ({
       model,
       cost,
-      fallbackUsed: rates.models[model] === undefined,
+      fallbackUsed: table[model] === undefined,
     })),
     missingModels: Array.from(missingModels),
   };
@@ -120,9 +142,15 @@ export function computeSummaryCredits(summary: SessionSummary, rates: RateCard):
   return creditsFromBuckets(summary.buckets, rates, summary.harness);
 }
 
+/** All-time OpenAI-API-rate cost for a full session (drawer). Null when unconfigured. */
+export function computeSessionApiCost(session: Session, rates: RateCard): SessionCredits | null {
+  if (Object.keys(rates.api_models ?? {}).length === 0) return null;
+  return historyCost(session, rates.api_models, fallbackModelFor(rates, session.harness));
+}
+
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {
   if (session.tokens_history.length > 0) {
-    return computeHistoryCredits(session, rates, null, null);
+    return historyCost(session, rates.models, fallbackModelFor(rates, session.harness));
   }
   const entries = Object.entries(session.tokens_by_model);
 
@@ -160,25 +188,21 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
   return { total, byModel, missingModels };
 }
 
-function computeHistoryCredits(
+function historyCost(
   session: Session,
-  rates: RateCard,
-  fromIso: string | null,
-  toIso: string | null,
+  table: Record<string, ModelRate>,
+  fallbackName: string,
 ): SessionCredits {
-
   const byModelMap = new Map<string, number>();
   const missingModels = new Set<string>();
   let total = 0;
 
-  const fallbackRate = rates.models[fallbackModelFor(rates, session.harness)];
+  const fallbackRate = table[fallbackName];
 
   for (const ev of session.tokens_history) {
-    if (fromIso && ev.timestamp < fromIso) continue;
-    if (toIso && ev.timestamp > toIso) continue;
     if (!ev.model) continue;
 
-    const directRate = rates.models[ev.model];
+    const directRate = table[ev.model];
     const fallbackUsed = directRate === undefined;
     if (fallbackUsed) missingModels.add(ev.model);
     const rate = directRate ?? fallbackRate;
@@ -198,7 +222,7 @@ function computeHistoryCredits(
     byModel: Array.from(byModelMap, ([model, cost]) => ({
       model,
       cost,
-      fallbackUsed: rates.models[model] === undefined,
+      fallbackUsed: table[model] === undefined,
     })),
     missingModels: Array.from(missingModels),
   };
