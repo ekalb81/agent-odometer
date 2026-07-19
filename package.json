@@ -1,6 +1,6 @@
 {
-  "name": "codex-data-viewer",
-  "version": "0.2.1",
+  "name": "agent-odometer",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {

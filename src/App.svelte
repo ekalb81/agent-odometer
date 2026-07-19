@@ -131,7 +131,7 @@
 
   <!-- Top bar -->
   <header class="flex items-center justify-between px-4 py-3 border-b-2 border-slate-700 bg-slate-800 shadow-md flex-shrink-0">
-    <span class="font-semibold text-lg tracking-tight text-white">Agent Activity Viewer</span>
+    <span class="font-semibold text-lg tracking-tight text-white">Odometer</span>
 
     <nav class="flex gap-1 bg-slate-900 rounded-lg p-1 border border-slate-700">
       <button

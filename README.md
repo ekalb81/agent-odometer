@@ -1,64 +1,83 @@
-# Codex Activity Viewer
+# Odometer
 
-A local activity viewer for agent CLI harnesses — the ChatGPT desktop app's Codex experience and Claude Code — presented as per-harness tabs. It explores local task history, token usage, turn lifecycle, subagent activity, and estimated cost directly from each harness's session files.
+**How far have your AI agents driven?** Odometer is a local desktop dashboard for your AI coding-agent usage. It reads the session files that [Codex](https://openai.com/codex) (the ChatGPT desktop app) and [Claude Code](https://claude.com/claude-code) already write to your machine and turns them into a searchable, sortable view of every session: what you asked, which models ran, how many tokens they consumed, and what that usage costs.
 
-## Features
+![Codex tab showing sessions, token totals, credits, and estimated API cost](docs/screenshots/codex-tab.png)
 
-- Per-harness tabs: Codex (ChatGPT app) and Claude Code, each with its own totals and cost currency.
-- Search and filter active or archived sessions by text, model, and date/time.
-- Inspect session metadata, prompts, context use, token history, and per-model totals.
-- Distinguish subagent tasks and completed, aborted, or rolled-back turns — including Claude Code subagent transcripts, which appear as their own linked sessions.
-- Open a Codex task (or a subagent's parent task) in ChatGPT through the supported `codex://` deep link.
-- Estimate usage cost from an editable per-million-token rate card: plan credits and an OpenAI-API-rate USD estimate for Codex, Anthropic API USD rates for Claude Code.
-- Watch multiple session/archive roots and overlay current names from Codex's session index.
-- Reveal a session transcript in the platform file manager.
-- Check for new releases at launch and self-update in place (signed updater packages).
+Everything happens on your machine. Odometer never uploads, phones home, or sends your prompts anywhere — it only reads the local files your agents already produced (and checks GitHub for its own updates).
 
-All session processing is local. Session files can contain sensitive prompts, responses, tool output, and filesystem paths; do not share or commit them.
+## What you can see
 
-## Stack
+- **Every session, across harnesses** — one tab for Codex, one for Claude Code, each with totals for the sessions in view.
+- **Tokens where they went** — input, cached, output, and reasoning tokens per session, per model, and per turn.
+- **What it costs** — Codex sessions show plan credits *and* an informational "what would this cost at OpenAI API rates" estimate; Claude Code sessions show Anthropic API-rate estimates. Rates live in an editable rate card.
+- **Turn-by-turn detail** — click any session for its full story: prompts, replies, per-turn tokens and cost, context-window fill, and a tokens-over-time sparkline.
+- **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
+- **Live** — sessions update in the list while your agents are still running.
+- **Time-scoped answers** — filter by date range and the token/cost columns re-total to exactly that window ("what did I burn last week?").
 
-- Tauri 2 and Rust for native filesystem and application logic.
-- Svelte 5, TypeScript, Vite 6, and Tailwind CSS 3 for the UI.
+![Claude Code tab with subagent sessions](docs/screenshots/claude-code-tab.png)
+![Session detail drawer with per-turn tokens and costs](docs/screenshots/session-details.png)
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full data flow, contracts, invariants, and known limitations.
+## Install
 
-## Prerequisites
+Download the installer for your platform from the [latest release](https://github.com/ekalb81/agent-odometer/releases/latest):
 
-- Node.js 22 and npm.
-- Stable Rust; the crate declares Rust 1.77 as its minimum version.
-- The [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/) for your operating system.
+| Platform | File | Note |
+| --- | --- | --- |
+| Windows | `.msi` (recommended) or `-setup.exe` | Installers aren't code-signed yet; SmartScreen may warn — choose "More info → Run anyway". |
+| macOS (Apple Silicon) | `.dmg` | Not notarized yet; right-click the app → Open on first launch. |
+| Linux | `.AppImage` (no install) or `.deb` / `.rpm` | Mark the AppImage executable, then run it. |
+
+Odometer checks for new releases when it starts and offers a one-click in-place update.
+
+### First run
+
+If Codex or Claude Code is installed with default paths, there is nothing to configure — Odometer finds your sessions automatically:
+
+- Codex: `$CODEX_HOME` if set, otherwise `~/.codex` (`sessions/`, `archived_sessions/`, `session_index.jsonl`)
+- Claude Code: `$CLAUDE_CONFIG_DIR/projects` if set, otherwise `~/.claude/projects`
+
+Custom locations can be added under **Settings → Watched roots**.
+
+## Privacy
+
+Session files contain your prompts, the agents' replies, tool output, and local file paths. Odometer processes them entirely locally and stores nothing outside your machine: settings live in your OS config directory (`agent-odometer/config.json`, plus `rates.json` if you customize rates). Treat the session files themselves as sensitive — don't share or commit them.
+
+## How costs are estimated
+
+Costs are computed from token counts against a bundled, editable rate card (per one million tokens):
+
+- **Codex** usage is priced in plan credits per the OpenAI Codex rate card, with documented Fast-mode multipliers applied per event. A second column estimates the same usage at OpenAI **API** USD rates — informational if you're on a subscription, but useful for comparison.
+- **Claude Code** usage is priced at Anthropic API USD rates. Cache reads are billed at the cached-input rate; cache *writes* (1.25×) aren't modeled, so estimates run slightly low. Thinking tokens are billed as ordinary output, matching Anthropic's billing.
+- Unknown models fall back to a configurable per-harness fallback rate and are flagged in the UI.
+
+Edit any rate under **Settings → Rate card**; your overrides persist and automatically inherit newly bundled models on upgrades.
+
+---
 
 ## Development
 
-Install the locked frontend dependencies and start the desktop app:
+Built with Tauri 2 + Rust (filesystem, parsing, IPC) and Svelte 5 + TypeScript + Tailwind (UI). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for data flow, wire contracts, invariants, and known limitations.
+
+Prerequisites: Node.js 22, stable Rust (MSRV 1.77), and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```powershell
 npm ci
 npm run tauri dev
 ```
 
-`npm run dev` starts only Vite on the fixed port `1420`; use it for frontend-only work where native IPC is not needed.
-
-Useful commands:
-
 | Command | Purpose |
 | --- | --- |
-| `npm run tauri dev` | Run the complete desktop app with hot reload |
-| `npm run dev` | Run the frontend development server only |
+| `npm run tauri dev` | Run the desktop app with hot reload |
+| `npm run dev` | Frontend dev server only (port 1420, no native IPC) |
 | `npm run check` | Type-check TypeScript and Svelte |
 | `npm run build` | Build the frontend into `dist/` |
-| `npm run tauri build` | Build and bundle the desktop app for the host platform |
-| `npm run preview` | Preview the already-built frontend |
+| `npm run tauri build` | Build and bundle the desktop app |
 
-Set `RUST_LOG` when native tracing is needed, for example `$env:RUST_LOG = 'debug'` in PowerShell before starting Tauri.
-
-## Verification
-
-Run the same checks used by CI:
+Match CI before handing off:
 
 ```powershell
-npm ci
 npm run check
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
@@ -66,40 +85,26 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-Rust parser integration tests and synthetic fixtures are under `src-tauri/tests/`. Rust unit tests live beside their modules. A frontend unit-test runner is not currently configured.
+Parser integration tests and synthetic fixtures live in `src-tauri/tests/`; never commit real session data. Set `RUST_LOG` (e.g. `$env:RUST_LOG = 'odometer_lib=info'`) for native tracing.
 
-## Configuration and data
-
-Codex inputs default to `$CODEX_HOME` when that environment variable is set, otherwise `~/.codex`:
-
-- `$CODEX_HOME/sessions`
-- `$CODEX_HOME/archived_sessions`
-- `$CODEX_HOME/session_index.jsonl`
-
-Claude Code sessions default to `$CLAUDE_CONFIG_DIR/projects`, otherwise `~/.claude/projects`.
-
-Settings are editable in the app. They persist under the operating system's configuration directory as `codex-data-viewer/config.json`. A customized rate card is stored beside it as `rates.json`; otherwise the app uses the bundled `src-tauri/rates.json`.
-
-The bundled rate card includes the current GPT-5.6 Sol, Terra, and Luna credit rates, their OpenAI API USD rates (for the Codex tab's est.-cost column), and Anthropic API USD rates for current Claude models. Rate values are per one million tokens. Cached input and reasoning output are subsets of input and output, not additional tokens. Unknown models use the configured per-harness fallback model's rate. When rollout settings identify Fast mode, the documented GPT-5.5 or GPT-5.4 multiplier is applied. Older user rate overrides automatically inherit newly bundled models without overwriting user-edited entries.
-
-## Repository layout
+### Repository layout
 
 ```text
 src/                     Svelte frontend
   components/            Views and reusable UI
   lib/ipc.ts             Typed Tauri command/event boundary
   lib/types.ts           TypeScript mirrors of Rust wire models
-  lib/credits.ts         Token-range and credit calculations
+  lib/credits.ts         Credit / API-cost calculations
 src-tauri/
-  src/                   Rust application modules
+  src/                   Rust application modules (scanner, parsers, watcher, commands)
   tests/                 Parser integration tests and fixtures
   capabilities/          Tauri permissions
-  rates.json             Bundled fallback rate card
-  tauri.conf.json         Desktop build/window configuration
+  rates.json             Bundled rate card
+  tauri.conf.json        Desktop build/window/updater configuration
 ```
 
-Tauri-generated schemas under `src-tauri/gen/schemas/` should not be edited manually. Keep `package-lock.json` and `src-tauri/Cargo.lock` committed.
+Generated schemas under `src-tauri/gen/schemas/` are not hand-edited. Both lockfiles stay committed.
 
-## Releases
+### Releases (maintainers)
 
-The GitHub release workflow builds Windows, Apple Silicon macOS, and Linux bundles for `v*` tags and creates a draft release for review. Updater packages are minisign-signed; the workflow requires the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets, and `tauri-action` uploads the `latest.json` manifest the in-app updater reads from the latest published release. The in-app updater only finds releases once they are published (not drafts) and publicly reachable. Platform code signing/notarization must be configured separately before distributing trusted production installers.
+Pushing a `v*` tag builds Windows/macOS/Linux bundles and drafts a GitHub release. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets — and `tauri-action` uploads the `latest.json` manifest that installed copies poll. The in-app updater only sees releases that are published (not drafts) and publicly reachable. OS code signing/notarization is not configured yet.

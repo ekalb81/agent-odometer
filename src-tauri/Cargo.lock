@@ -9,6 +9,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-odometer"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dashmap",
+ "dirs 5.0.1",
+ "notify",
+ "notify-debouncer-full",
+ "rayon",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-process",
+ "tauri-plugin-updater",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -330,29 +353,6 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link 0.2.1",
-]
-
-[[package]]
-name = "codex-data-viewer"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "chrono",
- "dashmap",
- "dirs 5.0.1",
- "notify",
- "notify-debouncer-full",
- "rayon",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-process",
- "tauri-plugin-updater",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "walkdir",
 ]
 
 [[package]]

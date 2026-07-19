@@ -55,11 +55,11 @@ impl Default for Config {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("codex-data-viewer").join("config.json"))
+    dirs::config_dir().map(|d| d.join("agent-odometer").join("config.json"))
 }
 
 impl Config {
-    /// Loads config from `<config_dir>/codex-data-viewer/config.json`.
+    /// Loads config from `<config_dir>/agent-odometer/config.json`.
     /// If the file doesn't exist, writes and returns the default. If it is
     /// malformed, warns and returns the default.
     pub fn load() -> anyhow::Result<Self> {
@@ -89,7 +89,7 @@ impl Config {
         }
     }
 
-    /// Persists config to `<config_dir>/codex-data-viewer/config.json`.
+    /// Persists config to `<config_dir>/agent-odometer/config.json`.
     /// Uses a `.tmp` → rename dance for an atomic-ish write.
     pub fn save(&self) -> anyhow::Result<()> {
         let path =

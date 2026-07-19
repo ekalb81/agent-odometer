@@ -2,7 +2,7 @@
 
 ## System overview
 
-Codex Activity Viewer is a local companion to agent CLI harnesses — the ChatGPT desktop app's Codex experience and Claude Code — with two halves:
+Odometer is a local companion to agent CLI harnesses — the ChatGPT desktop app's Codex experience and Claude Code — with two halves:
 
 - `src-tauri/`: Rust/Tauri backend for discovery, incremental JSONL parsing, filesystem watching, persistence, and native commands.
 - `src/`: Svelte 5/TypeScript frontend for reactive state, per-harness tabs, filtering, tables, details, settings, and credit calculations.
@@ -121,7 +121,7 @@ Claude Code sessions are resolved below `$CLAUDE_CONFIG_DIR`, falling back to `~
 
 - `$CLAUDE_CONFIG_DIR/projects`
 
-User-owned app data is stored under the platform configuration directory in `codex-data-viewer/config.json` and, after rate edits, `codex-data-viewer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`.
+User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`.
 
 Session files can contain full prompts, responses, system/developer instructions, local paths, and tool output. Keep processing local, avoid logging message bodies, and use synthetic/redacted test data. Tauri capabilities in `src-tauri/capabilities/default.json` should remain narrowly scoped.
 

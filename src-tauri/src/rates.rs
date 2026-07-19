@@ -41,7 +41,7 @@ pub struct RateCard {
 }
 
 fn rates_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("codex-data-viewer").join("rates.json"))
+    dirs::config_dir().map(|d| d.join("agent-odometer").join("rates.json"))
 }
 
 impl RateCard {
@@ -52,7 +52,7 @@ impl RateCard {
         Ok(card)
     }
 
-    /// Loads rates from <config_dir>/codex-data-viewer/rates.json.
+    /// Loads rates from <config_dir>/agent-odometer/rates.json.
     /// If the file is missing, returns load_bundled (and does NOT seed the disk file —
     /// users can edit the editor to materialize their own copy).
     /// If the file is present but malformed, logs a warn and returns load_bundled.
@@ -89,7 +89,7 @@ impl RateCard {
         }
     }
 
-    /// Atomic-ish write to <config_dir>/codex-data-viewer/rates.json.
+    /// Atomic-ish write to <config_dir>/agent-odometer/rates.json.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = rates_path().ok_or_else(|| anyhow::anyhow!("could not determine config dir"))?;
         if let Some(parent) = path.parent() {

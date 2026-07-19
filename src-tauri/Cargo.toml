@@ -1,15 +1,15 @@
 [package]
-name = "codex-data-viewer"
-version = "0.2.1"
+name = "agent-odometer"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "codex_data_viewer_lib"
+name = "odometer_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [[bin]]
-name = "codex-data-viewer"
+name = "agent-odometer"
 path = "src/main.rs"
 
 [build-dependencies]

@@ -1,5 +1,5 @@
-use codex_data_viewer_lib::model::TurnStatus;
-use codex_data_viewer_lib::parser;
+use odometer_lib::model::TurnStatus;
+use odometer_lib::parser;
 use std::path::PathBuf;
 
 fn fixture() -> PathBuf {
@@ -533,7 +533,7 @@ fn latest_context_tokens_tracks_last_call_not_cumulative() {
 
 #[test]
 fn new_turn_marks_stale_in_progress_turn_aborted() {
-    use codex_data_viewer_lib::parser::SessionParser;
+    use odometer_lib::parser::SessionParser;
     let mut p = SessionParser::new(std::path::PathBuf::from("synthetic.jsonl"), false);
     let apply = |p: &mut SessionParser, line: &str| p.apply_line(line).unwrap();
 

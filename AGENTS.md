@@ -4,7 +4,7 @@ These instructions apply to the entire repository.
 
 ## Project purpose
 
-Codex Activity Viewer is a local Tauri companion to agent CLI harnesses: the ChatGPT desktop app's Codex experience and Claude Code. It reads each harness's session JSONL files and presents searchable task, turn, token, subagent, and estimated cost data in per-harness tabs. Rust owns filesystem access, parsing, persistence, and Tauri IPC; Svelte owns filtering, presentation, and credit calculations.
+Odometer is a local Tauri companion to agent CLI harnesses: the ChatGPT desktop app's Codex experience and Claude Code. It reads each harness's session JSONL files and presents searchable task, turn, token, subagent, and estimated cost data in per-harness tabs. Rust owns filesystem access, parsing, persistence, and Tauri IPC; Svelte owns filtering, presentation, and credit calculations.
 
 Start with [README.md](README.md) for commands and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the data flow, contracts, invariants, and known limitations.
 

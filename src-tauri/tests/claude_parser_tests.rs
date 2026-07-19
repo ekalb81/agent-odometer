@@ -1,5 +1,5 @@
-use codex_data_viewer_lib::claude_parser::{self, ClaudeSessionParser};
-use codex_data_viewer_lib::model::{Harness, TurnStatus};
+use odometer_lib::claude_parser::{self, ClaudeSessionParser};
+use odometer_lib::model::{Harness, TurnStatus};
 use std::io::Write;
 use std::path::PathBuf;
 
