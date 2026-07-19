@@ -1,18 +1,19 @@
 # Codex Activity Viewer
 
-A local companion for the ChatGPT desktop app's Codex experience. It explores local task history, token usage, turn lifecycle, subagent activity, and estimated credit cost directly from Codex rollout files.
+A local activity viewer for agent CLI harnesses — the ChatGPT desktop app's Codex experience and Claude Code — presented as per-harness tabs. It explores local task history, token usage, turn lifecycle, subagent activity, and estimated cost directly from each harness's session files.
 
 ## Features
 
+- Per-harness tabs: Codex (ChatGPT app) and Claude Code, each with its own totals and cost currency.
 - Search and filter active or archived sessions by text, model, and date/time.
 - Inspect session metadata, prompts, context use, token history, and per-model totals.
-- Distinguish subagent tasks and completed, aborted, or rolled-back turns.
-- Open a task (or a subagent's parent task) in ChatGPT through the supported `codex://` deep link.
-- Estimate usage cost from an editable per-million-token rate card, including fallback rates.
+- Distinguish subagent tasks and completed, aborted, or rolled-back turns — including Claude Code subagent transcripts, which appear as their own linked sessions.
+- Open a Codex task (or a subagent's parent task) in ChatGPT through the supported `codex://` deep link.
+- Estimate usage cost from an editable per-million-token rate card: plan credits and an OpenAI-API-rate USD estimate for Codex, Anthropic API USD rates for Claude Code.
 - Watch multiple session/archive roots and overlay current names from Codex's session index.
-- Reveal a rollout in the platform file manager.
+- Reveal a session transcript in the platform file manager.
 
-All session processing is local. Rollout files can contain sensitive prompts, responses, tool output, and filesystem paths; do not share or commit them.
+All session processing is local. Session files can contain sensitive prompts, responses, tool output, and filesystem paths; do not share or commit them.
 
 ## Stack
 
@@ -68,15 +69,17 @@ Rust parser integration tests and synthetic fixtures are under `src-tauri/tests/
 
 ## Configuration and data
 
-The default inputs are below `$CODEX_HOME` when that environment variable is set, otherwise below `~/.codex`:
+Codex inputs default to `$CODEX_HOME` when that environment variable is set, otherwise `~/.codex`:
 
 - `$CODEX_HOME/sessions`
 - `$CODEX_HOME/archived_sessions`
 - `$CODEX_HOME/session_index.jsonl`
 
+Claude Code sessions default to `$CLAUDE_CONFIG_DIR/projects`, otherwise `~/.claude/projects`.
+
 Settings are editable in the app. They persist under the operating system's configuration directory as `codex-data-viewer/config.json`. A customized rate card is stored beside it as `rates.json`; otherwise the app uses the bundled `src-tauri/rates.json`.
 
-The bundled rate card includes the current GPT-5.6 Sol, Terra, and Luna credit rates. Rate values are per one million tokens. Cached input and reasoning output are subsets of input and output, not additional tokens. Unknown models use the configured fallback model's rate. When rollout settings identify Fast mode, the documented GPT-5.5 or GPT-5.4 multiplier is applied. Older user rate overrides automatically inherit newly bundled models without overwriting user-edited entries.
+The bundled rate card includes the current GPT-5.6 Sol, Terra, and Luna credit rates, their OpenAI API USD rates (for the Codex tab's est.-cost column), and Anthropic API USD rates for current Claude models. Rate values are per one million tokens. Cached input and reasoning output are subsets of input and output, not additional tokens. Unknown models use the configured per-harness fallback model's rate. When rollout settings identify Fast mode, the documented GPT-5.5 or GPT-5.4 multiplier is applied. Older user rate overrides automatically inherit newly bundled models without overwriting user-edited entries.
 
 ## Repository layout
 
