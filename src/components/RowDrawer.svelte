@@ -482,7 +482,7 @@
                       {/if}
                       {#if credit}
                         <span class="text-xs tabular-nums text-emerald-400">{fmtCredit(credit.cost)}</span>
-                        {#if credit.fallbackUsed}
+                        {#if credit.fallbackUsed && turn.tokens.total_tokens > 0}
                           <span class="text-amber-400" title="Fallback rate used (model not in rate card)">⚠</span>
                         {/if}
                       {/if}

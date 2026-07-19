@@ -130,3 +130,45 @@ fn incremental_append_with_partial_trailing_line() {
     assert_eq!(s.turns.len(), 2);
     assert_eq!(s.thread_name.as_deref(), Some("Healthcheck endpoint"));
 }
+
+#[test]
+fn subagent_transcript_gets_own_identity_and_parent_link() {
+    // agent-*.jsonl files reuse the PARENT session's sessionId on every
+    // record; they must not collide with the parent in the session map.
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-fixture123.jsonl");
+    let s = claude_parser::parse_file(&path).unwrap().unwrap();
+    assert_eq!(s.id, "agent-fixture123");
+    assert_eq!(
+        s.parent_thread_id.as_deref(),
+        Some("11111111-2222-3333-4444-555555555555")
+    );
+    assert_eq!(s.source.as_deref(), Some("subagent"));
+    assert_eq!(s.harness, Harness::ClaudeCode);
+    // Sidechain records form turns inside a subagent transcript.
+    assert_eq!(s.turns.len(), 1);
+    assert_eq!(
+        s.first_user_message.as_deref(),
+        Some("Search the codebase for the config loader")
+    );
+    assert_eq!(s.turns[0].status, TurnStatus::Completed);
+    assert_eq!(
+        s.turns[0].last_agent_message.as_deref(),
+        Some("Found it in src/config.rs.")
+    );
+    assert_eq!(s.tokens_total.input_tokens, 540);
+    assert_eq!(s.tokens_total.output_tokens, 20);
+}
+
+#[test]
+fn parent_transcript_still_ignores_sidechain_prompts() {
+    // The main fixture has an in-file sidechain prompt; it must not open a
+    // turn there (only subagent transcript files waive the filter).
+    let s = claude_parser::parse_file(&fixture()).unwrap().unwrap();
+    assert!(s
+        .turns
+        .iter()
+        .all(|t| t.user_message.as_deref() != Some("You are a subagent. Find the test file.")));
+    assert!(s.parent_thread_id.is_none());
+    assert!(s.source.is_none());
+}

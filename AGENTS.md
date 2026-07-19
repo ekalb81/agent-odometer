@@ -46,6 +46,7 @@ Claude Code sessions (`claude_parser.rs`) have their own invariants:
 - Anthropic `input_tokens` excludes cache traffic. Map to the viewer's subset convention: input = input + cache_read + cache_creation, cached = cache_read, reasoning = 0.
 - Turns open on real human prompts only — never on tool results, `isMeta` records, sidechain prompts, `<command-…>` echoes, or interruption markers. Sidechain usage still counts toward the enclosing turn.
 - Skip `<synthetic>` assistant messages. Records without timestamps (e.g. `custom-title`) must not move `last_event_at`.
+- Subagent transcripts (`agent-*.jsonl` / under a `subagents` dir) reuse the parent's `sessionId`; they must be keyed by file stem with `parent_thread_id` set, never by the record `sessionId`, or they clobber the parent session.
 - Sessions carry `harness: claude_code`; the per-harness `currencies`/`fallback_models` maps on the rate card keep Codex credits and Claude USD estimates separate.
 
 Parser integration tests and fixtures live in `src-tauri/tests/`; small Rust unit tests live beside their modules. There is currently no frontend unit-test runner, so do not invent an `npm test` command.

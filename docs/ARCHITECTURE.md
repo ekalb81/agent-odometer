@@ -68,6 +68,8 @@ Claude Code sessions (`~/.claude/projects/<project>/<uuid>.jsonl`) have no `sess
 - `assistant`: carries the Anthropic API message with `message.usage` and `message.model`. Streamed messages repeat one `message.id` across several lines with identical usage, so usage is counted once per message ID. `<synthetic>` messages are skipped.
 - `custom-title` / `summary`: thread-name sources (custom titles win).
 
+Subagent transcripts (`.../<session>/subagents/agent-<id>.jsonl`) carry the parent session's `sessionId` on every record and mark everything `isSidechain`. They parse as their own sessions — identified by file stem, linked via `parent_thread_id`, tagged `source: subagent` — otherwise they would collide with and clobber the parent in the session map. Inside them the sidechain filter is waived so the subagent's task prompt forms its turn. Parent files in the current format do not duplicate this usage inline, so no double counting occurs.
+
 Anthropic usage reports `input_tokens` excluding cache traffic, while the viewer's `TokenTotals` treats cached input as a subset of input. The mapping is `input = input + cache_read + cache_creation`, `cached = cache_read`, `reasoning = 0` (thinking is billed as ordinary output). Cache writes are priced at the plain input rate, a slight underestimate of the 1.25x write premium. There is no cumulative counter in the file; totals accumulate from per-message deltas, and sidechain usage counts toward the enclosing turn.
 
 The rate card prices Codex models in credits and Claude models in USD; `currencies` and `fallback_models` on the card map each harness to its display currency and fallback rate so the two never mix.

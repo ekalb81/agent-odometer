@@ -16,6 +16,12 @@
 //!   input = input + cache_read + cache_creation, cached = cache_read.
 //!   Cache-creation tokens are priced at the ordinary input rate, a slight
 //!   undercount of Anthropic's 1.25x cache-write premium.
+//!
+//! Subagent transcripts (`.../<session>/subagents/agent-<id>.jsonl`) carry
+//! the PARENT session's `sessionId` on every record and mark everything
+//! `isSidechain`. They are parsed as their own sessions — identified by the
+//! file stem, linked via `parent_thread_id` — otherwise they'd collide with
+//! (and clobber) the parent in the session map.
 
 use crate::model::{Harness, Session, TokenHistoryPoint, TokenTotals, TurnStatus};
 use chrono::{DateTime, Utc};
@@ -31,6 +37,10 @@ pub struct ClaudeSessionParser {
     pub session: Option<Session>,
     pub byte_offset: u64,
     pub file_path: PathBuf,
+    /// True when this file is a subagent transcript (agent-*.jsonl or under
+    /// a `subagents` directory): all its records are sidechain, and its
+    /// `sessionId` names the parent session rather than this transcript.
+    is_subagent: bool,
     /// Assistant `message.id`s whose usage has already been counted.
     seen_message_ids: HashSet<String>,
     /// uuid of the user prompt that opened the current turn.
@@ -41,10 +51,16 @@ pub struct ClaudeSessionParser {
 
 impl ClaudeSessionParser {
     pub fn new(file_path: PathBuf) -> Self {
+        let is_subagent = file_path.components().any(|c| c.as_os_str() == "subagents")
+            || file_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("agent-"));
         Self {
             session: None,
             byte_offset: 0,
             file_path,
+            is_subagent,
             seen_message_ids: HashSet::new(),
             current_turn_id: None,
             pending_thread_name: None,
@@ -163,16 +179,23 @@ impl ClaudeSessionParser {
             return;
         };
 
-        let id = root
+        let record_session_id = root
             .get("sessionId")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                self.file_path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            });
+            .map(str::to_owned);
+        let file_stem = self
+            .file_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // Subagent transcripts reuse the parent's sessionId; identify them by
+        // file stem instead and keep the parent linkage.
+        let (id, parent_thread_id, source) = if self.is_subagent {
+            (file_stem, record_session_id, Some("subagent".to_owned()))
+        } else {
+            (record_session_id.unwrap_or(file_stem), None, None)
+        };
         if id.is_empty() {
             return;
         }
@@ -182,7 +205,7 @@ impl ClaudeSessionParser {
             harness: Harness::ClaudeCode,
             thread_name: self.pending_thread_name.take(),
             forked_from_id: None,
-            parent_thread_id: None,
+            parent_thread_id,
             agent_path: None,
             agent_nickname: None,
             file_path: self.file_path.to_string_lossy().into_owned(),
@@ -191,7 +214,7 @@ impl ClaudeSessionParser {
             last_event_at: started_at,
             working_directory: None,
             originator: None,
-            source: None,
+            source,
             history_mode: None,
             memory_mode: None,
             cli_version: None,
@@ -240,7 +263,7 @@ impl ClaudeSessionParser {
     }
 
     fn handle_user(&mut self, root: &Value, timestamp: Option<DateTime<Utc>>) {
-        let Some(prompt) = extract_user_prompt(root) else {
+        let Some(prompt) = extract_user_prompt(root, self.is_subagent) else {
             return;
         };
         let turn_id = root
@@ -378,7 +401,7 @@ impl ClaudeSessionParser {
                         turn.duration_ms = (ts - started).num_milliseconds().try_into().ok();
                     }
                 }
-                if !is_sidechain {
+                if !is_sidechain || self.is_subagent {
                     if let Some(text) = last_agent_message {
                         turn.last_agent_message = Some(text);
                     }
@@ -390,9 +413,10 @@ impl ClaudeSessionParser {
 
 /// Returns the prompt text when a `user` record is a real human prompt:
 /// not a tool result, not meta/caveat noise, not subagent (sidechain)
-/// traffic, and not local slash-command echo.
-fn extract_user_prompt(root: &Value) -> Option<String> {
-    if root.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+/// traffic, and not local slash-command echo. Inside a subagent transcript
+/// every record is sidechain, so the filter is waived there.
+fn extract_user_prompt(root: &Value, allow_sidechain: bool) -> Option<String> {
+    if !allow_sidechain && root.get("isSidechain").and_then(Value::as_bool) == Some(true) {
         return None;
     }
     if root.get("isMeta").and_then(Value::as_bool) == Some(true) {
