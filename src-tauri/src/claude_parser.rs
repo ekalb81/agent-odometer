@@ -225,6 +225,7 @@ impl ClaudeSessionParser {
             credits_unlimited: None,
             credits_balance: None,
             context_window: None,
+            latest_context_tokens: None,
             total_turns: 0,
             first_user_message: None,
             tokens_total: TokenTotals::default(),
@@ -360,6 +361,9 @@ impl ClaudeSessionParser {
             if let Some(delta) = usage.map(usage_to_totals) {
                 if totals_any_positive(&delta) {
                     add_token_totals(&mut s.tokens_total, &delta);
+                    // input already folds in cache reads/writes, so this is
+                    // the context fill of the latest call.
+                    s.latest_context_tokens = Some(delta.input_tokens + delta.output_tokens);
                     if let Some(model) = &model {
                         let entry = s.tokens_by_model.entry(model.clone()).or_default();
                         add_token_totals(entry, &delta);

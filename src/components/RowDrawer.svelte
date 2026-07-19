@@ -87,10 +87,12 @@
     openTaskInChatGPT(session.parent_thread_id ?? session.id).catch(() => {});
   }
 
-  // Context window usage.
+  // Context window usage: the LAST call's context fill, not cumulative
+  // session throughput (which exceeds the window many times over in long
+  // sessions).
   const ctxPercent = $derived(
-    session && session.context_window
-      ? (session.tokens_total.total_tokens / session.context_window) * 100
+    session && session.context_window && session.latest_context_tokens != null
+      ? (session.latest_context_tokens / session.context_window) * 100
       : null,
   );
 
@@ -387,7 +389,7 @@
           <h3 class="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-3">Context window usage</h3>
           <div class="space-y-1.5">
             <div class="flex justify-between text-xs text-slate-400">
-              <span>{fmt(session.tokens_total.total_tokens)} / {fmt(session.context_window!)} tokens</span>
+              <span>{fmt(session.latest_context_tokens!)} / {fmt(session.context_window!)} tokens in last request</span>
               <span class={ctxPercent > 100 ? 'text-amber-400' : 'text-slate-300'}>
                 {pctFmt.format(ctxPercent)}%
               </span>

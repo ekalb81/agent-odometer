@@ -98,6 +98,12 @@ pub struct Session {
     pub credits_unlimited: Option<bool>,
     pub credits_balance: Option<f64>,
     pub context_window: Option<u32>,
+    /// Context fill of the most recent API call (raw input+output of the
+    /// latest usage event). Unlike `tokens_total` — which is cumulative
+    /// throughput and can exceed the window many times over — this is
+    /// comparable to `context_window`.
+    #[serde(default)]
+    pub latest_context_tokens: Option<u64>,
     pub total_turns: u32,
     /// Truncated first user message, used as a display-name fallback.
     pub first_user_message: Option<String>,
@@ -322,6 +328,7 @@ mod tests {
             credits_unlimited: None,
             credits_balance: None,
             context_window: None,
+            latest_context_tokens: None,
             total_turns: 0,
             first_user_message: None,
             tokens_total: TokenTotals::default(),

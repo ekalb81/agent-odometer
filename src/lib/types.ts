@@ -54,6 +54,8 @@ export interface Session {
   credits_unlimited: boolean | null;
   credits_balance: number | null;
   context_window: number | null;
+  /** Context fill of the most recent API call — comparable to context_window, unlike the cumulative tokens_total. */
+  latest_context_tokens: number | null;
   total_turns: number;
   first_user_message: string | null;
   tokens_total: TokenTotals;

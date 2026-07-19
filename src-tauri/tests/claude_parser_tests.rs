@@ -43,6 +43,8 @@ fn dedupes_streamed_usage_by_message_id() {
     assert_eq!(t.reasoning_output_tokens, 0);
     assert_eq!(t.total_tokens, 6_475);
     assert_eq!(s.tokens_history.len(), 4);
+    // Last counted message (msg_ccc): input 40+50+2000 = 2090, output 60.
+    assert_eq!(s.latest_context_tokens, Some(2_150));
 }
 
 #[test]

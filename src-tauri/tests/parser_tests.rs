@@ -521,3 +521,50 @@ fn parses_current_chatgpt_subagent_and_rollback_metadata() {
         "2026-07-13T12:00:03.500+00:00"
     );
 }
+
+#[test]
+fn latest_context_tokens_tracks_last_call_not_cumulative() {
+    let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
+    // Final token_count's raw last_token_usage: input 119,667 + output 683.
+    assert_eq!(s.latest_context_tokens, Some(120_350));
+    // Sanity: cumulative total is far larger — the old context math was wrong.
+    assert!(s.tokens_total.total_tokens > 120_350);
+}
+
+#[test]
+fn new_turn_marks_stale_in_progress_turn_aborted() {
+    use codex_data_viewer_lib::parser::SessionParser;
+    let mut p = SessionParser::new(std::path::PathBuf::from("synthetic.jsonl"), false);
+    let apply = |p: &mut SessionParser, line: &str| p.apply_line(line).unwrap();
+
+    apply(
+        &mut p,
+        r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"s1","timestamp":"2026-01-01T00:00:00Z"}}"#,
+    );
+    apply(
+        &mut p,
+        r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.5"}}"#,
+    );
+    apply(
+        &mut p,
+        r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+    );
+    // No task_complete/turn_aborted for t1 — the next turn supersedes it.
+    apply(
+        &mut p,
+        r#"{"timestamp":"2026-01-01T00:01:00Z","type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5.5"}}"#,
+    );
+
+    let s = p.session.as_ref().unwrap();
+    assert_eq!(s.turns.len(), 2);
+    assert_eq!(s.turns[0].status, TurnStatus::Aborted);
+    assert_eq!(s.turns[1].status, TurnStatus::InProgress);
+
+    // A late task_complete for the superseded turn still wins.
+    apply(
+        &mut p,
+        r#"{"timestamp":"2026-01-01T00:01:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1"}}"#,
+    );
+    let s = p.session.as_ref().unwrap();
+    assert_eq!(s.turns[0].status, TurnStatus::Completed);
+}

@@ -267,6 +267,7 @@ impl SessionParser {
             credits_unlimited: None,
             credits_balance: None,
             context_window: None,
+            latest_context_tokens: None,
             total_turns: 0,
             first_user_message: None,
             tokens_total: TokenTotals::default(),
@@ -562,6 +563,11 @@ impl SessionParser {
             if let Some(cw) = context_window {
                 s.context_window = Some(cw);
             }
+            // Raw (pre-reconciliation) last call: input already includes
+            // cached tokens, so input+output approximates current context fill.
+            if let Some(last) = &last_usage {
+                s.latest_context_tokens = Some(last.input_tokens + last.output_tokens);
+            }
 
             // Compute the per-event contribution once, then attribute it
             // identically to the model bucket, the history point, and the
@@ -677,6 +683,15 @@ fn timestamp_field(payload: &Value, key: &str) -> Option<DateTime<Utc>> {
 fn ensure_turn_index(s: &mut Session, turn_id: &str) -> usize {
     if let Some(pos) = s.turns.iter().position(|t| t.turn_id == turn_id) {
         return pos;
+    }
+    // A new turn starting while an earlier one is still InProgress means the
+    // earlier one ended without a task_complete/turn_aborted record (common
+    // in interrupted or steered sessions) — otherwise it shows "in progress"
+    // forever. A late task_complete still overwrites this with Completed.
+    for turn in s.turns.iter_mut() {
+        if turn.status == TurnStatus::InProgress {
+            turn.status = TurnStatus::Aborted;
+        }
     }
     let index = s.turns.len() as u32 + 1;
     s.turns.push(crate::model::TurnInfo {
