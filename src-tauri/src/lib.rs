@@ -28,6 +28,8 @@ pub fn run() {
     let state_for_setup = state.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             list_sessions,

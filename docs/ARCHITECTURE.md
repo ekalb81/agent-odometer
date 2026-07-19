@@ -95,6 +95,10 @@ Date-scoped numbers come from the `sessions_in_range` command, which walks the i
 
 The `open_task_in_chatgpt` command launches the supported `codex://threads/<id>` deep link. For a subagent rollout, the UI opens its parent task because subagents are not ordinary sidebar tasks. Claude Code sessions have no deep link; the button is hidden for them.
 
+## Auto-update
+
+The app registers `tauri-plugin-updater` and `tauri-plugin-process`. `App.svelte` checks for updates once at startup (silently tolerant of failure: offline, dev builds, or a not-yet-public endpoint) and shows a banner offering a one-click download-and-install with relaunch. Update packages are the platform installers themselves (`createUpdaterArtifacts`), minisign-signed in CI via `TAURI_SIGNING_PRIVATE_KEY`; the public key and the `releases/latest/download/latest.json` endpoint live in `tauri.conf.json`, and `tauri-apps/tauri-action` assembles and uploads `latest.json` per release. Note: the endpoint only resolves once the repository's releases are public and the release is published (drafts don't serve `latest/download` URLs). The private key lives outside the repo (`~/.tauri/`) and in GitHub secrets; losing it orphans every installed copy's update chain.
+
 ## Dates and ranges
 
 UI `datetime-local` values are local wall-clock values and must be converted to UTC ISO strings before comparison with rollout timestamps.

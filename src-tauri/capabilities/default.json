@@ -1,13 +1,15 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the main window: core APIs + event listener for our session/config/rates push events.",
+  "description": "Default capability for the main window: core APIs + event listener for our session/config/rates push events, plus updater check/install and app relaunch after an update.",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "core:event:default",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
-    "core:webview:allow-internal-toggle-devtools"
+    "core:webview:allow-internal-toggle-devtools",
+    "updater:default",
+    "process:allow-restart"
   ]
 }

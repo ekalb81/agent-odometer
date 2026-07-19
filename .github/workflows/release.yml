@@ -84,6 +84,10 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater artifact signing (minisign). tauri-action also assembles
+          # and uploads latest.json for the in-app updater when these are set.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'Codex Data Viewer ${{ github.ref_name }}'
@@ -95,6 +99,8 @@ jobs:
             - **Windows**: the `.msi` (recommended) or `.exe`.
             - **macOS (Apple Silicon)**: the `.dmg`. Right-click → Open on first launch (the app isn't notarized yet).
             - **Linux**: the `.AppImage` (single file, no install) or `.deb` (Debian/Ubuntu).
+
+            Installed copies check for new releases on launch and offer a one-click update.
 
             ## Changes
 

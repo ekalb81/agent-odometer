@@ -12,6 +12,7 @@ A local activity viewer for agent CLI harnesses — the ChatGPT desktop app's Co
 - Estimate usage cost from an editable per-million-token rate card: plan credits and an OpenAI-API-rate USD estimate for Codex, Anthropic API USD rates for Claude Code.
 - Watch multiple session/archive roots and overlay current names from Codex's session index.
 - Reveal a session transcript in the platform file manager.
+- Check for new releases at launch and self-update in place (signed updater packages).
 
 All session processing is local. Session files can contain sensitive prompts, responses, tool output, and filesystem paths; do not share or commit them.
 
@@ -101,4 +102,4 @@ Tauri-generated schemas under `src-tauri/gen/schemas/` should not be edited manu
 
 ## Releases
 
-The GitHub release workflow builds Windows, Apple Silicon macOS, and Linux bundles for `v*` tags and creates a draft release for review. Platform signing/notarization must be configured separately before distributing trusted production installers.
+The GitHub release workflow builds Windows, Apple Silicon macOS, and Linux bundles for `v*` tags and creates a draft release for review. Updater packages are minisign-signed; the workflow requires the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` repository secrets, and `tauri-action` uploads the `latest.json` manifest the in-app updater reads from the latest published release. The in-app updater only finds releases once they are published (not drafts) and publicly reachable. Platform code signing/notarization must be configured separately before distributing trusted production installers.

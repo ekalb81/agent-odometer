@@ -22,7 +22,7 @@ Start with [README.md](README.md) for commands and [docs/ARCHITECTURE.md](docs/A
 - Keep Rust serialized structs and `src/lib/types.ts` synchronized. Add backward-compatible Serde defaults when persisted or historical data may omit a new field.
 - Event names are contracts: `session-updated` (payload: `SessionSummary`), `session-removed`, `config-updated`, and `rates-updated`. Update every producer and listener together. Full sessions travel only through `get_session_details`; keep `SessionSummary` free of `turns`/`tokens_history` — the split exists because full sessions measured ~200 MB across a real corpus.
 - Use the established Svelte 5 rune style (`$state`, `$derived`, `$effect`). Module-level rune state belongs in `*.svelte.ts` files.
-- Keep Tauri capabilities minimal. Do not add remote content, network access, shell execution, or broader capabilities without an explicit requirement and a security review.
+- Keep Tauri capabilities minimal. Do not add remote content, network access, shell execution, or broader capabilities without an explicit requirement and a security review. Current exceptions: `updater:default` and `process:allow-restart` exist solely for the in-app auto-updater.
 
 ## Parser and accounting invariants
 
