@@ -5,6 +5,8 @@ name: CI
 #   - the frontend builds (vite build)
 #   - the Rust crate compiles (cargo check)
 #   - all Rust tests pass (cargo test)
+# A parallel job measures Rust test coverage and uploads it to Codecov
+# (tokenless upload; only functional while the repository is public).
 #
 # Runs on Linux only — these checks are platform-independent and Linux is
 # the fastest GitHub-hosted runner. The release workflow handles the
@@ -79,4 +81,76 @@ jobs:
 
       - name: Rust tests
         working-directory: ./src-tauri
-        run: cargo test --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked 2>&1 | tee test-output.txt
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Rust test results"
+            echo
+            echo '| Suite | Result |'
+            echo '| --- | --- |'
+            awk '/^     Running |^   Doc-tests / { suite=$2; sub(/\(.*/, "", suite) }
+                 /^test result:/ { gsub(/;/, "", $0); printf("| `%s` | %s passed, %s failed |\n", suite, $4, $6) }' \
+              src-tauri/test-output.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache Cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: coverage-linux
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            build-essential \
+            pkg-config
+
+      - name: Coverage
+        working-directory: ./src-tauri
+        shell: bash
+        run: |
+          cargo llvm-cov --locked --lcov --output-path lcov.info
+          {
+            echo "## Rust coverage"
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        continue-on-error: true
+        with:
+          files: src-tauri/lcov.info
+          fail_ci_if_error: false

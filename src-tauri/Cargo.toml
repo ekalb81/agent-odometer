@@ -3,6 +3,7 @@ name = "agent-odometer"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.77"
+license = "MIT"
 
 [lib]
 name = "odometer_lib"

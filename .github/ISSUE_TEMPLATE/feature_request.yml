@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an improvement or a new harness/metric to support
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to see or do?
+      description: Describe the question you want Odometer to answer, or the workflow that's awkward today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution (optional)
+  - type: input
+    id: harness
+    attributes:
+      label: If this is a new harness/tool to track, which one?
+      placeholder: e.g. Gemini CLI — and where it stores session files, if you know

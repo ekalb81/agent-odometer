@@ -1,5 +1,12 @@
 # Odometer
 
+[![CI](https://github.com/ekalb81/agent-odometer/actions/workflows/ci.yml/badge.svg)](https://github.com/ekalb81/agent-odometer/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ekalb81/agent-odometer)](https://github.com/ekalb81/agent-odometer/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/ekalb81/agent-odometer/total)](https://github.com/ekalb81/agent-odometer/releases)
+[![Coverage](https://codecov.io/gh/ekalb81/agent-odometer/graph/badge.svg)](https://codecov.io/gh/ekalb81/agent-odometer)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
+
 **How far have your AI agents driven?** Odometer is a local desktop dashboard for your AI coding-agent usage. It reads the session files that [Codex](https://openai.com/codex) (the ChatGPT desktop app) and [Claude Code](https://claude.com/claude-code) already write to your machine and turns them into a searchable, sortable view of every session: what you asked, which models ran, how many tokens they consumed, and what that usage costs.
 
 ![Codex tab showing sessions, token totals, credits, and estimated API cost](docs/screenshots/codex-tab.png)
@@ -108,3 +115,11 @@ Generated schemas under `src-tauri/gen/schemas/` are not hand-edited. Both lockf
 ### Releases (maintainers)
 
 Pushing a `v*` tag builds Windows/macOS/Linux bundles and drafts a GitHub release. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets — and `tauri-action` uploads the `latest.json` manifest that installed copies poll. The in-app updater only sees releases that are published (not drafts) and publicly reachable. OS code signing/notarization is not configured yet.
+
+## Contributing
+
+Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-PR checklist, and the one hard rule: never include real session data. Security issues go through [private reporting](SECURITY.md).
+
+## License
+
+[MIT](LICENSE)

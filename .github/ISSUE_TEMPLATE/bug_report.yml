@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in Odometer is broken or showing wrong numbers
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! One important note: **never paste real session-file contents** — they contain your prompts and local paths. Redact or synthesize any sample data.
+  - type: input
+    id: version
+    attributes:
+      label: Odometer version
+      placeholder: e.g. 0.3.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS (Apple Silicon)
+        - Linux
+    validations:
+      required: true
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Which tab / harness is affected?
+      options:
+        - Codex
+        - Claude Code
+        - Both / app-wide
+        - Settings
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you see instead? Screenshots welcome (check them for sensitive session content first).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the Claude Code tab
+        2. Set a date filter
+        3. ...
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: Run from a terminal with `RUST_LOG=odometer_lib=info` and paste relevant lines. Odometer never logs message bodies, but skim before pasting.
+      render: text
