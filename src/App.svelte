@@ -16,21 +16,31 @@
   let activeView: View = $state('codex');
 
   // ---------------------------------------------------------------------------
-  // Auto-update: check once at startup; failures (offline, endpoint not yet
-  // public, dev build) are silent — updating is never load-bearing.
+  // Auto-update: check at startup, then hourly and whenever the window
+  // regains focus — the app tends to stay open for days. Failures (offline,
+  // dev build) are silent; updating is never load-bearing.
   // ---------------------------------------------------------------------------
   let availableUpdate = $state<Update | null>(null);
   let updateState = $state<'idle' | 'installing' | 'error'>('idle');
   let updateProgress = $state(0);
   let updateTotal = $state(0);
 
+  const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
+  let updateCheckTimer: ReturnType<typeof setInterval> | null = null;
+
   async function checkForUpdate() {
+    // Already found one (banner is showing) or mid-install: nothing to gain.
+    if (availableUpdate || updateState === 'installing') return;
     try {
       const update = await check();
       if (update) availableUpdate = update;
     } catch (e) {
       console.debug('update check skipped:', e);
     }
+  }
+
+  function onFocusCheck() {
+    void checkForUpdate();
   }
 
   async function installUpdate() {
@@ -155,10 +165,14 @@
     });
 
     void checkForUpdate();
+    updateCheckTimer = setInterval(() => void checkForUpdate(), UPDATE_CHECK_INTERVAL_MS);
+    window.addEventListener('focus', onFocusCheck);
   });
 
   onDestroy(() => {
     if (flushTimer !== null) clearTimeout(flushTimer);
+    if (updateCheckTimer !== null) clearInterval(updateCheckTimer);
+    window.removeEventListener('focus', onFocusCheck);
     unlistenUpdated?.();
     unlistenRemoved?.();
     unlistenScan?.();
