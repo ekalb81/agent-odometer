@@ -83,6 +83,13 @@ impl ScanCache {
             .map(|e| &e.session)
     }
 
+    /// Consumes the cache, handing ownership of the entries to the caller —
+    /// lets the scanner MOVE hits into the refreshed cache instead of holding
+    /// a third full copy of every session during the scan.
+    pub fn into_entries(self) -> HashMap<String, CacheEntry> {
+        self.entries
+    }
+
     /// Atomically writes a new cache built from `entries`.
     pub fn save(path: &Path, entries: HashMap<String, CacheEntry>) {
         let cache = Self {

@@ -7,7 +7,7 @@ use notify::EventKind;
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 /// Opaque handle that keeps the debouncer alive. Dropping it stops the watcher.
@@ -21,6 +21,18 @@ enum AnyParser {
     Codex(SessionParser),
     Claude(ClaudeSessionParser),
 }
+
+/// A parser plus when it last saw activity. Each parser holds a full Session
+/// accumulator (a second copy of the session besides AppState), so idle
+/// entries are evicted; the only cost of eviction is one full re-parse if
+/// that file ever changes again.
+struct ParserSlot {
+    parser: AnyParser,
+    last_touch: Instant,
+}
+
+/// Idle parsers are dropped after this long without file activity.
+const PARSER_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 
 impl AnyParser {
     fn parse_to_end(&mut self) -> anyhow::Result<bool> {
@@ -53,7 +65,7 @@ pub fn start(
     claude_session_roots: Vec<PathBuf>,
     session_index_path: PathBuf,
 ) -> anyhow::Result<WatcherHandle> {
-    let parsers: Arc<DashMap<PathBuf, AnyParser>> = Arc::new(DashMap::new());
+    let parsers: Arc<DashMap<PathBuf, ParserSlot>> = Arc::new(DashMap::new());
     let archive_roots_arc: Arc<Vec<PathBuf>> = Arc::new(archive_roots.clone());
     let claude_roots_arc: Arc<Vec<PathBuf>> = Arc::new(claude_session_roots.clone());
     let session_index_path_arc: Arc<PathBuf> = Arc::new(session_index_path.clone());
@@ -109,8 +121,8 @@ pub fn start(
 
                     if is_remove(&kind) {
                         // Look up the session id before dropping the parser.
-                        if let Some((_, parser)) = parsers_cb.remove(path) {
-                            if let Some(session) = parser.session() {
+                        if let Some((_, slot)) = parsers_cb.remove(path) {
+                            if let Some(session) = slot.parser.session() {
                                 let id = session.id.clone();
                                 state_cb.sessions.remove(&id);
                                 if let Err(e) = app_cb.emit("session-removed", &id) {
@@ -124,14 +136,19 @@ pub fn start(
                         let archived = archive_roots_cb.iter().any(|root| path.starts_with(root));
 
                         let mut entry = parsers_cb.entry(path.clone()).or_insert_with(|| {
-                            if is_claude {
+                            let parser = if is_claude {
                                 AnyParser::Claude(ClaudeSessionParser::new(path.clone()))
                             } else {
                                 AnyParser::Codex(SessionParser::new(path.clone(), archived))
+                            };
+                            ParserSlot {
+                                parser,
+                                last_touch: Instant::now(),
                             }
                         });
+                        entry.last_touch = Instant::now();
 
-                        match entry.parse_to_end() {
+                        match entry.parser.parse_to_end() {
                             Ok(_) => {}
                             Err(e) => {
                                 tracing::warn!("parse error for {:?}: {}", path, e);
@@ -139,7 +156,7 @@ pub fn start(
                             }
                         }
 
-                        if let Some(session) = entry.session() {
+                        if let Some(session) = entry.parser.session() {
                             let summary = SessionSummary::of(session);
                             state_cb
                                 .sessions
@@ -151,6 +168,11 @@ pub fn start(
                     }
                 }
             }
+
+            // Sweep idle parsers so long-running apps don't hold a second
+            // copy of every session ever touched. AppState keeps the parsed
+            // session; only the incremental byte-offset state is lost.
+            parsers_cb.retain(|_, slot| slot.last_touch.elapsed() < PARSER_IDLE_TTL);
         },
     )
     .map_err(|e| anyhow::anyhow!("failed to create debouncer: {}", e))?;

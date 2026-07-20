@@ -268,10 +268,10 @@
   <!-- Main content. Harness views stay mounted so filters/sort survive tab switches. -->
   <main class="flex-1 overflow-hidden">
     <div class="h-full {activeView === 'codex' ? '' : 'hidden'}">
-      <SessionsView harness="codex" />
+      <SessionsView harness="codex" active={activeView === 'codex'} />
     </div>
     <div class="h-full {activeView === 'claude' ? '' : 'hidden'}">
-      <SessionsView harness="claude_code" />
+      <SessionsView harness="claude_code" active={activeView === 'claude'} />
     </div>
     {#if activeView === 'settings'}
       <SettingsView />

@@ -69,12 +69,16 @@ pub fn scan_all<F, P>(
     let total = work.len();
     on_progress(0, total);
 
-    let cache = cache_path.map(ScanCache::load).unwrap_or_default();
+    let loaded = cache_path.map(ScanCache::load).unwrap_or_default();
+    let loaded_len = loaded.len();
+    // Hits are MOVED out of here (and into next_entries) rather than cloned,
+    // so at most two full copies of the corpus exist during a scan — the
+    // cache being rebuilt and the sessions handed to the caller.
+    let cache_entries = Mutex::new(loaded.into_entries());
     let done = AtomicUsize::new(0);
     let hits = AtomicUsize::new(0);
-    // Entries for the refreshed cache, collected as files finish. The stamp
-    // is taken BEFORE parsing so a file that grows mid-parse looks changed
-    // on the next launch rather than serving a stale cache entry.
+    // The stamp is taken BEFORE parsing so a file that grows mid-parse looks
+    // changed on the next launch rather than serving a stale cache entry.
     let next_entries: Mutex<std::collections::HashMap<String, CacheEntry>> =
         Mutex::new(std::collections::HashMap::new());
 
@@ -82,10 +86,21 @@ pub fn scan_all<F, P>(
         let key = path.to_string_lossy().into_owned();
         let stamp = scan_cache::file_stamp(path);
 
-        let session = match stamp.and_then(|(size, mtime)| cache.lookup(&key, size, mtime)) {
-            Some(cached) => {
+        let taken = cache_entries.lock().unwrap().remove(&key);
+        let cached = match (taken, stamp) {
+            (Some(entry), Some((size, mtime_ms)))
+                if entry.size == size && entry.mtime_ms == mtime_ms =>
+            {
+                Some(entry)
+            }
+            // Stamp mismatch or unreadable file: the stale entry just drops.
+            _ => None,
+        };
+
+        let (session, entry) = match cached {
+            Some(entry) => {
                 hits.fetch_add(1, Ordering::Relaxed);
-                Some(cached.clone())
+                (Some(entry.session.clone()), Some(entry))
             }
             None => {
                 let result = match kind {
@@ -93,26 +108,27 @@ pub fn scan_all<F, P>(
                     FileKind::Claude => crate::claude_parser::parse_file(path),
                 };
                 match result {
-                    Ok(session) => session,
+                    Ok(Some(session)) => {
+                        let entry = stamp.map(|(size, mtime_ms)| CacheEntry {
+                            size,
+                            mtime_ms,
+                            session: session.clone(),
+                        });
+                        (Some(session), entry)
+                    }
+                    Ok(None) => (None, None),
                     Err(e) => {
                         tracing::warn!("failed to parse {:?}: {}", path, e);
-                        None
+                        (None, None)
                     }
                 }
             }
         };
 
+        if let Some(entry) = entry.filter(|_| cache_path.is_some()) {
+            next_entries.lock().unwrap().insert(key, entry);
+        }
         if let Some(session) = session {
-            if let Some((size, mtime_ms)) = stamp.filter(|_| cache_path.is_some()) {
-                next_entries.lock().unwrap().insert(
-                    key,
-                    CacheEntry {
-                        size,
-                        mtime_ms,
-                        session: session.clone(),
-                    },
-                );
-            }
             on_session(session);
         }
 
@@ -125,7 +141,7 @@ pub fn scan_all<F, P>(
         // Rewrite only when something actually changed: a parse happened
         // (miss) or entries disappeared relative to the loaded cache.
         let dirty =
-            hits.load(Ordering::Relaxed) != next_entries.len() || next_entries.len() != cache.len();
+            hits.load(Ordering::Relaxed) != next_entries.len() || next_entries.len() != loaded_len;
         if dirty {
             ScanCache::save(cache_path, next_entries);
         }

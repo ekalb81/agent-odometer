@@ -9,7 +9,7 @@
   import type { FilterState } from './Filters.svelte';
   import RowDrawer from './RowDrawer.svelte';
 
-  let { harness = 'codex' as Harness }: { harness?: Harness } = $props();
+  let { harness = 'codex' as Harness, active = true }: { harness?: Harness; active?: boolean } = $props();
 
   const fmt = new Intl.NumberFormat();
   const fmtCredit = (amount: number) =>
@@ -55,8 +55,20 @@
   }
 
   function isPulsing(lastUpdatedAt: number): boolean {
+    // pulseGen is bumped once ~2s after the last store change so highlights
+    // expire even when no further updates trigger a re-render.
+    void pulseGen;
     return Date.now() - lastUpdatedAt < 2000;
   }
+
+  let pulseGen = $state(0);
+  $effect(() => {
+    void sessionsStore.map;
+    const t = setTimeout(() => {
+      pulseGen += 1;
+    }, 2100);
+    return () => clearTimeout(t);
+  });
 
   // ---------------------------------------------------------------------------
   // Filter state
@@ -108,10 +120,12 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Filtered + sorted list
+  // Filtered + sorted list. All list computation is gated on `active`: the
+  // inactive harness tab stays mounted (so its filters survive switching)
+  // but must not re-filter/re-sort/re-price on every live update.
   // ---------------------------------------------------------------------------
   const allSessions = $derived(
-    [...sessionsStore.map.values()].filter((s) => s.harness === harness),
+    active ? [...sessionsStore.map.values()].filter((s) => s.harness === harness) : [],
   );
 
   // Convert datetime-local strings (local time) to UTC ISO once, so the rest
@@ -175,8 +189,10 @@
   $effect(() => {
     const from = fromUtc;
     const to = toUtc;
-    // Depend on the session map so live session updates refresh range data.
+    // Depend on the session map so live session updates refresh range data;
+    // skip entirely while this tab is hidden.
     void sessionsStore.map;
+    if (!active) return;
     if (!from && !to) {
       rangeTotals = {};
       return;
@@ -317,10 +333,13 @@
   // ---------------------------------------------------------------------------
   // Drawer state — the table only holds summaries, so the full session
   // (turns, token history) is fetched on open and refreshed when the
-  // session's summary is upserted by a live event.
+  // session's summary is upserted by a live event. The first fetch for a
+  // session is immediate; refreshes are debounced so a busy live session
+  // doesn't re-serialize its full history several times a second.
   // ---------------------------------------------------------------------------
   let openSessionId = $state<string | null>(null);
   let openSession = $state<Session | null>(null);
+  let detailsFetchTimer: ReturnType<typeof setTimeout> | null = null;
 
   $effect(() => {
     const id = openSessionId;
@@ -331,13 +350,25 @@
       return;
     }
     let cancelled = false;
-    getSessionDetails(id)
-      .then((s) => {
-        if (!cancelled && openSessionId === id) openSession = s;
-      })
-      .catch((e) => console.error('get_session_details failed:', e));
+    const fetchDetails = () => {
+      getSessionDetails(id)
+        .then((s) => {
+          if (!cancelled && openSessionId === id) openSession = s;
+        })
+        .catch((e) => console.error('get_session_details failed:', e));
+    };
+    if (openSession?.id === id) {
+      // Refresh of an already-open session: debounce.
+      detailsFetchTimer = setTimeout(fetchDetails, 400);
+    } else {
+      fetchDetails();
+    }
     return () => {
       cancelled = true;
+      if (detailsFetchTimer !== null) {
+        clearTimeout(detailsFetchTimer);
+        detailsFetchTimer = null;
+      }
     };
   });
 
