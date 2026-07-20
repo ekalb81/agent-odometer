@@ -114,7 +114,14 @@ Generated schemas under `src-tauri/gen/schemas/` are not hand-edited. Both lockf
 
 ### Releases (maintainers)
 
-Pushing a `v*` tag builds Windows/macOS/Linux bundles and drafts a GitHub release. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets — and `tauri-action` uploads the `latest.json` manifest that installed copies poll. The in-app updater only sees releases that are published (not drafts) and publicly reachable. OS code signing/notarization is not configured yet.
+Cutting a release, in order:
+
+```sh
+gh release create vX.Y.Z --draft --title "Odometer vX.Y.Z" --notes "…"   # pre-create the draft
+git tag vX.Y.Z main && git push origin vX.Y.Z                            # triggers the build
+```
+
+The workflow builds Windows/macOS/Linux bundles and uploads them (plus updater `.sig` files and `latest.json`) into the existing draft; review and publish it when the run completes. The pre-created draft matters: since the repository went public, `GITHUB_TOKEN` can upload assets to an existing release but is blocked from creating one. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets. The in-app updater follows the latest published release. OS code signing/notarization is not configured yet.
 
 ## Contributing
 
