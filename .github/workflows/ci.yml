@@ -15,7 +15,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 # Cancel in-progress runs when a new commit lands on the same ref.
