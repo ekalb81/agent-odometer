@@ -5,63 +5,28 @@
   import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, addDefenderExclusions } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
+  import { updaterStore } from './lib/stores/updater.svelte';
   import { rates } from './lib/stores/rates';
   import { config } from './lib/stores/config';
-  import { check, type Update } from '@tauri-apps/plugin-updater';
-  import { relaunch } from '@tauri-apps/plugin-process';
-  import type { UnlistenFn } from '@tauri-apps/api/event';
+  import { getVersion } from '@tauri-apps/api/app';
   import type { SessionSummary } from './lib/types';
+  import type { UnlistenFn } from '@tauri-apps/api/event';
 
   type View = 'codex' | 'claude' | 'settings';
   let activeView: View = $state('codex');
+  let appVersion = $state('');
 
   // ---------------------------------------------------------------------------
   // Auto-update: check at startup, then hourly and whenever the window
-  // regains focus — the app tends to stay open for days. Failures (offline,
-  // dev build) are silent; updating is never load-bearing.
+  // regains focus — the app tends to stay open for days. State lives in
+  // updaterStore so Settings can offer a manual check against the same
+  // update object.
   // ---------------------------------------------------------------------------
-  let availableUpdate = $state<Update | null>(null);
-  let updateState = $state<'idle' | 'installing' | 'error'>('idle');
-  let updateProgress = $state(0);
-  let updateTotal = $state(0);
-
   const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
   let updateCheckTimer: ReturnType<typeof setInterval> | null = null;
 
-  async function checkForUpdate() {
-    // Already found one (banner is showing) or mid-install: nothing to gain.
-    if (availableUpdate || updateState === 'installing') return;
-    try {
-      const update = await check();
-      if (update) availableUpdate = update;
-    } catch (e) {
-      console.debug('update check skipped:', e);
-    }
-  }
-
   function onFocusCheck() {
-    void checkForUpdate();
-  }
-
-  async function installUpdate() {
-    if (!availableUpdate || updateState === 'installing') return;
-    updateState = 'installing';
-    updateProgress = 0;
-    updateTotal = 0;
-    try {
-      await availableUpdate.downloadAndInstall((event) => {
-        if (event.event === 'Started') {
-          updateTotal = event.data.contentLength ?? 0;
-        } else if (event.event === 'Progress') {
-          updateProgress += event.data.chunkLength;
-        }
-      });
-      // Windows exits into the installer on its own; elsewhere relaunch now.
-      await relaunch();
-    } catch (e) {
-      console.error('update install failed:', e);
-      updateState = 'error';
-    }
+    void updaterStore.checkNow();
   }
 
   // ---------------------------------------------------------------------------
@@ -164,8 +129,9 @@
       }
     });
 
-    void checkForUpdate();
-    updateCheckTimer = setInterval(() => void checkForUpdate(), UPDATE_CHECK_INTERVAL_MS);
+    void getVersion().then((v) => (appVersion = v)).catch(() => {});
+    void updaterStore.checkNow();
+    updateCheckTimer = setInterval(() => void updaterStore.checkNow(), UPDATE_CHECK_INTERVAL_MS);
     window.addEventListener('focus', onFocusCheck);
   });
 
@@ -183,24 +149,24 @@
 
 <div class="flex flex-col h-screen bg-slate-900 text-slate-100">
   <!-- Update banner -->
-  {#if availableUpdate}
+  {#if updaterStore.available}
     <div class="flex items-center justify-center gap-3 px-4 py-1.5 bg-sky-900/60 border-b border-sky-700/60 text-sm text-sky-100 flex-shrink-0">
-      {#if updateState === 'installing'}
+      {#if updaterStore.phase === 'installing'}
         <span>
-          Downloading v{availableUpdate.version}…
-          {#if updateTotal > 0}
-            {Math.min(100, Math.round((updateProgress / updateTotal) * 100))}%
+          Downloading v{updaterStore.available.version}…
+          {#if updaterStore.total > 0}
+            {Math.min(100, Math.round((updaterStore.progress / updaterStore.total) * 100))}%
           {/if}
         </span>
       {:else}
-        <span>Version {availableUpdate.version} is available.</span>
+        <span>Version {updaterStore.available.version} is available.</span>
         <button
-          onclick={installUpdate}
+          onclick={() => void updaterStore.install()}
           class="px-2.5 py-0.5 rounded bg-sky-600 hover:bg-sky-500 text-white text-xs font-medium transition-colors"
         >
           Update &amp; restart
         </button>
-        {#if updateState === 'error'}
+        {#if updaterStore.phase === 'error'}
           <span class="text-xs text-red-300">Install failed — see console; you can retry.</span>
         {/if}
       {/if}
@@ -235,7 +201,12 @@
 
   <!-- Top bar -->
   <header class="flex items-center justify-between px-4 py-3 border-b-2 border-slate-700 bg-slate-800 shadow-md flex-shrink-0">
-    <span class="font-semibold text-lg tracking-tight text-white">Odometer</span>
+    <span class="font-semibold text-lg tracking-tight text-white">
+      Odometer
+      {#if appVersion}
+        <span class="ml-1.5 text-xs font-normal text-slate-500 align-middle">v{appVersion}</span>
+      {/if}
+    </span>
 
     <nav class="flex gap-1 bg-slate-900 rounded-lg p-1 border border-slate-700">
       <button

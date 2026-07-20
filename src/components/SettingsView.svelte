@@ -1,8 +1,16 @@
 <script lang="ts">
   import { config } from '../lib/stores/config';
   import { rates } from '../lib/stores/rates';
+  import { updaterStore } from '../lib/stores/updater.svelte';
   import { setConfig, setRates, getBundledRates, addDefenderExclusions } from '../lib/ipc';
+  import { getVersion } from '@tauri-apps/api/app';
+  import { onMount } from 'svelte';
   import type { RateCard, ModelRate } from '../lib/types';
+
+  let appVersion = $state('');
+  onMount(() => {
+    void getVersion().then((v) => (appVersion = v)).catch(() => {});
+  });
 
   // ---------------------------------------------------------------------------
   // Editable watched roots — local copies diverge from the store until saved.
@@ -323,6 +331,44 @@
 </script>
 
 <div class="flex flex-col gap-6 p-6 overflow-auto h-full">
+
+  <!-- About & updates -->
+  <section>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">About &amp; updates</h2>
+    <div class="flex items-center gap-3 flex-wrap text-sm text-slate-300">
+      <span>Odometer <span class="font-mono">{appVersion ? `v${appVersion}` : '…'}</span></span>
+      <a
+        href="https://github.com/ekalb81/agent-odometer/releases"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="text-xs text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors"
+      >release notes</a>
+      {#if updaterStore.available}
+        <button
+          onclick={() => void updaterStore.install()}
+          disabled={updaterStore.phase === 'installing'}
+          class="px-3 py-1.5 text-xs font-medium rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white transition-colors"
+        >
+          {updaterStore.phase === 'installing'
+            ? `Downloading v${updaterStore.available.version}…`
+            : `Update to v${updaterStore.available.version} & restart`}
+        </button>
+      {:else}
+        <button
+          onclick={() => void updaterStore.checkNow(true)}
+          disabled={updaterStore.phase === 'checking'}
+          class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40 text-slate-200 transition-colors"
+        >
+          {updaterStore.phase === 'checking' ? 'Checking…' : 'Check for updates'}
+        </button>
+        {#if updaterStore.lastManualResult === 'uptodate'}
+          <span class="text-xs text-emerald-400">You're on the latest version.</span>
+        {:else if updaterStore.lastManualResult === 'failed'}
+          <span class="text-xs text-red-400">Check failed: {updaterStore.error}</span>
+        {/if}
+      {/if}
+    </div>
+  </section>
 
   <!-- Editable watched roots -->
   <section>
