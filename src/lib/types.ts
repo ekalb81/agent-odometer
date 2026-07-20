@@ -117,6 +117,8 @@ export interface ScanStatus {
   done: number;
   total: number;
   complete: boolean;
+  /** Wall-clock duration of the last completed scan; null while running. */
+  elapsed_ms: number | null;
 }
 
 export interface Config {

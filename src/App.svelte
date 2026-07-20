@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, addDefenderExclusions } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
   import { rates } from './lib/stores/rates';
@@ -52,6 +52,40 @@
       console.error('update install failed:', e);
       updateState = 'error';
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Defender-exclusion suggestion: Windows scans every session file on read,
+  // which usually dominates a slow first load. Offer a one-click, UAC-gated
+  // exclusion of the session folders when a scan was slow; fully dismissible.
+  // ---------------------------------------------------------------------------
+  const SLOW_SCAN_MS = 20_000;
+  const DEFENDER_DISMISSED_KEY = 'defenderPromptDismissed';
+  const isWindows = navigator.userAgent.includes('Windows');
+  let defenderDismissed = $state(localStorage.getItem(DEFENDER_DISMISSED_KEY) === '1');
+  let defenderRequested = $state(false);
+  let defenderError = $state<string | null>(null);
+
+  const showDefenderBanner = $derived(
+    isWindows &&
+      !defenderDismissed &&
+      scanStore.status.complete &&
+      (scanStore.status.elapsed_ms ?? 0) > SLOW_SCAN_MS,
+  );
+
+  async function requestDefenderExclusion() {
+    defenderError = null;
+    try {
+      await addDefenderExclusions();
+      defenderRequested = true;
+    } catch (e) {
+      defenderError = String(e);
+    }
+  }
+
+  function dismissDefenderBanner() {
+    defenderDismissed = true;
+    localStorage.setItem(DEFENDER_DISMISSED_KEY, '1');
   }
 
   let unlistenUpdated: UnlistenFn | null = null;
@@ -154,6 +188,32 @@
         </button>
         {#if updateState === 'error'}
           <span class="text-xs text-red-300">Install failed — see console; you can retry.</span>
+        {/if}
+      {/if}
+    </div>
+  {/if}
+
+  <!-- Defender-exclusion suggestion (Windows, slow scan only) -->
+  {#if showDefenderBanner}
+    <div class="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1.5 bg-slate-800 border-b border-slate-700 text-sm text-slate-300 flex-shrink-0">
+      {#if defenderRequested}
+        <span>Approve the Windows security prompt to finish adding the exclusions. Takes effect next launch.</span>
+        <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded text-xs text-slate-400 hover:text-slate-200 transition-colors">Done</button>
+      {:else}
+        <span>
+          That scan took {Math.round((scanStore.status.elapsed_ms ?? 0) / 1000)}s — antivirus scanning of session files is usually the biggest cost.
+          You can exclude your session folders (Codex + Claude Code data only) from Windows Defender.
+        </span>
+        <button
+          onclick={requestDefenderExclusion}
+          class="px-2.5 py-0.5 rounded bg-slate-600 hover:bg-slate-500 text-white text-xs font-medium transition-colors"
+          title="Opens a Windows administrator prompt; excluded folders are no longer scanned for threats"
+        >
+          Add exclusions…
+        </button>
+        <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded text-xs text-slate-400 hover:text-slate-200 transition-colors">No thanks</button>
+        {#if defenderError}
+          <span class="text-xs text-red-300">{defenderError}</span>
         {/if}
       {/if}
     </div>

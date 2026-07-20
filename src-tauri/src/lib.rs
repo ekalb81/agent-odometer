@@ -11,8 +11,9 @@ pub mod store;
 pub mod watcher;
 
 use commands::{
-    get_bundled_rates, get_config, get_rates, get_scan_status, get_session_details, list_sessions,
-    open_task_in_chatgpt, reveal_in_file_manager, sessions_in_range, set_config, set_rates,
+    add_defender_exclusions, get_bundled_rates, get_config, get_rates, get_scan_status,
+    get_session_details, list_sessions, open_task_in_chatgpt, reveal_in_file_manager,
+    sessions_in_range, set_config, set_rates,
 };
 use config::Config;
 use std::sync::Arc;
@@ -44,6 +45,7 @@ pub fn run() {
             set_rates,
             reveal_in_file_manager,
             open_task_in_chatgpt,
+            add_defender_exclusions,
         ])
         .setup(move |app| {
             let config = Config::load().unwrap_or_else(|e| {

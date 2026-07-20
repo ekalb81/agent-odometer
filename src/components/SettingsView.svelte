@@ -1,7 +1,7 @@
 <script lang="ts">
   import { config } from '../lib/stores/config';
   import { rates } from '../lib/stores/rates';
-  import { setConfig, setRates, getBundledRates } from '../lib/ipc';
+  import { setConfig, setRates, getBundledRates, addDefenderExclusions } from '../lib/ipc';
   import type { RateCard, ModelRate } from '../lib/types';
 
   // ---------------------------------------------------------------------------
@@ -89,6 +89,24 @@
     rootsSavedAt = null;
     rootsSaveError = null;
     // Let the $effect above re-sync from the store.
+  }
+
+  // ---------------------------------------------------------------------------
+  // Performance: Windows Defender exclusions (Windows only).
+  // ---------------------------------------------------------------------------
+  const isWindows = navigator.userAgent.includes('Windows');
+  let defenderRequested = $state(false);
+  let defenderError = $state<string | null>(null);
+
+  async function handleDefenderExclusions() {
+    defenderError = null;
+    defenderRequested = false;
+    try {
+      await addDefenderExclusions();
+      defenderRequested = true;
+    } catch (e) {
+      defenderError = String(e);
+    }
   }
 
   async function saveRoots() {
@@ -455,6 +473,34 @@
       <p class="text-xs text-amber-400">Warning: duplicate paths detected in the lists above.</p>
     {/if}
   </section>
+
+  {#if isWindows}
+    <!-- Performance -->
+    <section>
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">Performance</h2>
+      <p class="text-xs text-slate-500 mb-2 max-w-2xl">
+        Windows Defender scans every session file as it's read, which usually dominates the first
+        load of a large history. You can exclude the watched session folders above from Defender's
+        real-time scanning. Trade-off: files in those folders are no longer scanned for threats —
+        they normally contain only text session logs written by Codex and Claude Code. Windows will
+        ask for administrator approval.
+      </p>
+      <div class="flex items-center gap-3 flex-wrap">
+        <button
+          onclick={handleDefenderExclusions}
+          class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
+        >
+          Exclude session folders from Defender…
+        </button>
+        {#if defenderRequested}
+          <span class="text-xs text-emerald-400">Requested — approve the Windows security prompt.</span>
+        {/if}
+        {#if defenderError}
+          <span class="text-xs text-red-400">{defenderError}</span>
+        {/if}
+      </div>
+    </section>
+  {/if}
 
   <!-- Rate card editor -->
   {#if $rates}

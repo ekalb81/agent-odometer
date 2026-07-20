@@ -31,6 +31,11 @@ export function getScanStatus(): Promise<ScanStatus> {
   return invoke<ScanStatus>('get_scan_status');
 }
 
+/** Windows only: opens the UAC flow to exclude session folders from Defender scanning. */
+export function addDefenderExclusions(): Promise<void> {
+  return invoke<void>('add_defender_exclusions');
+}
+
 export function getConfig(): Promise<Config> {
   return invoke<Config>('get_config');
 }

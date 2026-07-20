@@ -134,6 +134,7 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
                             done,
                             total,
                             complete: false,
+                            elapsed_ms: None,
                         },
                     );
                 }
@@ -152,12 +153,15 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
         }
 
         state.scanned.store(true, Ordering::Release);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        state.scan_elapsed_ms.store(elapsed_ms, Ordering::Release);
         let _ = app.emit(
             "scan-progress",
             &ScanStatus {
                 done: state.scan_done.load(Ordering::Acquire),
                 total: state.scan_total.load(Ordering::Acquire),
                 complete: true,
+                elapsed_ms: Some(elapsed_ms),
             },
         );
         tracing::info!(
@@ -175,6 +179,8 @@ pub struct ScanStatus {
     pub done: usize,
     pub total: usize,
     pub complete: bool,
+    /// Wall-clock duration of the last completed scan; None while running.
+    pub elapsed_ms: Option<u64>,
 }
 
 /// Returns the current bulk-scan progress. The frontend calls this once on
@@ -182,10 +188,14 @@ pub struct ScanStatus {
 /// and then follows the "scan-progress" events.
 #[tauri::command]
 pub fn get_scan_status(state: State<'_, Arc<AppState>>) -> ScanStatus {
+    let complete = state.scanned.load(Ordering::Acquire);
     ScanStatus {
         done: state.scan_done.load(Ordering::Acquire),
         total: state.scan_total.load(Ordering::Acquire),
-        complete: state.scanned.load(Ordering::Acquire),
+        complete,
+        elapsed_ms: complete
+            .then(|| state.scan_elapsed_ms.load(Ordering::Acquire))
+            .filter(|ms| *ms > 0),
     }
 }
 
@@ -303,6 +313,53 @@ fn valid_session_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+/// Escapes a path for a single-quoted PowerShell string literal.
+#[cfg(windows)]
+fn ps_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "''"))
+}
+
+/// Opens Windows' UAC consent flow to add the configured session roots as
+/// Windows Defender real-time-scanning path exclusions. Strictly opt-in from
+/// the UI: the user clicks the button AND approves the elevation prompt, and
+/// only the session-data directories are excluded — never the app itself.
+/// Returns Ok once the elevation prompt was launched; the user may still
+/// decline it there.
+#[tauri::command]
+pub fn add_defender_exclusions() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let config = Config::load().map_err(|e| e.to_string())?;
+        let paths: Vec<String> = config
+            .session_roots
+            .iter()
+            .chain(config.archive_roots.iter())
+            .chain(config.claude_session_roots.iter())
+            .filter(|p| p.exists())
+            .map(|p| ps_quote(&p.to_string_lossy()))
+            .collect();
+        if paths.is_empty() {
+            return Err("no existing session folders to exclude".into());
+        }
+
+        // Elevation happens through Start-Process -Verb RunAs, so Windows
+        // itself asks the user for consent; nothing runs silently.
+        let inner = format!("Add-MpPreference -ExclusionPath {}", paths.join(","));
+        let arg_list = ps_quote(&format!("-NoProfile -Command {inner}"));
+        let outer = format!("Start-Process powershell -Verb RunAs -ArgumentList {arg_list}");
+
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &outer])
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("Defender exclusions are only applicable on Windows".into())
+    }
 }
 
 #[cfg(test)]
