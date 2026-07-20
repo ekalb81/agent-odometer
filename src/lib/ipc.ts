@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, Config, RateCard } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -24,6 +24,11 @@ export function sessionsInRange(
   to: string | null,
 ): Promise<Record<string, RangeTotals>> {
   return invoke<Record<string, RangeTotals>>('sessions_in_range', { from, to });
+}
+
+/** Current bulk-scan progress (call once on mount, then follow events). */
+export function getScanStatus(): Promise<ScanStatus> {
+  return invoke<ScanStatus>('get_scan_status');
 }
 
 export function getConfig(): Promise<Config> {
@@ -64,6 +69,10 @@ export function onSessionUpdated(cb: (session: SessionSummary) => void): Promise
 
 export function onSessionRemoved(cb: (sessionId: string) => void): Promise<UnlistenFn> {
   return listen<string>('session-removed', (event) => cb(event.payload));
+}
+
+export function onScanProgress(cb: (status: ScanStatus) => void): Promise<UnlistenFn> {
+  return listen<ScanStatus>('scan-progress', (event) => cb(event.payload));
 }
 
 export function onRatesUpdated(cb: (rates: RateCard) => void): Promise<UnlistenFn> {

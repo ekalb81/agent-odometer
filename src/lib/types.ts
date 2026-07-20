@@ -112,6 +112,13 @@ export interface SessionSummary {
   buckets: TierBucket[];
 }
 
+/** Bulk-scan progress, from get_scan_status and "scan-progress" events. */
+export interface ScanStatus {
+  done: number;
+  total: number;
+  complete: boolean;
+}
+
 export interface Config {
   session_roots: string[];
   archive_roots: string[];

@@ -4,13 +4,14 @@ pub mod config;
 pub mod model;
 pub mod parser;
 pub mod rates;
+pub mod scan_cache;
 pub mod scanner;
 pub mod session_index;
 pub mod store;
 pub mod watcher;
 
 use commands::{
-    get_bundled_rates, get_config, get_rates, get_session_details, list_sessions,
+    get_bundled_rates, get_config, get_rates, get_scan_status, get_session_details, list_sessions,
     open_task_in_chatgpt, reveal_in_file_manager, sessions_in_range, set_config, set_rates,
 };
 use config::Config;
@@ -35,6 +36,7 @@ pub fn run() {
             list_sessions,
             get_session_details,
             sessions_in_range,
+            get_scan_status,
             get_config,
             set_config,
             get_rates,

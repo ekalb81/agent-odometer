@@ -15,7 +15,7 @@ The frontend starts at `src/main.ts` and `src/App.svelte`. The native process st
 
 1. `Config::load` reads the platform config file or creates defaults.
 2. `watcher::start` begins watching all configured roots immediately, so changes during the initial scan are not missed.
-3. `scanner::scan_all` bulk-loads existing sessions on a background thread, parsing files in parallel (rayon) and emitting a `session-updated` summary per file — the window is interactive immediately and the list populates progressively.
+3. `scanner::scan_all` bulk-loads existing sessions on a background thread, parsing files in parallel (rayon) and emitting a `session-updated` summary per file — the window is interactive immediately and the list populates progressively. A persistent scan cache (`scan_cache.rs`, stored under the OS cache directory and keyed by file size+mtime, versioned by app release) serves unchanged files without re-reading them, so only the first launch pays the full read cost. Progress flows to the UI via throttled `scan-progress` events and the `get_scan_status` command.
 4. `parser::parse_file` (Codex) or `claude_parser::parse_file` (Claude Code) builds a `Session` for each file, stored in `AppState.sessions` keyed by session ID. When duplicate IDs exist under multiple roots, the parallel scan's winner is nondeterministic.
 5. `session_index::read` overlays current thread names from Codex's session index after the scan.
 6. `App.svelte` invokes `list_sessions`, `get_config`, and `get_rates`, then subscribes to update/removal events.
@@ -31,7 +31,8 @@ Saving settings persists the new config, stops the old watcher, clears state, re
 | `src-tauri/src/model.rs` | Serialized session, harness, turn-status, and token wire models |
 | `src-tauri/src/parser.rs` | Full and incremental Codex rollout JSONL parsing |
 | `src-tauri/src/claude_parser.rs` | Full and incremental Claude Code session JSONL parsing |
-| `src-tauri/src/scanner.rs` | Recursive JSONL discovery and initial parse |
+| `src-tauri/src/scanner.rs` | Recursive JSONL discovery, cached parallel initial parse |
+| `src-tauri/src/scan_cache.rs` | Persistent parsed-session cache keyed by file size+mtime |
 | `src-tauri/src/watcher.rs` | Debounced file watching, per-harness parser dispatch, frontend events |
 | `src-tauri/src/session_index.rs` | Thread-name overlay from `session_index.jsonl` |
 | `src-tauri/src/commands.rs` | Tauri command boundary |
@@ -82,8 +83,11 @@ The rate card prices Codex models in credits and Claude models in USD; `currenci
 | --- | --- | --- |
 | `session-updated` | `SessionSummary` | Insert or replace a session in the list |
 | `session-removed` | session ID | Remove a session after its rollout disappears |
+| `scan-progress` | `ScanStatus` | Bulk-scan progress for the startup indicator (throttled; final event has `complete: true`) |
 | `config-updated` | `Config` | Refresh settings and replace the scanned session set |
 | `rates-updated` | `RateCard` | Recompute displayed credit estimates |
+
+The frontend batches incoming `session-updated` events into ~150ms flushes before touching the session store — during the initial scan they arrive by the hundred, and per-event map clones plus re-sorts would stall the UI.
 
 Sessions cross the wire in two shapes. `SessionSummary` (list rows, live updates) carries metadata, cumulative totals, and per-(model, service_tier) `TierBucket`s — credit math is linear per (model, tier), so buckets price usage exactly without the event history. The full `Session` (turns + `tokens_history`) is fetched per-id via `get_session_details` when the drawer opens. This matters at scale: a real 704-session corpus serializes to ~195 MB as full sessions but ~1 MB as summaries, and an active session's live update drops from ~2 MB to ~1 KB per emit.
 

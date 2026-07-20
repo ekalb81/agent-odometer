@@ -102,16 +102,40 @@ pub fn set_config(
 /// parses. Applies the session-index name overlay and sets `scanned` when
 /// done. Shared by startup (lib.rs) and set_config.
 pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
+    state.scan_done.store(0, Ordering::Release);
+    state.scan_total.store(0, Ordering::Release);
+
     std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let cache_path =
+            dirs::cache_dir().map(|d| d.join("agent-odometer").join("scan-cache.json"));
+
         crate::scanner::scan_all(
             &config.session_roots,
             &config.archive_roots,
             &config.claude_session_roots,
+            cache_path.as_deref(),
             |session| {
                 let summary = SessionSummary::of(&session);
                 state.sessions.insert(session.id.clone(), session);
                 if let Err(e) = app.emit("session-updated", &summary) {
                     tracing::warn!("emit session-updated failed: {}", e);
+                }
+            },
+            |done, total| {
+                state.scan_done.store(done, Ordering::Release);
+                state.scan_total.store(total, Ordering::Release);
+                // Throttle: every 25th file plus the endpoints is smooth
+                // enough for a progress line without event spam.
+                if done == 0 || done == total || done % 25 == 0 {
+                    let _ = app.emit(
+                        "scan-progress",
+                        &ScanStatus {
+                            done,
+                            total,
+                            complete: false,
+                        },
+                    );
                 }
             },
         );
@@ -128,12 +152,41 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
         }
 
         state.scanned.store(true, Ordering::Release);
+        let _ = app.emit(
+            "scan-progress",
+            &ScanStatus {
+                done: state.scan_done.load(Ordering::Acquire),
+                total: state.scan_total.load(Ordering::Acquire),
+                complete: true,
+            },
+        );
         tracing::info!(
-            "scan complete: {} sessions loaded, {} thread names from index",
+            "scan complete in {:.1?}: {} sessions loaded, {} thread names from index",
+            started.elapsed(),
             state.sessions.len(),
             names.len()
         );
     });
+}
+
+/// Snapshot of the bulk scan's progress, for the UI's startup indicator.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanStatus {
+    pub done: usize,
+    pub total: usize,
+    pub complete: bool,
+}
+
+/// Returns the current bulk-scan progress. The frontend calls this once on
+/// mount (scan-progress events may have fired before its listeners attached)
+/// and then follows the "scan-progress" events.
+#[tauri::command]
+pub fn get_scan_status(state: State<'_, Arc<AppState>>) -> ScanStatus {
+    ScanStatus {
+        done: state.scan_done.load(Ordering::Acquire),
+        total: state.scan_total.load(Ordering::Acquire),
+        complete: state.scanned.load(Ordering::Acquire),
+    }
 }
 
 /// Returns the rate card, preferring the user's on-disk copy over the bundled defaults.

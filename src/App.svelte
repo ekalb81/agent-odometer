@@ -2,13 +2,15 @@
   import { onMount, onDestroy } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
+  import { scanStore } from './lib/stores/scan.svelte';
   import { rates } from './lib/stores/rates';
   import { config } from './lib/stores/config';
   import { check, type Update } from '@tauri-apps/plugin-updater';
   import { relaunch } from '@tauri-apps/plugin-process';
   import type { UnlistenFn } from '@tauri-apps/api/event';
+  import type { SessionSummary } from './lib/types';
 
   type View = 'codex' | 'claude' | 'settings';
   let activeView: View = $state('codex');
@@ -56,6 +58,25 @@
   let unlistenRemoved: UnlistenFn | null = null;
   let unlistenRates: UnlistenFn | null = null;
   let unlistenConfig: UnlistenFn | null = null;
+  let unlistenScan: UnlistenFn | null = null;
+
+  // During the initial scan, session-updated events arrive by the hundred.
+  // Applying each one individually clones the store map and re-derives every
+  // view per event; batching into ~150ms flushes makes the flood cheap.
+  let pendingUpserts: SessionSummary[] = [];
+  let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function queueUpsert(s: SessionSummary) {
+    pendingUpserts.push(s);
+    if (flushTimer === null) {
+      flushTimer = setTimeout(() => {
+        const batch = pendingUpserts;
+        pendingUpserts = [];
+        flushTimer = null;
+        sessionsStore.upsertMany(batch);
+      }, 150);
+    }
+  }
 
   onMount(async () => {
     try {
@@ -63,6 +84,12 @@
       sessionsStore.replaceAll(sessions);
     } catch (e) {
       console.error('listSessions failed:', e);
+    }
+
+    try {
+      scanStore.set(await getScanStatus());
+    } catch (e) {
+      console.error('getScanStatus failed:', e);
     }
 
     try {
@@ -79,8 +106,9 @@
       console.error('getConfig failed:', e);
     }
 
-    unlistenUpdated = await onSessionUpdated((s) => sessionsStore.upsert(s));
+    unlistenUpdated = await onSessionUpdated((s) => queueUpsert(s));
     unlistenRemoved = await onSessionRemoved((id) => sessionsStore.remove(id));
+    unlistenScan = await onScanProgress((status) => scanStore.set(status));
     unlistenRates = await onRatesUpdated((card) => rates.set(card));
     unlistenConfig = await onConfigUpdated(async (newConfig) => {
       config.set(newConfig);
@@ -96,8 +124,10 @@
   });
 
   onDestroy(() => {
+    if (flushTimer !== null) clearTimeout(flushTimer);
     unlistenUpdated?.();
     unlistenRemoved?.();
+    unlistenScan?.();
     unlistenRates?.();
     unlistenConfig?.();
   });

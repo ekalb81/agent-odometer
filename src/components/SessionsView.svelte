@@ -1,5 +1,6 @@
 <script lang="ts">
   import { sessionsStore } from '../lib/stores/sessions.svelte';
+  import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { apiCostFromBuckets, computeSummaryCredits, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
   import { getSessionDetails, sessionsInRange } from '../lib/ipc';
@@ -239,7 +240,7 @@
   function compareSession(a: (typeof allSessions)[number], b: (typeof allSessions)[number]): number {
     if (sortKey === null) {
       // Default: last_event_at desc.
-      return new Date(b.last_event_at).getTime() - new Date(a.last_event_at).getTime();
+      return b.lastEventMs - a.lastEventMs;
     }
     const aTokens = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
     const bTokens = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
@@ -249,7 +250,7 @@
         cmp = sessionName(a).localeCompare(sessionName(b));
         break;
       case 'started':
-        cmp = new Date(a.started_at).getTime() - new Date(b.started_at).getTime();
+        cmp = a.startedMs - b.startedMs;
         break;
       case 'model':
         cmp = (a.model ?? '').localeCompare(b.model ?? '');
@@ -373,6 +374,19 @@
 
   <!-- Summary header -->
   <div class="flex flex-wrap items-center gap-x-6 gap-y-1 px-4 py-2 bg-slate-800 border-b border-slate-700 flex-shrink-0 text-sm text-slate-400">
+    {#if !scanStore.status.complete}
+      <span class="flex items-center gap-2 text-sky-300" role="status">
+        <svg class="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />
+          <path d="M22 12a10 10 0 0 0-10-10" stroke="currentColor" stroke-width="4" stroke-linecap="round" />
+        </svg>
+        {#if scanStore.status.total > 0}
+          Scanning sessions… {fmtTokens(scanStore.status.done)}/{fmtTokens(scanStore.status.total)} files
+        {:else}
+          Scanning sessions…
+        {/if}
+      </span>
+    {/if}
     <span>
       Showing
       <span class="font-semibold text-slate-200">{displayed.length}</span>
@@ -409,11 +423,16 @@
   <div class="flex-1 overflow-auto">
     {#if allSessions.length === 0}
       <div class="flex flex-col items-center justify-center h-full gap-3 text-slate-500">
-        <p class="text-lg">No tasks found</p>
-        {#if harness === 'claude_code'}
-          <p class="text-sm">Start a Claude Code session or check your Claude session roots in Settings.</p>
+        {#if !scanStore.status.complete}
+          <p class="text-lg">Scanning your sessions…</p>
+          <p class="text-sm">Results appear as files are parsed. The first launch reads everything; later launches use a cache and are much faster.</p>
         {:else}
-          <p class="text-sm">Start a Codex task in ChatGPT or check your config roots.</p>
+          <p class="text-lg">No tasks found</p>
+          {#if harness === 'claude_code'}
+            <p class="text-sm">Start a Claude Code session or check your Claude session roots in Settings.</p>
+          {:else}
+            <p class="text-sm">Start a Codex task in ChatGPT or check your config roots.</p>
+          {/if}
         {/if}
       </div>
     {:else if displayed.length === 0}
