@@ -7,7 +7,7 @@ Odometer is a local companion to agent CLI harnesses — the ChatGPT desktop app
 - `src-tauri/`: Rust/Tauri backend for discovery, incremental JSONL parsing, filesystem watching, persistence, and native commands.
 - `src/`: Svelte 5/TypeScript frontend for reactive state, per-harness tabs, filtering, tables, details, settings, and credit calculations.
 
-Every session carries a `harness` tag (`codex` | `claude_code`). The UI shows one tab per harness; both tabs share the same session store, table, drawer, and filter components.
+Every session carries a `harness` tag (`codex` | `claude_code`). The UI shows one tab per harness; both tabs share the same session store, table, detail-pane, and filter components.
 
 The frontend starts at `src/main.ts` and `src/App.svelte`. The native process starts at `src-tauri/src/main.rs`, which calls `src-tauri/src/lib.rs::run`.
 
@@ -73,7 +73,7 @@ Subagent transcripts (`.../<session>/subagents/agent-<id>.jsonl`) carry the pare
 
 Anthropic usage reports `input_tokens` excluding cache traffic, while the viewer's `TokenTotals` treats cached input as a subset of input. The mapping is `input = input + cache_read + cache_creation`, `cached = cache_read`, `reasoning = 0` (thinking is billed as ordinary output). Cache writes are priced at the plain input rate, a slight underestimate of the 1.25x write premium. There is no cumulative counter in the file; totals accumulate from per-message deltas, and sidechain usage counts toward the enclosing turn.
 
-The rate card prices Codex models in credits and Claude models in USD; `currencies` and `fallback_models` on the card map each harness to its display currency and fallback rate so the two never mix. A third table, `api_models`, holds the same Codex models at OpenAI API USD prices — it powers the Codex tab's informational "Est. $" column and the drawer's est.-API-cost line, priced from the same (model, tier) buckets as the credit math.
+The rate card prices Codex models in credits and Claude models in USD; `currencies` and `fallback_models` on the card map each harness to its display currency and fallback rate so the two never mix. A third table, `api_models`, holds the same Codex models at OpenAI API USD prices — it powers the Codex tab's informational "Est. $" column and the detail pane's est.-API-cost figures, priced from the same (model, tier) buckets as the credit math.
 
 ## IPC and frontend state
 
@@ -89,13 +89,13 @@ The rate card prices Codex models in credits and Claude models in USD; `currenci
 
 The frontend batches incoming `session-updated` events into ~150ms flushes before touching the session store — during the initial scan they arrive by the hundred, and per-event map clones plus re-sorts would stall the UI.
 
-Sessions cross the wire in two shapes. `SessionSummary` (list rows, live updates) carries metadata, cumulative totals, and per-(model, service_tier) `TierBucket`s — credit math is linear per (model, tier), so buckets price usage exactly without the event history. The full `Session` (turns + `tokens_history`) is fetched per-id via `get_session_details` when the drawer opens. This matters at scale: a real 704-session corpus serializes to ~195 MB as full sessions but ~1 MB as summaries, and an active session's live update drops from ~2 MB to ~1 KB per emit.
+Sessions cross the wire in two shapes. `SessionSummary` (list rows, live updates) carries metadata, cumulative totals, and per-(model, service_tier) `TierBucket`s — credit math is linear per (model, tier), so buckets price usage exactly without the event history. The full `Session` (turns + `tokens_history`) is fetched per-id via `get_session_details` when a session is selected. This matters at scale: a real 704-session corpus serializes to ~195 MB as full sessions but ~1 MB as summaries, and an active session's live update drops from ~2 MB to ~1 KB per emit.
 
 Date-scoped numbers come from the `sessions_in_range` command, which walks the in-memory histories in Rust and returns per-session `RangeTotals` (range token sums plus in-range tier buckets); the frontend fetches it debounced while a date filter is active. Range token sums include events not yet attributed to a model; the credit buckets exclude them, mirroring the reconciliation the per-event math has always used.
 
 `src/lib/types.ts` manually mirrors Rust's serialized structs. Rust field or serialization changes therefore require an explicit TypeScript update.
 
-`sessionsStore` is the canonical reactive session collection. `SessionsView.svelte` (one instance per harness tab) derives filters, ordering, range-scoped totals, and the open drawer. `SettingsView.svelte` edits roots and rate cards; `RowDrawer.svelte` presents one session; `Sparkline.svelte` is presentation-only.
+`sessionsStore` is the canonical reactive session collection. `SessionsView.svelte` (one instance per harness tab) derives filters, ordering, day groups, range-scoped totals, the analytics band, and the selected session. `SettingsView.svelte` edits roots, rate cards, and the theme; `DetailPane.svelte` presents one session (a fixed right-hand pane at ≥1100px window widths, an overlay drawer below that); `Sparkline.svelte` is presentation-only. Filter state lives in `App.svelte` (per harness) so the toolbar's search/date/filter cluster can drive whichever tab is active. Theme tokens are CSS variables in `app.css` (dark/light via `data-theme`, per-harness accents via `.accent-*` wrappers) mapped to semantic Tailwind colors; `theme.svelte.ts` follows the OS by default with a manual override persisted in localStorage.
 
 The `open_task_in_chatgpt` command launches the supported `codex://threads/<id>` deep link. For a subagent rollout, the UI opens its parent task because subagents are not ordinary sidebar tasks. Claude Code sessions have no deep link; the button is hidden for them.
 

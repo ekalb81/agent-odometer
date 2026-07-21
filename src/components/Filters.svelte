@@ -38,7 +38,6 @@
   // Keep localSearch in sync whenever the parent-provided filters.search changes
   // (e.g. when "Clear filters" resets the state from the parent).
   $effect(() => {
-    // Reading filters.search inside the effect body creates a reactive dependency.
     localSearch = filters.search;
   });
 
@@ -69,171 +68,267 @@
     [...new Set(sessions.map((s) => s.model).filter((m): m is string => m !== null))].sort(),
   );
 
-  // Quick-range presets — stored as `datetime-local` strings (local time).
+  // ---------------------------------------------------------------------------
+  // Date-range presets — stored as `datetime-local` strings (local time).
   // Empty bound = open-ended.
+  // ---------------------------------------------------------------------------
   function pad(n: number): string { return n.toString().padStart(2, '0'); }
   function toLocalInputValue(d: Date): string {
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
-  function presetToday() {
-    const start = new Date(); start.setHours(0, 0, 0, 0);
-    onchange({ ...filters, dateFrom: toLocalInputValue(start), dateTo: '' });
+  function startOfToday(): Date {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
   }
-  function presetLast24h() {
-    const from = new Date(Date.now() - 24 * 3600 * 1000);
-    onchange({ ...filters, dateFrom: toLocalInputValue(from), dateTo: '' });
+
+  type Preset = { label: string; from: () => Date | null };
+  const presets: Preset[] = [
+    { label: 'All time', from: () => null },
+    { label: 'Today', from: startOfToday },
+    { label: 'Last 24h', from: () => new Date(Date.now() - 24 * 3600 * 1000) },
+    { label: 'Last 7 days', from: () => new Date(Date.now() - 7 * 24 * 3600 * 1000) },
+    { label: 'Last 30 days', from: () => new Date(Date.now() - 30 * 24 * 3600 * 1000) },
+  ];
+
+  function applyPreset(p: Preset) {
+    const from = p.from();
+    emit({ dateFrom: from ? toLocalInputValue(from) : '', dateTo: '' });
+    rangeOpen = false;
   }
-  function presetLast7d() {
-    const from = new Date(Date.now() - 7 * 24 * 3600 * 1000);
-    onchange({ ...filters, dateFrom: toLocalInputValue(from), dateTo: '' });
+
+  // The pill label: recognise the preset that produced the current bounds
+  // (within tolerance — presets are relative to "now"), else show the range.
+  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  function fmtBound(local: string): string {
+    const d = new Date(local);
+    if (isNaN(d.getTime())) return '…';
+    return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
   }
+  const rangeLabel = $derived((() => {
+    if (!filters.dateFrom && !filters.dateTo) return 'All time';
+    if (filters.dateFrom && !filters.dateTo) {
+      const fromMs = new Date(filters.dateFrom).getTime();
+      const tolerance = 90 * 1000; // presets round to the minute; allow drift
+      for (const p of presets) {
+        const d = p.from();
+        if (d && Math.abs(fromMs - d.getTime()) < tolerance) return p.label;
+      }
+      return `${fmtBound(filters.dateFrom)} – now`;
+    }
+    return `${filters.dateFrom ? fmtBound(filters.dateFrom) : '…'} – ${filters.dateTo ? fmtBound(filters.dateTo) : '…'}`;
+  })());
+
+  const dateScoped = $derived(Boolean(filters.dateFrom || filters.dateTo));
+
+  // Count of active non-default filters behind the "Filters" pill.
+  const filterCount = $derived(
+    (filters.model ? 1 : 0) +
+      (filters.showActive && filters.showArchived ? 0 : 1) +
+      (filters.showSubagents ? 0 : 1),
+  );
 
   const isDefault = $derived(
-    filters.search === '' &&
-      filters.dateFrom === '' &&
-      filters.dateTo === '' &&
-      filters.model === '' &&
-      filters.showActive &&
-      filters.showArchived &&
-      filters.showSubagents,
+    filters.search === '' && !dateScoped && filterCount === 0,
   );
+
+  // ---------------------------------------------------------------------------
+  // Popover state + click-outside handling
+  // ---------------------------------------------------------------------------
+  let rangeOpen = $state(false);
+  let filtersOpen = $state(false);
+  let rangeEl = $state<HTMLElement | null>(null);
+  let filtersEl = $state<HTMLElement | null>(null);
+
+  function onWindowPointerDown(e: PointerEvent) {
+    const t = e.target as Node;
+    if (rangeOpen && rangeEl && !rangeEl.contains(t)) rangeOpen = false;
+    if (filtersOpen && filtersEl && !filtersEl.contains(t)) filtersOpen = false;
+  }
+
+  function onPopoverKeydown(e: KeyboardEvent) {
+    if (e.key === 'Escape') {
+      rangeOpen = false;
+      filtersOpen = false;
+      e.stopPropagation();
+    }
+  }
+
+  $effect(() => {
+    if (rangeOpen || filtersOpen) {
+      window.addEventListener('pointerdown', onWindowPointerDown);
+      return () => window.removeEventListener('pointerdown', onWindowPointerDown);
+    }
+  });
+
+  const pillClass =
+    'flex items-center gap-1.5 bg-app border border-edge rounded-full px-3.5 py-1.5 text-xs text-ink-2 hover:text-ink transition-colors whitespace-nowrap';
 </script>
 
-<div class="flex flex-wrap items-center gap-3 px-4 py-2 bg-slate-800/80 border-b border-slate-700 flex-shrink-0">
+<div class="flex items-center gap-2">
   <!-- Search -->
-  <div class="relative flex-1 min-w-[160px] max-w-xs">
+  <div class="relative">
     <svg
-      class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none"
+      class="absolute left-3 top-1/2 -translate-y-1/2 w-3 h-3 text-ink-faint pointer-events-none"
       fill="none"
       stroke="currentColor"
       viewBox="0 0 24 24"
       aria-hidden="true"
     >
-      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" />
+      <path stroke-linecap="round" stroke-width="2" d="M21 21l-4.35-4.35M17 11A6 6 0 1 1 5 11a6 6 0 0 1 12 0z" />
     </svg>
     <input
       type="search"
-      placeholder="Search…"
+      placeholder="Search sessions"
       value={localSearch}
       oninput={handleSearchInput}
-      class="w-full pl-8 pr-3 py-1.5 text-sm bg-slate-700 border border-slate-600 rounded-md text-slate-100 placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
+      class="w-[220px] pl-8 pr-3 py-1.5 text-xs bg-app border border-edge rounded-lg text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-accent focus:border-accent"
       aria-label="Search sessions"
     />
   </div>
 
-  <!-- Date/time from -->
-  <label class="flex items-center gap-1.5 text-xs text-slate-400 whitespace-nowrap">
-    <span>From</span>
-    <input
-      type="datetime-local"
-      value={filters.dateFrom}
-      onchange={(e) => emit({ dateFrom: (e.target as HTMLInputElement).value })}
-      class="py-1.5 px-2 text-sm bg-slate-700 border border-slate-600 rounded-md text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 [color-scheme:dark]"
-      aria-label="Start datetime from"
-    />
-  </label>
-
-  <!-- Date/time to -->
-  <label class="flex items-center gap-1.5 text-xs text-slate-400 whitespace-nowrap">
-    <span>To</span>
-    <input
-      type="datetime-local"
-      value={filters.dateTo}
-      onchange={(e) => emit({ dateTo: (e.target as HTMLInputElement).value })}
-      class="py-1.5 px-2 text-sm bg-slate-700 border border-slate-600 rounded-md text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 [color-scheme:dark]"
-      aria-label="Start datetime to"
-    />
-  </label>
-
-  <!-- Quick range presets -->
-  <div class="flex items-center gap-1">
+  <!-- Date-range pill -->
+  <div class="relative" bind:this={rangeEl}>
     <button
       type="button"
-      onclick={presetToday}
-      class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
-    >Today</button>
-    <button
-      type="button"
-      onclick={presetLast24h}
-      class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
-    >Last 24h</button>
-    <button
-      type="button"
-      onclick={presetLast7d}
-      class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
-    >Last 7d</button>
+      class="{pillClass} {dateScoped ? 'font-medium text-ink' : 'font-medium'}"
+      onclick={() => { rangeOpen = !rangeOpen; filtersOpen = false; }}
+      aria-haspopup="true"
+      aria-expanded={rangeOpen}
+    >
+      {rangeLabel} <span class="text-ink-faint">▾</span>
+    </button>
+    {#if rangeOpen}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="absolute right-0 top-full mt-2 w-64 bg-card border border-edge rounded-xl shadow-xl z-50 p-3 flex flex-col gap-3"
+        onkeydown={onPopoverKeydown}
+      >
+        <div class="flex flex-wrap gap-1.5">
+          {#each presets as p}
+            <button
+              type="button"
+              onclick={() => applyPreset(p)}
+              class="text-xs px-2.5 py-1 rounded-full border transition-colors
+                     {rangeLabel === p.label
+                       ? 'bg-accent-tab border-transparent text-white font-semibold'
+                       : 'bg-app border-edge text-ink-2 hover:text-ink'}"
+            >{p.label}</button>
+          {/each}
+        </div>
+        <div class="border-t border-edge pt-3 flex flex-col gap-2">
+          <label class="flex items-center justify-between gap-2 text-xs text-ink-muted">
+            <span>From</span>
+            <input
+              type="datetime-local"
+              value={filters.dateFrom}
+              onchange={(e) => emit({ dateFrom: (e.target as HTMLInputElement).value })}
+              class="py-1 px-2 text-xs bg-app border border-edge rounded-lg text-ink focus:outline-none focus:ring-1 focus:ring-accent"
+              aria-label="Start datetime from"
+            />
+          </label>
+          <label class="flex items-center justify-between gap-2 text-xs text-ink-muted">
+            <span>To</span>
+            <input
+              type="datetime-local"
+              value={filters.dateTo}
+              onchange={(e) => emit({ dateTo: (e.target as HTMLInputElement).value })}
+              class="py-1 px-2 text-xs bg-app border border-edge rounded-lg text-ink focus:outline-none focus:ring-1 focus:ring-accent"
+              aria-label="Start datetime to"
+            />
+          </label>
+        </div>
+      </div>
+    {/if}
   </div>
 
-  <!-- Model select -->
-  <select
-    value={filters.model}
-    onchange={(e) => emit({ model: (e.target as HTMLSelectElement).value })}
-    class="py-1.5 px-2 text-sm bg-slate-700 border border-slate-600 rounded-md text-slate-100 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500"
-    aria-label="Filter by model"
-  >
-    <option value="">All models</option>
-    {#each distinctModels as m}
-      <option value={m}>{m}</option>
-    {/each}
-  </select>
-
-  <!-- Status toggles -->
-  <fieldset class="flex items-center gap-3 text-sm text-slate-300">
-    <legend class="sr-only">Session status filter</legend>
-
-    <label class="flex items-center gap-1.5 cursor-pointer select-none">
-      <input
-        type="checkbox"
-        checked={filters.showActive}
-        onchange={(e) => {
-          const next = (e.target as HTMLInputElement).checked;
-          // Must keep at least one status on.
-          if (!next && !filters.showArchived) return;
-          emit({ showActive: next });
-        }}
-        disabled={filters.showActive && !filters.showArchived}
-        class="accent-blue-500"
-        aria-label="Show active sessions"
-      />
-      Active
-    </label>
-
-    <label class="flex items-center gap-1.5 cursor-pointer select-none">
-      <input
-        type="checkbox"
-        checked={filters.showArchived}
-        onchange={(e) => {
-          const next = (e.target as HTMLInputElement).checked;
-          if (!next && !filters.showActive) return;
-          emit({ showArchived: next });
-        }}
-        disabled={filters.showArchived && !filters.showActive}
-        class="accent-blue-500"
-        aria-label="Show archived sessions"
-      />
-      Archived
-    </label>
-  </fieldset>
-
-  <label class="flex items-center gap-1.5 cursor-pointer select-none text-sm text-slate-300">
-    <input
-      type="checkbox"
-      checked={filters.showSubagents}
-      onchange={(e) => emit({ showSubagents: (e.target as HTMLInputElement).checked })}
-      class="accent-blue-500"
-      aria-label="Show subagent tasks"
-    />
-    Subagents
-  </label>
-
-  <!-- Clear button — only visible when filters differ from defaults -->
-  {#if !isDefault}
+  <!-- Filters pill -->
+  <div class="relative" bind:this={filtersEl}>
     <button
-      onclick={clearAll}
-      class="ml-auto flex-shrink-0 text-xs px-2.5 py-1.5 rounded-md bg-slate-600 hover:bg-slate-500 text-slate-200 transition-colors"
-      aria-label="Clear all filters"
+      type="button"
+      class="{pillClass} {filterCount > 0 ? 'text-ink font-medium' : ''}"
+      onclick={() => { filtersOpen = !filtersOpen; rangeOpen = false; }}
+      aria-haspopup="true"
+      aria-expanded={filtersOpen}
     >
-      Clear filters
+      Filters{#if filterCount > 0}<span class="text-ink-faint">·</span>{filterCount}{/if}
     </button>
-  {/if}
+    {#if filtersOpen}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="absolute right-0 top-full mt-2 w-60 bg-card border border-edge rounded-xl shadow-xl z-50 p-3 flex flex-col gap-3"
+        onkeydown={onPopoverKeydown}
+      >
+        <label class="flex flex-col gap-1 text-xs text-ink-muted">
+          <span class="section-label">Model</span>
+          <select
+            value={filters.model}
+            onchange={(e) => emit({ model: (e.target as HTMLSelectElement).value })}
+            class="py-1.5 px-2 text-xs bg-app border border-edge rounded-lg text-ink font-mono focus:outline-none focus:ring-1 focus:ring-accent"
+            aria-label="Filter by model"
+          >
+            <option value="">All models</option>
+            {#each distinctModels as m}
+              <option value={m}>{m}</option>
+            {/each}
+          </select>
+        </label>
+
+        <fieldset class="flex flex-col gap-1.5 text-xs text-ink-2">
+          <legend class="section-label mb-1">Status</legend>
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={filters.showActive}
+              onchange={(e) => {
+                const next = (e.target as HTMLInputElement).checked;
+                // Must keep at least one status on.
+                if (!next && !filters.showArchived) return;
+                emit({ showActive: next });
+              }}
+              disabled={filters.showActive && !filters.showArchived}
+              class="accent-[var(--accent)]"
+              aria-label="Show active sessions"
+            />
+            Active
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={filters.showArchived}
+              onchange={(e) => {
+                const next = (e.target as HTMLInputElement).checked;
+                if (!next && !filters.showActive) return;
+                emit({ showArchived: next });
+              }}
+              disabled={filters.showArchived && !filters.showActive}
+              class="accent-[var(--accent)]"
+              aria-label="Show archived sessions"
+            />
+            Archived
+          </label>
+          <label class="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={filters.showSubagents}
+              onchange={(e) => emit({ showSubagents: (e.target as HTMLInputElement).checked })}
+              class="accent-[var(--accent)]"
+              aria-label="Show subagent tasks"
+            />
+            Subagents
+          </label>
+        </fieldset>
+
+        {#if !isDefault}
+          <button
+            onclick={clearAll}
+            class="self-start text-xs px-2.5 py-1 rounded-lg bg-app border border-edge text-ink-2 hover:text-ink transition-colors"
+            aria-label="Clear all filters"
+          >
+            Clear all filters
+          </button>
+        {/if}
+      </div>
+    {/if}
+  </div>
 </div>

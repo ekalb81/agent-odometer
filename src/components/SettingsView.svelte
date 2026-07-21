@@ -2,6 +2,7 @@
   import { config } from '../lib/stores/config';
   import { rates } from '../lib/stores/rates';
   import { updaterStore } from '../lib/stores/updater.svelte';
+  import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, addDefenderExclusions } from '../lib/ipc';
   import { getVersion } from '@tauri-apps/api/app';
   import { onMount } from 'svelte';
@@ -11,6 +12,12 @@
   onMount(() => {
     void getVersion().then((v) => (appVersion = v)).catch(() => {});
   });
+
+  const themeOptions: { value: ThemePreference; label: string }[] = [
+    { value: 'system', label: 'System' },
+    { value: 'dark', label: 'Dark' },
+    { value: 'light', label: 'Light' },
+  ];
 
   // ---------------------------------------------------------------------------
   // Editable watched roots — local copies diverge from the store until saved.
@@ -334,20 +341,20 @@
 
   <!-- About & updates -->
   <section>
-    <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">About &amp; updates</h2>
-    <div class="flex items-center gap-3 flex-wrap text-sm text-slate-300">
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">About &amp; updates</h2>
+    <div class="flex items-center gap-3 flex-wrap text-sm text-ink-2">
       <span>Odometer <span class="font-mono">{appVersion ? `v${appVersion}` : '…'}</span></span>
       <a
         href="https://github.com/ekalb81/agent-odometer/releases"
         target="_blank"
         rel="noopener noreferrer"
-        class="text-xs text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors"
+        class="text-xs text-accent-chipfg hover:opacity-80 underline underline-offset-2 transition-colors"
       >release notes</a>
       {#if updaterStore.available}
         <button
           onclick={() => void updaterStore.install()}
           disabled={updaterStore.phase === 'installing'}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
         >
           {updaterStore.phase === 'installing'
             ? `Downloading v${updaterStore.available.version}…`
@@ -357,59 +364,83 @@
         <button
           onclick={() => void updaterStore.checkNow(true)}
           disabled={updaterStore.phase === 'checking'}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40 text-slate-200 transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded bg-app hover:bg-[var(--row-hover)] disabled:opacity-40 text-ink transition-colors"
         >
           {updaterStore.phase === 'checking' ? 'Checking…' : 'Check for updates'}
         </button>
         {#if updaterStore.lastManualResult === 'uptodate'}
-          <span class="text-xs text-emerald-400">You're on the latest version.</span>
+          <span class="text-xs text-pos">You're on the latest version.</span>
         {:else if updaterStore.lastManualResult === 'failed'}
-          <span class="text-xs text-red-400">Check failed: {updaterStore.error}</span>
+          <span class="text-xs text-red-500">Check failed: {updaterStore.error}</span>
         {/if}
+      {/if}
+    </div>
+  </section>
+
+  <!-- Appearance -->
+  <section>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Appearance</h2>
+    <div class="flex items-center gap-3">
+      <span class="text-xs text-ink-faint">Theme</span>
+      <div class="flex bg-app rounded-lg p-[2px] gap-[2px] border border-edge">
+        {#each themeOptions as opt (opt.value)}
+          <button
+            onclick={() => themeStore.set(opt.value)}
+            class="px-3.5 py-1 rounded-md text-xs transition-colors {themeStore.preference === opt.value
+              ? 'bg-ink text-app font-semibold'
+              : 'text-ink-muted hover:text-ink'}"
+            aria-pressed={themeStore.preference === opt.value}
+          >
+            {opt.label}
+          </button>
+        {/each}
+      </div>
+      {#if themeStore.preference === 'system'}
+        <span class="text-xs text-ink-faint">following OS ({themeStore.resolved})</span>
       {/if}
     </div>
   </section>
 
   <!-- Editable watched roots -->
   <section>
-    <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-3">Watched roots</h2>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-3">Watched roots</h2>
 
     <!-- Action bar -->
     <div class="flex items-center gap-3 mb-3 flex-wrap">
       <button
         onclick={saveRoots}
         disabled={!rootsDirty || rootsSaving}
-        class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
+        class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
       >
         {rootsSaving ? 'Saving…' : 'Save changes'}
       </button>
       <button
         onclick={resetRoots}
         disabled={!rootsDirty || rootsSaving}
-        class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 transition-colors"
+        class="px-3 py-1.5 text-xs font-medium rounded bg-app hover:bg-[var(--row-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-ink transition-colors"
       >
         Reset
       </button>
       {#if rootsSavedAt && !rootsDirty}
-        <span class="text-xs text-emerald-400">Saved at {rootsSavedAt} · scanning…</span>
+        <span class="text-xs text-pos">Saved at {rootsSavedAt} · scanning…</span>
       {/if}
       {#if rootsSaveError}
-        <span class="text-xs text-red-400">{rootsSaveError}</span>
+        <span class="text-xs text-red-500">{rootsSaveError}</span>
       {/if}
     </div>
 
     <!-- Session roots -->
-    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Session roots</h3>
-    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden mb-2">
+    <h3 class="text-xs text-ink-faint uppercase tracking-wider mb-1">Session roots</h3>
+    <ul class="bg-card border border-edge rounded-lg divide-y divide-edge overflow-hidden mb-2">
       {#if editedSessionRoots.length === 0}
-        <li class="px-4 py-2 text-xs text-slate-500 italic">None configured</li>
+        <li class="px-4 py-2 text-xs text-ink-faint italic">None configured</li>
       {:else}
         {#each editedSessionRoots as root, i}
           <li class="flex items-center justify-between gap-2 px-4 py-2">
-            <span class="font-mono text-xs text-slate-300 break-all">{root}</span>
+            <span class="font-mono text-xs text-ink-2 break-all">{root}</span>
             <button
               onclick={() => removeSessionRoot(i)}
-              class="flex-shrink-0 text-slate-500 hover:text-red-400 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-slate-700"
+              class="flex-shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-[var(--row-hover)]"
               aria-label="Remove {root}"
               title="Remove"
             >Remove</button>
@@ -422,27 +453,27 @@
           placeholder="/absolute/path/to/sessions"
           bind:value={newSessionRoot}
           onkeydown={(e) => { if (e.key === 'Enter') addSessionRoot(); }}
-          class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+          class="flex-1 bg-app border border-edge rounded px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
         />
         <button
           onclick={addSessionRoot}
-          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
         >Add</button>
       </li>
     </ul>
 
     <!-- Archive roots -->
-    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Archive roots</h3>
-    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden mb-2">
+    <h3 class="text-xs text-ink-faint uppercase tracking-wider mb-1">Archive roots</h3>
+    <ul class="bg-card border border-edge rounded-lg divide-y divide-edge overflow-hidden mb-2">
       {#if editedArchiveRoots.length === 0}
-        <li class="px-4 py-2 text-xs text-slate-500 italic">None configured</li>
+        <li class="px-4 py-2 text-xs text-ink-faint italic">None configured</li>
       {:else}
         {#each editedArchiveRoots as root, i}
           <li class="flex items-center justify-between gap-2 px-4 py-2">
-            <span class="font-mono text-xs text-slate-300 break-all">{root}</span>
+            <span class="font-mono text-xs text-ink-2 break-all">{root}</span>
             <button
               onclick={() => removeArchiveRoot(i)}
-              class="flex-shrink-0 text-slate-500 hover:text-red-400 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-slate-700"
+              class="flex-shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-[var(--row-hover)]"
               aria-label="Remove {root}"
               title="Remove"
             >Remove</button>
@@ -455,31 +486,31 @@
           placeholder="/absolute/path/to/archives"
           bind:value={newArchiveRoot}
           onkeydown={(e) => { if (e.key === 'Enter') addArchiveRoot(); }}
-          class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+          class="flex-1 bg-app border border-edge rounded px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
         />
         <button
           onclick={addArchiveRoot}
-          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
         >Add</button>
       </li>
     </ul>
 
     <!-- Claude Code session roots -->
-    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Claude Code session roots</h3>
-    <p class="text-xs text-slate-500 mb-1">
+    <h3 class="text-xs text-ink-faint uppercase tracking-wider mb-1">Claude Code session roots</h3>
+    <p class="text-xs text-ink-faint mb-1">
       Directories containing Claude Code session files. Claude Code writes them under
       <span class="font-mono">~/.claude/projects</span> by default.
     </p>
-    <ul class="bg-slate-800 rounded-lg divide-y divide-slate-700 overflow-hidden mb-2">
+    <ul class="bg-card border border-edge rounded-lg divide-y divide-edge overflow-hidden mb-2">
       {#if editedClaudeRoots.length === 0}
-        <li class="px-4 py-2 text-xs text-slate-500 italic">None configured</li>
+        <li class="px-4 py-2 text-xs text-ink-faint italic">None configured</li>
       {:else}
         {#each editedClaudeRoots as root, i}
           <li class="flex items-center justify-between gap-2 px-4 py-2">
-            <span class="font-mono text-xs text-slate-300 break-all">{root}</span>
+            <span class="font-mono text-xs text-ink-2 break-all">{root}</span>
             <button
               onclick={() => removeClaudeRoot(i)}
-              class="flex-shrink-0 text-slate-500 hover:text-red-400 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-slate-700"
+              class="flex-shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-[var(--row-hover)]"
               aria-label="Remove {root}"
               title="Remove"
             >Remove</button>
@@ -492,18 +523,18 @@
           placeholder="/absolute/path/to/.claude/projects"
           bind:value={newClaudeRoot}
           onkeydown={(e) => { if (e.key === 'Enter') addClaudeRoot(); }}
-          class="flex-1 bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono"
+          class="flex-1 bg-app border border-edge rounded px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
         />
         <button
           onclick={addClaudeRoot}
-          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
         >Add</button>
       </li>
     </ul>
 
     <!-- Session index file -->
-    <h3 class="text-xs text-slate-500 uppercase tracking-wider mb-1">Session index file</h3>
-    <p class="text-xs text-slate-500 mb-1">
+    <h3 class="text-xs text-ink-faint uppercase tracking-wider mb-1">Session index file</h3>
+    <p class="text-xs text-ink-faint mb-1">
       JSONL file mapping session ids to thread names. Codex writes this at
       <span class="font-mono">~/.codex/session_index.jsonl</span> by default.
     </p>
@@ -512,19 +543,19 @@
       placeholder="/absolute/path/to/session_index.jsonl"
       bind:value={editedIndexPath}
       oninput={markRootsDirty}
-      class="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono mb-2"
+      class="w-full bg-card border border-edge rounded px-3 py-2 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono mb-2"
     />
 
     {#if hasDuplicateRoots}
-      <p class="text-xs text-amber-400">Warning: duplicate paths detected in the lists above.</p>
+      <p class="text-xs text-amber-500">Warning: duplicate paths detected in the lists above.</p>
     {/if}
   </section>
 
   {#if isWindows}
     <!-- Performance -->
     <section>
-      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">Performance</h2>
-      <p class="text-xs text-slate-500 mb-2 max-w-2xl">
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Performance</h2>
+      <p class="text-xs text-ink-faint mb-2 max-w-2xl">
         Windows Defender scans every session file as it's read, which usually dominates the first
         load of a large history. You can exclude the watched session folders above from Defender's
         real-time scanning. Trade-off: files in those folders are no longer scanned for threats —
@@ -534,15 +565,15 @@
       <div class="flex items-center gap-3 flex-wrap">
         <button
           onclick={handleDefenderExclusions}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 hover:bg-slate-600 text-slate-200 transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded bg-card border border-edge hover:bg-[var(--row-hover)] text-ink transition-colors"
         >
           Exclude session folders from Defender…
         </button>
         {#if defenderRequested}
-          <span class="text-xs text-emerald-400">Requested — approve the Windows security prompt.</span>
+          <span class="text-xs text-pos">Requested — approve the Windows security prompt.</span>
         {/if}
         {#if defenderError}
-          <span class="text-xs text-red-400">{defenderError}</span>
+          <span class="text-xs text-red-500">{defenderError}</span>
         {/if}
       </div>
     </section>
@@ -551,10 +582,10 @@
   <!-- Rate card editor -->
   {#if $rates}
     <section>
-      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">Rate card</h2>
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Rate card</h2>
 
       <!-- Metadata row -->
-      <div class="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 text-xs text-slate-500">
+      <div class="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 text-xs text-ink-faint">
         <span>v{ratesVersion} · {ratesCurrency} · {ratesUnit}</span>
         {#if fetchedAt}
           <span>fetched {fetchedAt}</span>
@@ -564,7 +595,7 @@
             href={sourceUrl}
             target="_blank"
             rel="noopener noreferrer"
-            class="text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors"
+            class="text-accent-chipfg hover:opacity-80 underline underline-offset-2 transition-colors"
           >{sourceUrl}</a>
         {/if}
       </div>
@@ -574,36 +605,36 @@
         <button
           onclick={handleSave}
           disabled={!dirty || saving}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
         >
           {saving ? 'Saving…' : 'Save'}
         </button>
         <button
           onclick={handleReset}
           disabled={saving}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed text-slate-200 transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded bg-app hover:bg-[var(--row-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-ink transition-colors"
         >
           Reset to shipped defaults
         </button>
         {#if savedAt && !dirty}
-          <span class="text-xs text-emerald-400">Saved at {savedAt}</span>
+          <span class="text-xs text-pos">Saved at {savedAt}</span>
         {/if}
         {#if saveError}
-          <span class="text-xs text-red-400">{saveError}</span>
+          <span class="text-xs text-red-500">{saveError}</span>
         {/if}
         {#if validationError}
-          <span class="text-xs text-amber-400">{validationError}</span>
+          <span class="text-xs text-amber-500">{validationError}</span>
         {/if}
       </div>
 
       <!-- Fallback model selector -->
       <div class="flex items-center gap-3 mb-4">
-        <label for="fallback-model" class="text-xs text-slate-400 whitespace-nowrap">Fallback model</label>
+        <label for="fallback-model" class="text-xs text-ink-muted whitespace-nowrap">Fallback model</label>
         <select
           id="fallback-model"
           bind:value={fallbackModel}
           onchange={markDirty}
-          class="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500"
+          class="bg-card border border-edge rounded px-2 py-1 text-xs text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
         >
           <option value="">— select —</option>
           {#each rows as row}
@@ -614,21 +645,21 @@
 
       <!-- Rate table -->
       <div class="overflow-x-auto">
-        <table class="w-full text-xs border-collapse bg-slate-800 rounded-lg overflow-hidden">
+        <table class="w-full text-xs border-collapse bg-card rounded-lg overflow-hidden">
           <thead>
-            <tr class="border-b border-slate-700">
-              <th class="text-left px-3 py-2 text-slate-400 font-medium">Model</th>
-              <th class="text-right px-3 py-2 text-slate-400 font-medium">Input $/1M</th>
-              <th class="text-right px-3 py-2 text-slate-400 font-medium">Cached $/1M</th>
-              <th class="text-right px-3 py-2 text-slate-400 font-medium">Output $/1M</th>
-              <th class="text-right px-3 py-2 text-slate-400 font-medium">Reasoning $/1M</th>
+            <tr class="border-b border-edge">
+              <th class="text-left px-3 py-2 text-ink-muted font-medium">Model</th>
+              <th class="text-right px-3 py-2 text-ink-muted font-medium">Input $/1M</th>
+              <th class="text-right px-3 py-2 text-ink-muted font-medium">Cached $/1M</th>
+              <th class="text-right px-3 py-2 text-ink-muted font-medium">Output $/1M</th>
+              <th class="text-right px-3 py-2 text-ink-muted font-medium">Reasoning $/1M</th>
               <th class="px-3 py-2"></th>
             </tr>
           </thead>
           <tbody>
             {#each rows as row, i (row.name + i)}
-              <tr class="border-b border-slate-700/50">
-                <td class="px-3 py-1.5 font-mono text-slate-300">{row.name}</td>
+              <tr class="border-b border-edgerow">
+                <td class="px-3 py-1.5 font-mono text-ink-2">{row.name}</td>
                 <td class="px-3 py-1.5">
                   <input
                     type="number"
@@ -636,7 +667,7 @@
                     step="0.001"
                     bind:value={row.input}
                     oninput={markDirty}
-                    class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -646,7 +677,7 @@
                     step="0.001"
                     bind:value={row.cached_input}
                     oninput={markDirty}
-                    class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -656,7 +687,7 @@
                     step="0.001"
                     bind:value={row.output}
                     oninput={markDirty}
-                    class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -666,13 +697,13 @@
                     step="0.001"
                     bind:value={row.reasoning}
                     oninput={markDirty}
-                    class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5 text-center">
                   <button
                     onclick={() => removeRow(i)}
-                    class="text-slate-500 hover:text-red-400 transition-colors"
+                    class="text-ink-faint hover:text-red-500 transition-colors"
                     title="Remove model"
                     aria-label="Remove {row.name}"
                   >
@@ -687,13 +718,13 @@
             {/each}
 
             <!-- Add model inline row -->
-            <tr class="border-t border-slate-600 bg-slate-800/80">
+            <tr class="border-t border-edge bg-card">
               <td class="px-3 py-1.5">
                 <input
                   type="text"
                   placeholder="model-name"
                   bind:value={newName}
-                  class="w-full bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 font-mono text-xs"
+                  class="w-full bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono text-xs"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -703,7 +734,7 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newInput}
-                  class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -713,7 +744,7 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newCachedInput}
-                  class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -723,7 +754,7 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newOutput}
-                  class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -733,13 +764,13 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newReasoning}
-                  class="w-24 text-right bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-blue-500 tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5 text-center">
                 <button
                   onclick={addModel}
-                  class="text-xs px-2 py-0.5 rounded bg-blue-600 hover:bg-blue-500 text-white transition-colors"
+                  class="text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
                 >
                   Add
                 </button>
@@ -751,8 +782,8 @@
     </section>
   {:else}
     <section>
-      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-400 mb-2">Rate card</h2>
-      <p class="text-xs text-slate-500 italic">Loading…</p>
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Rate card</h2>
+      <p class="text-xs text-ink-faint italic">Loading…</p>
     </section>
   {/if}
 

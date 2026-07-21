@@ -236,17 +236,20 @@ const ISO_CURRENCY = /^[A-Z]{3}$/;
  * Otherwise (e.g. "credits"), formats as a plain decimal with the unit suffix.
  */
 export function formatCredits(amount: number, currency: string): string {
+  // Two decimals everywhere per the Instrument Ledger spec; amounts that
+  // would round to 0.00 keep enough significant digits to stay honest.
+  const subCent = amount !== 0 && Math.abs(amount) < 0.005;
   if (ISO_CURRENCY.test(currency)) {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency,
       minimumFractionDigits: 2,
-      maximumFractionDigits: 4,
+      maximumFractionDigits: subCent ? 4 : 2,
     }).format(amount);
   }
   const num = new Intl.NumberFormat('en-US', {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    maximumFractionDigits: subCent ? 4 : 2,
   }).format(amount);
   return `${num} ${currency}`;
 }
