@@ -7,9 +7,9 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
-**How far have your AI agents driven?** Odometer is a local desktop dashboard for your AI coding-agent usage. It reads the session files that [Codex](https://openai.com/codex) (the ChatGPT desktop app) and [Claude Code](https://claude.com/claude-code) already write to your machine and turns them into a searchable, sortable view of every session: what you asked, which models ran, how many tokens they consumed, and what that usage costs.
+**How far have your AI agents driven?** Odometer is a local desktop dashboard for your AI coding-agent usage. It reads the session files that [Codex](https://openai.com/codex) (OpenAI's coding agent) and [Claude Code](https://claude.com/claude-code) already write to your machine and turns them into a searchable, sortable view of every session: what you asked, which models ran, how many tokens they consumed, and what that usage costs.
 
-![Codex tab showing sessions, token totals, credits, and estimated API cost](docs/screenshots/codex-tab.png)
+![Codex tab with the session list, cost overview, and a session open in the detail pane](docs/screenshots/codex-tab.png)
 
 Everything happens on your machine. Odometer never uploads, phones home, or sends your prompts anywhere — it only reads the local files your agents already produced (and checks GitHub for its own updates).
 
@@ -22,9 +22,10 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
 - **Live** — sessions update in the list while your agents are still running.
 - **Time-scoped answers** — filter by date range and the token/cost columns re-total to exactly that window ("what did I burn last week?").
+- **Light and dark** — follows your OS theme by default; switchable in Settings.
 
-![Claude Code tab with subagent sessions](docs/screenshots/claude-code-tab.png)
-![Session detail drawer with per-turn tokens and costs](docs/screenshots/session-details.png)
+![Claude Code tab with subagent sessions and per-model spend](docs/screenshots/claude-code-tab.png)
+![Session detail pane in dark mode showing per-turn costs and the turn history](docs/screenshots/session-details.png)
 
 ## Install
 
@@ -36,7 +37,7 @@ Download the installer for your platform from the [latest release](https://githu
 | macOS (Apple Silicon) | `.dmg` | Not notarized yet; right-click the app → Open on first launch. |
 | Linux | `.AppImage` (no install) or `.deb` / `.rpm` | Mark the AppImage executable, then run it. |
 
-Odometer checks for new releases when it starts and offers a one-click in-place update.
+Odometer checks for new releases on launch (and periodically while running) and offers a one-click in-place update.
 
 ### First run
 

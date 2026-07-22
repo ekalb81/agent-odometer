@@ -6,7 +6,8 @@ name: CI
 #   - the Rust crate compiles (cargo check)
 #   - all Rust tests pass (cargo test)
 # A parallel job measures Rust test coverage and uploads it to Codecov
-# (tokenless upload; only functional while the repository is public).
+# (authenticated via GitHub OIDC; only functional while the repository is
+# public).
 #
 # Runs on Linux only — these checks are platform-independent and Linux is
 # the fastest GitHub-hosted runner. The release workflow handles the
@@ -17,6 +18,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  # Lets the Codecov upload authenticate via GitHub OIDC instead of a token.
+  id-token: write
 
 # Cancel in-progress runs when a new commit lands on the same ref.
 concurrency:
@@ -153,4 +159,5 @@ jobs:
         continue-on-error: true
         with:
           files: src-tauri/lcov.info
+          use_oidc: true
           fail_ci_if_error: false
