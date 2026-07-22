@@ -80,6 +80,45 @@ const FIXTURES: Fixture[] = [
   { id: '9fbad994-22fa-41fc-8888-0000c1de0007', harness: 'claude_code', name: 'Migrate to slash commands', started: at(8, 10), hoursActive: 1, model: 'claude-sonnet-5', total: 585_410, turns: 3 },
 ];
 
+// Stress mode: `?stress=N` appends N synthetic sessions per harness so list
+// performance can be profiled at realistic history sizes. Dev-mock only.
+const stressN = Number(new URLSearchParams(location.search).get('stress') ?? 0);
+if (stressN > 0) {
+  const CODEX_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
+  const CLAUDE_MODELS = ['claude-fable-5', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-haiku-4-5'];
+  const NAMES = [
+    'Refactor ingestion pipeline', 'Fix flaky auth test', 'Add CSV export', 'Profile slow query',
+    'Migrate config format', 'Review PR feedback', 'Write release notes', 'Debug watcher leak',
+    'Tune cache eviction', 'Port build to CI', 'Sketch onboarding flow', 'Harden error paths',
+  ];
+  for (const harness of ['codex', 'claude_code'] as const) {
+    const models = harness === 'codex' ? CODEX_MODELS : CLAUDE_MODELS;
+    let parentId: string | null = null;
+    for (let i = 0; i < stressN; i++) {
+      const id = `57e55000-0000-4000-8000-${harness === 'codex' ? 'c0de' : 'c1de'}${String(i).padStart(8, '0')}`;
+      // Every 40th session starts a cluster; the following ~30 rows become its
+      // subagents, mimicking large fan-out sessions.
+      const inCluster = parentId !== null && i % 40 !== 0;
+      if (i % 40 === 0) parentId = id;
+      const total = 50_000 + ((i * 2654435761) % 5_000_000);
+      FIXTURES.push({
+        id,
+        harness,
+        name: `${NAMES[i % NAMES.length]} #${i}`,
+        started: at(Math.floor(i / 30), 8 + (i % 12), (i * 7) % 60),
+        hoursActive: 0.5 + (i % 5),
+        model: models[i % models.length],
+        total,
+        turns: 1 + (i % 12),
+        archived: i % 17 === 0,
+        parent: inCluster ? (parentId ?? undefined) : undefined,
+        unlimited: harness === 'codex' ? true : undefined,
+      });
+    }
+  }
+  console.info(`[dev-mock] stress mode: +${stressN * 2} synthetic sessions`);
+}
+
 function buckets(f: Fixture): TierBucket[] {
   return [{ model: f.model, service_tier: null, tokens: tok(f.total) }];
 }

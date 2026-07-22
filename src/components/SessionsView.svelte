@@ -236,34 +236,61 @@
     };
   }
 
+  type DisplayEntry = {
+    tokens: TokenTotals;
+    total: number;
+    refCost: number;
+    apiTotal: number;
+    missingModels: string[];
+  };
+
+  // Live updates replace only the changed sessions' objects in the store, so
+  // object identity is a correct invalidation key: cache each session's priced
+  // display entry and skip the ~N-1 unchanged sessions on every flush. Stable
+  // entry identities also let unchanged rows skip DOM patching entirely.
+  const displayCache = new WeakMap<
+    TrackedSession,
+    { rates: unknown; rt: unknown; scoped: boolean; value: DisplayEntry }
+  >();
+
   // Per-session display values: tokens AND costs, both scoped to the date
   // filter when one is active so the row numbers add up to the totals row.
   const sessionDisplayMap = $derived((() => {
     const r = $rates;
-    const out = new Map<
-      string,
-      { tokens: TokenTotals; total: number; refCost: number; apiTotal: number; missingModels: string[] }
-    >();
+    const out = new Map<string, DisplayEntry>();
     for (const s of filtered) {
       const rt = dateScoped ? rangeTotals[s.id] : undefined;
-      const tokens = dateScoped ? (rt?.tokens ?? zeroTotals()) : s.tokens_total;
       if (!r) {
-        out.set(s.id, { tokens, total: 0, refCost: 0, apiTotal: 0, missingModels: [] });
+        out.set(s.id, {
+          tokens: dateScoped ? (rt?.tokens ?? zeroTotals()) : s.tokens_total,
+          total: 0,
+          refCost: 0,
+          apiTotal: 0,
+          missingModels: [],
+        });
         continue;
       }
+      const cached = displayCache.get(s);
+      if (cached && cached.rates === r && cached.rt === rt && cached.scoped === dateScoped) {
+        out.set(s.id, cached.value);
+        continue;
+      }
+      const tokens = dateScoped ? (rt?.tokens ?? zeroTotals()) : s.tokens_total;
       // Reference cost (à-la-carte equivalent) is always all-time for the
       // unlimited-plan tooltip — that's the figure people compare against.
       const allTime = computeSummaryCredits(s, r);
       const credits = dateScoped ? creditsFromBuckets(rt?.buckets ?? [], r, s.harness) : allTime;
       const buckets = dateScoped ? (rt?.buckets ?? []) : s.buckets;
       const apiTotal = apiCostFromBuckets(buckets, r, s.harness)?.total ?? 0;
-      out.set(s.id, {
+      const value: DisplayEntry = {
         tokens,
         total: credits.total,
         refCost: allTime.total,
         apiTotal,
         missingModels: credits.missingModels,
-      });
+      };
+      displayCache.set(s, { rates: r, rt, scoped: dateScoped, value });
+      out.set(s.id, value);
     }
     return out;
   })());
@@ -489,6 +516,10 @@
     void sessionsStore.map;
     if (!active) return;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
+    // A calm debounce: each refresh issues ~16 sessions_in_range calls whose
+    // responses are full per-session maps, so refreshing per store-flush
+    // (150ms) would keep the main thread busy parsing them. Analytics can
+    // trail live sessions by a second without anyone noticing.
     analyticsTimer = setTimeout(async () => {
       // Day-aligned buckets, coalesced so long ranges stay ≤14 fetches.
       const dayStart = (ms: number) => {
@@ -517,7 +548,7 @@
       } catch (e) {
         console.error('analytics sessions_in_range failed:', e);
       }
-    }, 300);
+    }, 1000);
     return () => {
       if (analyticsTimer !== null) clearTimeout(analyticsTimer);
     };
@@ -526,21 +557,38 @@
   /** Price one range-rollup map for the sessions currently in view. Uses the
    *  non-date-filtered set: the rollup itself scopes usage to its window, and
    *  the previous window's sessions may not intersect the current date range. */
+  // Pricing is linear per bucket, so a range's cost equals the sum of its
+  // sessions' costs. Price each fetched rollup map once (keyed by identity),
+  // then every recompute — keystrokes, store flushes — just sums numbers.
+  const rangePriceCache = new WeakMap<
+    object,
+    { rates: unknown; api: boolean; per: Map<string, { cost: number; tokens: number }> }
+  >();
   function priceRange(data: Record<string, RangeTotals> | null): { cost: number; tokens: number } {
     const r = $rates;
     if (!data || !r) return { cost: 0, tokens: 0 };
-    const buckets: TierBucket[] = [];
+    let cached = rangePriceCache.get(data);
+    if (!cached || cached.rates !== r || cached.api !== showApiCost) {
+      const per = new Map<string, { cost: number; tokens: number }>();
+      for (const [id, rt] of Object.entries(data)) {
+        if (rt.tokens.total_tokens === 0) continue;
+        const priced = showApiCost
+          ? apiCostFromBuckets(rt.buckets, r, harness)
+          : creditsFromBuckets(rt.buckets, r, harness);
+        per.set(id, { cost: priced?.total ?? 0, tokens: rt.tokens.total_tokens });
+      }
+      cached = { rates: r, api: showApiCost, per };
+      rangePriceCache.set(data, cached);
+    }
+    let cost = 0;
     let tokens = 0;
     for (const s of filteredNoDate) {
-      const rt = data[s.id];
-      if (!rt) continue;
-      tokens += rt.tokens.total_tokens;
-      buckets.push(...rt.buckets);
+      const p = cached.per.get(s.id);
+      if (!p) continue;
+      cost += p.cost;
+      tokens += p.tokens;
     }
-    const priced = showApiCost
-      ? apiCostFromBuckets(buckets, r, harness)
-      : creditsFromBuckets(buckets, r, harness);
-    return { cost: priced?.total ?? 0, tokens };
+    return { cost, tokens };
   }
 
   const spendSeries = $derived(analyticsBuckets.map((b) => ({ label: b.label, ...priceRange(b.data) })));
@@ -553,6 +601,10 @@
   // the last 7 days) and the same non-date filters, so the band tells one
   // consistent story. A session counts as active when it has usage in window.
   // ---------------------------------------------------------------------------
+  // Rollup objects are recreated per fetch but reused across the store
+  // flushes in between; caching their priced totals by identity keeps this
+  // derived cheap when only the session list changed.
+  const rollupPriceCache = new WeakMap<object, { rates: unknown; api: boolean; total: number }>();
   const windowStats = $derived((() => {
     const r = $rates;
     const data = analyticsCurrent;
@@ -564,6 +616,16 @@
       allUnlimited: false,
     };
     if (!data || !r) return out;
+    const priceRollup = (rt: RangeTotals, api: boolean): number => {
+      const cached = rollupPriceCache.get(rt);
+      if (cached && cached.rates === r && cached.api === api) return cached.total;
+      const priced = api
+        ? apiCostFromBuckets(rt.buckets, r, harness)
+        : creditsFromBuckets(rt.buckets, r, harness);
+      const total = priced?.total ?? 0;
+      rollupPriceCache.set(rt, { rates: r, api, total });
+      return total;
+    };
     const buckets: TierBucket[] = [];
     for (const s of filteredNoDate) {
       const rt = data[s.id];
@@ -572,14 +634,11 @@
       buckets.push(...rt.buckets);
       if (harness === 'codex') {
         if (s.credits_unlimited === true) out.credits.unlimitedCount++;
-        else out.credits.billedTotal += creditsFromBuckets(rt.buckets, r, s.harness).total;
+        else out.credits.billedTotal += priceRollup(rt, false);
       }
       if (isSub(s)) {
         out.subagents.count++;
-        const priced = showApiCost
-          ? apiCostFromBuckets(rt.buckets, r, s.harness)
-          : creditsFromBuckets(rt.buckets, r, s.harness);
-        out.subagents.cost += priced?.total ?? 0;
+        out.subagents.cost += priceRollup(rt, showApiCost);
       }
     }
     const priced = showApiCost
