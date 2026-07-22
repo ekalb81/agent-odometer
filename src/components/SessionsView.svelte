@@ -331,6 +331,7 @@
     const append = (s: TrackedSession, anchor: number) => {
       list.push(s);
       anchorMs.set(s.id, anchor);
+      if (collapsedParents.has(s.id)) return;
       for (const c of children.get(s.id) ?? []) append(c, anchor);
     };
     for (const r of roots) append(r, r.startedMs);
@@ -338,6 +339,45 @@
   })());
 
   const displayed = $derived(displayedWithAnchors.list);
+
+  // Collapsed parents hide their nested subagent rows (default order only —
+  // explicit column sorts show a flat list where nesting doesn't apply).
+  let collapsedParents = $state<ReadonlySet<string>>(new Set());
+  function toggleCollapsed(id: string) {
+    const next = new Set(collapsedParents);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    collapsedParents = next;
+  }
+
+  // Combined cost (session + all in-view descendant subagents) per row that
+  // has in-view children. Row cost stays per-thread; this feeds the Σ line.
+  const combinedCost = $derived((() => {
+    const childrenOf = new Map<string, TrackedSession[]>();
+    const ids = new Set(filtered.map((s) => s.id));
+    for (const s of filtered) {
+      if (s.parent_thread_id && ids.has(s.parent_thread_id)) {
+        const arr = childrenOf.get(s.parent_thread_id);
+        if (arr) arr.push(s);
+        else childrenOf.set(s.parent_thread_id, [s]);
+      }
+    }
+    const memo = new Map<string, number>();
+    const total = (id: string): number => {
+      const cached = memo.get(id);
+      if (cached !== undefined) return cached;
+      memo.set(id, costOf(id)); // pre-set guards against parent-id cycles
+      let sum = costOf(id);
+      for (const c of childrenOf.get(id) ?? []) sum += total(c.id);
+      memo.set(id, sum);
+      return sum;
+    };
+    const out = new Map<string, number>();
+    for (const s of filtered) {
+      if ((childrenOf.get(s.id)?.length ?? 0) > 0) out.set(s.id, total(s.id));
+    }
+    return out;
+  })());
 
   // ---------------------------------------------------------------------------
   // Day groups ("Today · Jul 19", "Yesterday…", "Earlier this week", months).
@@ -406,38 +446,6 @@
 
   // Money total for the pinned totals row (matches the column semantics).
   const costTotal = $derived(filtered.reduce((sum, s) => sum + costOf(s.id), 0));
-
-  // Credit totals: only count sessions that are NOT on unlimited plans.
-  const creditSummary = $derived((() => {
-    let billedTotal = 0;
-    let unlimitedCount = 0;
-    for (const s of filtered) {
-      const c = sessionDisplayMap.get(s.id);
-      if (!c) continue;
-      if (s.credits_unlimited === true) {
-        unlimitedCount++;
-      } else {
-        billedTotal += c.total;
-      }
-    }
-    return { billedTotal, unlimitedCount };
-  })());
-
-  const allUnlimited = $derived(
-    filtered.length > 0 && creditSummary.unlimitedCount === filtered.length,
-  );
-
-  // Subagent rollup for the Claude KPI stack.
-  const subagentSummary = $derived((() => {
-    let count = 0;
-    let cost = 0;
-    for (const s of filtered) {
-      if (!isSub(s)) continue;
-      count++;
-      cost += costOf(s.id);
-    }
-    return { count, cost };
-  })());
 
   // ---------------------------------------------------------------------------
   // Analytics band: spend-by-day series + window totals for the delta pills.
@@ -539,6 +547,49 @@
   const windowTotals = $derived(priceRange(analyticsCurrent));
   const prevTotals = $derived(priceRange(analyticsPrev));
 
+  // ---------------------------------------------------------------------------
+  // Window-scoped stats for the rest of the analytics band. Every card reads
+  // from the same rollup map as the spend card (the date filter when set, else
+  // the last 7 days) and the same non-date filters, so the band tells one
+  // consistent story. A session counts as active when it has usage in window.
+  // ---------------------------------------------------------------------------
+  const windowStats = $derived((() => {
+    const r = $rates;
+    const data = analyticsCurrent;
+    const out = {
+      sessionCount: 0,
+      byModel: [] as { model: string; cost: number }[],
+      credits: { billedTotal: 0, unlimitedCount: 0 },
+      subagents: { count: 0, cost: 0 },
+      allUnlimited: false,
+    };
+    if (!data || !r) return out;
+    const buckets: TierBucket[] = [];
+    for (const s of filteredNoDate) {
+      const rt = data[s.id];
+      if (!rt || rt.tokens.total_tokens === 0) continue;
+      out.sessionCount++;
+      buckets.push(...rt.buckets);
+      if (harness === 'codex') {
+        if (s.credits_unlimited === true) out.credits.unlimitedCount++;
+        else out.credits.billedTotal += creditsFromBuckets(rt.buckets, r, s.harness).total;
+      }
+      if (isSub(s)) {
+        out.subagents.count++;
+        const priced = showApiCost
+          ? apiCostFromBuckets(rt.buckets, r, s.harness)
+          : creditsFromBuckets(rt.buckets, r, s.harness);
+        out.subagents.cost += priced?.total ?? 0;
+      }
+    }
+    const priced = showApiCost
+      ? apiCostFromBuckets(buckets, r, harness)
+      : creditsFromBuckets(buckets, r, harness);
+    out.byModel = [...(priced?.byModel ?? [])].sort((a, b) => b.cost - a.cost);
+    out.allUnlimited = out.sessionCount > 0 && out.credits.unlimitedCount === out.sessionCount;
+    return out;
+  })());
+
   function deltaPct(cur: number, prev: number): number | null {
     if (prev <= 0) return null;
     const pct = Math.round(((cur - prev) / prev) * 100);
@@ -573,19 +624,9 @@
     return spendSeries.filter((_, i) => i % step === 0).map((p) => p.label);
   })());
 
-  // Cost by model — aggregated buckets of the sessions in view, top four.
+  // Cost by model — aggregated from the same window as the spend card, top four.
   const costByModel = $derived((() => {
-    const r = $rates;
-    if (!r) return { rows: [] as { model: string; cost: number; pct: number }[], more: 0 };
-    const buckets: TierBucket[] = [];
-    for (const s of filtered) {
-      buckets.push(...(dateScoped ? (rangeTotals[s.id]?.buckets ?? []) : s.buckets));
-    }
-    const priced = showApiCost
-      ? apiCostFromBuckets(buckets, r, harness)
-      : creditsFromBuckets(buckets, r, harness);
-    if (!priced) return { rows: [], more: 0 };
-    const sorted = [...priced.byModel].sort((a, b) => b.cost - a.cost);
+    const sorted = windowStats.byModel;
     const max = sorted[0]?.cost ?? 0;
     const rows = sorted.slice(0, 4).map((m) => ({
       model: m.model,
@@ -611,7 +652,7 @@
   );
   const spendCardNote = $derived(
     harness === 'codex'
-      ? (allUnlimited ? 'à la carte · all sessions unlimited' : 'OpenAI API rates')
+      ? (windowStats.allUnlimited ? 'à la carte · all sessions unlimited' : 'OpenAI API rates')
       : 'Anthropic API rates',
   );
 
@@ -725,10 +766,10 @@
     <!-- Cost by model -->
     <div class="bg-card border border-edge rounded-xl px-5 py-4 min-w-0">
       <div class="text-[11px] text-ink-muted font-medium mb-3">
-        {harness === 'codex' ? 'Cost by model' : 'Spend by model'}
+        {harness === 'codex' ? 'Cost by model' : 'Spend by model'} · {windowLabel}
       </div>
       {#if costByModel.rows.length === 0}
-        <div class="text-[11px] text-ink-faint">No priced usage in view</div>
+        <div class="text-[11px] text-ink-faint">No priced usage in this window</div>
       {:else}
         <div class="flex flex-col gap-2.5 text-xs">
           {#each costByModel.rows as row, i (row.model)}
@@ -752,16 +793,16 @@
     <!-- KPI stack -->
     <div class="bg-card border border-edge rounded-xl px-5 py-4 flex flex-col justify-between gap-2 min-w-0">
       <div>
-        <div class="text-[11px] text-ink-muted font-medium">Sessions</div>
+        <div class="text-[11px] text-ink-muted font-medium">Sessions · {windowLabel}</div>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-          {displayed.length}
+          {windowStats.sessionCount}
           <span class="text-[11px] text-ink-faint font-normal">of {allSessions.length}</span>
         </div>
       </div>
       <div>
-        <div class="text-[11px] text-ink-muted font-medium">Tokens</div>
+        <div class="text-[11px] text-ink-muted font-medium">Tokens · {windowLabel}</div>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-          {fmtCompact(filteredTotal)}
+          {fmtCompact(windowTotals.tokens)}
           {#if tokensDelta !== null}
             <span class="text-[11px] font-medium {tokensDelta >= 0 ? 'text-pos' : 'text-ink-faint'}">
               {tokensDelta >= 0 ? '▲' : '▼'} {Math.abs(tokensDelta)}%
@@ -771,15 +812,15 @@
       </div>
       {#if harness === 'codex'}
         <div>
-          <div class="text-[11px] text-ink-muted font-medium">Credits</div>
-          {#if creditSummary.billedTotal > 0}
+          <div class="text-[11px] text-ink-muted font-medium">Credits · {windowLabel}</div>
+          {#if windowStats.credits.billedTotal > 0}
             <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-              {fmtAmount(creditSummary.billedTotal)}
-              {#if creditSummary.unlimitedCount > 0}
-                <span class="text-[11px] text-ink-faint font-normal">{creditSummary.unlimitedCount} unlimited excluded</span>
+              {fmtAmount(windowStats.credits.billedTotal)}
+              {#if windowStats.credits.unlimitedCount > 0}
+                <span class="text-[11px] text-ink-faint font-normal">{windowStats.credits.unlimitedCount} unlimited excluded</span>
               {/if}
             </div>
-          {:else if creditSummary.unlimitedCount > 0}
+          {:else if windowStats.credits.unlimitedCount > 0}
             <!-- Never print 0.00 next to an unlimited count. -->
             <div class="text-xl font-bold font-mono mt-0.5 text-ink">
               — <span class="text-[11px] text-ink-faint font-normal">all sessions unlimited</span>
@@ -790,11 +831,11 @@
         </div>
       {:else}
         <div>
-          <div class="text-[11px] text-ink-muted font-medium">Subagents</div>
+          <div class="text-[11px] text-ink-muted font-medium">Subagents · {windowLabel}</div>
           <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-            {subagentSummary.count}
-            {#if subagentSummary.count > 0}
-              <span class="text-[11px] text-ink-faint font-normal">{fmtMoney(subagentSummary.cost)} total</span>
+            {windowStats.subagents.count}
+            {#if windowStats.subagents.count > 0}
+              <span class="text-[11px] text-ink-faint font-normal">{fmtMoney(windowStats.subagents.cost)} total</span>
             {/if}
           </div>
         </div>
@@ -854,6 +895,8 @@
               {@const rowTokens = display?.tokens ?? session.tokens_total}
               {@const sub = isSub(session)}
               {@const kids = childCounts.get(session.id) ?? 0}
+              {@const combined = combinedCost.get(session.id)}
+              {@const collapsed = collapsedParents.has(session.id)}
               {@const selected = selectedSessionId === session.id}
               <div
                 role="button"
@@ -870,8 +913,16 @@
                 onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}
                 aria-label="Select session {name}"
               >
-                <span class="truncate min-w-0 {selected ? 'font-semibold text-ink' : 'text-[var(--row-name)]'}" title={name}>
-                  {#if sub}<span class="text-ink-faint">↳ </span>{/if}{truncate(name, 90)}
+                <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-[var(--row-name)]'}" title={name}>
+                  {#if combined !== undefined && sortKey === null}
+                    <button
+                      class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center"
+                      onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.id); }}
+                      aria-expanded={!collapsed}
+                      aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}"
+                    >{collapsed ? '▸' : '▾'}</button>
+                  {/if}
+                  {#if sub}<span class="text-[var(--subagent-chip-fg)] font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
                   {#if sub}
                     <span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">subagent</span>
                   {:else if kids > 0}
@@ -888,6 +939,12 @@
                   {fmtAmount(costOf(session.id))}{#if display && display.missingModels.length > 0}<span
                       class="text-amber-500 cursor-help"
                       title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}
+                  {#if combined !== undefined}
+                    <div
+                      class="text-[10px] text-ink-faint font-normal cursor-help"
+                      title="This session plus its subagent threads (in view)"
+                    >Σ {fmtAmount(combined)}</div>
+                  {/if}
                 </span>
               </div>
             {/each}
