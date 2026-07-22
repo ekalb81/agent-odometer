@@ -3,7 +3,7 @@
 [![CI](https://github.com/ekalb81/agent-odometer/actions/workflows/ci.yml/badge.svg)](https://github.com/ekalb81/agent-odometer/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ekalb81/agent-odometer)](https://github.com/ekalb81/agent-odometer/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/ekalb81/agent-odometer/total)](https://github.com/ekalb81/agent-odometer/releases)
-[![Coverage](https://codecov.io/gh/ekalb81/agent-odometer/graph/badge.svg)](https://codecov.io/gh/ekalb81/agent-odometer)
+[![Coverage](https://codecov.io/github/ekalb81/agent-odometer/branch/main/graph/badge.svg?token=FtbdQEOLFu)](https://codecov.io/github/ekalb81/agent-odometer)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
