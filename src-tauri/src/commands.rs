@@ -369,7 +369,9 @@ pub async fn add_defender_exclusions() -> Result<(), String> {
 
         match output.status.code() {
             Some(0) => Ok(()),
-            Some(2) => Err("The Windows security prompt was declined — nothing was changed.".into()),
+            Some(2) => {
+                Err("The Windows security prompt was declined — nothing was changed.".into())
+            }
             _ => Err(
                 "Windows Defender did not accept the exclusions. Another security product or a \
                  policy may be managing it."
