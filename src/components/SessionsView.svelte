@@ -331,17 +331,14 @@
     return sortDir === 'asc' ? cmp : -cmp;
   }
 
-  // In the default order, subagent rows tuck in directly beneath their parent
-  // (when the parent is in view); explicit column sorts keep strict order.
-  // anchorMs records which day group a row belongs to — children inherit
-  // their parent's group so a nested row never splits a day section.
+  // Subagent rows tuck in directly beneath their parent (when the parent is
+  // in view) under every sort order: column sorts rank the parents, and each
+  // parent's children among themselves, so a child never floats above its
+  // parent. anchorMs records which day group a row belongs to — children
+  // inherit their parent's group so a nested row never splits a day section.
   const displayedWithAnchors = $derived((() => {
     const sorted = [...filtered].sort(compareSession);
     const anchorMs = new Map<string, number>();
-    if (sortKey !== null) {
-      for (const s of sorted) anchorMs.set(s.id, s.startedMs);
-      return { list: sorted, anchorMs };
-    }
     const ids = new Set(sorted.map((s) => s.id));
     const children = new Map<string, TrackedSession[]>();
     const roots: TrackedSession[] = [];
@@ -367,8 +364,7 @@
 
   const displayed = $derived(displayedWithAnchors.list);
 
-  // Collapsed parents hide their nested subagent rows (default order only —
-  // explicit column sorts show a flat list where nesting doesn't apply).
+  // Collapsed parents hide their nested subagent rows.
   let collapsedParents = $state<ReadonlySet<string>>(new Set());
   function toggleCollapsed(id: string) {
     const next = new Set(collapsedParents);
@@ -973,7 +969,7 @@
                 aria-label="Select session {name}"
               >
                 <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-[var(--row-name)]'}" title={name}>
-                  {#if combined !== undefined && sortKey === null}
+                  {#if combined !== undefined}
                     <button
                       class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center"
                       onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.id); }}
