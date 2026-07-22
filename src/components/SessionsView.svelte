@@ -20,7 +20,14 @@
 
   const fmt = new Intl.NumberFormat();
   const fmt2 = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const fmt4 = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
   const fmtUsd = (amount: number) => formatCredits(amount, 'USD');
+
+  /** Plain-number money cells: 2 decimals, but sub-cent amounts keep enough
+   *  significant digits to stay honest (same rule as formatCredits). */
+  function fmtAmount(n: number): string {
+    return n !== 0 && Math.abs(n) < 0.005 ? fmt4.format(n) : fmt2.format(n);
+  }
 
   // Codex additionally shows what the usage would cost at OpenAI API rates;
   // its money column and analytics use that figure. Claude Code prices at
@@ -143,19 +150,16 @@
   const fromUtc = $derived(toUtcIso(filters.dateFrom));
   const toUtc = $derived(toUtcIso(filters.dateTo));
 
-  const filtered = $derived((() => {
+  // Everything except the date bounds. Kept separate so the analytics
+  // previous-window totals can include sessions that were active then but
+  // fall outside the current date range.
+  const filteredNoDate = $derived((() => {
     const lc = filters.search.toLowerCase();
     return allSessions.filter((s) => {
       // Status filter.
       if (s.archived && !filters.showArchived) return false;
       if (!s.archived && !filters.showActive) return false;
       if (!filters.showSubagents && isSub(s)) return false;
-
-      // Datetime range — overlap semantics: include any session whose
-      // [started_at, last_event_at] window intersects the filter range.
-      // Comparison is lexical on UTC ISO strings, which sorts chronologically.
-      if (fromUtc && s.last_event_at < fromUtc) return false;
-      if (toUtc && s.started_at > toUtc) return false;
 
       // Model filter.
       if (filters.model && s.model !== filters.model) return false;
@@ -176,6 +180,15 @@
       return true;
     });
   })());
+
+  // Datetime range — overlap semantics: include any session whose
+  // [started_at, last_event_at] window intersects the filter range.
+  // Comparison is lexical on UTC ISO strings, which sorts chronologically.
+  const filtered = $derived(
+    filteredNoDate.filter(
+      (s) => !(fromUtc && s.last_event_at < fromUtc) && !(toUtc && s.started_at > toUtc),
+    ),
+  );
 
   // True when the user has narrowed by date — drives whether per-session
   // tokens and costs are "all-time" or scoped to the visible window.
@@ -502,13 +515,15 @@
     };
   });
 
-  /** Price one range-rollup map for the sessions currently in view. */
+  /** Price one range-rollup map for the sessions currently in view. Uses the
+   *  non-date-filtered set: the rollup itself scopes usage to its window, and
+   *  the previous window's sessions may not intersect the current date range. */
   function priceRange(data: Record<string, RangeTotals> | null): { cost: number; tokens: number } {
     const r = $rates;
     if (!data || !r) return { cost: 0, tokens: 0 };
     const buckets: TierBucket[] = [];
     let tokens = 0;
-    for (const s of filtered) {
+    for (const s of filteredNoDate) {
       const rt = data[s.id];
       if (!rt) continue;
       tokens += rt.tokens.total_tokens;
@@ -586,7 +601,7 @@
     showApiCost || ($rates ? /^[A-Z]{3}$/.test(harnessCurrency($rates, harness)) : false),
   );
   function fmtMoney(n: number): string {
-    return moneyIsUsd ? fmtUsd(n) : fmt2.format(n);
+    return moneyIsUsd ? fmtUsd(n) : fmtAmount(n);
   }
 
   const spendCardLabel = $derived(
@@ -759,7 +774,7 @@
           <div class="text-[11px] text-ink-muted font-medium">Credits</div>
           {#if creditSummary.billedTotal > 0}
             <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-              {fmt2.format(creditSummary.billedTotal)}
+              {fmtAmount(creditSummary.billedTotal)}
               {#if creditSummary.unlimitedCount > 0}
                 <span class="text-[11px] text-ink-faint font-normal">{creditSummary.unlimitedCount} unlimited excluded</span>
               {/if}
@@ -870,7 +885,7 @@
                 <span class="text-ink-muted font-mono text-xs truncate" title={session.model ?? ''}>{session.model ?? '—'}</span>
                 <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}</span>
                 <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">
-                  {fmt2.format(costOf(session.id))}{#if display && display.missingModels.length > 0}<span
+                  {fmtAmount(costOf(session.id))}{#if display && display.missingModels.length > 0}<span
                       class="text-amber-500 cursor-help"
                       title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}
                 </span>
@@ -886,7 +901,7 @@
             <span class="section-label">Totals · in view</span>
             <span></span><span></span>
             <span class="text-right font-mono text-xs text-ink">{fmt.format(filteredTotal)}</span>
-            <span class="text-right font-mono text-xs text-accent-cost">{fmt2.format(costTotal)}</span>
+            <span class="text-right font-mono text-xs text-accent-cost">{fmtAmount(costTotal)}</span>
           </div>
         </div>
       {/if}

@@ -58,7 +58,8 @@ function eventCost(delta: TokenTotals, rate: ModelRate, multiplier = 1): number 
  * Cost of an arbitrary token bucket attributed to a single model, e.g. one
  * turn's tokens. Falls back to the rate card's fallback model when the model
  * isn't listed; returns 0 if neither resolves. Returns `fallbackUsed` so the
- * UI can flag it.
+ * UI can flag it. `table` selects which rate table to price against —
+ * defaults to plan-credit rates; pass `rates.api_models` for API USD.
  */
 export function tokensCost(
   tokens: TokenTotals,
@@ -66,10 +67,11 @@ export function tokensCost(
   rates: RateCard,
   serviceTier: string | null = null,
   harness: Harness = 'codex',
+  table: Record<string, ModelRate> = rates.models,
 ): { cost: number; fallbackUsed: boolean } {
-  const directRate = model ? rates.models[model] : undefined;
+  const directRate = model ? table[model] : undefined;
   const fallbackUsed = directRate === undefined;
-  const rate = directRate ?? rates.models[fallbackModelFor(rates, harness)];
+  const rate = directRate ?? table[fallbackModelFor(rates, harness)];
   if (!rate) return { cost: 0, fallbackUsed };
   return {
     cost: eventCost(tokens, rate, serviceTierMultiplier(model, serviceTier)),

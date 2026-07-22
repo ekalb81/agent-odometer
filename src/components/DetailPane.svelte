@@ -70,9 +70,15 @@
   function toggleTurn(id: string) {
     expandedTurn = expandedTurn === id ? null : id;
   }
-  // Collapse expanded turn when switching sessions.
+  // Collapse the expanded turn when switching sessions — but not on live
+  // refreshes of the same session, which replace the object while it's busy.
+  let lastSessionId: string | null = null;
   $effect(() => {
-    if (session) expandedTurn = null;
+    const id = session?.id ?? null;
+    if (id !== lastSessionId) {
+      lastSessionId = id;
+      expandedTurn = null;
+    }
   });
 
   let copied = $state(false);
@@ -129,21 +135,30 @@
       : (sessionCredits ? { label: 'Cost', text: fmtCredit(sessionCredits.total) } : null),
   );
 
-  // Per-turn costs for the mini bar chart (turn order, oldest → newest).
-  const turnCosts = $derived((() => {
-    if (!session || !$rates) return [];
-    return turnsAsc.map((t) => ({
-      index: t.index,
-      cost: tokensCost(t.tokens, t.model, $rates!, t.service_tier, session!.harness).cost,
-    }));
+  // Per-turn costs, priced from the same table as the headline figure —
+  // api_models when the pane is in API-USD mode, plan credits otherwise —
+  // so per-turn amounts reconcile with the displayed total.
+  const turnCostById = $derived((() => {
+    const m = new Map<string, { cost: number; fallbackUsed: boolean }>();
+    if (!session || !$rates) return m;
+    const table =
+      session.harness === 'codex' && sessionApiCost
+        ? ($rates.api_models ?? $rates.models)
+        : $rates.models;
+    for (const t of session.turns) {
+      m.set(t.turn_id, tokensCost(t.tokens, t.model, $rates, t.service_tier, session.harness, table));
+    }
+    return m;
   })());
+
+  // Mini bar chart series (turn order, oldest → newest).
+  const turnCosts = $derived(
+    turnsAsc.map((t) => ({ index: t.index, cost: turnCostById.get(t.turn_id)?.cost ?? 0 })),
+  );
   const maxTurnCost = $derived(turnCosts.reduce((m, t) => Math.max(m, t.cost), 0));
 
   function turnCost(turnId: string): { cost: number; fallbackUsed: boolean } | null {
-    if (!session || !$rates) return null;
-    const t = session.turns.find((x) => x.turn_id === turnId);
-    if (!t) return null;
-    return tokensCost(t.tokens, t.model, $rates, t.service_tier, session.harness);
+    return turnCostById.get(turnId) ?? null;
   }
 
   const fmtMoney = $derived((n: number) =>
