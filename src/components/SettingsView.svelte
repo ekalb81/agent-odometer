@@ -110,16 +110,19 @@
   // Performance: Windows Defender exclusions (Windows only).
   // ---------------------------------------------------------------------------
   const isWindows = navigator.userAgent.includes('Windows');
-  let defenderRequested = $state(false);
+  let defenderState = $state<'idle' | 'pending' | 'done'>('idle');
   let defenderError = $state<string | null>(null);
 
   async function handleDefenderExclusions() {
     defenderError = null;
-    defenderRequested = false;
+    defenderState = 'pending';
     try {
+      // Resolves only after the elevated process finishes, so success here
+      // means the exclusions really were added.
       await addDefenderExclusions();
-      defenderRequested = true;
+      defenderState = 'done';
     } catch (e) {
+      defenderState = 'idle';
       defenderError = String(e);
     }
   }
@@ -565,12 +568,15 @@
       <div class="flex items-center gap-3 flex-wrap">
         <button
           onclick={handleDefenderExclusions}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-card border border-edge hover:bg-[var(--row-hover)] text-ink transition-colors"
+          disabled={defenderState === 'pending'}
+          class="px-3 py-1.5 text-xs font-medium rounded bg-card border border-edge hover:bg-[var(--row-hover)] text-ink transition-colors disabled:opacity-50"
         >
           Exclude session folders from Defender…
         </button>
-        {#if defenderRequested}
-          <span class="text-xs text-pos">Requested — approve the Windows security prompt.</span>
+        {#if defenderState === 'pending'}
+          <span class="text-xs text-ink-muted">Waiting for approval in the Windows security prompt…</span>
+        {:else if defenderState === 'done'}
+          <span class="text-xs text-pos">Done — the session folders are excluded from real-time scanning.</span>
         {/if}
         {#if defenderError}
           <span class="text-xs text-red-500">{defenderError}</span>

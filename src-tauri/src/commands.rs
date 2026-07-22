@@ -325,10 +325,11 @@ fn ps_quote(path: &str) -> String {
 /// Windows Defender real-time-scanning path exclusions. Strictly opt-in from
 /// the UI: the user clicks the button AND approves the elevation prompt, and
 /// only the session-data directories are excluded — never the app itself.
-/// Returns Ok once the elevation prompt was launched; the user may still
-/// decline it there.
+/// Waits for the elevated process and reports the real outcome — non-admin
+/// processes cannot read the exclusion list back, so the exit code relayed
+/// through the launcher is the only verification available.
 #[tauri::command]
-pub fn add_defender_exclusions() -> Result<(), String> {
+pub async fn add_defender_exclusions() -> Result<(), String> {
     #[cfg(windows)]
     {
         let config = Config::load().map_err(|e| e.to_string())?;
@@ -345,16 +346,36 @@ pub fn add_defender_exclusions() -> Result<(), String> {
         }
 
         // Elevation happens through Start-Process -Verb RunAs, so Windows
-        // itself asks the user for consent; nothing runs silently.
-        let inner = format!("Add-MpPreference -ExclusionPath {}", paths.join(","));
+        // itself asks the user for consent; nothing runs silently. The
+        // elevated shell exits 0/1 by Add-MpPreference outcome; a declined
+        // UAC prompt makes Start-Process throw, mapped to exit 2.
+        let inner = format!(
+            "try {{ Add-MpPreference -ExclusionPath {} -ErrorAction Stop; exit 0 }} catch {{ exit 1 }}",
+            paths.join(",")
+        );
         let arg_list = ps_quote(&format!("-NoProfile -Command {inner}"));
-        let outer = format!("Start-Process powershell -Verb RunAs -ArgumentList {arg_list}");
+        let outer = format!(
+            "try {{ $p = Start-Process powershell -Verb RunAs -ArgumentList {arg_list} -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode }} catch {{ exit 2 }}"
+        );
 
-        std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &outer])
-            .spawn()
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let output = tauri::async_runtime::spawn_blocking(move || {
+            std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &outer])
+                .output()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+        match output.status.code() {
+            Some(0) => Ok(()),
+            Some(2) => Err("The Windows security prompt was declined — nothing was changed.".into()),
+            _ => Err(
+                "Windows Defender did not accept the exclusions. Another security product or a \
+                 policy may be managing it."
+                    .into(),
+            ),
+        }
     }
     #[cfg(not(windows))]
     {
