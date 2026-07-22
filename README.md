@@ -77,7 +77,7 @@ npm run tauri dev
 | Command | Purpose |
 | --- | --- |
 | `npm run tauri dev` | Run the desktop app with hot reload |
-| `npm run dev` | Frontend dev server only (port 1420, no native IPC) |
+| `npm run dev` | Frontend dev server only (port 1420; no native IPC — a fixture mock supplies demo data in plain browsers) |
 | `npm run check` | Type-check TypeScript and Svelte |
 | `npm run build` | Build the frontend into `dist/` |
 | `npm run tauri build` | Build and bundle the desktop app |

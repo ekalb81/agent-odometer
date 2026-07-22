@@ -2,22 +2,172 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Spline Sans / Spline Sans Mono — bundled variable fonts (latin, OFL). */
+@font-face {
+  font-family: 'Spline Sans';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./assets/fonts/spline-sans-latin-var.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'Spline Sans Mono';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('./assets/fonts/spline-sans-mono-latin-var.woff2') format('woff2');
+}
+
+/* ---------------------------------------------------------------------------
+   "Instrument Ledger" design tokens. Semantic names are mapped to Tailwind
+   colors in tailwind.config.js; [data-theme] on <html> flips the theme.
+   --------------------------------------------------------------------------- */
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --bg: #17191e; /* app background */
+  --chrome: #1d2026; /* toolbar + status bar */
+  --panel: #1d2026; /* detail pane, table header, totals row */
+  --card: #1e2127;
+  --border: #2a2e37;
+  --row-border: rgba(51, 65, 85, 0.5);
+  --row-hover: rgba(51, 65, 85, 0.4);
+  --track: #2a2e37; /* progress-bar troughs */
+  --table: #17191e; /* session-table surface */
+
+  --text: #e8eaee;
+  --text-2: #c3c9d4;
+  --muted: #8b93a2;
+  --faint: #5f6673;
+  --row-name: #c3c9d4; /* session name in unselected table rows */
+
+  --positive: #3ecf8e;
+  --positive-chip-bg: rgba(62, 207, 142, 0.14);
+  --positive-chip-border: rgba(62, 207, 142, 0.3);
+  --subagent-chip-bg: rgba(139, 108, 240, 0.16);
+  --subagent-chip-fg: #b6a3f5;
+  --archived-chip-bg: #2a2e37;
+  --archived-chip-fg: #8b93a2;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+
+  --bg: #f7f6f3;
+  --chrome: #ffffff;
+  --panel: #fbfaf7;
+  --card: #ffffff;
+  --border: #e7e4dd;
+  --row-border: #f1efe9;
+  --row-hover: #fbf9f5;
+  --track: #f1efe9;
+  --table: #ffffff;
+
+  --text: #1b1d22;
+  --text-2: #57584f;
+  --muted: #6f7280;
+  --faint: #a3a49e;
+  --row-name: #1b1d22;
+
+  --positive: #2f9e6a;
+  --positive-chip-bg: rgba(47, 158, 106, 0.12);
+  --positive-chip-border: rgba(47, 158, 106, 0.3);
+  --subagent-chip-bg: #f0e9fb;
+  --subagent-chip-fg: #8a5cd6;
+  --archived-chip-bg: #f1efe9;
+  --archived-chip-fg: #6f7280;
+}
+
+/* ---------------------------------------------------------------------------
+   Per-harness accents. Codex is blue, Claude Code is orange; each theme gets
+   its own shades. Spec'd values: Codex dark + Claude light; the other two are
+   matched interpolations. Bars 1–4 are the cost-by-model ranking shades.
+   --------------------------------------------------------------------------- */
+.accent-codex {
+  --accent: #4c8dff;
+  --accent-dim: #3d5a85; /* dim bars in cost-per-turn chart */
+  --accent-tab: #2b58c9; /* segmented-control active fill */
+  --accent-cost: #4c8dff; /* cost figures in tables */
+  --accent-chip-bg: rgba(76, 141, 255, 0.14);
+  --accent-chip-fg: #7aa5ff;
+  --accent-row-bg: rgba(76, 141, 255, 0.1); /* selected row */
+  --accent-fill: rgba(76, 141, 255, 0.13); /* area-chart fill */
+  --bar-1: #4c8dff;
+  --bar-2: #7aa5ff;
+  --bar-3: #a7c3ff;
+  --bar-4: #5f6673;
+}
+:root[data-theme='light'] .accent-codex {
+  --accent: #4c8dff;
+  --accent-dim: #a9c6ff;
+  --accent-tab: #2b58c9;
+  --accent-cost: #2b58c9;
+  --accent-chip-bg: #e6eeff;
+  --accent-chip-fg: #2b58c9;
+  --accent-row-bg: #eef4ff;
+  --accent-fill: rgba(76, 141, 255, 0.14);
+  --bar-1: #4c8dff;
+  --bar-2: #7aa5ff;
+  --bar-3: #a7c3ff;
+  --bar-4: #d4d6dd;
+}
+.accent-claude {
+  --accent: #e8935a;
+  --accent-dim: #85583d;
+  --accent-tab: #e8935a;
+  --accent-cost: #e8935a;
+  --accent-chip-bg: rgba(232, 147, 90, 0.14);
+  --accent-chip-fg: #eeb28a;
+  --accent-row-bg: rgba(232, 147, 90, 0.1);
+  --accent-fill: rgba(232, 147, 90, 0.13);
+  --bar-1: #e8935a;
+  --bar-2: #eeb28a;
+  --bar-3: #f3cdb1;
+  --bar-4: #5f6673;
+}
+:root[data-theme='light'] .accent-claude {
+  --accent: #e8935a;
+  --accent-dim: #eeb28a;
+  --accent-tab: #e8935a;
+  --accent-cost: #b4551e;
+  --accent-chip-bg: #fdeee2;
+  --accent-chip-fg: #b4551e;
+  --accent-row-bg: #fdf4ec;
+  --accent-fill: rgba(232, 147, 90, 0.14);
+  --bar-1: #e8935a;
+  --bar-2: #eeb28a;
+  --bar-3: #f3cdb1;
+  --bar-4: #f8e0cf;
+}
+
 :root {
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: 'Spline Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
   margin: 0;
   min-height: 100vh;
-  background-color: #0f172a;
-  color: #f1f5f9;
+  background-color: var(--bg);
+  color: var(--text);
+  font-size: 13px;
 }
 
 #app {
   height: 100vh;
   display: flex;
   flex-direction: column;
+}
+
+/* Section labels: 10–11px/600, uppercase, wide tracking. */
+.section-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--faint);
 }

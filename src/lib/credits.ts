@@ -58,7 +58,8 @@ function eventCost(delta: TokenTotals, rate: ModelRate, multiplier = 1): number 
  * Cost of an arbitrary token bucket attributed to a single model, e.g. one
  * turn's tokens. Falls back to the rate card's fallback model when the model
  * isn't listed; returns 0 if neither resolves. Returns `fallbackUsed` so the
- * UI can flag it.
+ * UI can flag it. `table` selects which rate table to price against —
+ * defaults to plan-credit rates; pass `rates.api_models` for API USD.
  */
 export function tokensCost(
   tokens: TokenTotals,
@@ -66,10 +67,11 @@ export function tokensCost(
   rates: RateCard,
   serviceTier: string | null = null,
   harness: Harness = 'codex',
+  table: Record<string, ModelRate> = rates.models,
 ): { cost: number; fallbackUsed: boolean } {
-  const directRate = model ? rates.models[model] : undefined;
+  const directRate = model ? table[model] : undefined;
   const fallbackUsed = directRate === undefined;
-  const rate = directRate ?? rates.models[fallbackModelFor(rates, harness)];
+  const rate = directRate ?? table[fallbackModelFor(rates, harness)];
   if (!rate) return { cost: 0, fallbackUsed };
   return {
     cost: eventCost(tokens, rate, serviceTierMultiplier(model, serviceTier)),
@@ -236,17 +238,20 @@ const ISO_CURRENCY = /^[A-Z]{3}$/;
  * Otherwise (e.g. "credits"), formats as a plain decimal with the unit suffix.
  */
 export function formatCredits(amount: number, currency: string): string {
+  // Two decimals everywhere per the Instrument Ledger spec; amounts that
+  // would round to 0.00 keep enough significant digits to stay honest.
+  const subCent = amount !== 0 && Math.abs(amount) < 0.005;
   if (ISO_CURRENCY.test(currency)) {
     return new Intl.NumberFormat('en-US', {
       style: 'currency',
       currency,
       minimumFractionDigits: 2,
-      maximumFractionDigits: 4,
+      maximumFractionDigits: subCent ? 4 : 2,
     }).format(amount);
   }
   const num = new Intl.NumberFormat('en-US', {
     minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    maximumFractionDigits: subCent ? 4 : 2,
   }).format(amount);
   return `${num} ${currency}`;
 }
