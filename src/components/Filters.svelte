@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
   import type { SessionSummary } from '../lib/types';
+  import { RANGE_PRESETS, rangeLabelFor, toLocalInputValue, type RangePreset } from '../lib/dateRange';
 
   export type FilterState = {
     search: string;
@@ -70,54 +71,16 @@
 
   // ---------------------------------------------------------------------------
   // Date-range presets — stored as `datetime-local` strings (local time).
-  // Empty bound = open-ended.
+  // Empty bound = open-ended. Definitions and labelling live in lib/dateRange
+  // so the analytics band describes its window with the same words.
   // ---------------------------------------------------------------------------
-  function pad(n: number): string { return n.toString().padStart(2, '0'); }
-  function toLocalInputValue(d: Date): string {
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  }
-  function startOfToday(): Date {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d;
-  }
-
-  type Preset = { label: string; from: () => Date | null };
-  const presets: Preset[] = [
-    { label: 'All time', from: () => null },
-    { label: 'Today', from: startOfToday },
-    { label: 'Last 24h', from: () => new Date(Date.now() - 24 * 3600 * 1000) },
-    { label: 'Last 7 days', from: () => new Date(Date.now() - 7 * 24 * 3600 * 1000) },
-    { label: 'Last 30 days', from: () => new Date(Date.now() - 30 * 24 * 3600 * 1000) },
-  ];
-
-  function applyPreset(p: Preset) {
+  function applyPreset(p: RangePreset) {
     const from = p.from();
     emit({ dateFrom: from ? toLocalInputValue(from) : '', dateTo: '' });
     rangeOpen = false;
   }
 
-  // The pill label: recognise the preset that produced the current bounds
-  // (within tolerance — presets are relative to "now"), else show the range.
-  const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  function fmtBound(local: string): string {
-    const d = new Date(local);
-    if (isNaN(d.getTime())) return '…';
-    return `${MONTHS[d.getMonth()]} ${d.getDate()}`;
-  }
-  const rangeLabel = $derived((() => {
-    if (!filters.dateFrom && !filters.dateTo) return 'All time';
-    if (filters.dateFrom && !filters.dateTo) {
-      const fromMs = new Date(filters.dateFrom).getTime();
-      const tolerance = 90 * 1000; // presets round to the minute; allow drift
-      for (const p of presets) {
-        const d = p.from();
-        if (d && Math.abs(fromMs - d.getTime()) < tolerance) return p.label;
-      }
-      return `${fmtBound(filters.dateFrom)} – now`;
-    }
-    return `${filters.dateFrom ? fmtBound(filters.dateFrom) : '…'} – ${filters.dateTo ? fmtBound(filters.dateTo) : '…'}`;
-  })());
+  const rangeLabel = $derived(rangeLabelFor(filters.dateFrom, filters.dateTo));
 
   const dateScoped = $derived(Boolean(filters.dateFrom || filters.dateTo));
 
@@ -205,7 +168,7 @@
         onkeydown={onPopoverKeydown}
       >
         <div class="flex flex-wrap gap-1.5">
-          {#each presets as p}
+          {#each RANGE_PRESETS as p}
             <button
               type="button"
               onclick={() => applyPreset(p)}

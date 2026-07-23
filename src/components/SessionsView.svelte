@@ -7,6 +7,7 @@
   import { getSessionDetails, sessionsInRange } from '../lib/ipc';
   import type { Harness, RangeTotals, Session, TierBucket, TokenTotals } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
+  import { rangeLabelFor } from '../lib/dateRange';
   import DetailPane from './DetailPane.svelte';
 
   interface Props {
@@ -487,25 +488,40 @@
   const DAY_MS = 86_400_000;
   const MAX_CHART_BUCKETS = 14;
 
-  // The chart window: the date filter when set, else the last 7 days.
+  // Earliest session start — the window floor for a "To"-only date filter.
+  // Separate derived so windowBounds only tracks the session list in that case.
+  const earliestStartMs = $derived((() => {
+    let min = Infinity;
+    for (const s of allSessions) {
+      const t = new Date(s.started_at).getTime();
+      if (t < min) min = t;
+    }
+    return min;
+  })());
+
+  // The chart window: the date filter when set, else a rolling last-7-days —
+  // the same definition as the "Last 7 days" preset, so picking that preset
+  // doesn't shift the numbers. A "To"-only filter reaches back to the earliest
+  // session so the band covers the same sessions as the list.
   const windowBounds = $derived((() => {
-    void pulseGen; // stay fresh across midnight
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
+    void pulseGen; // stay fresh as time advances
     const endMs = toUtc ? new Date(toUtc).getTime() : Date.now();
     let startMs: number;
     if (fromUtc) {
       startMs = new Date(fromUtc).getTime();
     } else if (toUtc) {
-      startMs = endMs - 7 * DAY_MS;
+      startMs = Number.isFinite(earliestStartMs) ? earliestStartMs : endMs - 7 * DAY_MS;
     } else {
-      startMs = today.getTime() - 6 * DAY_MS;
+      startMs = endMs - 7 * DAY_MS;
     }
     if (startMs >= endMs) startMs = endMs - DAY_MS;
     return { startMs, endMs };
   })());
 
-  const windowLabel = $derived(dateScoped ? 'in range' : 'last 7 days');
+  // Card labels echo the filter pill's wording for the same bounds.
+  const windowLabel = $derived(
+    dateScoped ? rangeLabelFor(filters.dateFrom, filters.dateTo) : 'Last 7 days',
+  );
 
   $effect(() => {
     const { startMs, endMs } = windowBounds;
@@ -594,7 +610,7 @@
   // ---------------------------------------------------------------------------
   // Window-scoped stats for the rest of the analytics band. Every card reads
   // from the same rollup map as the spend card (the date filter when set, else
-  // the last 7 days) and the same non-date filters, so the band tells one
+  // the rolling last 7 days) and the same non-date filters, so the band tells one
   // consistent story. A session counts as active when it has usage in window.
   // ---------------------------------------------------------------------------
   // Rollup objects are recreated per fetch but reused across the store
@@ -797,7 +813,7 @@
         </div>
         {#if costDelta !== null}
           <span class="text-[11px] font-semibold bg-accent-chipbg text-accent-chipfg rounded-full px-[9px] py-[2px] whitespace-nowrap">
-            {costDelta >= 0 ? '▲' : '▼'} {Math.abs(costDelta)}% vs previous {windowLabel === 'in range' ? 'period' : 'week'}
+            {costDelta >= 0 ? '▲' : '▼'} {Math.abs(costDelta)}% vs previous {windowLabel === 'Last 7 days' ? 'week' : 'period'}
           </span>
         {/if}
         <span class="ml-auto text-[11px] text-ink-faint whitespace-nowrap">{spendCardNote}</span>
