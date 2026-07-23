@@ -7,7 +7,13 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 pub const CLASSIFIER_VERSION: u32 = 1;
-pub const ANALYZER_VERSION: u32 = 1;
+pub const ANALYZER_VERSION: u32 = 2;
+pub const REPEATED_READ_THRESHOLD: usize = 3;
+pub const CORRECTIVE_MUTATION_THRESHOLD: usize = 2;
+pub const REPEATED_FAILURE_THRESHOLD: usize = 2;
+pub const HIGH_TOOL_CHURN_THRESHOLD: usize = 20;
+pub const EXCESSIVE_OUTPUT_BYTES_THRESHOLD: u64 = 1024 * 1024;
+pub const RATIO_EVIDENCE_MIN_CALLS: u64 = 8;
 
 pub fn classify_tool(name: &str) -> ToolKind {
     let value = name.to_ascii_lowercase();
@@ -239,13 +245,20 @@ pub fn classify_turn(text: &str, tool: &ToolMetrics) -> TurnClassification {
     }
 }
 
-pub fn findings(observations: &[ToolObservation]) -> Vec<OptimizationFinding> {
+pub fn findings<'a>(
+    observations: impl IntoIterator<Item = &'a ToolObservation>,
+) -> Vec<OptimizationFinding> {
     let mut groups: BTreeMap<(String, String, String), Vec<&ToolObservation>> = BTreeMap::new();
+    let mut target_activity: BTreeMap<(String, String), Vec<&ToolObservation>> = BTreeMap::new();
     let mut turn_calls: BTreeMap<String, Vec<&ToolObservation>> = BTreeMap::new();
     for item in observations {
         let turn = item.turn_id.clone().unwrap_or_else(|| "session".into());
         turn_calls.entry(turn.clone()).or_default().push(item);
         if let Some(target) = &item.target {
+            target_activity
+                .entry((turn.clone(), target.clone()))
+                .or_default()
+                .push(item);
             groups
                 .entry((turn, item.kind.as_str().into(), target.clone()))
                 .or_default()
@@ -253,20 +266,55 @@ pub fn findings(observations: &[ToolObservation]) -> Vec<OptimizationFinding> {
         }
     }
     let mut out = Vec::new();
+
+    // Re-reads are actionable only when they occur in one uninterrupted
+    // segment. A mutation of the same target is a relevant context change and
+    // resets the counter; reads in later turns are evaluated independently.
+    for ((turn, target), mut items) in target_activity {
+        items.sort_by_key(|item| item.timestamp);
+        let model = items.iter().rev().find_map(|item| item.model.clone());
+        let mut reads = 0;
+        let mut max_reads = 0;
+        let mut finding_timestamp = None;
+        for item in &items {
+            match item.kind {
+                ToolKind::Read => {
+                    reads += 1;
+                    if reads > max_reads {
+                        max_reads = reads;
+                        finding_timestamp = Some(item.timestamp);
+                    }
+                }
+                ToolKind::Mutation => reads = 0,
+                _ => {}
+            }
+        }
+        if max_reads >= REPEATED_READ_THRESHOLD {
+            out.push(OptimizationFinding {
+                version: ANALYZER_VERSION,
+                rule_id: "repeated-read".into(),
+                severity: "info".into(),
+                turn_id: (turn != "session").then_some(turn.clone()),
+                model,
+                timestamp: finding_timestamp,
+                evidence: format!("{max_reads} uninterrupted reads of {target}"),
+                remediation: "Reuse the prior result until the target changes".into(),
+            });
+        }
+    }
+
     for ((turn, kind, target), items) in groups {
         let failures = items
             .iter()
             .filter(|item| item.outcome == ToolOutcome::Failure)
             .count();
-        let rule = if kind == "read" && items.len() >= 3 {
-            Some(("repeated-read", "info", "Repeated reads of the same target"))
-        } else if kind == "mutation" && items.len() >= 2 {
+        let rule = if kind == "mutation" && items.len() >= CORRECTIVE_MUTATION_THRESHOLD {
             Some((
                 "corrective-mutation",
                 "warning",
                 "Repeated mutations of the same target",
             ))
-        } else if failures >= 2 {
+        } else if failures >= REPEATED_FAILURE_THRESHOLD {
             Some((
                 "repeated-failure",
                 "warning",
@@ -282,21 +330,63 @@ pub fn findings(observations: &[ToolObservation]) -> Vec<OptimizationFinding> {
                 severity: severity.into(),
                 turn_id: (turn != "session").then_some(turn),
                 model: items.last().and_then(|item| item.model.clone()),
+                timestamp: items.last().map(|item| item.timestamp),
                 evidence: format!("{} calls to {}", items.len(), target),
                 remediation: message.into(),
             });
         }
     }
     for (turn, items) in turn_calls {
-        if items.len() > 20 {
+        let metrics = metrics(items.iter().copied());
+        if items.len() > HIGH_TOOL_CHURN_THRESHOLD {
             out.push(OptimizationFinding {
                 version: ANALYZER_VERSION,
                 rule_id: "high-tool-churn".into(),
                 severity: "info".into(),
-                turn_id: (turn != "session").then_some(turn),
+                turn_id: (turn != "session").then_some(turn.clone()),
                 model: items.last().and_then(|item| item.model.clone()),
+                timestamp: items.last().map(|item| item.timestamp),
                 evidence: format!("{} tool calls", items.len()),
                 remediation: "Batch compatible work and narrow intermediate output".into(),
+            });
+        }
+        if metrics.output_bytes > EXCESSIVE_OUTPUT_BYTES_THRESHOLD {
+            out.push(OptimizationFinding {
+                version: ANALYZER_VERSION,
+                rule_id: "excessive-command-output".into(),
+                severity: "warning".into(),
+                turn_id: (turn != "session").then_some(turn.clone()),
+                model: items.last().and_then(|item| item.model.clone()),
+                timestamp: items.last().map(|item| item.timestamp),
+                evidence: format!("{} captured output bytes", metrics.output_bytes),
+                remediation: "Filter, paginate, or summarize command output at the source".into(),
+            });
+        }
+        if metrics.calls >= RATIO_EVIDENCE_MIN_CALLS {
+            let mutations = metrics.mutations.max(1);
+            let decided = metrics.successes + metrics.failures;
+            let read_edit_ratio = metrics.reads as f64 / mutations as f64;
+            let failure_rate = if decided == 0 {
+                0.0
+            } else {
+                metrics.failures as f64 / decided as f64
+            };
+            out.push(OptimizationFinding {
+                version: ANALYZER_VERSION,
+                rule_id: "tool-ratio-evidence".into(),
+                severity: "info".into(),
+                turn_id: (turn != "session").then_some(turn),
+                model: items.last().and_then(|item| item.model.clone()),
+                timestamp: items.last().map(|item| item.timestamp),
+                evidence: format!(
+                    "read/edit {:.2}; success/failure {}/{}",
+                    read_edit_ratio, metrics.successes, metrics.failures
+                ),
+                remediation: if failure_rate >= 0.5 {
+                    "Review the failing tool path; ratios are evidence, not a quality score".into()
+                } else {
+                    "Use this ratio as context; no universal target is implied".into()
+                },
             });
         }
     }
@@ -444,5 +534,150 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn classifier_is_ordered_deterministic_and_handles_ambiguous_text() {
+        let none = ToolMetrics::default();
+        assert_eq!(
+            classify_turn("write tests and fix a bug", &none).category,
+            TaskCategory::Testing
+        );
+        assert_eq!(
+            classify_turn("fix a bug after review", &none).category,
+            TaskCategory::Debugging
+        );
+        assert_eq!(
+            classify_turn("review the architecture plan", &none).category,
+            TaskCategory::Review
+        );
+        assert_eq!(
+            classify_turn("design an approach", &none).category,
+            TaskCategory::Planning
+        );
+        assert_eq!(
+            classify_turn("implement the feature", &none).category,
+            TaskCategory::Coding
+        );
+        assert_eq!(
+            classify_turn("research the current flow", &none).category,
+            TaskCategory::Exploration
+        );
+        let unknown = classify_turn("hello", &none);
+        assert_eq!(unknown.category, TaskCategory::Other);
+        assert_eq!(unknown.version, CLASSIFIER_VERSION);
+        assert_eq!(unknown.signals, vec!["no-strong-signal"]);
+
+        let mut tools = ToolMetrics {
+            mutations: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            classify_turn("continue", &tools).category,
+            TaskCategory::Coding
+        );
+        tools.failures = 1;
+        assert_eq!(
+            classify_turn("continue", &tools).category,
+            TaskCategory::Debugging
+        );
+    }
+
+    fn observation(
+        id: usize,
+        kind: ToolKind,
+        target: Option<&str>,
+        outcome: ToolOutcome,
+        output_bytes: u64,
+    ) -> ToolObservation {
+        ToolObservation {
+            call_id: id.to_string(),
+            turn_id: Some("t".into()),
+            harness: Harness::Codex,
+            model: Some("m".into()),
+            timestamp: DateTime::from_timestamp(id as i64, 0).unwrap(),
+            kind,
+            name: "synthetic".into(),
+            target: target.map(str::to_owned),
+            outcome,
+            duration_ms: None,
+            output_bytes,
+        }
+    }
+
+    #[test]
+    fn analyzer_resets_repeated_reads_after_a_mutation() {
+        let items = vec![
+            observation(1, ToolKind::Read, Some("read:a"), ToolOutcome::Success, 0),
+            observation(2, ToolKind::Read, Some("read:a"), ToolOutcome::Success, 0),
+            observation(
+                3,
+                ToolKind::Mutation,
+                Some("read:a"),
+                ToolOutcome::Success,
+                0,
+            ),
+            observation(4, ToolKind::Read, Some("read:a"), ToolOutcome::Success, 0),
+            observation(5, ToolKind::Read, Some("read:a"), ToolOutcome::Success, 0),
+        ];
+        assert!(!findings(&items)
+            .iter()
+            .any(|item| item.rule_id == "repeated-read"));
+    }
+
+    #[test]
+    fn analyzer_emits_each_initial_rule_with_bounded_evidence() {
+        let mut items = vec![
+            observation(
+                1,
+                ToolKind::Mutation,
+                Some("mutation:a"),
+                ToolOutcome::Success,
+                0,
+            ),
+            observation(
+                2,
+                ToolKind::Mutation,
+                Some("mutation:a"),
+                ToolOutcome::Failure,
+                0,
+            ),
+            observation(
+                3,
+                ToolKind::Command,
+                Some("command:b"),
+                ToolOutcome::Failure,
+                700_000,
+            ),
+            observation(
+                4,
+                ToolKind::Command,
+                Some("command:b"),
+                ToolOutcome::Failure,
+                700_000,
+            ),
+        ];
+        for id in 5..=9 {
+            items.push(observation(
+                id,
+                ToolKind::Other,
+                None,
+                ToolOutcome::Success,
+                0,
+            ));
+        }
+        let result = findings(&items);
+        for rule in [
+            "corrective-mutation",
+            "repeated-failure",
+            "excessive-command-output",
+            "tool-ratio-evidence",
+        ] {
+            assert!(
+                result.iter().any(|item| item.rule_id == rule),
+                "missing {rule}"
+            );
+        }
+        assert!(result.iter().all(|item| item.evidence.len() < 160));
     }
 }

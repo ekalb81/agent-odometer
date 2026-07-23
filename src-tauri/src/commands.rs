@@ -519,6 +519,27 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
         if state.current_scan_generation() != generation {
             return;
         }
+
+        // Session working directories are now known, so replace the startup
+        // watcher with one that also covers project-scoped Codex/Claude
+        // configuration surfaces. This same path runs after settings changes.
+        let config_watcher_started = Instant::now();
+        let config_watcher_result = crate::config_events::start(app.clone(), state.clone());
+        let config_watcher_ok = config_watcher_result.is_ok();
+        match config_watcher_result {
+            Ok(replacement) => {
+                let previous = state.config_watcher.lock().unwrap().replace(replacement);
+                drop(previous);
+            }
+            Err(error) => tracing::warn!("could not refresh config watcher: {}", error),
+        }
+        state.performance.record_backend(
+            "background.config_watcher_refresh",
+            config_watcher_started,
+            config_watcher_ok,
+            BTreeMap::from([("sessions".into(), state.sessions.len().to_string())]),
+        );
+
         state.scanned.store(true, Ordering::Release);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         state.scan_elapsed_ms.store(elapsed_ms, Ordering::Release);
@@ -799,10 +820,16 @@ mod tests {
     fn export_writer_accepts_only_csv_and_json() {
         let dir = tempfile::tempdir().unwrap();
         let csv = dir.path().join("usage.csv");
-        write_export_file(&csv, "csv", "a,b\r\n1,2\r\n").unwrap();
-        assert_eq!(std::fs::read_to_string(csv).unwrap(), "a,b\r\n1,2\r\n");
+        let unicode = "name,note\r\n\"Δelta\",\"comma, quote \"\" and\nnewline\"\r\n";
+        write_export_file(&csv, "csv", unicode).unwrap();
+        assert_eq!(std::fs::read_to_string(csv).unwrap(), unicode);
+        let json = dir.path().join("empty.json");
+        write_export_file(&json, "json", "[]\n").unwrap();
+        assert_eq!(std::fs::read_to_string(json).unwrap(), "[]\n");
         let text = dir.path().join("usage.txt");
         assert!(write_export_file(&text, "csv", "nope").is_err());
+        let missing_parent = dir.path().join("missing/usage.csv");
+        assert!(write_export_file(&missing_parent, "csv", "a\r\n").is_err());
     }
 
     #[test]
@@ -815,6 +842,7 @@ mod tests {
                 ..Default::default()
             },
             tool_metrics_by_model: Default::default(),
+            optimization_findings_count: 0,
         };
         assert!(range_has_data(&range));
     }

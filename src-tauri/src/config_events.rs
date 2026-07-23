@@ -12,13 +12,8 @@ use walkdir::WalkDir;
 
 const MAX_LOADED_EVENTS: usize = 10_000;
 const MAX_EVENT_LOG_BYTES: u64 = 8 * 1024 * 1024;
-const DIRECT_CONFIG_NAMES: &[&str] = &[
-    "config.toml",
-    "settings.json",
-    "settings.local.json",
-    "CLAUDE.md",
-    "AGENTS.md",
-];
+const CODEX_CONFIG_NAMES: &[&str] = &["config.toml", "AGENTS.md"];
+const CLAUDE_CONFIG_NAMES: &[&str] = &["settings.json", "settings.local.json", "CLAUDE.md"];
 
 pub struct ConfigWatcherHandle {
     _inner: Box<dyn std::any::Any + Send + Sync>,
@@ -26,6 +21,15 @@ pub struct ConfigWatcherHandle {
 
 type SnapshotValue = (String, u64);
 type Snapshot = HashMap<String, SnapshotValue>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigRoot {
+    harness: String,
+    path: PathBuf,
+    scope: Option<String>,
+    direct_names: &'static [&'static str],
+    nested: bool,
+}
 
 fn data_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|path| path.join("agent-odometer"))
@@ -49,7 +53,18 @@ fn stable_hash(bytes: &[u8]) -> String {
     format!("{:016x}", hash)
 }
 
-fn roots() -> Vec<(String, PathBuf)> {
+fn project_scope(path: &Path) -> PathBuf {
+    gix::discover(path)
+        .ok()
+        .map(|repo| {
+            repo.work_dir()
+                .unwrap_or_else(|| repo.git_dir())
+                .to_path_buf()
+        })
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn roots(state: &AppState) -> Vec<ConfigRoot> {
     let home = dirs::home_dir();
     let codex = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -57,14 +72,78 @@ fn roots() -> Vec<(String, PathBuf)> {
     let claude = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(|| home.map(|path| path.join(".claude")));
-    [("codex", codex), ("claude_code", claude)]
+    let mut out = Vec::new();
+    if let Some(path) = codex {
+        out.push(ConfigRoot {
+            harness: "codex".into(),
+            path,
+            scope: None,
+            direct_names: CODEX_CONFIG_NAMES,
+            nested: true,
+        });
+    }
+    if let Some(path) = claude {
+        out.push(ConfigRoot {
+            harness: "claude_code".into(),
+            path,
+            scope: None,
+            direct_names: CLAUDE_CONFIG_NAMES,
+            nested: true,
+        });
+    }
+
+    let working_directories: BTreeSet<PathBuf> = state
+        .sessions
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .value()
+                .working_directory
+                .as_deref()
+                .map(PathBuf::from)
+        })
+        .collect();
+    let project_scopes: BTreeSet<PathBuf> = working_directories
         .into_iter()
-        .filter_map(|(harness, root)| root.map(|root| (harness.into(), root)))
-        .collect()
+        .map(|path| project_scope(&path))
+        .collect();
+    for scope_path in project_scopes {
+        let scope = Some(scope_path.to_string_lossy().into_owned());
+        // Root-level instruction files belong to their respective harnesses.
+        out.push(ConfigRoot {
+            harness: "codex".into(),
+            path: scope_path.clone(),
+            scope: scope.clone(),
+            direct_names: &["AGENTS.md"],
+            nested: false,
+        });
+        out.push(ConfigRoot {
+            harness: "claude_code".into(),
+            path: scope_path.clone(),
+            scope: scope.clone(),
+            direct_names: &["CLAUDE.md"],
+            nested: false,
+        });
+        out.push(ConfigRoot {
+            harness: "codex".into(),
+            path: scope_path.join(".codex"),
+            scope: scope.clone(),
+            direct_names: CODEX_CONFIG_NAMES,
+            nested: true,
+        });
+        out.push(ConfigRoot {
+            harness: "claude_code".into(),
+            path: scope_path.join(".claude"),
+            scope,
+            direct_names: CLAUDE_CONFIG_NAMES,
+            nested: true,
+        });
+    }
+    out
 }
 
-fn is_safe_config_path(root: &Path, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
+fn is_safe_config_path(root: &ConfigRoot, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(&root.path) else {
         return false;
     };
     let components = relative
@@ -86,13 +165,15 @@ fn is_safe_config_path(root: &Path, path: &Path) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     (components.len() == 1
-        && matches!(
-            name.as_str(),
-            "config.toml" | "settings.json" | "settings.local.json" | "claude.md" | "agents.md"
-        ))
-        || (components.first().is_some_and(|part| part == "hooks")
+        && root
+            .direct_names
+            .iter()
+            .any(|allowed| name.eq_ignore_ascii_case(allowed)))
+        || (root.nested
+            && components.first().is_some_and(|part| part == "hooks")
             && path.extension().and_then(|value| value.to_str()) == Some("json"))
-        || (components.first().is_some_and(|part| part == "skills")
+        || (root.nested
+            && components.first().is_some_and(|part| part == "skills")
             && path.extension().and_then(|value| value.to_str()) == Some("md"))
 }
 
@@ -129,16 +210,17 @@ fn save_snapshot(snapshot: &Snapshot) {
     }
 }
 
-fn discover_snapshot(roots: &[(String, PathBuf)]) -> (Snapshot, HashMap<String, String>) {
+fn discover_snapshot(roots: &[ConfigRoot]) -> (Snapshot, HashMap<String, ConfigRoot>) {
     let mut snapshot = Snapshot::new();
-    let mut harness_by_key = HashMap::new();
-    for (harness, root) in roots {
-        if !root.exists() {
+    let mut root_by_key = HashMap::new();
+    for root in roots {
+        if !root.path.exists() {
             continue;
         }
-        let direct = DIRECT_CONFIG_NAMES.iter().map(|name| root.join(name));
-        let nested = [root.join("hooks"), root.join("skills")]
+        let direct = root.direct_names.iter().map(|name| root.path.join(name));
+        let nested = [root.path.join("hooks"), root.path.join("skills")]
             .into_iter()
+            .filter(|_| root.nested)
             .filter(|path| path.exists())
             .flat_map(|path| {
                 WalkDir::new(path)
@@ -154,12 +236,12 @@ fn discover_snapshot(roots: &[(String, PathBuf)]) -> (Snapshot, HashMap<String, 
         {
             if let Some(current) = snapshot_file(&path) {
                 let key = path.to_string_lossy().into_owned();
-                harness_by_key.insert(key.clone(), harness.clone());
+                root_by_key.insert(key.clone(), root.clone());
                 snapshot.insert(key, current);
             }
         }
     }
-    (snapshot, harness_by_key)
+    (snapshot, root_by_key)
 }
 
 fn snapshot_diff(
@@ -182,11 +264,8 @@ fn snapshot_diff(
         .collect()
 }
 
-fn harness_for_path<'a>(path: &Path, roots: &'a [(String, PathBuf)]) -> Option<&'a str> {
-    roots
-        .iter()
-        .find(|(_, root)| path.starts_with(root))
-        .map(|(harness, _)| harness.as_str())
+fn tracked_root_for_path<'a>(path: &Path, roots: &'a [ConfigRoot]) -> Option<&'a ConfigRoot> {
+    roots.iter().find(|root| is_safe_config_path(root, path))
 }
 
 pub fn load_events() -> Vec<ExternalEvent> {
@@ -246,7 +325,7 @@ fn append_event_locked(event: &ExternalEvent) {
 
 fn event_for(
     path: &Path,
-    harness: &str,
+    root: &ConfigRoot,
     previous: Option<&(String, u64)>,
     current: Option<&(String, u64)>,
 ) -> ExternalEvent {
@@ -256,7 +335,7 @@ fn event_for(
         _ => "modified",
     };
     let mut metadata = BTreeMap::new();
-    metadata.insert("harness".into(), harness.into());
+    metadata.insert("harness".into(), root.harness.clone());
     metadata.insert(
         "path_id".into(),
         stable_hash(path.to_string_lossy().as_bytes()),
@@ -269,6 +348,12 @@ fn event_for(
         metadata.insert("content_hash".into(), hash.clone());
         metadata.insert("size".into(), size.to_string());
     }
+    let previous_size = previous.map_or(0, |(_, size)| *size);
+    let current_size = current.map_or(0, |(_, size)| *size);
+    metadata.insert(
+        "safe_diff".into(),
+        format!("size {previous_size} -> {current_size} bytes; content hash changed"),
+    );
     let timestamp = Utc::now();
     ExternalEvent {
         id: format!(
@@ -277,7 +362,7 @@ fn event_for(
             metadata["path_id"]
         ),
         timestamp,
-        scope: None,
+        scope: root.scope.clone(),
         source: "config".into(),
         kind: kind.into(),
         metadata,
@@ -288,8 +373,7 @@ fn record_change(
     app: &AppHandle,
     state: &Arc<AppState>,
     snapshot: &Arc<Mutex<Snapshot>>,
-    harness: &str,
-    root: &Path,
+    root: &ConfigRoot,
     path: &Path,
 ) {
     if !is_safe_config_path(root, path) {
@@ -306,7 +390,7 @@ fn record_change(
         if previous == current {
             return;
         }
-        let event = event_for(path, harness, previous.as_ref(), current.as_ref());
+        let event = event_for(path, root, previous.as_ref(), current.as_ref());
         match current {
             Some(value) => {
                 guard.insert(key, value);
@@ -325,8 +409,19 @@ fn record_change(
 }
 
 pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatcherHandle> {
-    let roots = roots();
+    let roots = roots(&state);
     let previous = load_snapshot();
+    // A startup watcher is created before the session scan has discovered
+    // project scopes. Keep prior project entries untouched until the post-scan
+    // watcher can evaluate them, otherwise every launch would report false
+    // remove/create pairs for unchanged project files.
+    let tracked_previous = previous.as_ref().map(|snapshot| {
+        snapshot
+            .iter()
+            .filter(|(path, _)| tracked_root_for_path(Path::new(path), &roots).is_some())
+            .map(|(path, value)| (path.clone(), value.clone()))
+            .collect::<Snapshot>()
+    });
     let snapshot = Arc::new(Mutex::new(previous.clone().unwrap_or_default()));
 
     let app_cb = app.clone();
@@ -344,21 +439,26 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
             let Ok(events) = result else { return };
             for event in events {
                 for path in &event.paths {
-                    if let Some((harness, root)) =
-                        roots_cb.iter().find(|(_, root)| path.starts_with(root))
-                    {
-                        record_change(&app_cb, &state_cb, &snapshot_cb, harness, root, path);
+                    if let Some(root) = tracked_root_for_path(path, &roots_cb) {
+                        record_change(&app_cb, &state_cb, &snapshot_cb, root, path);
                     }
                 }
             }
         },
     )?;
-    for (_, root) in &roots {
-        if root.exists() {
-            debouncer.watch(root, RecursiveMode::NonRecursive)?;
-            for nested in [root.join("hooks"), root.join("skills")] {
-                if nested.exists() {
-                    debouncer.watch(&nested, RecursiveMode::Recursive)?;
+    let mut watched = BTreeSet::new();
+    for root in &roots {
+        if root.path.exists() && watched.insert((root.path.clone(), false)) {
+            if let Err(error) = debouncer.watch(&root.path, RecursiveMode::NonRecursive) {
+                tracing::warn!("could not watch config root {:?}: {}", root.path, error);
+            }
+        }
+        if root.nested {
+            for nested in [root.path.join("hooks"), root.path.join("skills")] {
+                if nested.exists() && watched.insert((nested.clone(), true)) {
+                    if let Err(error) = debouncer.watch(&nested, RecursiveMode::Recursive) {
+                        tracing::warn!("could not watch config tree {:?}: {}", nested, error);
+                    }
                 }
             }
         }
@@ -372,9 +472,9 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
     let baseline_snapshot = snapshot.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let (current, harness_by_key) = discover_snapshot(&roots);
+        let (current, root_by_key) = discover_snapshot(&roots);
         let discovered_files = current.len();
-        let changes = snapshot_diff(previous.as_ref(), &current);
+        let changes = snapshot_diff(tracked_previous.as_ref(), &current);
         let mut emitted = Vec::new();
         let _io = event_io_lock().lock().unwrap();
         let snapshot_copy = {
@@ -404,12 +504,11 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
         let mut event_records = Vec::with_capacity(change_count);
         for (key, old, current) in emitted {
             let path = PathBuf::from(&key);
-            let harness = harness_by_key
+            let root = root_by_key
                 .get(&key)
-                .map(String::as_str)
-                .or_else(|| harness_for_path(&path, &roots));
-            let Some(harness) = harness else { continue };
-            let event = event_for(&path, harness, old.as_ref(), current.as_ref());
+                .or_else(|| tracked_root_for_path(&path, &roots));
+            let Some(root) = root else { continue };
+            let event = event_for(&path, root, old.as_ref(), current.as_ref());
             append_event_locked(&event);
             event_records.push(event);
         }
@@ -436,10 +535,20 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_snapshot, event_for, harness_for_path, is_safe_config_path, snapshot_diff,
-        Snapshot,
+        discover_snapshot, event_for, is_safe_config_path, snapshot_diff, tracked_root_for_path,
+        ConfigRoot, Snapshot, CODEX_CONFIG_NAMES,
     };
     use std::path::Path;
+
+    fn config_root(path: &Path, scope: Option<&str>) -> ConfigRoot {
+        ConfigRoot {
+            harness: "codex".into(),
+            path: path.to_path_buf(),
+            scope: scope.map(str::to_owned),
+            direct_names: CODEX_CONFIG_NAMES,
+            nested: true,
+        }
+    }
 
     #[test]
     fn first_snapshot_is_a_baseline() {
@@ -482,7 +591,13 @@ mod tests {
         std::fs::write(root.join("skills/example/SKILL.md"), "# Synthetic skill").unwrap();
         std::fs::write(root.join("sessions/deep/AGENTS.md"), "must be ignored").unwrap();
 
-        let (snapshot, _) = discover_snapshot(&[("codex".into(), root)]);
+        let (snapshot, _) = discover_snapshot(&[super::ConfigRoot {
+            harness: "codex".into(),
+            path: root,
+            scope: None,
+            direct_names: CODEX_CONFIG_NAMES,
+            nested: true,
+        }]);
         assert_eq!(snapshot.len(), 2);
         assert!(snapshot.keys().all(|key| !key.contains("sessions")));
     }
@@ -490,46 +605,65 @@ mod tests {
     #[test]
     fn safe_paths_are_resolved_relative_to_the_harness_root() {
         let root = Path::new("/tmp/synthetic-root");
-        assert!(is_safe_config_path(root, &root.join("config.toml")));
-        assert!(is_safe_config_path(root, &root.join("hooks/example.json")));
+        let config_root = config_root(root, None);
+        assert!(is_safe_config_path(&config_root, &root.join("config.toml")));
         assert!(is_safe_config_path(
-            root,
+            &config_root,
+            &root.join("hooks/example.json")
+        ));
+        assert!(is_safe_config_path(
+            &config_root,
             &root.join("skills/example/SKILL.md")
         ));
         assert!(!is_safe_config_path(
-            root,
+            &config_root,
             Path::new("/tmp/outside/config.toml")
         ));
-        assert!(!is_safe_config_path(root, &root.join("cache/config.toml")));
-        assert!(!is_safe_config_path(root, &root.join("hooks/example.txt")));
-        assert!(!is_safe_config_path(root, &root.join("nested/config.toml")));
+        assert!(!is_safe_config_path(
+            &config_root,
+            &root.join("cache/config.toml")
+        ));
+        assert!(!is_safe_config_path(
+            &config_root,
+            &root.join("hooks/example.txt")
+        ));
+        assert!(!is_safe_config_path(
+            &config_root,
+            &root.join("nested/config.toml")
+        ));
     }
 
     #[test]
     fn config_events_capture_change_kind_and_redacted_metadata() {
         let path = Path::new("/synthetic/config.toml");
-        let created = event_for(path, "codex", None, Some(&("new".into(), 3)));
+        let config_root = config_root(Path::new("/synthetic"), Some("/synthetic/project"));
+        let created = event_for(path, &config_root, None, Some(&("new".into(), 3)));
         assert_eq!(created.kind, "created");
         assert_eq!(created.metadata["harness"], "codex");
         assert_eq!(created.metadata["content_hash"], "new");
+        assert_eq!(created.scope.as_deref(), Some("/synthetic/project"));
+        assert_eq!(
+            created.metadata["safe_diff"],
+            "size 0 -> 3 bytes; content hash changed"
+        );
         assert!(!created.metadata.contains_key("path"));
 
-        let removed = event_for(path, "codex", Some(&("old".into(), 2)), None);
+        let removed = event_for(path, &config_root, Some(&("old".into(), 2)), None);
         assert_eq!(removed.kind, "removed");
         assert_eq!(removed.metadata["previous_hash"], "old");
 
         let modified = event_for(
             path,
-            "codex",
+            &config_root,
             Some(&("old".into(), 2)),
             Some(&("new".into(), 3)),
         );
         assert_eq!(modified.kind, "modified");
-        let roots = [("codex".into(), Path::new("/synthetic").to_path_buf())];
-        assert_eq!(harness_for_path(path, &roots), Some("codex"));
+        let roots = [config_root];
         assert_eq!(
-            harness_for_path(Path::new("/other/config.toml"), &roots),
-            None
+            tracked_root_for_path(path, &roots).map(|root| root.harness.as_str()),
+            Some("codex")
         );
+        assert!(tracked_root_for_path(Path::new("/other/config.toml"), &roots).is_none());
     }
 }

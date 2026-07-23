@@ -102,6 +102,10 @@ Sessions cross the wire in two shapes. `SessionSummary` (list rows, live updates
 
 Date-scoped numbers come from the batched `sessions_in_ranges` command. The frontend passes the filtered session IDs, and chronological histories use binary partitioning to visit only each window's relevant slice. It returns per-session `RangeTotals` (tokens, tier buckets, and compact tool metrics). The table, analytics, model comparison, export, tray, and generic correlation engine reuse those maps rather than starting per-row scans.
 
+Configuration tracking resolves global harness roots plus project scopes derived from session working directories (using the containing Git worktree when available). Only known settings/instruction files and bounded hook/skill trees are watched. Events retain hashes, sizes, a size-only safe diff, and a hashed path identity; they never persist config values or raw paths. The watcher is rebuilt after each session scan so newly discovered project scopes and settings-root changes share the same coverage. Config markers appear on the existing spend chart and the timeline reports before/after tokens, turns, active session duration, tool metrics, samples, and confounds through the source-agnostic correlation engine.
+
+Optimization findings are timestamped at the observation that triggered them. `RangeTotals.optimization_findings_count` therefore scopes precomputed findings by date without rerunning the analyzer for every analytics window.
+
 `src/lib/types.ts` manually mirrors Rust's serialized structs. Rust field or serialization changes therefore require an explicit TypeScript update.
 
 `sessionsStore` is the canonical reactive session collection. `sessionProjection.ts` owns the pure selection, date-scoped pricing, model aggregation, and export rows used by every scope. `SessionsView.svelte` derives ordering, day groups, analytics, comparison, export, event correlation, and selection from that projection; its fixed-height virtual list keeps DOM size bounded for large corpora. `DetailPane.svelte` fetches full details only on demand, including normalized observations, categories, and findings.

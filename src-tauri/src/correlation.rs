@@ -39,6 +39,9 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct CorrelationObservation {
     pub session_count: u64,
+    pub turn_count: u64,
+    /// Sum of each included session's overlap with the observation window.
+    pub session_duration_ms: u64,
     pub tokens: TokenTotals,
     pub buckets_by_harness: BTreeMap<Harness, Vec<TierBucket>>,
     pub tool_metrics: ToolMetrics,
@@ -74,15 +77,16 @@ fn normalized_scope(value: &str) -> String {
 }
 
 fn scope_matches(session: &Session, event: &ExternalEvent) -> bool {
-    if event.source == "config" {
-        if let Some(harness) = event.metadata.get("harness") {
-            let session_harness = match session.harness {
-                Harness::Codex => "codex",
-                Harness::ClaudeCode => "claude_code",
-            };
-            if harness != session_harness {
-                return false;
-            }
+    // Harness is optional source metadata, not a source-specific branch. Any
+    // event producer can constrain its observations to one harness while the
+    // core remains agnostic to config/git event kinds.
+    if let Some(harness) = event.metadata.get("harness") {
+        let session_harness = match session.harness {
+            Harness::Codex => "codex",
+            Harness::ClaudeCode => "claude_code",
+        };
+        if harness != session_harness {
+            return false;
         }
     }
     let Some(event_scope) = event.scope.as_deref() else {
@@ -117,13 +121,53 @@ fn add_bucket(target: &mut Vec<TierBucket>, value: &TierBucket) {
     }
 }
 
-fn add_range(out: &mut CorrelationObservation, harness: Harness, range: RangeTotals) {
+fn interval_overlaps(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> bool {
+    from.is_none_or(|from| end >= from) && to.is_none_or(|to| start <= to)
+}
+
+fn overlap_duration_ms(
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> u64 {
+    let start = from.map_or(start, |from| start.max(from));
+    let end = to.map_or(end, |to| end.min(to));
+    end.signed_duration_since(start).num_milliseconds().max(0) as u64
+}
+
+fn add_range(
+    out: &mut CorrelationObservation,
+    session: &Session,
+    window: (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
+    range: RangeTotals,
+) {
     if range.tokens.total_tokens == 0 && range.tool_metrics.calls == 0 {
         return;
     }
     out.session_count += 1;
+    out.turn_count += session
+        .turns
+        .iter()
+        .filter(|turn| {
+            let start = turn.started_at.unwrap_or(session.started_at);
+            let end = turn.completed_at.unwrap_or(session.last_event_at);
+            interval_overlaps(start, end, window.0, window.1)
+        })
+        .count() as u64;
+    out.session_duration_ms += overlap_duration_ms(
+        session.started_at,
+        session.last_event_at,
+        window.0,
+        window.1,
+    );
     add_tokens(&mut out.tokens, &range.tokens);
-    let harness_buckets = out.buckets_by_harness.entry(harness).or_default();
+    let harness_buckets = out.buckets_by_harness.entry(session.harness).or_default();
     for bucket in &range.buckets {
         add_bucket(harness_buckets, bucket);
     }
@@ -205,8 +249,18 @@ pub fn correlate<S: Borrow<Session>>(sessions: &[S], query: CorrelationQuery) ->
             .enumerate()
         {
             let index = matched[position];
-            add_range(&mut observations[index].0, session.harness, pair[0].clone());
-            add_range(&mut observations[index].1, session.harness, pair[1].clone());
+            add_range(
+                &mut observations[index].0,
+                session,
+                windows[index].0,
+                pair[0].clone(),
+            );
+            add_range(
+                &mut observations[index].1,
+                session,
+                windows[index].1,
+                pair[1].clone(),
+            );
         }
     }
 
@@ -398,5 +452,72 @@ mod tests {
         );
         assert_eq!(result.results[0].after.tokens.total_tokens, 20);
         assert_eq!(result.results[0].after.session_count, 1);
+    }
+
+    #[test]
+    fn before_after_windows_are_symmetric_and_subagents_are_optional() {
+        let sessions = vec![
+            session(
+                "before",
+                None,
+                &[("2026-01-01T00:00:00Z", 4), ("2026-01-01T12:00:00Z", 6)],
+                false,
+            ),
+            session(
+                "after",
+                None,
+                &[("2026-01-02T12:00:00Z", 5), ("2026-01-03T00:00:00Z", 5)],
+                false,
+            ),
+            session("subagent", None, &[("2026-01-02T18:00:00Z", 3)], true),
+        ];
+        let query = |include_subagents| CorrelationQuery {
+            events: vec![event("e", "2026-01-02T00:00:00Z", None)],
+            before_days: 1,
+            after_days: 1,
+            exclude_confounded: false,
+            include_subagents,
+        };
+        let without = correlate(&sessions, query(false));
+        assert_eq!(without.results[0].before.tokens.total_tokens, 10);
+        assert_eq!(without.results[0].after.tokens.total_tokens, 10);
+        assert_eq!(
+            without.results[0].before.session_duration_ms,
+            12 * 60 * 60 * 1_000
+        );
+        assert_eq!(
+            without.results[0].after.session_duration_ms,
+            12 * 60 * 60 * 1_000
+        );
+
+        let with = correlate(&sessions, query(true));
+        assert_eq!(with.results[0].after.tokens.total_tokens, 13);
+        assert_eq!(with.results[0].after.session_count, 2);
+    }
+
+    #[test]
+    fn missing_scope_and_empty_samples_return_zero_observations() {
+        let sessions = vec![session(
+            "elsewhere",
+            Some("C:/other"),
+            &[("2026-01-02T00:00:00Z", 10)],
+            false,
+        )];
+        let result = correlate(
+            &sessions,
+            CorrelationQuery {
+                events: vec![event("e", "2026-01-02T00:00:00Z", Some("C:/missing"))],
+                before_days: 1,
+                after_days: 1,
+                exclude_confounded: false,
+                include_subagents: true,
+            },
+        );
+        assert_eq!(result.results[0].before, CorrelationObservation::default());
+        assert_eq!(result.results[0].after, CorrelationObservation::default());
+        assert!(result.results[0]
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("low sample")));
     }
 }

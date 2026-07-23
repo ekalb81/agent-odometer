@@ -421,4 +421,112 @@ mod tests {
             .all(|outcome| outcome.evidence == "commit overlaps multiple session windows"));
         assert_eq!(events.len(), 2);
     }
+
+    #[test]
+    fn discovers_nested_directories_and_includes_clock_boundaries() {
+        let directory = repository();
+        let first = commit(
+            directory.path(),
+            "first",
+            &["-m", "At session start"],
+            "2026-02-01T00:00:00Z",
+        );
+        let last = commit(
+            directory.path(),
+            "last",
+            &["-m", "At post-window end"],
+            "2026-02-01T02:00:00Z",
+        );
+        let nested = directory.path().join("packages/app/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let sessions = [session(
+            "bounded",
+            Some(&nested),
+            "2026-02-01T00:00:00Z",
+            "2026-02-01T01:00:00Z",
+        )];
+
+        let (outcomes, _) = evaluate(&sessions, 1);
+        assert_eq!(outcomes[0].kind, GitOutcomeKind::Kept);
+        assert_eq!(outcomes[0].commit_ids, vec![first, last]);
+        assert_eq!(
+            Path::new(outcomes[0].repository_scope.as_deref().unwrap()),
+            directory.path()
+        );
+    }
+
+    #[test]
+    fn handles_detached_head_amends_and_linked_worktrees() {
+        let directory = repository();
+        let branch = git(directory.path(), &["branch", "--show-current"], None);
+        commit(
+            directory.path(),
+            "base",
+            &["-m", "Base"],
+            "2026-03-01T00:00:00Z",
+        );
+        git(directory.path(), &["checkout", "--quiet", "--detach"], None);
+        let old = commit(
+            directory.path(),
+            "detached",
+            &["-m", "Detached"],
+            "2026-03-02T00:00:00Z",
+        );
+        std::fs::write(directory.path().join("fixture.txt"), "amended").unwrap();
+        git(directory.path(), &["add", "fixture.txt"], None);
+        git(
+            directory.path(),
+            &["commit", "--quiet", "--amend", "-m", "Amended detached"],
+            Some("2026-03-02T01:00:00Z"),
+        );
+        let amended = git(directory.path(), &["rev-parse", "HEAD"], None);
+        assert_ne!(old, amended);
+
+        let detached = [session(
+            "detached",
+            Some(directory.path()),
+            "2026-03-02T00:30:00Z",
+            "2026-03-02T01:00:00Z",
+        )];
+        let (outcomes, _) = evaluate(&detached, 0);
+        assert_eq!(outcomes[0].kind, GitOutcomeKind::Kept);
+        assert_eq!(outcomes[0].commit_ids, vec![amended]);
+
+        let linked_parent = tempfile::tempdir().unwrap();
+        let linked = linked_parent.path().join("linked-worktree");
+        git(
+            directory.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "synthetic-worktree",
+                linked.to_str().unwrap(),
+                &branch,
+            ],
+            None,
+        );
+        let linked_commit = commit(
+            &linked,
+            "linked",
+            &["-m", "Linked worktree"],
+            "2026-03-03T00:00:00Z",
+        );
+        let linked_nested = linked.join("crates/example");
+        std::fs::create_dir_all(&linked_nested).unwrap();
+        let linked_session = [session(
+            "linked",
+            Some(&linked_nested),
+            "2026-03-02T23:59:00Z",
+            "2026-03-03T00:00:00Z",
+        )];
+        let (outcomes, _) = evaluate(&linked_session, 0);
+        assert_eq!(outcomes[0].kind, GitOutcomeKind::Kept);
+        assert_eq!(outcomes[0].commit_ids, vec![linked_commit]);
+        assert_eq!(
+            Path::new(outcomes[0].repository_scope.as_deref().unwrap()),
+            linked.as_path()
+        );
+    }
 }

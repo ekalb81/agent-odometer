@@ -66,6 +66,7 @@ export interface OptimizationFinding {
   severity: string;
   turn_id: string | null;
   model: string | null;
+  timestamp: string | null;
   evidence: string;
   remediation: string;
 }
@@ -149,6 +150,7 @@ export interface RangeTotals {
   buckets: TierBucket[];
   tool_metrics: ToolMetrics;
   tool_metrics_by_model: Record<string, ToolMetrics>;
+  optimization_findings_count: number;
 }
 
 /** Lightweight wire form of a Session for the list view and live updates. */
@@ -244,6 +246,8 @@ export interface ExternalEvent {
 
 export interface CorrelationObservation {
   session_count: number;
+  turn_count: number;
+  session_duration_ms: number;
   tokens: TokenTotals;
   buckets_by_harness: Partial<Record<Harness, TierBucket[]>>;
   tool_metrics: ToolMetrics;
