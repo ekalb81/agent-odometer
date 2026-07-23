@@ -1,0 +1,9 @@
+# Native host adapters require a running Tauri event loop, window, tray, or
+# filesystem notification backend. CI still compiles and lints these modules;
+# unit coverage focuses on the pure parsing, accounting, storage, and analytics
+# code behind them.
+ignore:
+  - "src-tauri/src/commands.rs"
+  - "src-tauri/src/lib.rs"
+  - "src-tauri/src/tray.rs"
+  - "src-tauri/src/watcher.rs"

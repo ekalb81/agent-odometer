@@ -435,7 +435,11 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
 
 #[cfg(test)]
 mod tests {
-    use super::{discover_snapshot, snapshot_diff, Snapshot};
+    use super::{
+        discover_snapshot, event_for, harness_for_path, is_safe_config_path, snapshot_diff,
+        Snapshot,
+    };
+    use std::path::Path;
 
     #[test]
     fn first_snapshot_is_a_baseline() {
@@ -481,5 +485,51 @@ mod tests {
         let (snapshot, _) = discover_snapshot(&[("codex".into(), root)]);
         assert_eq!(snapshot.len(), 2);
         assert!(snapshot.keys().all(|key| !key.contains("sessions")));
+    }
+
+    #[test]
+    fn safe_paths_are_resolved_relative_to_the_harness_root() {
+        let root = Path::new("/tmp/synthetic-root");
+        assert!(is_safe_config_path(root, &root.join("config.toml")));
+        assert!(is_safe_config_path(root, &root.join("hooks/example.json")));
+        assert!(is_safe_config_path(
+            root,
+            &root.join("skills/example/SKILL.md")
+        ));
+        assert!(!is_safe_config_path(
+            root,
+            Path::new("/tmp/outside/config.toml")
+        ));
+        assert!(!is_safe_config_path(root, &root.join("cache/config.toml")));
+        assert!(!is_safe_config_path(root, &root.join("hooks/example.txt")));
+        assert!(!is_safe_config_path(root, &root.join("nested/config.toml")));
+    }
+
+    #[test]
+    fn config_events_capture_change_kind_and_redacted_metadata() {
+        let path = Path::new("/synthetic/config.toml");
+        let created = event_for(path, "codex", None, Some(&("new".into(), 3)));
+        assert_eq!(created.kind, "created");
+        assert_eq!(created.metadata["harness"], "codex");
+        assert_eq!(created.metadata["content_hash"], "new");
+        assert!(!created.metadata.contains_key("path"));
+
+        let removed = event_for(path, "codex", Some(&("old".into(), 2)), None);
+        assert_eq!(removed.kind, "removed");
+        assert_eq!(removed.metadata["previous_hash"], "old");
+
+        let modified = event_for(
+            path,
+            "codex",
+            Some(&("old".into(), 2)),
+            Some(&("new".into(), 3)),
+        );
+        assert_eq!(modified.kind, "modified");
+        let roots = [("codex".into(), Path::new("/synthetic").to_path_buf())];
+        assert_eq!(harness_for_path(path, &roots), Some("codex"));
+        assert_eq!(
+            harness_for_path(Path::new("/other/config.toml"), &roots),
+            None
+        );
     }
 }
