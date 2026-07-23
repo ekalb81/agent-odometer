@@ -4,8 +4,8 @@
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
-  import { getSessionDetails, sessionsInRanges, writeExport } from '../lib/ipc';
-  import type { Harness, RangeTotals, RateCard, Session } from '../lib/types';
+  import { getSessionDetails, listExternalEvents, onConfigEvent, sessionsInRanges, writeExport } from '../lib/ipc';
+  import type { ExternalEvent, Harness, RangeTotals, RateCard, Session } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
   import { rangeLabelFor } from '../lib/dateRange';
   import {
@@ -88,7 +88,6 @@
     }, 2100);
     return () => clearTimeout(t);
   });
-
   // ---------------------------------------------------------------------------
   // Sort state — 3-state (asc → desc → cleared). Cleared shows the
   // day-grouped view ordered by start time.
@@ -531,6 +530,35 @@
     dateScoped ? rangeLabelFor(filters.dateFrom, filters.dateTo) : 'Last 7 days',
   );
 
+  let configEvents = $state<ExternalEvent[]>([]);
+  let configEventsGeneration = 0;
+  $effect(() => {
+    const generation = ++configEventsGeneration;
+    if (!active) return;
+    listExternalEvents()
+      .then((events) => {
+        if (active && generation === configEventsGeneration) {
+          configEvents = events.filter((event) => event.source === 'config');
+        }
+      })
+      .catch((error) => console.error('list_external_events failed:', error));
+    return () => { if (generation === configEventsGeneration) configEventsGeneration += 1; };
+  });
+  onMount(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    onConfigEvent((event) => {
+      if (!disposed) configEvents = [...configEvents.filter((item) => item.id !== event.id), event];
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else unlisten = dispose;
+    }).catch((error) => console.error('config-event listener failed:', error));
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  });
+
   // Mirrors lastTableRange: date-filter changes refresh immediately, only
   // store flushes are debounced. Keyed on the filter bounds, not windowBounds
   // — the default window's endMs is "now", which moves on every recompute.
@@ -717,6 +745,7 @@
       byModel: [] as ReturnType<typeof aggregateModelMetrics>,
       credits: { billedTotal: 0, unlimitedCount: 0 },
       subagents: { count: 0, cost: 0 },
+      findingCount: 0,
       allUnlimited: false,
     };
     if (!data || !r) return out;
@@ -726,6 +755,7 @@
       const priced = priceRangeSession(data, s, r);
       if (!priced) continue;
       out.sessionCount++;
+      out.findingCount += rt.optimization_findings_count ?? 0;
       if (s.harness === 'codex') {
         if (s.credits_unlimited === true) out.credits.unlimitedCount++;
         else out.credits.billedTotal += priced.planCost;
@@ -777,6 +807,22 @@
     if (n === 0) return [];
     const step = Math.max(1, Math.ceil(n / 7));
     return spendSeries.filter((_, i) => i % step === 0).map((p) => p.label);
+  })());
+
+  const chartConfigMarkers = $derived((() => {
+    const { startMs, endMs } = windowBounds;
+    const span = Math.max(1, endMs - startMs);
+    return configEvents
+      .filter((event) => {
+        const timestamp = new Date(event.timestamp).getTime();
+        const eventHarness = event.metadata.harness;
+        return timestamp >= startMs && timestamp <= endMs && (harness === 'all' || eventHarness === harness);
+      })
+      .slice(-50)
+      .map((event) => ({
+        event,
+        x: ((new Date(event.timestamp).getTime() - startMs) / span) * 700,
+      }));
   })());
 
   // Cost by model — aggregated from the same window as the spend card, top four.
@@ -1003,6 +1049,11 @@
         {:else}
           <line x1="0" y1="66" x2="700" y2="66" stroke="var(--accent-dim)" stroke-width="1.5" stroke-dasharray="4 4" />
         {/if}
+        {#each chartConfigMarkers as marker (marker.event.id)}
+          <line x1={marker.x} y1="5" x2={marker.x} y2="68" stroke="var(--amber, #d97706)" stroke-width="1" stroke-dasharray="2 3">
+            <title>{marker.event.kind} {marker.event.metadata.harness} configuration · {new Date(marker.event.timestamp).toLocaleString()}</title>
+          </line>
+        {/each}
       </svg>
       <div class="flex justify-between text-[10px] text-ink-faint mt-[5px] font-mono">
         {#each chartLabels as label}
@@ -1137,7 +1188,7 @@
     </details>
 
     <details class="bg-card border border-edge rounded-lg px-3 py-2">
-      <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view</summary>
+      <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view · {windowStats.findingCount} optimization findings in {windowLabel}</summary>
       {#if categoryRows.length === 0}<p class="text-xs text-ink-faint py-2">No classified turns.</p>{:else}
         <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
           <div class="section-label col-span-2">Harness / category</div><div class="section-label text-right">Turns</div><div class="section-label text-right">Tokens</div><div class="section-label text-right">Tools</div><div class="section-label text-right">Cost</div>
@@ -1148,7 +1199,7 @@
       {/if}
     </details>
 
-    <ConfigTimeline {active} />
+    <ConfigTimeline {active} events={configEvents} />
     <GitOutcomes />
 
     <div class="flex items-center gap-2 text-xs">

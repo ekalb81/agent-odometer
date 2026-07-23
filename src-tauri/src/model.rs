@@ -151,6 +151,8 @@ pub struct OptimizationFinding {
     pub severity: String,
     pub turn_id: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<DateTime<Utc>>,
     pub evidence: String,
     pub remediation: String,
 }
@@ -297,6 +299,8 @@ pub struct RangeTotals {
     pub tool_metrics: ToolMetrics,
     #[serde(default)]
     pub tool_metrics_by_model: BTreeMap<String, ToolMetrics>,
+    #[serde(default)]
+    pub optimization_findings_count: u64,
 }
 
 /// Lightweight wire form of a Session for the list view and live update
@@ -508,9 +512,8 @@ impl Session {
                     self.tool_observations
                         .partition_point(|item| item.timestamp <= *to)
                 });
-                crate::telemetry::metrics_with_models(
-                    self.tool_observations[start.min(end)..end].iter(),
-                )
+                let selected = &self.tool_observations[start.min(end)..end];
+                crate::telemetry::metrics_with_models(selected.iter())
             } else {
                 crate::telemetry::metrics_with_models(self.tool_observations.iter().filter(
                     |item| {
@@ -521,6 +524,17 @@ impl Session {
                     },
                 ))
             };
+            let optimization_findings_count = self
+                .optimization_findings
+                .iter()
+                .filter(|finding| match finding.timestamp {
+                    Some(timestamp) => {
+                        from.is_none_or(|from| timestamp >= from)
+                            && to.is_none_or(|to| timestamp <= to)
+                    }
+                    None => from.is_none() && to.is_none(),
+                })
+                .count() as u64;
 
             buckets.sort_by(|a, b| {
                 a.model
@@ -532,6 +546,7 @@ impl Session {
                 buckets,
                 tool_metrics,
                 tool_metrics_by_model,
+                optimization_findings_count,
             });
         }
         results
@@ -708,6 +723,34 @@ mod tests {
             Some("2026-01-01T00:00:02Z".parse().unwrap()),
         );
         assert_eq!(rt.tokens.input_tokens, 3);
+    }
+
+    #[test]
+    fn range_totals_count_only_findings_timestamped_in_range() {
+        let mut s = session_with_history(vec![]);
+        s.tool_observations = (1..=3)
+            .map(|second| ToolObservation {
+                call_id: second.to_string(),
+                turn_id: Some("turn".into()),
+                harness: Harness::Codex,
+                model: Some("m".into()),
+                timestamp: format!("2026-01-01T00:00:0{second}Z").parse().unwrap(),
+                kind: ToolKind::Read,
+                name: "read".into(),
+                target: Some("read:synthetic".into()),
+                outcome: ToolOutcome::Success,
+                duration_ms: None,
+                output_bytes: 0,
+            })
+            .collect();
+        crate::telemetry::refresh_session(&mut s);
+        let partial = s.range_totals(
+            Some("2026-01-01T00:00:01Z".parse().unwrap()),
+            Some("2026-01-01T00:00:02Z".parse().unwrap()),
+        );
+        assert_eq!(partial.optimization_findings_count, 0);
+        let all = s.range_totals(None, None);
+        assert_eq!(all.optimization_findings_count, 1);
     }
 
     #[test]

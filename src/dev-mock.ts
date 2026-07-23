@@ -271,6 +271,7 @@ function rangeTotals(from: string | null, to: string | null): Record<string, Ran
       buckets: buckets(f).map((b) => ({ ...b, tokens: scaleTok(b.tokens, fraction) })),
       tool_metrics: toolMetrics(Math.round(f.turns * 3 * fraction)),
       tool_metrics_by_model: { [f.model]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
+      optimization_findings_count: 0,
     };
   }
   return out;

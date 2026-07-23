@@ -6,13 +6,14 @@
   let busy = $state(false);
   let error = $state<string | null>(null);
   let correlations = $state<Record<string, EventCorrelation>>({});
+  let postWindowHours = $state(24);
   const kinds: GitOutcomeKind[] = ['kept', 'reverted', 'abandoned', 'ambiguous', 'not_evaluated'];
   const correlationBatchSize = 2_000;
 
   async function scan() {
     busy = true; error = null;
     try {
-      outcomes = await scanGitOutcomes(24);
+      outcomes = await scanGitOutcomes(postWindowHours);
       const sessionIds = new Set(outcomes.map((outcome) => outcome.session_id));
       const events = (await listExternalEvents()).filter((event) => event.source === 'git' && sessionIds.has(event.metadata.session_id));
       const results: EventCorrelation[] = [];
@@ -37,7 +38,10 @@
   <summary class="cursor-pointer text-xs font-semibold text-ink">Local git outcomes</summary>
   <div class="mt-2 flex items-center gap-2">
     <button class="px-3 py-1.5 rounded-md border border-edge bg-panel hover:bg-app text-xs disabled:opacity-50" disabled={busy} onclick={scan}>{busy ? 'Scanning…' : 'Evaluate local repositories'}</button>
-    <span class="text-[11px] text-ink-faint">HEAD-reachable commits · 24h post-session · no remotes or worktree changes</span>
+    <label class="text-[11px] text-ink-muted">Post-session window
+      <input class="ml-1 w-16 rounded border border-edge bg-app px-1.5 py-1 font-mono" type="number" min="0" max="8760" step="1" bind:value={postWindowHours} disabled={busy} /> h
+    </label>
+    <span class="text-[11px] text-ink-faint">HEAD-reachable commits · no remotes or worktree changes</span>
   </div>
   {#if error}<p class="text-xs text-neg mt-2">{error}</p>{/if}
   {#if outcomes.length > 0}

@@ -145,3 +145,7 @@ export function onRatesUpdated(cb: (rates: RateCard) => void): Promise<UnlistenF
 export function onConfigUpdated(cb: (config: Config) => void): Promise<UnlistenFn> {
   return listen<Config>('config-updated', (event) => cb(event.payload));
 }
+
+export function onConfigEvent(cb: (event: ExternalEvent) => void): Promise<UnlistenFn> {
+  return listen<ExternalEvent>('config-event', (event) => cb(event.payload));
+}
