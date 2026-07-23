@@ -2,16 +2,9 @@
   import { onDestroy } from 'svelte';
   import type { SessionSummary } from '../lib/types';
   import { RANGE_PRESETS, rangeLabelFor, toLocalInputValue, type RangePreset } from '../lib/dateRange';
+  import { defaultFilters, type SessionFilterState } from '../lib/sessionProjection';
 
-  export type FilterState = {
-    search: string;
-    dateFrom: string;
-    dateTo: string;
-    model: string;
-    showActive: boolean;
-    showArchived: boolean;
-    showSubagents: boolean;
-  };
+  export type FilterState = SessionFilterState;
 
   interface Props {
     filters: FilterState;
@@ -20,16 +13,6 @@
   }
 
   let { filters, sessions, onchange }: Props = $props();
-
-  const defaultFilters = (): FilterState => ({
-    search: '',
-    dateFrom: '',
-    dateTo: '',
-    model: '',
-    showActive: true,
-    showArchived: true,
-    showSubagents: true,
-  });
 
   // Debounce timer for the search input.
   let searchTimer: ReturnType<typeof setTimeout> | null = null;
@@ -47,8 +30,16 @@
     localSearch = value;
     if (searchTimer !== null) clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
+      searchTimer = null;
       emit({ search: value });
     }, 150);
+  }
+
+  function cancelSearch(): void {
+    if (searchTimer !== null) {
+      clearTimeout(searchTimer);
+      searchTimer = null;
+    }
   }
 
   function emit(patch: Partial<FilterState>) {
@@ -56,12 +47,13 @@
   }
 
   function clearAll() {
+    cancelSearch();
     localSearch = '';
     onchange(defaultFilters());
   }
 
   onDestroy(() => {
-    if (searchTimer !== null) clearTimeout(searchTimer);
+    cancelSearch();
   });
 
   // Collect distinct model values reactively from the full session list.

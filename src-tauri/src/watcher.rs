@@ -74,13 +74,18 @@ pub fn start(
     let archive_roots_cb = archive_roots_arc.clone();
     let claude_roots_cb = claude_roots_arc.clone();
     let session_index_path_cb = session_index_path_arc.clone();
-    let state_cb = state.clone();
+    // AppState owns the watcher handle; a strong capture here would create a
+    // self-cycle that prevents watcher and recorder teardown.
+    let state_cb = Arc::downgrade(&state);
     let app_cb = app.clone();
 
     let mut debouncer = new_debouncer(
         Duration::from_millis(250),
         None,
         move |result: DebounceEventResult| {
+            let Some(state_cb) = state_cb.upgrade() else {
+                return;
+            };
             let events = match result {
                 Ok(evts) => evts,
                 Err(errors) => {
@@ -100,12 +105,22 @@ pub fn start(
                     // delivers backslash paths; PathBuf::join from a slash literal does not
                     // normalize) still match.
                     if paths_equivalent(path, session_index_path_cb.as_path()) {
+                        let started = Instant::now();
                         let names = crate::session_index::read(path);
                         let changed = crate::session_index::apply(&state_cb.sessions, &names);
+                        state_cb.performance.record_backend(
+                            "watcher.session_index_refresh",
+                            started,
+                            true,
+                            std::collections::BTreeMap::from([
+                                ("names".into(), names.len().to_string()),
+                                ("changed".into(), changed.len().to_string()),
+                            ]),
+                        );
                         for id in changed {
                             if let Some(session) = state_cb.sessions.get(&id) {
                                 if let Err(e) = app_cb
-                                    .emit("session-updated", &SessionSummary::of(session.value()))
+                                    .emit("session-updated", &SessionSummary::of(session.as_ref()))
                                 {
                                     tracing::warn!("emit session-updated failed: {}", e);
                                 }
@@ -120,11 +135,20 @@ pub fn start(
                     }
 
                     if is_remove(&kind) {
-                        // Look up the session id before dropping the parser.
-                        if let Some((_, slot)) = parsers_cb.remove(path) {
-                            if let Some(session) = slot.parser.session() {
-                                let id = session.id.clone();
-                                state_cb.sessions.remove(&id);
+                        // Bulk-scanned and idle-evicted files may not have a
+                        // parser slot, so path ownership in AppState is the
+                        // source of truth for removal.
+                        let parser_id = parsers_cb
+                            .remove(path)
+                            .and_then(|(_, slot)| slot.parser.session().map(|s| s.id.clone()));
+                        if let Some((id, removed)) = state_cb.remove_session_path(path) {
+                            if removed {
+                                if let Err(e) = app_cb.emit("session-removed", &id) {
+                                    tracing::warn!("emit session-removed failed: {}", e);
+                                }
+                            }
+                        } else if let Some(id) = parser_id {
+                            if state_cb.sessions.remove(&id).is_some() {
                                 if let Err(e) = app_cb.emit("session-removed", &id) {
                                     tracing::warn!("emit session-removed failed: {}", e);
                                 }
@@ -148,8 +172,20 @@ pub fn start(
                         });
                         entry.last_touch = Instant::now();
 
-                        match entry.parser.parse_to_end() {
-                            Ok(_) => {}
+                        let parse_started = Instant::now();
+                        let parse_result = entry.parser.parse_to_end();
+                        state_cb.performance.record_backend(
+                            "watcher.incremental_parse",
+                            parse_started,
+                            parse_result.is_ok(),
+                            std::collections::BTreeMap::from([(
+                                "harness".into(),
+                                if is_claude { "claude_code" } else { "codex" }.into(),
+                            )]),
+                        );
+                        match parse_result {
+                            Ok(true) => {}
+                            Ok(false) => continue,
                             Err(e) => {
                                 tracing::warn!("parse error for {:?}: {}", path, e);
                                 continue;
@@ -158,9 +194,7 @@ pub fn start(
 
                         if let Some(session) = entry.parser.session() {
                             let summary = SessionSummary::of(session);
-                            state_cb
-                                .sessions
-                                .insert(session.id.clone(), session.clone());
+                            state_cb.publish_watched_session(path, session.clone());
                             if let Err(e) = app_cb.emit("session-updated", &summary) {
                                 tracing::warn!("emit session-updated failed: {}", e);
                             }

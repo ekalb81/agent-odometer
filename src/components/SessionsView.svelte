@@ -1,23 +1,40 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
-  import { apiCostFromBuckets, computeSummaryCredits, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
-  import { getSessionDetails, sessionsInRanges } from '../lib/ipc';
-  import type { Harness, RangeTotals, Session, TierBucket, TokenTotals } from '../lib/types';
+  import { apiCostFromBuckets, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
+  import { getSessionDetails, sessionsInRanges, writeExport } from '../lib/ipc';
+  import type { Harness, RangeTotals, RateCard, Session } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
   import { rangeLabelFor } from '../lib/dateRange';
+  import {
+    aggregateModelMetrics,
+    addTotals,
+    defaultFilters,
+    exportRows,
+    filterSessions,
+    isSubagent,
+    projectSessions,
+    rowsToCsv,
+    sessionName,
+    toUtcIso,
+    type ViewScope,
+    zeroTotals,
+  } from '../lib/sessionProjection';
   import DetailPane from './DetailPane.svelte';
+  import ConfigTimeline from './ConfigTimeline.svelte';
+  import GitOutcomes from './GitOutcomes.svelte';
+  import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
 
   interface Props {
-    harness?: Harness;
+    harness?: ViewScope;
     active?: boolean;
     filters: FilterState;
     onfilterschange: (f: FilterState) => void;
   }
 
-  let { harness = 'codex' as Harness, active = true, filters, onfilterschange }: Props = $props();
+  let { harness = 'all', active = true, filters, onfilterschange }: Props = $props();
 
   const fmt = new Intl.NumberFormat();
   const fmt2 = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -33,7 +50,14 @@
   // Codex additionally shows what the usage would cost at OpenAI API rates;
   // its money column and analytics use that figure. Claude Code prices at
   // Anthropic API rates directly.
-  const showApiCost = $derived(harness === 'codex' && Object.keys($rates?.api_models ?? {}).length > 0);
+  const showApiCost = $derived(harness !== 'claude_code' && Object.keys($rates?.api_models ?? {}).length > 0);
+  const allUsdAvailable = $derived(
+    harness !== 'all' || Boolean(
+      $rates &&
+      Object.keys($rates.api_models ?? {}).length > 0 &&
+      harnessCurrency($rates, 'claude_code') === 'USD'
+    ),
+  );
 
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -44,28 +68,8 @@
     return String(n);
   }
 
-  function sessionName(s: {
-    thread_name: string | null;
-    first_user_message: string | null;
-    working_directory: string | null;
-    id: string;
-  }): string {
-    if (s.thread_name) return s.thread_name;
-    if (s.first_user_message) return s.first_user_message;
-    if (s.working_directory) {
-      const parts = s.working_directory.replace(/\\/g, '/').split('/');
-      const base = parts[parts.length - 1];
-      if (base) return base;
-    }
-    return s.id.slice(0, 8);
-  }
-
   function truncate(str: string, max: number): string {
     return str.length > max ? str.slice(0, max) + '…' : str;
-  }
-
-  function isSub(s: TrackedSession): boolean {
-    return Boolean(s.parent_thread_id || s.agent_path || s.source === 'subagent');
   }
 
   function isPulsing(lastUpdatedAt: number): boolean {
@@ -77,24 +81,13 @@
 
   let pulseGen = $state(0);
   $effect(() => {
+    if (!active) return;
     void sessionsStore.map;
     const t = setTimeout(() => {
       pulseGen += 1;
     }, 2100);
     return () => clearTimeout(t);
   });
-
-  function defaultFilters(): FilterState {
-    return {
-      search: '',
-      dateFrom: '',
-      dateTo: '',
-      model: '',
-      showActive: true,
-      showArchived: true,
-      showSubagents: true,
-    };
-  }
 
   // ---------------------------------------------------------------------------
   // Sort state — 3-state (asc → desc → cleared). Cleared shows the
@@ -137,59 +130,26 @@
   // not re-filter/re-sort/re-price on every live update.
   // ---------------------------------------------------------------------------
   const allSessions = $derived(
-    active ? [...sessionsStore.map.values()].filter((s) => s.harness === harness) : [],
+    active ? filterSessions(sessionsStore.map.values(), harness, defaultFilters(), false) : [],
   );
 
   // Convert datetime-local strings (local time) to UTC ISO once, so the rest
   // of the pipeline can do lexical comparison against the UTC ISO timestamps
   // we store on sessions and history points.
-  function toUtcIso(local: string): string | null {
-    if (!local) return null;
-    const d = new Date(local);
-    return isNaN(d.getTime()) ? null : d.toISOString();
-  }
   const fromUtc = $derived(toUtcIso(filters.dateFrom));
   const toUtc = $derived(toUtcIso(filters.dateTo));
 
   // Everything except the date bounds. Kept separate so the analytics
   // previous-window totals can include sessions that were active then but
   // fall outside the current date range.
-  const filteredNoDate = $derived((() => {
-    const lc = filters.search.toLowerCase();
-    return allSessions.filter((s) => {
-      // Status filter.
-      if (s.archived && !filters.showArchived) return false;
-      if (!s.archived && !filters.showActive) return false;
-      if (!filters.showSubagents && isSub(s)) return false;
-
-      // Model filter.
-      if (filters.model && s.model !== filters.model) return false;
-
-      // Free-text search.
-      if (lc) {
-        const haystack = [
-          s.thread_name ?? '',
-          s.id,
-          s.first_user_message ?? '',
-          s.working_directory ?? '',
-          s.agent_path ?? '',
-          s.agent_nickname ?? '',
-        ].join('\0').toLowerCase();
-        if (!haystack.includes(lc)) return false;
-      }
-
-      return true;
-    });
-  })());
+  const filteredNoDate = $derived(filterSessions(allSessions, harness, filters, false));
 
   // Datetime range — overlap semantics: include any session whose
   // [started_at, last_event_at] window intersects the filter range.
   // Comparison is lexical on UTC ISO strings, which sorts chronologically.
-  const filtered = $derived(
-    filteredNoDate.filter(
-      (s) => !(fromUtc && s.last_event_at < fromUtc) && !(toUtc && s.started_at > toUtc),
-    ),
-  );
+  const filtered = $derived(filterSessions(filteredNoDate, harness, filters, true));
+  const filteredIds = $derived(filtered.map((session) => session.id));
+  const analyticsSessionIds = $derived(filteredNoDate.map((session) => session.id));
 
   // True when the user has narrowed by date — drives whether per-session
   // tokens and costs are "all-time" or scoped to the visible window.
@@ -201,114 +161,74 @@
   // ---------------------------------------------------------------------------
   let rangeTotals = $state<Record<string, RangeTotals>>({});
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
+  let rangeRequestGeneration = 0;
+  let lastTableRequestKey: string | null = null;
   // Debounce is only for coalescing live store flushes (~150ms apart). A
   // changed range is a discrete user action (preset click, committed input)
   // and fetches immediately.
   let lastTableRange: string | null = null;
 
   $effect(() => {
+    const generation = ++rangeRequestGeneration;
     const from = fromUtc;
     const to = toUtc;
+    const sessionIds = filteredIds;
     // Depend on the session map so live session updates refresh range data;
     // skip entirely while this tab is hidden.
     void sessionsStore.map;
-    if (!active) return;
+    if (!active) {
+      rangeTotals = {};
+      lastTableRange = null;
+      lastTableRequestKey = null;
+      return;
+    }
     if (!from && !to) {
       rangeTotals = {};
       lastTableRange = null;
+      lastTableRequestKey = null;
       return;
     }
     const key = `${from}|${to}`;
+    const requestKey = `${key}|${filters.search}|${filters.model}|${filters.showActive}|${filters.showArchived}|${filters.showSubagents}|${sessionIds.length}`;
     const delay = key === lastTableRange ? 250 : 0;
+    if (requestKey !== lastTableRequestKey) rangeTotals = {};
     lastTableRange = key;
+    lastTableRequestKey = requestKey;
     if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
     rangeFetchTimer = setTimeout(() => {
-      sessionsInRanges([{ from, to }])
+      rangeFetchTimer = null;
+      measureAsync(
+        'frontend.table_range_fetch',
+        () => sessionsInRanges([{ from, to }], sessionIds),
+        { sessions: sessionIds.length, ranges: 1 },
+      )
         .then(([result]) => {
-          // Drop stale responses if the filter moved on meanwhile.
-          if (fromUtc === from && toUtc === to) rangeTotals = result;
+          if (active && generation === rangeRequestGeneration) rangeTotals = result;
         })
         .catch((e) => console.error('sessions_in_ranges failed:', e));
     }, delay);
     return () => {
-      if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
+      if (generation === rangeRequestGeneration) rangeRequestGeneration += 1;
+      if (rangeFetchTimer !== null) {
+        clearTimeout(rangeFetchTimer);
+        rangeFetchTimer = null;
+      }
     };
   });
 
-  function zeroTotals(): TokenTotals {
-    return {
-      input_tokens: 0,
-      cached_input_tokens: 0,
-      output_tokens: 0,
-      reasoning_output_tokens: 0,
-      total_tokens: 0,
-    };
-  }
-
-  type DisplayEntry = {
-    tokens: TokenTotals;
-    total: number;
-    refCost: number;
-    apiTotal: number;
-    missingModels: string[];
-  };
-
-  // Live updates replace only the changed sessions' objects in the store, so
-  // object identity is a correct invalidation key: cache each session's priced
-  // display entry and skip the ~N-1 unchanged sessions on every flush. Stable
-  // entry identities also let unchanged rows skip DOM patching entirely.
-  const displayCache = new WeakMap<
-    TrackedSession,
-    { rates: unknown; rt: unknown; scoped: boolean; value: DisplayEntry }
-  >();
-
   // Per-session display values: tokens AND costs, both scoped to the date
   // filter when one is active so the row numbers add up to the totals row.
-  const sessionDisplayMap = $derived((() => {
-    const r = $rates;
-    const out = new Map<string, DisplayEntry>();
-    for (const s of filtered) {
-      const rt = dateScoped ? rangeTotals[s.id] : undefined;
-      if (!r) {
-        out.set(s.id, {
-          tokens: dateScoped ? (rt?.tokens ?? zeroTotals()) : s.tokens_total,
-          total: 0,
-          refCost: 0,
-          apiTotal: 0,
-          missingModels: [],
-        });
-        continue;
-      }
-      const cached = displayCache.get(s);
-      if (cached && cached.rates === r && cached.rt === rt && cached.scoped === dateScoped) {
-        out.set(s.id, cached.value);
-        continue;
-      }
-      const tokens = dateScoped ? (rt?.tokens ?? zeroTotals()) : s.tokens_total;
-      // Reference cost (à-la-carte equivalent) is always all-time for the
-      // unlimited-plan tooltip — that's the figure people compare against.
-      const allTime = computeSummaryCredits(s, r);
-      const credits = dateScoped ? creditsFromBuckets(rt?.buckets ?? [], r, s.harness) : allTime;
-      const buckets = dateScoped ? (rt?.buckets ?? []) : s.buckets;
-      const apiTotal = apiCostFromBuckets(buckets, r, s.harness)?.total ?? 0;
-      const value: DisplayEntry = {
-        tokens,
-        total: credits.total,
-        refCost: allTime.total,
-        apiTotal,
-        missingModels: credits.missingModels,
-      };
-      displayCache.set(s, { rates: r, rt, scoped: dateScoped, value });
-      out.set(s.id, value);
-    }
-    return out;
-  })());
+  // Export and the model comparison consume this exact projection too.
+  const sessionDisplayMap = $derived(
+    projectSessions(filtered, $rates, rangeTotals, dateScoped),
+  );
 
   /** The money-column value for a session (Est.$ on Codex, Cost elsewhere). */
   function costOf(id: string): number {
+    if (!allUsdAvailable) return 0;
     const d = sessionDisplayMap.get(id);
     if (!d) return 0;
-    return showApiCost ? d.apiTotal : d.total;
+    return d.displayCost;
   }
 
   function compareSession(a: TrackedSession, b: TrackedSession): number {
@@ -453,6 +373,84 @@
     return out;
   })());
 
+  // Flatten and virtualize the list locally. Rows have explicit heights so
+  // thousands of sessions do not become thousands of live DOM nodes, while
+  // group headings and keyboard-selectable session rows preserve their
+  // existing behavior without another frontend dependency.
+  type ListRow =
+    | { kind: 'group'; key: string; label: string; height: number }
+    | { kind: 'session'; key: string; session: TrackedSession; height: number };
+  const GROUP_ROW_HEIGHT = 28;
+  const SESSION_ROW_HEIGHT = 48;
+  const LIST_HEADER_HEIGHT = 33;
+  const LIST_OVERSCAN = 8;
+  const listRows = $derived((() => {
+    const rows: ListRow[] = [];
+    for (const [groupIndex, group] of groups.entries()) {
+      if (group.label) {
+        rows.push({
+          kind: 'group',
+          key: `group:${groupIndex}:${group.label}`,
+          label: group.label,
+          height: GROUP_ROW_HEIGHT,
+        });
+      }
+      for (const session of group.sessions) {
+        rows.push({ kind: 'session', key: `session:${session.id}`, session, height: SESSION_ROW_HEIGHT });
+      }
+    }
+    return rows;
+  })());
+  const listOffsets = $derived((() => {
+    const offsets = [0];
+    for (const row of listRows) offsets.push(offsets[offsets.length - 1] + row.height);
+    return offsets;
+  })());
+  let listViewport = $state<HTMLDivElement>();
+  let listScrollTop = $state(0);
+  let listViewportHeight = $state(600);
+
+  function rowIndexAt(offsets: number[], position: number): number {
+    let low = 0;
+    let high = Math.max(0, offsets.length - 1);
+    while (low < high) {
+      const middle = Math.floor((low + high + 1) / 2);
+      if (offsets[middle] <= position) low = middle;
+      else high = middle - 1;
+    }
+    return Math.min(low, Math.max(0, offsets.length - 2));
+  }
+
+  const virtualList = $derived((() => {
+    const offsets = listOffsets;
+    const contentTop = Math.max(0, listScrollTop - LIST_HEADER_HEIGHT);
+    const start = Math.max(0, rowIndexAt(offsets, contentTop) - LIST_OVERSCAN);
+    const end = Math.min(
+      listRows.length,
+      rowIndexAt(offsets, contentTop + listViewportHeight) + LIST_OVERSCAN + 1,
+    );
+    return {
+      rows: listRows.slice(start, end),
+      top: offsets[start] ?? 0,
+      bottom: Math.max(0, (offsets[offsets.length - 1] ?? 0) - (offsets[end] ?? 0)),
+    };
+  })());
+
+  $effect(() => {
+    if (!active) return;
+    const started = performance.now();
+    const rows = listRows.length;
+    measureNextPaint('frontend.session_list_paint', started, { rows });
+  });
+
+  onMount(() => {
+    const resize = new ResizeObserver(([entry]) => {
+      listViewportHeight = entry.contentRect.height;
+    });
+    if (listViewport) resize.observe(listViewport);
+    return () => resize.disconnect();
+  });
+
   /** Started column: time-of-day for today/yesterday, date otherwise. */
   function fmtStarted(startedMs: number): string {
     if (startedMs >= dayBoundaries.yesterday) {
@@ -492,6 +490,8 @@
   let analyticsPrev = $state<Record<string, RangeTotals> | null>(null);
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
+  let analyticsRequestGeneration = 0;
+  let lastAnalyticsRequestKey: string | null = null;
 
   const DAY_MS = 86_400_000;
   const MAX_CHART_BUCKETS = 14;
@@ -537,17 +537,34 @@
   let lastAnalyticsRange: string | null = null;
 
   $effect(() => {
+    const generation = ++analyticsRequestGeneration;
     const { startMs, endMs } = windowBounds;
+    const sessionIds = analyticsSessionIds;
     void sessionsStore.map;
-    if (!active) return;
+    if (!active) {
+      analyticsBuckets = [];
+      analyticsPrev = null;
+      analyticsCurrent = null;
+      lastAnalyticsRange = null;
+      lastAnalyticsRequestKey = null;
+      return;
+    }
     const key = `${fromUtc}|${toUtc}`;
+    const requestKey = `${key}|${filters.search}|${filters.model}|${filters.showActive}|${filters.showArchived}|${filters.showSubagents}|${sessionIds.length}`;
     const delay = key === lastAnalyticsRange ? 250 : 0;
+    if (requestKey !== lastAnalyticsRequestKey) {
+      analyticsBuckets = [];
+      analyticsPrev = null;
+      analyticsCurrent = null;
+    }
     lastAnalyticsRange = key;
+    lastAnalyticsRequestKey = requestKey;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
     // Debounced so a burst of store flushes (150ms apart) coalesces into one
     // refresh. All ~16 windows go in a single batched call the backend
     // computes in one pass, so the refresh itself is cheap.
     analyticsTimer = setTimeout(async () => {
+      analyticsTimer = null;
       // Day-aligned buckets, coalesced so long ranges stay ≤14 chart points.
       const dayStart = (ms: number) => {
         const d = new Date(ms);
@@ -563,13 +580,17 @@
       const prevFrom = startMs - (endMs - startMs);
       const iso = (ms: number) => new Date(ms).toISOString();
       try {
-        const [current, prev, ...days] = await sessionsInRanges([
+        const requestedRanges = [
           { from: iso(startMs), to: iso(endMs) },
           { from: iso(prevFrom), to: iso(startMs - 1) },
           ...bounds.map((b) => ({ from: iso(b.from), to: iso(b.to) })),
-        ]);
-        // Drop stale responses if the window moved on meanwhile.
-        if (windowBounds.startMs !== startMs || windowBounds.endMs !== endMs) return;
+        ];
+        const [current, prev, ...days] = await measureAsync(
+          'frontend.analytics_range_fetch',
+          () => sessionsInRanges(requestedRanges, sessionIds),
+          { sessions: sessionIds.length, ranges: requestedRanges.length },
+        );
+        if (!active || generation !== analyticsRequestGeneration) return;
         analyticsCurrent = current;
         analyticsPrev = prev;
         analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
@@ -578,7 +599,11 @@
       }
     }, delay);
     return () => {
-      if (analyticsTimer !== null) clearTimeout(analyticsTimer);
+      if (generation === analyticsRequestGeneration) analyticsRequestGeneration += 1;
+      if (analyticsTimer !== null) {
+        clearTimeout(analyticsTimer);
+        analyticsTimer = null;
+      }
     };
   });
 
@@ -588,35 +613,87 @@
   // Pricing is linear per bucket, so a range's cost equals the sum of its
   // sessions' costs. Price each fetched rollup map once (keyed by identity),
   // then every recompute — keystrokes, store flushes — just sums numbers.
-  const rangePriceCache = new WeakMap<
-    object,
-    { rates: unknown; api: boolean; per: Map<string, { cost: number; tokens: number }> }
-  >();
-  function priceRange(data: Record<string, RangeTotals> | null): { cost: number; tokens: number } {
-    const r = $rates;
-    if (!data || !r) return { cost: 0, tokens: 0 };
+  type RangePrice = {
+    cost: number;
+    tokens: number;
+    codexCredits: number;
+    codexApiUsd: number;
+    claudeUsd: number;
+    completeUsd: boolean;
+  };
+  type RangeSessionPrice = {
+    tokens: number;
+    planCost: number;
+    planComplete: boolean;
+    apiCost: number | null;
+    apiComplete: boolean;
+  };
+  const rangePriceCache = new WeakMap<object, {
+    rates: unknown;
+    perSession: Map<string, RangeSessionPrice>;
+  }>();
+
+  function priceRangeSession(
+    data: Record<string, RangeTotals>,
+    session: TrackedSession,
+    rateCard: RateCard,
+  ): RangeSessionPrice | null {
+    const totals = data[session.id];
+    if (!totals || totals.tokens.total_tokens === 0) return null;
     let cached = rangePriceCache.get(data);
-    if (!cached || cached.rates !== r || cached.api !== showApiCost) {
-      const per = new Map<string, { cost: number; tokens: number }>();
-      for (const [id, rt] of Object.entries(data)) {
-        if (rt.tokens.total_tokens === 0) continue;
-        const priced = showApiCost
-          ? apiCostFromBuckets(rt.buckets, r, harness)
-          : creditsFromBuckets(rt.buckets, r, harness);
-        per.set(id, { cost: priced?.total ?? 0, tokens: rt.tokens.total_tokens });
-      }
-      cached = { rates: r, api: showApiCost, per };
+    if (!cached || cached.rates !== rateCard) {
+      cached = { rates: rateCard, perSession: new Map() };
       rangePriceCache.set(data, cached);
     }
-    let cost = 0;
-    let tokens = 0;
+    const existing = cached.perSession.get(session.id);
+    if (existing) return existing;
+    const plan = creditsFromBuckets(totals.buckets, rateCard, session.harness);
+    const api = session.harness === 'codex'
+      ? apiCostFromBuckets(totals.buckets, rateCard, session.harness)
+      : null;
+    const value: RangeSessionPrice = {
+      tokens: totals.tokens.total_tokens,
+      planCost: plan.total,
+      planComplete: plan.missingModels.length === 0,
+      apiCost: api?.total ?? null,
+      apiComplete: Boolean(api && api.missingModels.length === 0),
+    };
+    cached.perSession.set(session.id, value);
+    return value;
+  }
+
+  function priceRange(data: Record<string, RangeTotals> | null): RangePrice {
+    const r = $rates;
+    const out: RangePrice = {
+      cost: 0,
+      tokens: 0,
+      codexCredits: 0,
+      codexApiUsd: 0,
+      claudeUsd: 0,
+      completeUsd: allUsdAvailable,
+    };
+    if (!data || !r) return out;
     for (const s of filteredNoDate) {
-      const p = cached.per.get(s.id);
-      if (!p) continue;
-      cost += p.cost;
-      tokens += p.tokens;
+      const priced = priceRangeSession(data, s, r);
+      if (!priced) continue;
+      out.tokens += priced.tokens;
+      if (s.harness === 'codex') {
+        out.codexCredits += priced.planCost;
+        out.codexApiUsd += priced.apiCost ?? 0;
+        if (!priced.apiComplete) out.completeUsd = false;
+      } else {
+        out.claudeUsd += priced.planCost;
+        if (!priced.planComplete || harnessCurrency(r, s.harness) !== 'USD') out.completeUsd = false;
+      }
     }
-    return { cost, tokens };
+    out.cost = harness === 'codex'
+      ? (showApiCost ? out.codexApiUsd : out.codexCredits)
+      : harness === 'claude_code'
+        ? out.claudeUsd
+        : allUsdAvailable && out.completeUsd
+          ? out.codexApiUsd + out.claudeUsd
+          : 0;
+    return out;
   }
 
   const spendSeries = $derived(analyticsBuckets.map((b) => ({ label: b.label, ...priceRange(b.data) })));
@@ -632,48 +709,39 @@
   // Rollup objects are recreated per fetch but reused across the store
   // flushes in between; caching their priced totals by identity keeps this
   // derived cheap when only the session list changed.
-  const rollupPriceCache = new WeakMap<object, { rates: unknown; api: boolean; total: number }>();
   const windowStats = $derived((() => {
     const r = $rates;
     const data = analyticsCurrent;
     const out = {
       sessionCount: 0,
-      byModel: [] as { model: string; cost: number }[],
+      byModel: [] as ReturnType<typeof aggregateModelMetrics>,
       credits: { billedTotal: 0, unlimitedCount: 0 },
       subagents: { count: 0, cost: 0 },
       allUnlimited: false,
     };
     if (!data || !r) return out;
-    const priceRollup = (rt: RangeTotals, api: boolean): number => {
-      const cached = rollupPriceCache.get(rt);
-      if (cached && cached.rates === r && cached.api === api) return cached.total;
-      const priced = api
-        ? apiCostFromBuckets(rt.buckets, r, harness)
-        : creditsFromBuckets(rt.buckets, r, harness);
-      const total = priced?.total ?? 0;
-      rollupPriceCache.set(rt, { rates: r, api, total });
-      return total;
-    };
-    const buckets: TierBucket[] = [];
     for (const s of filteredNoDate) {
       const rt = data[s.id];
       if (!rt || rt.tokens.total_tokens === 0) continue;
+      const priced = priceRangeSession(data, s, r);
+      if (!priced) continue;
       out.sessionCount++;
-      buckets.push(...rt.buckets);
-      if (harness === 'codex') {
+      if (s.harness === 'codex') {
         if (s.credits_unlimited === true) out.credits.unlimitedCount++;
-        else out.credits.billedTotal += priceRollup(rt, false);
+        else out.credits.billedTotal += priced.planCost;
       }
-      if (isSub(s)) {
+      if (isSubagent(s)) {
         out.subagents.count++;
-        out.subagents.cost += priceRollup(rt, showApiCost);
+        if (allUsdAvailable) {
+          out.subagents.cost += s.harness === 'codex' && priced.apiCost !== null
+            ? priced.apiCost
+            : priced.planCost;
+        }
       }
     }
-    const priced = showApiCost
-      ? apiCostFromBuckets(buckets, r, harness)
-      : creditsFromBuckets(buckets, r, harness);
-    out.byModel = [...(priced?.byModel ?? [])].sort((a, b) => b.cost - a.cost);
-    out.allUnlimited = out.sessionCount > 0 && out.credits.unlimitedCount === out.sessionCount;
+    out.byModel = allUsdAvailable ? aggregateModelMetrics(filteredNoDate, data, r) : [];
+    const codexCount = filteredNoDate.filter((session) => data[session.id]?.tokens.total_tokens && session.harness === 'codex').length;
+    out.allUnlimited = codexCount > 0 && out.credits.unlimitedCount === codexCount;
     return out;
   })());
 
@@ -716,7 +784,7 @@
     const sorted = windowStats.byModel;
     const max = sorted[0]?.cost ?? 0;
     const rows = sorted.slice(0, 4).map((m) => ({
-      model: m.model,
+      model: `${harness === 'all' ? `${m.harness} · ` : ''}${m.model}`,
       cost: m.cost,
       pct: max > 0 ? Math.max(2, Math.round((m.cost / max) * 100)) : 0,
     }));
@@ -726,22 +794,108 @@
   // Money formatting for analytics: USD gets the $ prefix, plan credits get
   // a plain number (the card labels carry the unit).
   const moneyIsUsd = $derived(
-    showApiCost || ($rates ? /^[A-Z]{3}$/.test(harnessCurrency($rates, harness)) : false),
+    harness === 'all' || showApiCost || ($rates ? /^[A-Z]{3}$/.test(harnessCurrency($rates, harness)) : false),
   );
   function fmtMoney(n: number): string {
     return moneyIsUsd ? fmtUsd(n) : fmtAmount(n);
   }
 
   const spendCardLabel = $derived(
-    harness === 'codex'
+    harness === 'all'
+      ? `Combined API estimate · ${windowLabel}`
+      : harness === 'codex'
       ? (showApiCost ? `Est. API cost · ${windowLabel}` : `Credits · ${windowLabel}`)
       : `Est. spend · ${windowLabel}`,
   );
   const spendCardNote = $derived(
-    harness === 'codex'
+    harness === 'all'
+      ? (windowTotals.completeUsd ? 'Codex + Claude USD' : 'unavailable · missing direct rates')
+      : harness === 'codex'
       ? (windowStats.allUnlimited ? 'à la carte · all sessions unlimited' : 'OpenAI API rates')
       : 'Anthropic API rates',
   );
+
+  const modelComparison = $derived(windowStats.byModel);
+  const modelComparisonCostTotal = $derived(
+    modelComparison.reduce((total, metric) => total + metric.cost, 0),
+  );
+  const categoryRows = $derived((() => {
+    const rateCard = $rates;
+    const grouped = new Map<string, {
+      harness: Harness;
+      category: string;
+      turns: number;
+      tokens: ReturnType<typeof zeroTotals>;
+      calls: number;
+      cost: number;
+      currency: string;
+    }>();
+    if (!rateCard) return [];
+    for (const session of filtered) {
+      for (const [category, metric] of Object.entries(session.category_totals ?? {})) {
+        if (!metric) continue;
+        const key = `${session.harness}:${category}`;
+        let row = grouped.get(key);
+        if (!row) {
+          row = {
+            harness: session.harness,
+            category,
+            turns: 0,
+            tokens: zeroTotals(),
+            calls: 0,
+            cost: 0,
+            currency: session.harness === 'codex' && Object.keys(rateCard.api_models ?? {}).length > 0
+              ? 'USD'
+              : harnessCurrency(rateCard, session.harness),
+          };
+          grouped.set(key, row);
+        }
+        row.turns += metric.turns;
+        row.calls += metric.tool_calls;
+        addTotals(row.tokens, metric.tokens);
+        const priced = session.harness === 'codex' && Object.keys(rateCard.api_models ?? {}).length > 0
+          ? apiCostFromBuckets(metric.buckets, rateCard, session.harness)
+          : creditsFromBuckets(metric.buckets, rateCard, session.harness);
+        row.cost += priced?.total ?? 0;
+      }
+    }
+    return [...grouped.values()].sort((a, b) => b.tokens.total_tokens - a.tokens.total_tokens);
+  })());
+
+  let exportBusy = $state(false);
+  let exportError = $state<string | null>(null);
+  let includeWorkingDirectory = $state(false);
+
+  async function exportView(format: 'csv' | 'json') {
+    exportBusy = true;
+    exportError = null;
+    try {
+      const exportSessions = filtered;
+      const exportRanges = dateScoped
+        ? (await measureAsync(
+            'frontend.session_export_range_fetch',
+            () => sessionsInRanges([{ from: fromUtc, to: toUtc }], exportSessions.map((session) => session.id)),
+            { sessions: exportSessions.length, ranges: 1 },
+          ))[0]
+        : rangeTotals;
+      const exportProjection = projectSessions(exportSessions, $rates, exportRanges, dateScoped);
+      const rows = measureSync(
+        'frontend.session_export_build',
+        () => exportRows(exportProjection.values(), includeWorkingDirectory),
+        { sessions: exportProjection.size, format },
+      );
+      const content = format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows);
+      await writeExport(
+        `odometer-${harness}-${new Date().toISOString().slice(0, 10)}.${format}`,
+        format,
+        content,
+      );
+    } catch (error) {
+      exportError = String(error);
+    } finally {
+      exportBusy = false;
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Selection + detail pane. The table only holds summaries, so the full
@@ -753,9 +907,15 @@
   let selectedSessionId = $state<string | null>(null);
   let selectedSession = $state<Session | null>(null);
   let detailsFetchTimer: ReturnType<typeof setTimeout> | null = null;
+  let detailsRequestGeneration = 0;
 
   $effect(() => {
+    const generation = ++detailsRequestGeneration;
     const id = selectedSessionId;
+    if (!active) {
+      selectedSession = null;
+      return;
+    }
     // Reactive dep: refetch details when this session's summary updates.
     void (id !== null ? sessionsStore.map.get(id)?.lastUpdatedAt : undefined);
     if (id === null) {
@@ -764,9 +924,9 @@
     }
     let cancelled = false;
     const fetchDetails = () => {
-      getSessionDetails(id)
+      measureAsync('frontend.session_detail_fetch', () => getSessionDetails(id))
         .then((s) => {
-          if (!cancelled && selectedSessionId === id) selectedSession = s;
+          if (!cancelled && active && generation === detailsRequestGeneration) selectedSession = s;
         })
         .catch((e) => console.error('get_session_details failed:', e));
     };
@@ -778,6 +938,7 @@
     }
     return () => {
       cancelled = true;
+      if (generation === detailsRequestGeneration) detailsRequestGeneration += 1;
       if (detailsFetchTimer !== null) {
         clearTimeout(detailsFetchTimer);
         detailsFetchTimer = null;
@@ -824,7 +985,7 @@
         <div>
           <div class="text-[11px] text-ink-muted font-medium">{spendCardLabel}</div>
           <div class="text-[30px] font-bold tracking-[-0.03em] font-mono mt-0.5 {showApiCost ? 'text-accent-cost' : 'text-ink'}">
-            {fmtMoney(windowTotals.cost)}
+            {harness === 'all' && !windowTotals.completeUsd ? 'Unavailable' : fmtMoney(windowTotals.cost)}
           </div>
         </div>
         {#if costDelta !== null}
@@ -853,9 +1014,11 @@
     <!-- Cost by model -->
     <div class="bg-card border border-edge rounded-xl px-5 py-4 min-w-0">
       <div class="text-[11px] text-ink-muted font-medium mb-3">
-        {harness === 'codex' ? 'Cost by model' : 'Spend by model'} · {windowLabel}
+        {harness === 'codex' ? 'Cost by model' : harness === 'all' ? 'USD spend by model' : 'Spend by model'} · {windowLabel}
       </div>
-      {#if costByModel.rows.length === 0}
+      {#if harness === 'all' && !allUsdAvailable}
+        <div class="text-[11px] text-ink-faint">Combined USD unavailable · configure USD rates for both harnesses</div>
+      {:else if costByModel.rows.length === 0}
         <div class="text-[11px] text-ink-faint">No priced usage in this window</div>
       {:else}
         <div class="flex flex-col gap-2.5 text-xs">
@@ -897,7 +1060,7 @@
           {/if}
         </div>
       </div>
-      {#if harness === 'codex'}
+      {#if harness === 'codex' || harness === 'all'}
         <div>
           <div class="text-[11px] text-ink-muted font-medium">Credits · {windowLabel}</div>
           {#if windowStats.credits.billedTotal > 0}
@@ -922,11 +1085,77 @@
           <div class="text-xl font-bold font-mono mt-0.5 text-ink">
             {windowStats.subagents.count}
             {#if windowStats.subagents.count > 0}
-              <span class="text-[11px] text-ink-faint font-normal">{fmtMoney(windowStats.subagents.cost)} total</span>
+              <span class="text-[11px] text-ink-faint font-normal">{allUsdAvailable ? `${fmtMoney(windowStats.subagents.cost)} total` : 'cost unavailable'}</span>
             {/if}
           </div>
         </div>
       {/if}
+    </div>
+  </div>
+
+  <div class="px-4 pb-3 flex-shrink-0 flex flex-col gap-2">
+    {#if harness === 'all'}
+      <div class="grid grid-cols-3 gap-2 text-xs">
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex credits</span><div class="font-mono font-semibold">{fmtAmount(windowTotals.codexCredits)}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex est. API USD</span><div class="font-mono font-semibold">{allUsdAvailable ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
+      </div>
+    {/if}
+
+    <details class="bg-card border border-edge rounded-lg px-3 py-2">
+      <summary class="cursor-pointer text-xs font-semibold text-ink">Model comparison · {windowLabel} · {modelComparison.length} models</summary>
+      {#if harness === 'all' && !allUsdAvailable}
+        <p class="text-xs text-ink-faint py-3">Combined model shares are unavailable until both harnesses have USD rates.</p>
+      {:else if modelComparison.length === 0}
+        <p class="text-xs text-ink-faint py-3">No model usage in this window.</p>
+      {:else}
+        <div class="overflow-x-auto mt-2">
+          <table class="w-full text-[11px] font-mono">
+            <thead class="text-ink-muted"><tr><th class="text-left py-1">Harness / model</th><th class="text-right">Input</th><th class="text-right">Cached</th><th class="text-right">Output</th><th class="text-right">Reasoning</th><th class="text-right">Total</th><th class="text-right">Calls</th><th class="text-right">One-shot</th><th class="text-right">Retries</th><th class="text-right">Failure</th><th class="text-right">Cost/call</th><th class="text-right">Cost</th><th class="text-right">Share</th></tr></thead>
+            <tbody>
+              {#each modelComparison as metric (`${metric.harness}:${metric.model}`)}
+                <tr class="border-t border-edgerow">
+                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{metric.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {metric.model}{#if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
+                  <td class="text-right">{fmt.format(metric.tokens.input_tokens)}</td>
+                  <td class="text-right">{fmt.format(metric.tokens.cached_input_tokens)}</td>
+                  <td class="text-right">{fmt.format(metric.tokens.output_tokens)}</td>
+                  <td class="text-right">{fmt.format(metric.tokens.reasoning_output_tokens)}</td>
+                  <td class="text-right font-semibold">{fmt.format(metric.tokens.total_tokens)}</td>
+                  <td class="text-right">{fmt.format(metric.tools.calls)}</td>
+                  <td class="text-right">{metric.tools.mutation_targets > 0 ? `${((metric.tools.one_shot_mutations / metric.tools.mutation_targets) * 100).toFixed(0)}%` : '—'}</td>
+                  <td class="text-right">{fmt.format(metric.tools.retry_count)}</td>
+                  <td class="text-right">{metric.tools.calls > 0 ? `${((metric.tools.failures / metric.tools.calls) * 100).toFixed(0)}%` : '—'}</td>
+                  <td class="text-right">{metric.tools.calls > 0 ? formatCredits(metric.cost / metric.tools.calls, metric.currency) : '—'}</td>
+                  <td class="text-right">{formatCredits(metric.cost, metric.currency)}</td>
+                  <td class="text-right">{modelComparisonCostTotal > 0 ? `${((metric.cost / modelComparisonCostTotal) * 100).toFixed(1)}%` : '—'}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </details>
+
+    <details class="bg-card border border-edge rounded-lg px-3 py-2">
+      <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view</summary>
+      {#if categoryRows.length === 0}<p class="text-xs text-ink-faint py-2">No classified turns.</p>{:else}
+        <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
+          <div class="section-label col-span-2">Harness / category</div><div class="section-label text-right">Turns</div><div class="section-label text-right">Tokens</div><div class="section-label text-right">Tools</div><div class="section-label text-right">Cost</div>
+          {#each categoryRows as row (`${row.harness}:${row.category}`)}
+            <div class="col-span-2 border-t border-edgerow pt-1"><span class="text-ink-faint">{row.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {row.category}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.turns}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{fmt.format(row.tokens.total_tokens)}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.calls}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{formatCredits(row.cost, row.currency)}</div>
+          {/each}
+        </div>
+      {/if}
+    </details>
+
+    <ConfigTimeline {active} />
+    <GitOutcomes />
+
+    <div class="flex items-center gap-2 text-xs">
+      <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('csv')}>Export CSV</button>
+      <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('json')}>Export JSON</button>
+      <label class="flex items-center gap-1.5 text-ink-muted"><input type="checkbox" bind:checked={includeWorkingDirectory} /> Include working directories</label>
+      {#if exportError}<span class="text-neg ml-auto" role="alert">{exportError}</span>{/if}
     </div>
   </div>
 
@@ -942,6 +1171,8 @@
             <p class="text-base text-ink-muted">No sessions found</p>
             {#if harness === 'claude_code'}
               <p class="text-xs">Start a Claude Code session or check your Claude session roots in Settings.</p>
+            {:else if harness === 'all'}
+              <p class="text-xs">Start a Codex or Claude Code task, or check both session roots in Settings.</p>
             {:else}
               <p class="text-xs">Start a Codex task in ChatGPT or check your config roots.</p>
             {/if}
@@ -958,7 +1189,11 @@
           </button>
         </div>
       {:else}
-        <div class="flex-1 overflow-y-auto min-h-0 relative">
+        <div
+          class="flex-1 overflow-y-auto min-h-0 relative"
+          bind:this={listViewport}
+          onscroll={(event) => { listScrollTop = event.currentTarget.scrollTop; }}
+        >
           <!-- Column header -->
           <div
             class="grid px-5 py-2 border-b border-edge bg-panel sticky top-0 z-10 section-label"
@@ -969,18 +1204,19 @@
             <span role="columnheader" aria-sort={ariaSortAttr('started')} class="text-left"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('started')}>Started{caretFor('started')}</button></span>
             <span role="columnheader" aria-sort={ariaSortAttr('model')} class="text-left"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('model')}>Model{caretFor('model')}</button></span>
             <span role="columnheader" aria-sort={ariaSortAttr('total')} class="text-right"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('total')}>Total tok{caretFor('total')}</button></span>
-            <span role="columnheader" aria-sort={ariaSortAttr('cost')} class="text-right"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('cost')}>{showApiCost ? 'Est. $' : 'Cost'}{caretFor('cost')}</button></span>
+            <span role="columnheader" aria-sort={ariaSortAttr('cost')} class="text-right"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('cost')}>{harness === 'all' ? 'Est. USD' : showApiCost ? 'Est. $' : 'Cost'}{caretFor('cost')}</button></span>
           </div>
 
-          {#each groups as group (group.label ?? '·')}
-            {#if group.label}
-              <div class="px-5 pt-2 pb-[3px] section-label">{group.label}</div>
-            {/if}
-            {#each group.sessions as session (session.id)}
+          <div aria-hidden="true" style:height={`${virtualList.top}px`}></div>
+          {#each virtualList.rows as row (row.key)}
+            {#if row.kind === 'group'}
+              <div class="h-7 px-5 pb-[3px] flex items-end section-label">{row.label}</div>
+            {:else}
+              {@const session = row.session}
               {@const name = sessionName(session)}
               {@const display = sessionDisplayMap.get(session.id)}
               {@const rowTokens = display?.tokens ?? session.tokens_total}
-              {@const sub = isSub(session)}
+              {@const sub = isSubagent(session)}
               {@const kids = childCounts.get(session.id) ?? 0}
               {@const combined = combinedCost.get(session.id)}
               {@const collapsed = collapsedParents.has(session.id)}
@@ -988,7 +1224,7 @@
               <div
                 role="button"
                 tabindex="0"
-                class="grid px-5 py-2 border-b border-edgerow items-center cursor-pointer transition-colors
+                class="grid h-12 px-5 py-1 border-b border-edgerow items-center cursor-pointer transition-colors
                        {session.archived ? 'opacity-55' : ''}
                        {selected
                          ? 'bg-accent-rowbg shadow-[inset_2px_0_0_var(--accent)]'
@@ -1018,15 +1254,18 @@
                   {#if session.archived}
                     <span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)] ml-1 whitespace-nowrap">archived</span>
                   {/if}
+                  {#if harness === 'all'}
+                    <span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{session.harness === 'codex' ? 'Codex' : 'Claude'}</span>
+                  {/if}
                 </span>
                 <span class="text-ink-muted font-mono text-xs">{fmtStarted(session.startedMs)}</span>
                 <span class="text-ink-muted font-mono text-xs truncate" title={session.model ?? ''}>{session.model ?? '—'}</span>
                 <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}</span>
                 <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">
-                  {fmtAmount(costOf(session.id))}{#if display && display.missingModels.length > 0}<span
+                  {allUsdAvailable ? fmtAmount(costOf(session.id)) : 'unavailable'}{#if allUsdAvailable && display && display.missingModels.length > 0}<span
                       class="text-amber-500 cursor-help"
                       title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}
-                  {#if combined !== undefined}
+                  {#if allUsdAvailable && combined !== undefined}
                     <div
                       class="text-[10px] text-ink-faint font-normal cursor-help"
                       title="This session plus its subagent threads (in view)"
@@ -1034,8 +1273,9 @@
                   {/if}
                 </span>
               </div>
-            {/each}
+            {/if}
           {/each}
+          <div aria-hidden="true" style:height={`${virtualList.bottom}px`}></div>
 
           <!-- Pinned totals -->
           <div
@@ -1045,7 +1285,7 @@
             <span class="section-label">Totals · in view</span>
             <span></span><span></span>
             <span class="text-right font-mono text-xs text-ink">{fmt.format(filteredTotal)}</span>
-            <span class="text-right font-mono text-xs text-accent-cost">{fmtAmount(costTotal)}</span>
+            <span class="text-right font-mono text-xs text-accent-cost">{allUsdAvailable ? fmtAmount(costTotal) : 'unavailable'}</span>
           </div>
         </div>
       {/if}

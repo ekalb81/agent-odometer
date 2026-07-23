@@ -106,6 +106,40 @@ jobs:
               src-tauri/test-output.txt
           } >> "$GITHUB_STEP_SUMMARY"
 
+  msrv:
+    name: Minimum supported Rust 1.88
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache Cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: msrv-linux-1.88
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            build-essential \
+            pkg-config
+
+      - name: Check declared MSRV
+        working-directory: ./src-tauri
+        run: cargo check --locked
+
   coverage:
     name: Coverage
     runs-on: ubuntu-22.04

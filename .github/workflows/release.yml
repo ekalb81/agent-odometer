@@ -5,8 +5,8 @@ name: Release
 # (deb + AppImage), and attaches them to a DRAFT GitHub Release that you
 # review and publish manually.
 #
-# Manual trigger (workflow_dispatch) is also wired up so you can do a dry
-# run from the Actions tab without cutting a tag.
+# Manual trigger (workflow_dispatch) is a build-only dry run. It never derives
+# a release tag from the selected branch and never creates or uploads a release.
 
 on:
   push:
@@ -18,8 +18,60 @@ permissions:
   contents: write
 
 jobs:
+  preflight:
+    name: Verify release versions
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify package versions and release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package_version="$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync("package.json", "utf8")).version)')"
+          tauri_version="$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")).version)')"
+          cargo_version="$(awk -F '=' '
+            /^\[package\][[:space:]]*$/ { in_package = 1; next }
+            /^\[/ { if (in_package) exit }
+            in_package && $1 ~ /^[[:space:]]*version[[:space:]]*$/ {
+              value = $2
+              gsub(/[[:space:]"]/, "", value)
+              print value
+              exit
+            }
+          ' src-tauri/Cargo.toml)"
+
+          if [[ -z "$package_version" || -z "$cargo_version" || -z "$tauri_version" ]]; then
+            echo "::error::Could not read all release versions"
+            exit 1
+          fi
+
+          if [[ "$package_version" != "$cargo_version" || "$package_version" != "$tauri_version" ]]; then
+            echo "::error::Version mismatch: package.json=$package_version Cargo.toml=$cargo_version tauri.conf.json=$tauri_version"
+            exit 1
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            expected_tag="v${package_version}"
+            if [[ "$GITHUB_REF_TYPE" != "tag" || "$GITHUB_REF_NAME" != "$expected_tag" ]]; then
+              echo "::error::Release tag '$GITHUB_REF_NAME' must exactly match '$expected_tag'"
+              exit 1
+            fi
+          fi
+
+          echo "Release version verified: $package_version"
+
   build:
     name: ${{ matrix.platform }} — ${{ matrix.label }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -80,7 +132,19 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
+      - name: Build and bundle (manual dry run; no release upload)
+        if: github.event_name == 'workflow_dispatch'
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # createUpdaterArtifacts is enabled, so dry runs still exercise the
+          # updater-signing path while keeping every artifact local to the job.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: ${{ matrix.args }}
+
       - name: Build, bundle, and upload to draft release
+        if: github.event_name == 'push'
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

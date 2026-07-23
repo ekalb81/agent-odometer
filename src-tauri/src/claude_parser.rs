@@ -27,7 +27,7 @@ use crate::model::{Harness, Session, TokenHistoryPoint, TokenTotals, TurnStatus}
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 /// Max characters retained for per-turn prompt / agent-message previews.
@@ -43,6 +43,8 @@ pub struct ClaudeSessionParser {
     is_subagent: bool,
     /// Assistant `message.id`s whose usage has already been counted.
     seen_message_ids: HashSet<String>,
+    /// Tool ids whose `tool_use` block has already been observed in streamed records.
+    seen_tool_ids: HashSet<String>,
     /// uuid of the user prompt that opened the current turn.
     current_turn_id: Option<String>,
     /// Thread name seen before the session object existed.
@@ -62,6 +64,7 @@ impl ClaudeSessionParser {
             file_path,
             is_subagent,
             seen_message_ids: HashSet::new(),
+            seen_tool_ids: HashSet::new(),
             current_turn_id: None,
             pending_thread_name: None,
         }
@@ -69,42 +72,73 @@ impl ClaudeSessionParser {
 
     pub fn parse_to_end(&mut self) -> anyhow::Result<bool> {
         let file = std::fs::File::open(&self.file_path)?;
+        if file.metadata()?.len() < self.byte_offset {
+            self.reset_for_replaced_file();
+        }
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.byte_offset))?;
 
         let mut updated = false;
-        let mut line = String::new();
+        let mut line = Vec::new();
 
         loop {
             let start = self.byte_offset;
             line.clear();
-            let n = reader.read_line(&mut line)?;
+            let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
                 break;
             }
 
             // A partial trailing line has no terminating newline — leave byte_offset at its start.
-            if !line.ends_with('\n') {
+            if !line.ends_with(b"\n") {
                 break;
             }
 
             self.byte_offset = start + n as u64;
 
-            let trimmed = line.trim();
+            let trimmed = match std::str::from_utf8(&line) {
+                Ok(line) => line.trim(),
+                Err(error) => {
+                    tracing::warn!("skipping non-UTF-8 line at offset {}: {}", start, error);
+                    continue;
+                }
+            };
             if trimmed.is_empty() {
                 continue;
             }
 
-            match self.apply_line(trimmed) {
+            match self.apply_line_without_refresh(trimmed) {
                 Ok(()) => updated = true,
                 Err(e) => tracing::warn!("skipping unparseable line at offset {}: {}", start, e),
             }
         }
 
+        if updated {
+            if let Some(session) = self.session.as_mut() {
+                crate::telemetry::refresh_session(session);
+            }
+        }
         Ok(updated)
     }
 
+    fn reset_for_replaced_file(&mut self) {
+        self.session = None;
+        self.byte_offset = 0;
+        self.seen_message_ids.clear();
+        self.seen_tool_ids.clear();
+        self.current_turn_id = None;
+        self.pending_thread_name = None;
+    }
+
     pub fn apply_line(&mut self, line: &str) -> anyhow::Result<()> {
+        self.apply_line_without_refresh(line)?;
+        if let Some(session) = self.session.as_mut() {
+            crate::telemetry::refresh_session(session);
+        }
+        Ok(())
+    }
+
+    fn apply_line_without_refresh(&mut self, line: &str) -> anyhow::Result<()> {
         let root: Value = serde_json::from_str(line)?;
 
         let record_type = root.get("type").and_then(Value::as_str).unwrap_or("");
@@ -125,7 +159,10 @@ impl ClaudeSessionParser {
         }
 
         match record_type {
-            "user" => self.handle_user(&root, timestamp),
+            "user" => {
+                self.handle_tool_results(&root);
+                self.handle_user(&root, timestamp);
+            }
             "assistant" => self.handle_assistant(&root, timestamp),
             "custom-title" => {
                 let title = root
@@ -232,6 +269,11 @@ impl ClaudeSessionParser {
             tokens_by_model: HashMap::new(),
             tokens_history: Vec::new(),
             turns: Vec::new(),
+            tool_observations: Vec::new(),
+            tool_metrics: Default::default(),
+            tool_metrics_by_model: Default::default(),
+            category_totals: Default::default(),
+            optimization_findings: Vec::new(),
         });
         self.refresh_metadata(root);
     }
@@ -307,6 +349,53 @@ impl ClaudeSessionParser {
         self.current_turn_id = Some(turn_id);
     }
 
+    fn handle_tool_results(&mut self, root: &Value) {
+        let Some(blocks) = root
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let call_id = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let failed = block
+                .get("is_error")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                || root
+                    .get("toolUseResult")
+                    .and_then(|result| result.get("is_error"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            let output_bytes = match block.get("content") {
+                Some(Value::String(value)) => value.len() as u64,
+                Some(value) => serialized_len(value),
+                None => 0,
+            };
+            crate::telemetry::observe_result(
+                &mut session.tool_observations,
+                call_id,
+                if failed {
+                    crate::model::ToolOutcome::Failure
+                } else {
+                    crate::model::ToolOutcome::Success
+                },
+                None,
+                output_bytes,
+            );
+        }
+    }
+
     fn handle_assistant(&mut self, root: &Value, timestamp: Option<DateTime<Utc>>) {
         let Some(message) = root.get("message") else {
             return;
@@ -346,6 +435,32 @@ impl ClaudeSessionParser {
         });
         let last_agent_message = last_text_block(message);
 
+        let tool_calls: Vec<(String, String, Value)> =
+            if timestamp.is_some() && self.session.is_some() {
+                message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+                    .filter_map(|block| {
+                        let id = block.get("id").and_then(Value::as_str)?;
+                        if id.is_empty() || !self.seen_tool_ids.insert(id.to_owned()) {
+                            return None;
+                        }
+                        let name = block
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        let input = block.get("input").cloned().unwrap_or(Value::Null);
+                        Some((id.to_owned(), name, input))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
         let Some(s) = self.session.as_mut() else {
             return;
         };
@@ -355,6 +470,23 @@ impl ClaudeSessionParser {
         }
         if service_tier.is_some() {
             s.service_tier = service_tier.clone();
+        }
+
+        if let Some(ts) = timestamp {
+            for (call_id, name, input) in tool_calls {
+                crate::telemetry::observe_call(
+                    &mut s.tool_observations,
+                    crate::telemetry::ToolCallInput {
+                        call_id,
+                        turn_id: self.current_turn_id.clone(),
+                        harness: Harness::ClaudeCode,
+                        model: model.clone(),
+                        timestamp: ts,
+                        name,
+                        arguments: &input,
+                    },
+                );
+            }
         }
 
         if first_occurrence {
@@ -413,6 +545,27 @@ impl ClaudeSessionParser {
             }
         }
     }
+}
+
+#[derive(Default)]
+struct ByteCounter(u64);
+
+impl Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buffer.len() as u64);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_len(value: &Value) -> u64 {
+    let mut counter = ByteCounter::default();
+    serde_json::to_writer(&mut counter, value)
+        .map(|()| counter.0)
+        .unwrap_or(0)
 }
 
 /// Returns the prompt text when a `user` record is a real human prompt:

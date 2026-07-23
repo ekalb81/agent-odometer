@@ -1,6 +1,5 @@
-use odometer_lib::scan_cache::{self, CacheEntry, ScanCache};
+use odometer_lib::scan_cache::{self, ScanCache};
 use odometer_lib::scanner;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -19,7 +18,7 @@ fn scan_ids(
         &[],
         std::slice::from_ref(claude_root),
         cache_path,
-        |s| sessions.lock().unwrap().push(s.id.clone()),
+        |_path, s| sessions.lock().unwrap().push(s.id.clone()),
         |done, total| progress.lock().unwrap().push((done, total)),
     );
     (
@@ -34,7 +33,7 @@ fn scan_reports_progress_and_writes_cache() {
     let root = dir.path().join("projects");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::copy(fixture(), root.join("session.jsonl")).unwrap();
-    let cache_path = dir.path().join("cache.json");
+    let cache_path = dir.path().join("cache.sqlite3");
 
     let (ids, progress) = scan_ids(&root, Some(&cache_path));
     assert_eq!(ids, vec!["11111111-2222-3333-4444-555555555555"]);
@@ -54,7 +53,7 @@ fn matching_cache_entry_is_served_without_parsing() {
     std::fs::create_dir_all(&root).unwrap();
     let file = root.join("session.jsonl");
     std::fs::copy(fixture(), &file).unwrap();
-    let cache_path = dir.path().join("cache.json");
+    let cache_path = dir.path().join("cache.sqlite3");
 
     // Fabricate a cache entry with a marker id and the file's real stamp; a
     // hit must return the cached session, proving no re-parse happened.
@@ -66,16 +65,8 @@ fn matching_cache_entry_is_served_without_parsing() {
         .unwrap()
         .unwrap();
     marker.id = "from-the-cache".into();
-    let mut entries = HashMap::new();
-    entries.insert(
-        file.to_string_lossy().into_owned(),
-        CacheEntry {
-            size,
-            mtime_ms,
-            session: marker,
-        },
-    );
-    ScanCache::save(&cache_path, entries);
+    cache.store(&file.to_string_lossy(), size, mtime_ms, &marker);
+    cache.finish_scan();
 
     let (ids, _) = scan_ids(&root, Some(&cache_path));
     assert_eq!(ids, vec!["from-the-cache"]);

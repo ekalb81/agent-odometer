@@ -46,14 +46,14 @@ pub fn read(path: &Path) -> HashMap<String, String> {
 /// Returns the list of session ids that were actually updated (so callers can
 /// emit fine-grained `session-updated` events).
 pub fn apply(
-    sessions: &dashmap::DashMap<String, crate::model::Session>,
+    sessions: &dashmap::DashMap<String, std::sync::Arc<crate::model::Session>>,
     names: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut updated = Vec::new();
     for (id, name) in names {
         if let Some(mut entry) = sessions.get_mut(id) {
-            if entry.thread_name.as_ref() != Some(name) {
-                entry.thread_name = Some(name.clone());
+            if entry.value().thread_name.as_ref() != Some(name) {
+                std::sync::Arc::make_mut(entry.value_mut()).thread_name = Some(name.clone());
                 updated.push(id.clone());
             }
         }

@@ -125,6 +125,61 @@ fn incremental_parsing_matches_full_parse() {
     );
     assert_eq!(incr.tokens_by_model, full.tokens_by_model);
     assert_eq!(incr.total_turns, full.total_turns);
+    assert_eq!(incr.tool_observations, full.tool_observations);
+    assert_eq!(incr.tool_metrics, full.tool_metrics);
+}
+
+#[test]
+fn malformed_utf8_record_does_not_abort_later_records() {
+    let bytes = std::fs::read(fixture()).unwrap();
+    let split = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let mut with_bad_record = Vec::with_capacity(bytes.len() + 2);
+    with_bad_record.extend_from_slice(&bytes[..split]);
+    with_bad_record.extend_from_slice(&[0xff, b'\n']);
+    with_bad_record.extend_from_slice(&bytes[split..]);
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), with_bad_record).unwrap();
+    let parsed = parser::parse_file(tmp.path(), false).unwrap().unwrap();
+    let expected = parser::parse_file(&fixture(), false).unwrap().unwrap();
+    assert_eq!(parsed.tokens_total, expected.tokens_total);
+    assert_eq!(parsed.total_turns, expected.total_turns);
+}
+
+#[test]
+fn incremental_parser_resets_after_file_truncation() {
+    let bytes = std::fs::read(fixture()).unwrap();
+    let split = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), &bytes).unwrap();
+
+    let mut parser = parser::SessionParser::new(tmp.path().to_path_buf(), false);
+    parser.parse_to_end().unwrap();
+    assert!(parser.session.as_ref().unwrap().tokens_total.total_tokens > 0);
+
+    std::fs::write(tmp.path(), &bytes[..split]).unwrap();
+    parser.parse_to_end().unwrap();
+    let session = parser.session.as_ref().unwrap();
+    assert_eq!(parser.byte_offset, split as u64);
+    assert_eq!(session.tokens_total.total_tokens, 0);
+    assert!(session.turns.is_empty());
+    assert!(session.tool_observations.is_empty());
+}
+
+#[test]
+fn normalizes_tool_calls_without_retaining_arguments_or_output() {
+    let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
+    assert!(s.tool_metrics.calls > 0);
+    assert_eq!(s.tool_metrics.calls as usize, s.tool_observations.len());
+    assert!(s.tool_observations.iter().all(|item| {
+        item.target.is_none()
+            || item
+                .target
+                .as_deref()
+                .is_some_and(|target| !target.contains("Users\\demo"))
+                && !item.name.contains("Exit code")
+    }));
+    assert!(s.tool_metrics_by_model.contains_key("gpt-5.5"));
 }
 
 #[test]

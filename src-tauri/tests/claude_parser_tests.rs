@@ -62,6 +62,16 @@ fn buckets_tokens_by_model_and_skips_synthetic() {
 }
 
 #[test]
+fn pairs_deduplicated_tool_use_and_results() {
+    let s = claude_parser::parse_file(&fixture()).unwrap().unwrap();
+    assert_eq!(s.tool_observations.len(), 1);
+    assert_eq!(s.tool_observations[0].call_id, "toolu_1");
+    assert_eq!(s.tool_metrics.calls, 1);
+    assert_eq!(s.tool_metrics.successes, 1);
+    assert_eq!(s.turns[0].tool_metrics.calls, 1);
+}
+
+#[test]
 fn derives_turns_from_user_prompts() {
     let s = claude_parser::parse_file(&fixture()).unwrap().unwrap();
     // Tool results, meta caveats, slash-command echoes, and sidechain prompts
@@ -131,6 +141,42 @@ fn incremental_append_with_partial_trailing_line() {
     assert_eq!(s.tokens_total.total_tokens, 6_475);
     assert_eq!(s.turns.len(), 2);
     assert_eq!(s.thread_name.as_deref(), Some("Healthcheck endpoint"));
+}
+
+#[test]
+fn malformed_utf8_record_does_not_abort_later_records() {
+    let bytes = std::fs::read(fixture()).unwrap();
+    let split = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let mut with_bad_record = Vec::with_capacity(bytes.len() + 2);
+    with_bad_record.extend_from_slice(&bytes[..split]);
+    with_bad_record.extend_from_slice(&[0xff, b'\n']);
+    with_bad_record.extend_from_slice(&bytes[split..]);
+
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), with_bad_record).unwrap();
+    let parsed = claude_parser::parse_file(tmp.path()).unwrap().unwrap();
+    let expected = claude_parser::parse_file(&fixture()).unwrap().unwrap();
+    assert_eq!(parsed.tokens_total, expected.tokens_total);
+    assert_eq!(parsed.total_turns, expected.total_turns);
+}
+
+#[test]
+fn incremental_parser_resets_after_file_truncation() {
+    let bytes = std::fs::read(fixture()).unwrap();
+    let split = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(tmp.path(), &bytes).unwrap();
+
+    let mut parser = ClaudeSessionParser::new(tmp.path().to_path_buf());
+    parser.parse_to_end().unwrap();
+    assert!(parser.session.as_ref().unwrap().tokens_total.total_tokens > 0);
+
+    std::fs::write(tmp.path(), &bytes[..split]).unwrap();
+    parser.parse_to_end().unwrap();
+    let session = parser.session.as_ref().unwrap();
+    assert_eq!(parser.byte_offset, split as u64);
+    assert_eq!(session.tokens_total.total_tokens, 0);
+    assert!(session.tool_observations.is_empty());
 }
 
 #[test]

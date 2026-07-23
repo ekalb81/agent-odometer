@@ -5,12 +5,154 @@ use std::collections::{BTreeMap, HashMap};
 /// Which agent harness produced a session's transcript. Serialized as
 /// snake_case strings; defaults to Codex so previously-serialized sessions
 /// and frontends without the field keep working.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Harness {
     #[default]
     Codex,
     ClaudeCode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolKind {
+    Read,
+    Search,
+    Mutation,
+    Command,
+    #[default]
+    Other,
+}
+
+impl ToolKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Search => "search",
+            Self::Mutation => "mutation",
+            Self::Command => "command",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcome {
+    Pending,
+    Success,
+    Failure,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ToolObservation {
+    pub call_id: String,
+    pub turn_id: Option<String>,
+    pub harness: Harness,
+    pub model: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub kind: ToolKind,
+    pub name: String,
+    /// Stable hashed identity; raw arguments and paths are never retained.
+    pub target: Option<String>,
+    pub outcome: ToolOutcome,
+    pub duration_ms: Option<u64>,
+    pub output_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ToolMetrics {
+    pub calls: u64,
+    pub reads: u64,
+    pub searches: u64,
+    pub mutations: u64,
+    pub commands: u64,
+    pub other: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub unknown: u64,
+    pub mutation_targets: u64,
+    pub one_shot_mutations: u64,
+    pub retry_count: u64,
+    pub duration_ms: u64,
+    pub output_bytes: u64,
+}
+
+impl ToolMetrics {
+    pub fn add_assign(&mut self, value: &Self) {
+        self.calls += value.calls;
+        self.reads += value.reads;
+        self.searches += value.searches;
+        self.mutations += value.mutations;
+        self.commands += value.commands;
+        self.other += value.other;
+        self.successes += value.successes;
+        self.failures += value.failures;
+        self.unknown += value.unknown;
+        self.mutation_targets += value.mutation_targets;
+        self.one_shot_mutations += value.one_shot_mutations;
+        self.retry_count += value.retry_count;
+        self.duration_ms += value.duration_ms;
+        self.output_bytes += value.output_bytes;
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCategory {
+    Planning,
+    Exploration,
+    Coding,
+    Debugging,
+    Testing,
+    Review,
+    #[default]
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnClassification {
+    pub version: u32,
+    pub category: TaskCategory,
+    pub confidence: f32,
+    pub signals: Vec<String>,
+}
+
+impl Default for TurnClassification {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            category: TaskCategory::Other,
+            confidence: 0.0,
+            signals: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct CategoryMetric {
+    pub turns: u64,
+    pub tokens: TokenTotals,
+    pub tool_calls: u64,
+    #[serde(default)]
+    pub buckets: Vec<TierBucket>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct OptimizationFinding {
+    pub version: u32,
+    pub rule_id: String,
+    pub severity: String,
+    pub turn_id: Option<String>,
+    pub model: Option<String>,
+    pub evidence: String,
+    pub remediation: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -69,6 +211,10 @@ pub struct TurnInfo {
     pub last_agent_message: Option<String>,
     /// Tokens attributed to this turn (sum of reconciled per-event deltas).
     pub tokens: TokenTotals,
+    #[serde(default)]
+    pub tool_metrics: ToolMetrics,
+    #[serde(default)]
+    pub classification: TurnClassification,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +257,16 @@ pub struct Session {
     pub tokens_by_model: HashMap<String, TokenTotals>,
     pub tokens_history: Vec<TokenHistoryPoint>,
     pub turns: Vec<TurnInfo>,
+    #[serde(default)]
+    pub tool_observations: Vec<ToolObservation>,
+    #[serde(default)]
+    pub tool_metrics: ToolMetrics,
+    #[serde(default)]
+    pub tool_metrics_by_model: BTreeMap<String, ToolMetrics>,
+    #[serde(default)]
+    pub category_totals: BTreeMap<TaskCategory, CategoryMetric>,
+    #[serde(default)]
+    pub optimization_findings: Vec<OptimizationFinding>,
 }
 
 /// Token usage grouped by (model, service_tier). Credit math is linear per
@@ -137,6 +293,10 @@ pub struct RangeTotals {
     /// bucket by a later event, mirroring the credit math the frontend has
     /// always used.
     pub buckets: Vec<TierBucket>,
+    #[serde(default)]
+    pub tool_metrics: ToolMetrics,
+    #[serde(default)]
+    pub tool_metrics_by_model: BTreeMap<String, ToolMetrics>,
 }
 
 /// Lightweight wire form of a Session for the list view and live update
@@ -170,6 +330,14 @@ pub struct SessionSummary {
     pub first_user_message: Option<String>,
     pub tokens_total: TokenTotals,
     pub buckets: Vec<TierBucket>,
+    #[serde(default)]
+    pub tool_metrics: ToolMetrics,
+    #[serde(default)]
+    pub tool_metrics_by_model: BTreeMap<String, ToolMetrics>,
+    #[serde(default)]
+    pub category_totals: BTreeMap<TaskCategory, CategoryMetric>,
+    #[serde(default)]
+    pub optimization_findings_count: u64,
 }
 
 impl SessionSummary {
@@ -200,6 +368,10 @@ impl SessionSummary {
             first_user_message: s.first_user_message.clone(),
             tokens_total: s.tokens_total.clone(),
             buckets: s.tier_buckets(),
+            tool_metrics: s.tool_metrics.clone(),
+            tool_metrics_by_model: s.tool_metrics_by_model.clone(),
+            category_totals: s.category_totals.clone(),
+            optimization_findings_count: s.optimization_findings.len() as u64,
         }
     }
 }
@@ -219,18 +391,18 @@ fn bucket_history<'a, I>(events: I) -> Vec<TierBucket>
 where
     I: Iterator<Item = &'a TokenHistoryPoint>,
 {
-    let mut map: BTreeMap<(String, Option<String>), TokenTotals> = BTreeMap::new();
+    let mut map: BTreeMap<(&str, Option<&str>), TokenTotals> = BTreeMap::new();
     for ev in events {
         let Some(model) = &ev.model else { continue };
         let entry = map
-            .entry((model.clone(), ev.service_tier.clone()))
+            .entry((model.as_str(), ev.service_tier.as_deref()))
             .or_default();
         add_totals(entry, &ev.delta);
     }
     map.into_iter()
         .map(|((model, service_tier), tokens)| TierBucket {
-            model,
-            service_tier,
+            model: model.to_owned(),
+            service_tier: service_tier.map(str::to_owned),
             tokens,
         })
         .collect()
@@ -271,50 +443,98 @@ impl Session {
             .expect("one window in, one rollup out")
     }
 
-    /// `range_totals` for several windows at once, walking the (potentially
-    /// large) history a single time instead of once per window. Buckets
-    /// accumulate through a linear probe of a short Vec — sessions touch only
-    /// a few (model, tier) pairs, and this avoids the per-event key clones a
-    /// map entry API would cost.
+    /// `range_totals` for several windows at once. Histories emitted by both
+    /// harnesses are chronological, so binary partitioning narrows each range
+    /// to its matching slice instead of testing every event against every
+    /// window. The defensive unsorted path preserves correctness for unusual
+    /// or historical fixtures.
     pub fn range_totals_multi(&self, ranges: &[RangeWindow]) -> Vec<RangeTotals> {
-        let mut tokens = vec![TokenTotals::default(); ranges.len()];
-        let mut buckets: Vec<Vec<TierBucket>> = vec![Vec::new(); ranges.len()];
-        for ev in &self.tokens_history {
-            for (i, (from, to)) in ranges.iter().enumerate() {
-                // map_or rather than is_none_or: the crate's MSRV (1.77) predates it.
-                let in_range = from.map_or(true, |f| ev.timestamp >= f)
-                    && to.map_or(true, |t| ev.timestamp <= t);
-                if !in_range {
-                    continue;
-                }
-                add_totals(&mut tokens[i], &ev.delta);
-                let Some(model) = &ev.model else { continue };
-                match buckets[i]
-                    .iter_mut()
-                    .find(|b| &b.model == model && b.service_tier == ev.service_tier)
-                {
-                    Some(b) => add_totals(&mut b.tokens, &ev.delta),
-                    None => buckets[i].push(TierBucket {
+        let history_sorted = self
+            .tokens_history
+            .windows(2)
+            .all(|pair| pair[0].timestamp <= pair[1].timestamp);
+        let observations_sorted = self
+            .tool_observations
+            .windows(2)
+            .all(|pair| pair[0].timestamp <= pair[1].timestamp);
+        let mut results = Vec::with_capacity(ranges.len());
+
+        for (from, to) in ranges {
+            let mut tokens = TokenTotals::default();
+            let mut buckets: Vec<TierBucket> = Vec::new();
+            let mut add_event = |event: &TokenHistoryPoint| {
+                add_totals(&mut tokens, &event.delta);
+                let Some(model) = &event.model else { return };
+                match buckets.iter_mut().find(|bucket| {
+                    &bucket.model == model && bucket.service_tier == event.service_tier
+                }) {
+                    Some(bucket) => add_totals(&mut bucket.tokens, &event.delta),
+                    None => buckets.push(TierBucket {
                         model: model.clone(),
-                        service_tier: ev.service_tier.clone(),
-                        tokens: ev.delta.clone(),
+                        service_tier: event.service_tier.clone(),
+                        tokens: event.delta.clone(),
                     }),
                 }
-            }
-        }
-        tokens
-            .into_iter()
-            .zip(buckets)
-            .map(|(tokens, mut buckets)| {
-                // Same (model, tier) ordering bucket_history's BTreeMap produced.
-                buckets.sort_by(|a, b| {
-                    a.model
-                        .cmp(&b.model)
-                        .then_with(|| a.service_tier.cmp(&b.service_tier))
+            };
+            if history_sorted {
+                let start = from.as_ref().map_or(0, |from| {
+                    self.tokens_history
+                        .partition_point(|event| event.timestamp < *from)
                 });
-                RangeTotals { tokens, buckets }
-            })
-            .collect()
+                let end = to.as_ref().map_or(self.tokens_history.len(), |to| {
+                    self.tokens_history
+                        .partition_point(|event| event.timestamp <= *to)
+                });
+                for event in &self.tokens_history[start.min(end)..end] {
+                    add_event(event);
+                }
+            } else {
+                for event in &self.tokens_history {
+                    if (from.is_none()
+                        || from.as_ref().is_some_and(|start| event.timestamp >= *start))
+                        && (to.is_none() || to.as_ref().is_some_and(|end| event.timestamp <= *end))
+                    {
+                        add_event(event);
+                    }
+                }
+            }
+
+            let (tool_metrics, tool_metrics_by_model) = if observations_sorted {
+                let start = from.as_ref().map_or(0, |from| {
+                    self.tool_observations
+                        .partition_point(|item| item.timestamp < *from)
+                });
+                let end = to.as_ref().map_or(self.tool_observations.len(), |to| {
+                    self.tool_observations
+                        .partition_point(|item| item.timestamp <= *to)
+                });
+                crate::telemetry::metrics_with_models(
+                    self.tool_observations[start.min(end)..end].iter(),
+                )
+            } else {
+                crate::telemetry::metrics_with_models(self.tool_observations.iter().filter(
+                    |item| {
+                        (from.is_none()
+                            || from.as_ref().is_some_and(|start| item.timestamp >= *start))
+                            && (to.is_none()
+                                || to.as_ref().is_some_and(|end| item.timestamp <= *end))
+                    },
+                ))
+            };
+
+            buckets.sort_by(|a, b| {
+                a.model
+                    .cmp(&b.model)
+                    .then_with(|| a.service_tier.cmp(&b.service_tier))
+            });
+            results.push(RangeTotals {
+                tokens,
+                buckets,
+                tool_metrics,
+                tool_metrics_by_model,
+            });
+        }
+        results
     }
 }
 
@@ -375,6 +595,11 @@ mod tests {
             tokens_by_model: HashMap::new(),
             tokens_history: history,
             turns: Vec::new(),
+            tool_observations: Vec::new(),
+            tool_metrics: ToolMetrics::default(),
+            tool_metrics_by_model: BTreeMap::new(),
+            category_totals: BTreeMap::new(),
+            optimization_findings: Vec::new(),
         }
     }
 
@@ -469,6 +694,49 @@ mod tests {
         assert_eq!(rt.tokens.input_tokens, 15);
         assert_eq!(rt.buckets.len(), 1);
         assert_eq!(rt.buckets[0].tokens.input_tokens, 5);
+    }
+
+    #[test]
+    fn range_totals_preserve_correctness_for_unsorted_history() {
+        let s = session_with_history(vec![
+            point("2026-01-01T00:00:03Z", Some("m1"), None, 4),
+            point("2026-01-01T00:00:01Z", Some("m1"), None, 1),
+            point("2026-01-01T00:00:02Z", Some("m1"), None, 2),
+        ]);
+        let rt = s.range_totals(
+            Some("2026-01-01T00:00:01Z".parse().unwrap()),
+            Some("2026-01-01T00:00:02Z".parse().unwrap()),
+        );
+        assert_eq!(rt.tokens.input_tokens, 3);
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn performance_range_rollup_100k_points_16_windows() {
+        let base: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let history = (0..100_000)
+            .map(|second| TokenHistoryPoint {
+                timestamp: base + chrono::Duration::seconds(second),
+                model: Some("m".into()),
+                service_tier: None,
+                total_tokens: second as u64,
+                delta: delta(1),
+            })
+            .collect();
+        let session = session_with_history(history);
+        let windows: Vec<RangeWindow> = (0..16)
+            .map(|index| {
+                let start = base + chrono::Duration::seconds(index * 6_000);
+                (Some(start), Some(start + chrono::Duration::seconds(5_999)))
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let totals = session.range_totals_multi(&windows);
+        eprintln!("100k points x 16 windows: {:?}", started.elapsed());
+        assert_eq!(totals.len(), 16);
+        assert!(totals
+            .iter()
+            .all(|total| total.tokens.input_tokens == 6_000));
     }
 
     #[test]
