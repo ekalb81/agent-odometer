@@ -64,45 +64,8 @@ fn project_scope(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-fn roots(state: &AppState) -> Vec<ConfigRoot> {
-    let home = dirs::home_dir();
-    let codex = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|path| path.join(".codex")));
-    let claude = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| home.map(|path| path.join(".claude")));
+fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<ConfigRoot> {
     let mut out = Vec::new();
-    if let Some(path) = codex {
-        out.push(ConfigRoot {
-            harness: "codex".into(),
-            path,
-            scope: None,
-            direct_names: CODEX_CONFIG_NAMES,
-            nested: true,
-        });
-    }
-    if let Some(path) = claude {
-        out.push(ConfigRoot {
-            harness: "claude_code".into(),
-            path,
-            scope: None,
-            direct_names: CLAUDE_CONFIG_NAMES,
-            nested: true,
-        });
-    }
-
-    let working_directories: BTreeSet<PathBuf> = state
-        .sessions
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .value()
-                .working_directory
-                .as_deref()
-                .map(PathBuf::from)
-        })
-        .collect();
     let project_scopes: BTreeSet<PathBuf> = working_directories
         .into_iter()
         .map(|path| project_scope(&path))
@@ -139,6 +102,48 @@ fn roots(state: &AppState) -> Vec<ConfigRoot> {
             nested: true,
         });
     }
+    out
+}
+
+fn roots(state: &AppState) -> Vec<ConfigRoot> {
+    let home = dirs::home_dir();
+    let codex = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|path| path.join(".codex")));
+    let claude = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|path| path.join(".claude")));
+    let mut out = Vec::new();
+    if let Some(path) = codex {
+        out.push(ConfigRoot {
+            harness: "codex".into(),
+            path,
+            scope: None,
+            direct_names: CODEX_CONFIG_NAMES,
+            nested: true,
+        });
+    }
+    if let Some(path) = claude {
+        out.push(ConfigRoot {
+            harness: "claude_code".into(),
+            path,
+            scope: None,
+            direct_names: CLAUDE_CONFIG_NAMES,
+            nested: true,
+        });
+    }
+    let working_directories: BTreeSet<PathBuf> = state
+        .sessions
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .value()
+                .working_directory
+                .as_deref()
+                .map(PathBuf::from)
+        })
+        .collect();
+    out.extend(project_roots(working_directories));
     out
 }
 
@@ -535,10 +540,11 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_snapshot, event_for, is_safe_config_path, snapshot_diff, tracked_root_for_path,
-        ConfigRoot, Snapshot, CODEX_CONFIG_NAMES,
+        discover_snapshot, event_for, is_safe_config_path, project_roots, snapshot_diff,
+        tracked_root_for_path, ConfigRoot, Snapshot, CODEX_CONFIG_NAMES,
     };
     use std::path::Path;
+    use std::process::Command;
 
     fn config_root(path: &Path, scope: Option<&str>) -> ConfigRoot {
         ConfigRoot {
@@ -554,6 +560,44 @@ mod tests {
     fn first_snapshot_is_a_baseline() {
         let current = Snapshot::from([("config.toml".into(), ("a".into(), 1))]);
         assert!(snapshot_diff(None, &current).is_empty());
+    }
+
+    #[test]
+    fn project_roots_use_the_containing_worktree_and_harness_surfaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(directory.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let nested = directory.path().join("packages/example");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let roots = project_roots([nested]);
+        assert_eq!(roots.len(), 4);
+        assert!(roots
+            .iter()
+            .all(|root| { Path::new(root.scope.as_deref().unwrap()) == directory.path() }));
+        assert!(roots.iter().any(|root| {
+            root.harness == "codex" && root.path == directory.path().join(".codex") && root.nested
+        }));
+        assert!(roots.iter().any(|root| {
+            root.harness == "claude_code"
+                && root.path == directory.path().join(".claude")
+                && root.nested
+        }));
+        assert!(roots.iter().any(|root| {
+            root.harness == "codex"
+                && root.path == directory.path()
+                && root.direct_names == ["AGENTS.md"]
+        }));
+        assert!(roots.iter().any(|root| {
+            root.harness == "claude_code"
+                && root.path == directory.path()
+                && root.direct_names == ["CLAUDE.md"]
+        }));
     }
 
     #[test]
