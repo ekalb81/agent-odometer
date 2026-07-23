@@ -18,12 +18,13 @@ export function getSessionDetails(sessionId: string): Promise<Session | null> {
   return invoke<Session | null>('get_session_details', { sessionId });
 }
 
-/** Date-scoped rollups for all sessions; bounds are inclusive UTC ISO strings. */
-export function sessionsInRange(
-  from: string | null,
-  to: string | null,
-): Promise<Record<string, RangeTotals>> {
-  return invoke<Record<string, RangeTotals>>('sessions_in_range', { from, to });
+/** Date-scoped rollups for all sessions, one result map per requested window.
+ *  Bounds are inclusive UTC ISO strings; null = open bound. Sessions with no
+ *  usage in a window are omitted from that window's map. */
+export function sessionsInRanges(
+  ranges: { from: string | null; to: string | null }[],
+): Promise<Record<string, RangeTotals>[]> {
+  return invoke<Record<string, RangeTotals>[]>('sessions_in_ranges', { ranges });
 }
 
 /** Current bulk-scan progress (call once on mount, then follow events). */

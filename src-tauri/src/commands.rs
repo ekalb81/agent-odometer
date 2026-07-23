@@ -30,26 +30,52 @@ pub fn get_session_details(state: State<'_, Arc<AppState>>, session_id: String) 
         .map(|entry| entry.value().clone())
 }
 
-/// Date-scoped token/credit rollups for every session, computed from the
-/// in-memory event histories. Bounds are inclusive RFC3339 instants; None is
-/// an open bound.
+/// One [from, to] window for `sessions_in_ranges`. Bounds are inclusive
+/// RFC3339 instants; None is an open bound.
+#[derive(Debug, serde::Deserialize)]
+pub struct RangeBounds {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// Date-scoped token/credit rollups for every session across several windows
+/// at once, computed from the in-memory event histories in a single pass.
+/// Sessions with no usage in a window are omitted from that window's map —
+/// the frontend treats a missing entry as zero. Async so the walk runs on a
+/// worker thread instead of stalling the main thread's IPC.
 #[tauri::command]
-pub fn sessions_in_range(
+pub async fn sessions_in_ranges(
     state: State<'_, Arc<AppState>>,
-    from: Option<String>,
-    to: Option<String>,
-) -> Result<HashMap<String, RangeTotals>, String> {
-    let parse = |v: Option<String>| -> Result<Option<DateTime<Utc>>, String> {
-        v.map(|s| s.parse().map_err(|e| format!("invalid timestamp: {e}")))
+    ranges: Vec<RangeBounds>,
+) -> Result<Vec<HashMap<String, RangeTotals>>, String> {
+    let parse = |v: &Option<String>| -> Result<Option<DateTime<Utc>>, String> {
+        v.as_ref()
+            .map(|s| s.parse().map_err(|e| format!("invalid timestamp: {e}")))
             .transpose()
     };
-    let from = parse(from)?;
-    let to = parse(to)?;
-    Ok(state
-        .sessions
+    let bounds = ranges
         .iter()
-        .map(|entry| (entry.key().clone(), entry.value().range_totals(from, to)))
-        .collect())
+        .map(|r| Ok((parse(&r.from)?, parse(&r.to)?)))
+        .collect::<Result<Vec<_>, String>>()?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); bounds.len()];
+        for entry in state.sessions.iter() {
+            for (i, rt) in entry
+                .value()
+                .range_totals_multi(&bounds)
+                .into_iter()
+                .enumerate()
+            {
+                if rt.tokens.total_tokens != 0 {
+                    out[i].insert(entry.key().clone(), rt);
+                }
+            }
+        }
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Returns the current configuration.

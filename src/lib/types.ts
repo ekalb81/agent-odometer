@@ -77,7 +77,7 @@ export interface TierBucket {
   tokens: TokenTotals;
 }
 
-/** Date-scoped rollup returned by sessions_in_range. */
+/** Date-scoped rollup returned by sessions_in_ranges. */
 export interface RangeTotals {
   tokens: TokenTotals;
   buckets: TierBucket[];

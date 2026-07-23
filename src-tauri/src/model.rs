@@ -123,8 +123,11 @@ pub struct TierBucket {
     pub tokens: TokenTotals,
 }
 
+/// Inclusive [from, to] window for range rollups; None is an open bound.
+pub type RangeWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
 /// Date-scoped rollup of one session's usage, returned by the
-/// `sessions_in_range` command.
+/// `sessions_in_ranges` command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeTotals {
     /// Sum of all event deltas in range (including events with no model yet).
@@ -263,18 +266,55 @@ impl Session {
         from: Option<DateTime<Utc>>,
         to: Option<DateTime<Utc>>,
     ) -> RangeTotals {
-        // map_or rather than is_none_or: the crate's MSRV (1.77) predates it.
-        let in_range = |ev: &&TokenHistoryPoint| {
-            from.map_or(true, |f| ev.timestamp >= f) && to.map_or(true, |t| ev.timestamp <= t)
-        };
-        let mut tokens = TokenTotals::default();
-        for ev in self.tokens_history.iter().filter(in_range) {
-            add_totals(&mut tokens, &ev.delta);
+        self.range_totals_multi(&[(from, to)])
+            .pop()
+            .expect("one window in, one rollup out")
+    }
+
+    /// `range_totals` for several windows at once, walking the (potentially
+    /// large) history a single time instead of once per window. Buckets
+    /// accumulate through a linear probe of a short Vec — sessions touch only
+    /// a few (model, tier) pairs, and this avoids the per-event key clones a
+    /// map entry API would cost.
+    pub fn range_totals_multi(&self, ranges: &[RangeWindow]) -> Vec<RangeTotals> {
+        let mut tokens = vec![TokenTotals::default(); ranges.len()];
+        let mut buckets: Vec<Vec<TierBucket>> = vec![Vec::new(); ranges.len()];
+        for ev in &self.tokens_history {
+            for (i, (from, to)) in ranges.iter().enumerate() {
+                // map_or rather than is_none_or: the crate's MSRV (1.77) predates it.
+                let in_range = from.map_or(true, |f| ev.timestamp >= f)
+                    && to.map_or(true, |t| ev.timestamp <= t);
+                if !in_range {
+                    continue;
+                }
+                add_totals(&mut tokens[i], &ev.delta);
+                let Some(model) = &ev.model else { continue };
+                match buckets[i]
+                    .iter_mut()
+                    .find(|b| &b.model == model && b.service_tier == ev.service_tier)
+                {
+                    Some(b) => add_totals(&mut b.tokens, &ev.delta),
+                    None => buckets[i].push(TierBucket {
+                        model: model.clone(),
+                        service_tier: ev.service_tier.clone(),
+                        tokens: ev.delta.clone(),
+                    }),
+                }
+            }
         }
-        RangeTotals {
-            tokens,
-            buckets: bucket_history(self.tokens_history.iter().filter(in_range)),
-        }
+        tokens
+            .into_iter()
+            .zip(buckets)
+            .map(|(tokens, mut buckets)| {
+                // Same (model, tier) ordering bucket_history's BTreeMap produced.
+                buckets.sort_by(|a, b| {
+                    a.model
+                        .cmp(&b.model)
+                        .then_with(|| a.service_tier.cmp(&b.service_tier))
+                });
+                RangeTotals { tokens, buckets }
+            })
+            .collect()
     }
 }
 
@@ -391,6 +431,32 @@ mod tests {
 
         let all = s.range_totals(None, None);
         assert_eq!(all.tokens.input_tokens, 7);
+    }
+
+    #[test]
+    fn range_totals_multi_matches_per_window_calls() {
+        let s = session_with_history(vec![
+            point("2026-01-01T00:00:01Z", Some("m1"), None, 1),
+            point("2026-01-01T00:00:02Z", Some("m2"), Some("fast"), 2),
+            point("2026-01-01T00:00:03Z", None, None, 4),
+        ]);
+        let windows = [
+            (None, Some("2026-01-01T00:00:02Z".parse().unwrap())),
+            (Some("2026-01-01T00:00:02Z".parse().unwrap()), None),
+            (None, None),
+            // Empty window.
+            (Some("2027-01-01T00:00:00Z".parse().unwrap()), None),
+        ];
+        let multi = s.range_totals_multi(&windows);
+        assert_eq!(multi.len(), windows.len());
+        for (rt, (from, to)) in multi.iter().zip(windows) {
+            let single = s.range_totals(from, to);
+            assert_eq!(rt.tokens, single.tokens);
+            assert_eq!(rt.buckets, single.buckets);
+        }
+        assert_eq!(multi[2].tokens.input_tokens, 7);
+        assert_eq!(multi[2].buckets.len(), 2);
+        assert_eq!(multi[3].tokens.total_tokens, 0);
     }
 
     #[test]

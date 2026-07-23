@@ -13,7 +13,7 @@ pub mod watcher;
 use commands::{
     add_defender_exclusions, get_bundled_rates, get_config, get_rates, get_scan_status,
     get_session_details, list_sessions, open_task_in_chatgpt, reveal_in_file_manager,
-    sessions_in_range, set_config, set_rates,
+    sessions_in_ranges, set_config, set_rates,
 };
 use config::Config;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             get_session_details,
-            sessions_in_range,
+            sessions_in_ranges,
             get_scan_status,
             get_config,
             set_config,

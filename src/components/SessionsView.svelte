@@ -4,7 +4,7 @@
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { apiCostFromBuckets, computeSummaryCredits, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
-  import { getSessionDetails, sessionsInRange } from '../lib/ipc';
+  import { getSessionDetails, sessionsInRanges } from '../lib/ipc';
   import type { Harness, RangeTotals, Session, TierBucket, TokenTotals } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
   import { rangeLabelFor } from '../lib/dateRange';
@@ -201,6 +201,10 @@
   // ---------------------------------------------------------------------------
   let rangeTotals = $state<Record<string, RangeTotals>>({});
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
+  // Debounce is only for coalescing live store flushes (~150ms apart). A
+  // changed range is a discrete user action (preset click, committed input)
+  // and fetches immediately.
+  let lastTableRange: string | null = null;
 
   $effect(() => {
     const from = fromUtc;
@@ -211,17 +215,21 @@
     if (!active) return;
     if (!from && !to) {
       rangeTotals = {};
+      lastTableRange = null;
       return;
     }
+    const key = `${from}|${to}`;
+    const delay = key === lastTableRange ? 250 : 0;
+    lastTableRange = key;
     if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
     rangeFetchTimer = setTimeout(() => {
-      sessionsInRange(from, to)
-        .then((result) => {
+      sessionsInRanges([{ from, to }])
+        .then(([result]) => {
           // Drop stale responses if the filter moved on meanwhile.
           if (fromUtc === from && toUtc === to) rangeTotals = result;
         })
-        .catch((e) => console.error('sessions_in_range failed:', e));
-    }, 250);
+        .catch((e) => console.error('sessions_in_ranges failed:', e));
+    }, delay);
     return () => {
       if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
     };
@@ -473,7 +481,7 @@
 
   // ---------------------------------------------------------------------------
   // Analytics band: spend-by-day series + window totals for the delta pills.
-  // Day buckets come from sessions_in_range (summaries carry no history);
+  // Day buckets come from sessions_in_ranges (summaries carry no history);
   // pricing happens client-side so rate-card edits recompute without refetch.
   // ---------------------------------------------------------------------------
   interface DayBucket {
@@ -523,17 +531,24 @@
     dateScoped ? rangeLabelFor(filters.dateFrom, filters.dateTo) : 'Last 7 days',
   );
 
+  // Mirrors lastTableRange: date-filter changes refresh immediately, only
+  // store flushes are debounced. Keyed on the filter bounds, not windowBounds
+  // — the default window's endMs is "now", which moves on every recompute.
+  let lastAnalyticsRange: string | null = null;
+
   $effect(() => {
     const { startMs, endMs } = windowBounds;
     void sessionsStore.map;
     if (!active) return;
+    const key = `${fromUtc}|${toUtc}`;
+    const delay = key === lastAnalyticsRange ? 250 : 0;
+    lastAnalyticsRange = key;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
-    // A calm debounce: each refresh issues ~16 sessions_in_range calls whose
-    // responses are full per-session maps, so refreshing per store-flush
-    // (150ms) would keep the main thread busy parsing them. Analytics can
-    // trail live sessions by a second without anyone noticing.
+    // Debounced so a burst of store flushes (150ms apart) coalesces into one
+    // refresh. All ~16 windows go in a single batched call the backend
+    // computes in one pass, so the refresh itself is cheap.
     analyticsTimer = setTimeout(async () => {
-      // Day-aligned buckets, coalesced so long ranges stay ≤14 fetches.
+      // Day-aligned buckets, coalesced so long ranges stay ≤14 chart points.
       const dayStart = (ms: number) => {
         const d = new Date(ms);
         d.setHours(0, 0, 0, 0);
@@ -546,11 +561,12 @@
         bounds.push({ from: Math.max(t, startMs), to: Math.min(t + daysPerBucket * DAY_MS - 1, endMs) });
       }
       const prevFrom = startMs - (endMs - startMs);
+      const iso = (ms: number) => new Date(ms).toISOString();
       try {
-        const [current, prev, ...days] = await Promise.all([
-          sessionsInRange(new Date(startMs).toISOString(), new Date(endMs).toISOString()),
-          sessionsInRange(new Date(prevFrom).toISOString(), new Date(startMs - 1).toISOString()),
-          ...bounds.map((b) => sessionsInRange(new Date(b.from).toISOString(), new Date(b.to).toISOString())),
+        const [current, prev, ...days] = await sessionsInRanges([
+          { from: iso(startMs), to: iso(endMs) },
+          { from: iso(prevFrom), to: iso(startMs - 1) },
+          ...bounds.map((b) => ({ from: iso(b.from), to: iso(b.to) })),
         ]);
         // Drop stale responses if the window moved on meanwhile.
         if (windowBounds.startMs !== startMs || windowBounds.endMs !== endMs) return;
@@ -558,9 +574,9 @@
         analyticsPrev = prev;
         analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
       } catch (e) {
-        console.error('analytics sessions_in_range failed:', e);
+        console.error('analytics sessions_in_ranges failed:', e);
       }
-    }, 1000);
+    }, delay);
     return () => {
       if (analyticsTimer !== null) clearTimeout(analyticsTimer);
     };

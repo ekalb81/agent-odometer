@@ -266,9 +266,9 @@ mockIPC((cmd, payload) => {
       const f = FIXTURES.find((x) => x.id === sessionId);
       return f ? details(f) : null;
     }
-    case 'sessions_in_range': {
-      const { from, to } = payload as { from: string | null; to: string | null };
-      return rangeTotals(from, to);
+    case 'sessions_in_ranges': {
+      const { ranges } = payload as { ranges: { from: string | null; to: string | null }[] };
+      return ranges.map((r) => rangeTotals(r.from, r.to));
     }
     case 'get_scan_status':
       return { done: FIXTURES.length, total: FIXTURES.length, complete: true, elapsed_ms: 1240 };
