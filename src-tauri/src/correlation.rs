@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 pub struct ExternalEvent {
     pub id: String,
     pub timestamp: DateTime<Utc>,
-    /// None is global; otherwise a canonical project/repository path identity.
+    /// None is global; otherwise a canonical path or redacted project identity.
     pub scope: Option<String>,
     pub source: String,
     pub kind: String,
@@ -76,6 +76,37 @@ fn normalized_scope(value: &str) -> String {
         .to_ascii_lowercase()
 }
 
+const REDACTED_PROJECT_SCOPE_PREFIX: &str = "project:";
+
+fn stable_hash(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub(crate) fn project_scope_identity(value: &str) -> String {
+    format!(
+        "{REDACTED_PROJECT_SCOPE_PREFIX}{}",
+        stable_hash(normalized_scope(value).as_bytes())
+    )
+}
+
+fn redacted_scope_matches(cwd: &str, event_scope: &str) -> bool {
+    let mut candidate = normalized_scope(cwd);
+    loop {
+        if project_scope_identity(&candidate) == event_scope {
+            return true;
+        }
+        let Some(separator) = candidate.rfind('/') else {
+            return false;
+        };
+        candidate.truncate(separator);
+    }
+}
+
 fn scope_matches(session: &Session, event: &ExternalEvent) -> bool {
     // Harness is optional source metadata, not a source-specific branch. Any
     // event producer can constrain its observations to one harness while the
@@ -95,6 +126,9 @@ fn scope_matches(session: &Session, event: &ExternalEvent) -> bool {
     let Some(cwd) = session.working_directory.as_deref() else {
         return false;
     };
+    if event_scope.starts_with(REDACTED_PROJECT_SCOPE_PREFIX) {
+        return redacted_scope_matches(cwd, event_scope);
+    }
     let event_scope = normalized_scope(event_scope);
     let cwd = normalized_scope(cwd);
     cwd == event_scope
@@ -373,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_inclusive_after_bounds_and_project_scope() {
+    fn uses_inclusive_after_bounds_and_redacted_project_scope() {
         let sessions = vec![
             session(
                 "a",
@@ -391,7 +425,11 @@ mod tests {
         let result = correlate(
             &sessions,
             CorrelationQuery {
-                events: vec![event("e", "2026-01-02T00:00:00Z", Some("C:/repo"))],
+                events: vec![event(
+                    "e",
+                    "2026-01-02T00:00:00Z",
+                    Some(&project_scope_identity("C:/repo")),
+                )],
                 before_days: 1,
                 after_days: 1,
                 exclude_confounded: false,
@@ -400,6 +438,15 @@ mod tests {
         );
         assert_eq!(result.results[0].before.tokens.total_tokens, 2);
         assert_eq!(result.results[0].after.tokens.total_tokens, 4);
+    }
+
+    #[test]
+    fn project_scope_identities_are_path_normalized_and_do_not_expose_paths() {
+        let scope = project_scope_identity("C:\\Private\\Client\\");
+        assert_eq!(scope, project_scope_identity("c:/private/client"));
+        assert!(scope.starts_with("project:"));
+        assert!(!scope.contains("private"));
+        assert!(!scope.contains("client"));
     }
 
     #[test]

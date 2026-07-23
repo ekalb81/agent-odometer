@@ -1,4 +1,4 @@
-use crate::correlation::ExternalEvent;
+use crate::correlation::{project_scope_identity, ExternalEvent};
 use crate::store::AppState;
 use chrono::Utc;
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
@@ -71,7 +71,7 @@ fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<
         .map(|path| project_scope(&path))
         .collect();
     for scope_path in project_scopes {
-        let scope = Some(scope_path.to_string_lossy().into_owned());
+        let scope = Some(project_scope_identity(&scope_path.to_string_lossy()));
         // Root-level instruction files belong to their respective harnesses.
         out.push(ConfigRoot {
             harness: "codex".into(),
@@ -540,8 +540,8 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_snapshot, event_for, is_safe_config_path, project_roots, snapshot_diff,
-        tracked_root_for_path, ConfigRoot, Snapshot, CODEX_CONFIG_NAMES,
+        discover_snapshot, event_for, is_safe_config_path, project_roots, project_scope_identity,
+        snapshot_diff, tracked_root_for_path, ConfigRoot, Snapshot, CODEX_CONFIG_NAMES,
     };
     use std::path::Path;
     use std::process::Command;
@@ -550,7 +550,7 @@ mod tests {
         ConfigRoot {
             harness: "codex".into(),
             path: path.to_path_buf(),
-            scope: scope.map(str::to_owned),
+            scope: scope.map(project_scope_identity),
             direct_names: CODEX_CONFIG_NAMES,
             nested: true,
         }
@@ -577,9 +577,10 @@ mod tests {
 
         let roots = project_roots([nested]);
         assert_eq!(roots.len(), 4);
+        let expected_scope = project_scope_identity(&directory.path().to_string_lossy());
         assert!(roots
             .iter()
-            .all(|root| { Path::new(root.scope.as_deref().unwrap()) == directory.path() }));
+            .all(|root| root.scope.as_deref() == Some(expected_scope.as_str())));
         assert!(roots.iter().any(|root| {
             root.harness == "codex" && root.path == directory.path().join(".codex") && root.nested
         }));
@@ -685,7 +686,9 @@ mod tests {
         assert_eq!(created.kind, "created");
         assert_eq!(created.metadata["harness"], "codex");
         assert_eq!(created.metadata["content_hash"], "new");
-        assert_eq!(created.scope.as_deref(), Some("/synthetic/project"));
+        let scope = created.scope.as_deref().unwrap();
+        assert!(scope.starts_with("project:"));
+        assert!(!scope.contains("synthetic"));
         assert_eq!(
             created.metadata["safe_diff"],
             "size 0 -> 3 bytes; content hash changed"
