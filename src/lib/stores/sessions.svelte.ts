@@ -47,6 +47,18 @@ function createSessionsStore() {
     map = next;
   }
 
+  /** Apply one coalesced event batch with a single map clone. Each id must be
+   * present in only one collection; callers use the last event for an id. */
+  function applyMutations(list: SessionSummary[], removedIds: Iterable<string>): void {
+    const removals = [...removedIds];
+    if (list.length === 0 && removals.length === 0) return;
+    const now = Date.now();
+    const next = new Map(map);
+    for (const s of list) next.set(s.id, track(s, now));
+    for (const id of removals) next.delete(id);
+    map = next;
+  }
+
   /** Remove a session by id (called on session-removed events). */
   function remove(id: string): void {
     const next = new Map(map);
@@ -69,6 +81,7 @@ function createSessionsStore() {
     replaceAll,
     upsert,
     upsertMany,
+    applyMutations,
     remove,
   };
 }

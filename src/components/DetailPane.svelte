@@ -293,6 +293,32 @@
         </div>
       {/if}
 
+      {#if (session.tool_metrics?.calls ?? 0) > 0 || (session.optimization_findings?.length ?? 0) > 0}
+        <div class="px-5 py-3 border-b border-edge space-y-2">
+          <div class="section-label">Tool efficiency</div>
+          <div class="grid grid-cols-4 gap-2 text-[11px]">
+            <div><span class="text-ink-faint">Calls</span><div class="font-mono text-ink">{session.tool_metrics.calls}</div></div>
+            <div><span class="text-ink-faint">One-shot</span><div class="font-mono text-ink">{session.tool_metrics.mutation_targets > 0 ? `${Math.round((session.tool_metrics.one_shot_mutations / session.tool_metrics.mutation_targets) * 100)}%` : '—'}</div></div>
+            <div><span class="text-ink-faint">Retries</span><div class="font-mono text-ink">{session.tool_metrics.retry_count}</div></div>
+            <div><span class="text-ink-faint">Failures</span><div class="font-mono text-ink">{session.tool_metrics.failures}</div></div>
+          </div>
+          {#if session.optimization_findings?.length > 0}
+            <details>
+              <summary class="cursor-pointer text-[11px] text-amber-500">{session.optimization_findings.length} optimization findings</summary>
+              <div class="mt-1.5 space-y-1.5">
+                {#each session.optimization_findings as finding (`${finding.rule_id}:${finding.turn_id ?? 'session'}:${finding.evidence}`)}
+                  <div class="text-[11px] bg-card border border-edge rounded px-2 py-1.5">
+                    <div class="font-semibold text-ink">{finding.rule_id.replaceAll('-', ' ')}</div>
+                    <div class="text-ink-muted">{finding.evidence}</div>
+                    <div class="text-ink-2">{finding.remediation}</div>
+                  </div>
+                {/each}
+              </div>
+            </details>
+          {/if}
+        </div>
+      {/if}
+
       <!-- Turns, newest first -->
       {#if turnsDesc.length > 0}
         <div class="px-5 py-3">
@@ -312,6 +338,9 @@
                     <span class="font-semibold text-ink">
                       #{turn.index}
                       <span class="text-ink-faint font-normal">{fmtTime(turn.started_at)}</span>
+                      {#if turn.classification}
+                        <span class="ml-1 font-medium px-1.5 py-px rounded-full bg-panel text-ink-muted">{turn.classification.category}</span>
+                      {/if}
                       {#if turn.status !== 'completed'}
                         <span class="ml-1 font-medium px-1.5 py-px rounded-full
                           {turn.status === 'aborted'
@@ -368,6 +397,11 @@
                       {/if}
                       {#if turn.service_tier}
                         <span>Tier <span class="text-ink-2">{turn.service_tier}</span></span>
+                      {/if}
+                      {#if turn.tool_metrics?.calls > 0}
+                        <span>Tools <span class="text-ink-2 font-mono">{turn.tool_metrics.calls}</span></span>
+                        <span>Retries <span class="text-ink-2 font-mono">{turn.tool_metrics.retry_count}</span></span>
+                        <span>Failures <span class="text-ink-2 font-mono">{turn.tool_metrics.failures}</span></span>
                       {/if}
                     </div>
                     {#if turn.abort_reason}

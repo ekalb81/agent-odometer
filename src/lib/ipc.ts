@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -23,8 +23,12 @@ export function getSessionDetails(sessionId: string): Promise<Session | null> {
  *  usage in a window are omitted from that window's map. */
 export function sessionsInRanges(
   ranges: { from: string | null; to: string | null }[],
+  sessionIds?: string[],
 ): Promise<Record<string, RangeTotals>[]> {
-  return invoke<Record<string, RangeTotals>[]>('sessions_in_ranges', { ranges });
+  return invoke<Record<string, RangeTotals>[]>('sessions_in_ranges', {
+    ranges,
+    sessionIds: sessionIds ?? null,
+  });
 }
 
 /** Current bulk-scan progress (call once on mount, then follow events). */
@@ -63,6 +67,59 @@ export function revealInFileManager(path: string): Promise<void> {
 
 export function openTaskInChatGPT(sessionId: string): Promise<void> {
   return invoke<void>('open_task_in_chatgpt', { sessionId });
+}
+
+/** Opens a backend-owned native save dialog and writes only its selected path. */
+export function writeExport(
+  defaultName: string,
+  format: 'csv' | 'json',
+  content: string,
+): Promise<boolean> {
+  return invoke<boolean>('write_export', { defaultName, format, content });
+}
+
+export function listExternalEvents(): Promise<ExternalEvent[]> {
+  return invoke<ExternalEvent[]>('list_external_events');
+}
+
+export function correlateEvents(query: CorrelationQuery): Promise<CorrelationResult> {
+  return invoke<CorrelationResult>('correlate_events', { query });
+}
+
+export function scanGitOutcomes(postWindowHours = 24): Promise<GitOutcome[]> {
+  return invoke<GitOutcome[]>('scan_git_outcomes', { postWindowHours });
+}
+
+export interface TrayTotals {
+  tokens: string;
+  codex_credits: string;
+  codex_api_usd: string;
+  claude_usd: string;
+}
+
+export function setTrayTotals(totals: TrayTotals): Promise<void> {
+  return invoke<void>('set_tray_totals', { totals });
+}
+
+export function getPerformanceStatus(): Promise<PerformanceStatus> {
+  return invoke<PerformanceStatus>('get_performance_status');
+}
+
+export function recordFrontendPerformance(
+  operation: string,
+  durationMs: number,
+  success: boolean,
+  metadata: Record<string, string>,
+): Promise<void> {
+  return invoke<void>('record_frontend_performance', { operation, durationMs, success, metadata });
+}
+
+export function exportPerformanceData(format: 'jsonl' | 'csv'): Promise<boolean> {
+  return invoke<boolean>('export_performance_data', { format });
+}
+
+export function onOpenSettings(cb: () => void): Promise<UnlistenFn> {
+  return listen('open-settings', cb);
 }
 
 // ---------------------------------------------------------------------------

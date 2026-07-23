@@ -15,13 +15,17 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 
 ## What you can see
 
-- **Every session, across harnesses** — one tab for Codex, one for Claude Code, each with totals for the sessions in view.
+- **Every session, across harnesses** — Codex, Claude Code, and an All tab that keeps credits and USD estimates explicitly separated.
 - **Tokens where they went** — input, cached, output, and reasoning tokens per session, per model, and per turn.
 - **What it costs** — Codex sessions show plan credits *and* an informational "what would this cost at OpenAI API rates" estimate; Claude Code sessions show Anthropic API-rate estimates. Rates live in an editable rate card.
 - **Turn-by-turn detail** — click any session for its full story: prompts, replies, per-turn tokens and cost, context-window fill, and a tokens-over-time sparkline.
 - **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
 - **Live** — sessions update in the list while your agents are still running.
 - **Time-scoped answers** — filter by date range and the token/cost columns re-total to exactly that window ("what did I burn last week?").
+- **Export and compare** — save the exact filtered projection as CSV/JSON and compare every model's token mix, cost, calls, retries, failures, and one-shot mutation rate.
+- **Local efficiency signals** — normalized tool metrics, deterministic task categories, bounded optimization findings, configuration-change correlations, and opt-in local Git outcome scans never retain raw tool arguments or output.
+- **Opt-in performance evidence** — default-off local timings cover startup, scans/cache/parsers, analytics, exports, and UI work; logs are size-bounded and exportable as JSONL or CSV.
+- **Quick glance** — the tray menu mirrors today's tokens, Codex credits/API estimate, and Claude USD with native show, hide, settings, and quit controls.
 - **Light and dark** — follows your OS theme by default; switchable in Settings.
 
 ![Claude Code tab with subagent sessions and per-model spend](docs/screenshots/claude-code-tab.png)
@@ -50,7 +54,7 @@ Custom locations can be added under **Settings → Watched roots**.
 
 ## Privacy
 
-Session files contain your prompts, the agents' replies, tool output, and local file paths. Odometer processes them entirely locally and stores nothing outside your machine: settings live in your OS config directory (`agent-odometer/config.json`, plus `rates.json` if you customize rates). Treat the session files themselves as sensitive — don't share or commit them.
+Session files contain your prompts, the agents' replies, tool output, and local file paths. Odometer processes them entirely locally and stores nothing outside your machine: settings and rate overrides live under the OS config directory, while the scan cache and redacted configuration-event hashes live under the OS cache/data directories. Tool telemetry stores hashed target identities and byte counts, never raw arguments or output. Optional application performance tracking is off by default and stores only operation timings, success flags, and aggregate counts — never prompts, session IDs, paths, commands, tool arguments, or output. Its rotating local JSONL can be exported from Settings. Treat the session files themselves as sensitive — don't share or commit them.
 
 ## How costs are estimated
 
@@ -103,8 +107,9 @@ src/                     Svelte frontend
   lib/ipc.ts             Typed Tauri command/event boundary
   lib/types.ts           TypeScript mirrors of Rust wire models
   lib/credits.ts         Credit / API-cost calculations
+  lib/sessionProjection.ts Shared filter, pricing, model-comparison, and export projection
 src-tauri/
-  src/                   Rust application modules (scanner, parsers, watcher, commands)
+  src/                   Rust parsers, telemetry, correlation, config events, git outcomes, tray, and commands
   tests/                 Parser integration tests and fixtures
   capabilities/          Tauri permissions
   rates.json             Bundled rate card
@@ -118,11 +123,16 @@ Generated schemas under `src-tauri/gen/schemas/` are not hand-edited. Both lockf
 Cutting a release, in order:
 
 ```sh
-gh release create vX.Y.Z --draft --title "Odometer vX.Y.Z" --notes "…"   # pre-create the draft
-git tag vX.Y.Z main && git push origin vX.Y.Z                            # triggers the build
+git switch main
+git pull --ff-only origin main
+git tag -s vX.Y.Z -m "Odometer vX.Y.Z" main  # annotated tag signed with your Git signing key
+git push origin vX.Y.Z                        # triggers the cross-platform build
+gh release create vX.Y.Z --verify-tag --draft --title "Odometer vX.Y.Z" --notes "…"
 ```
 
-The workflow builds Windows/macOS/Linux bundles and uploads them (plus updater `.sig` files and `latest.json`) into the existing draft; review and publish it when the run completes. The pre-created draft matters: since the repository went public, `GITHUB_TOKEN` can upload assets to an existing release but is blocked from creating one. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets. The in-app updater follows the latest published release. OS code signing/notarization is not configured yet.
+All three version fields (`package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`) must already equal `X.Y.Z`; the release workflow rejects a mismatched `vX.Y.Z` tag before any platform builds start. `git tag -s` creates an annotated, cryptographically signed Git tag; this Git signature is separate from the updater artifact signature.
+
+The workflow builds Windows/macOS/Linux bundles and uploads them (plus updater `.sig` files and `latest.json`) into the existing draft; review and publish it when the run completes. Create the draft immediately after pushing the tag and before the build reaches its upload step. `--verify-tag` is important: without it, `gh release create` can silently create a lightweight tag from the default branch. Since the repository went public, `GITHUB_TOKEN` can upload assets to an existing release but is blocked from creating one. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets. The in-app updater follows the latest published release. OS code signing/notarization is not configured yet. A manual Actions run is build-only: it validates the three internal versions and bundles every platform, but never creates a tag or GitHub release.
 
 ## Contributing
 

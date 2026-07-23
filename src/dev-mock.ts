@@ -11,6 +11,7 @@ import type {
   TierBucket,
   TokenTotals,
   TurnInfo,
+  ToolMetrics,
 } from './lib/types';
 
 const DAY = 86_400_000;
@@ -38,6 +39,14 @@ function scaleTok(t: TokenTotals, f: number): TokenTotals {
     reasoning_output_tokens: Math.round(t.reasoning_output_tokens * f),
     total_tokens: Math.round(t.total_tokens * f),
   };
+}
+
+function toolMetrics(calls = 0): ToolMetrics {
+  return { calls, reads: Math.floor(calls / 3), searches: Math.floor(calls / 4),
+    mutations: Math.floor(calls / 3), commands: Math.floor(calls / 4), other: 0,
+    successes: calls, failures: 0, unknown: 0, mutation_targets: Math.floor(calls / 3),
+    one_shot_mutations: Math.floor(calls / 3), retry_count: 0,
+    duration_ms: calls * 400, output_bytes: calls * 250 };
 }
 
 function at(daysAgo: number, hours: number, minutes = 0): string {
@@ -150,6 +159,10 @@ function summary(f: Fixture): SessionSummary {
     first_user_message: `${f.name} — please take a look.`,
     tokens_total: tok(f.total),
     buckets: buckets(f),
+    tool_metrics: toolMetrics(f.turns * 3),
+    tool_metrics_by_model: { [f.model]: toolMetrics(f.turns * 3) },
+    category_totals: { coding: { turns: f.turns, tokens: tok(f.total), tool_calls: f.turns * 3, buckets: buckets(f) } },
+    optimization_findings_count: 0,
   };
 }
 
@@ -185,6 +198,8 @@ function details(f: Fixture): Session {
       user_message: TURN_PROMPTS[i % TURN_PROMPTS.length],
       last_agent_message: 'Done — summarized in the diff above.',
       tokens: tok(Math.round(perTurn * jitter)),
+      tool_metrics: toolMetrics(3),
+      classification: { version: 1, category: 'coding', confidence: 0.8, signals: ['fixture'] },
     };
   });
   let cumulative = 0;
@@ -207,6 +222,8 @@ function details(f: Fixture): Session {
     tokens_by_model: { [f.model]: tok(f.total) },
     tokens_history: history,
     turns,
+    tool_observations: [],
+    optimization_findings: [],
   };
 }
 
@@ -252,6 +269,8 @@ function rangeTotals(from: string | null, to: string | null): Record<string, Ran
     out[f.id] = {
       tokens: scaleTok(tok(f.total), fraction),
       buckets: buckets(f).map((b) => ({ ...b, tokens: scaleTok(b.tokens, fraction) })),
+      tool_metrics: toolMetrics(Math.round(f.turns * 3 * fraction)),
+      tool_metrics_by_model: { [f.model]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
     };
   }
   return out;
@@ -272,12 +291,16 @@ mockIPC((cmd, payload) => {
     }
     case 'get_scan_status':
       return { done: FIXTURES.length, total: FIXTURES.length, complete: true, elapsed_ms: 1240 };
+    case 'get_performance_status':
+      return { enabled: false, max_log_mb: 64, stored_bytes: 0, recorded_this_run: 0, dropped_this_run: 0 };
     case 'get_config':
       return {
         session_roots: ['/home/dev/.codex/sessions'],
         archive_roots: ['/home/dev/.codex/archived_sessions'],
         session_index_path: '/home/dev/.codex/session_index.jsonl',
         claude_session_roots: ['/home/dev/.claude/projects'],
+        performance_tracking_enabled: false,
+        performance_log_max_mb: 64,
       };
     case 'get_rates':
     case 'get_bundled_rates':
@@ -286,6 +309,18 @@ mockIPC((cmd, payload) => {
     case 'set_config':
     case 'reveal_in_file_manager':
     case 'open_task_in_chatgpt':
+    case 'write_export':
+    case 'export_performance_data':
+      return true;
+    case 'record_frontend_performance':
+      return undefined;
+    case 'list_external_events':
+      return cmd === 'list_external_events' ? [] : undefined;
+    case 'correlate_events':
+      return { results: [] };
+    case 'scan_git_outcomes':
+      return [];
+    case 'set_tray_totals':
       return undefined;
     case 'plugin:app|version':
       return '0.0.0-dev';

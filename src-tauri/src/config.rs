@@ -10,6 +10,16 @@ pub struct Config {
     /// Roots containing Claude Code session JSONL files (~/.claude/projects).
     #[serde(default = "default_claude_session_roots")]
     pub claude_session_roots: Vec<PathBuf>,
+    /// Local app performance measurements. Disabled unless explicitly enabled.
+    #[serde(default)]
+    pub performance_tracking_enabled: bool,
+    /// Per-segment limit; the recorder keeps the current and previous segment.
+    #[serde(default = "default_performance_log_max_mb")]
+    pub performance_log_max_mb: u64,
+}
+
+fn default_performance_log_max_mb() -> u64 {
+    64
 }
 
 fn default_session_index_path() -> PathBuf {
@@ -50,6 +60,8 @@ impl Default for Config {
             archive_roots: vec![codex_home.join("archived_sessions")],
             session_index_path: codex_home.join("session_index.jsonl"),
             claude_session_roots: default_claude_session_roots(),
+            performance_tracking_enabled: false,
+            performance_log_max_mb: default_performance_log_max_mb(),
         }
     }
 }
@@ -59,6 +71,13 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl Config {
+    pub fn session_sources_equal(&self, other: &Self) -> bool {
+        self.session_roots == other.session_roots
+            && self.archive_roots == other.archive_roots
+            && self.session_index_path == other.session_index_path
+            && self.claude_session_roots == other.claude_session_roots
+    }
+
     /// Loads config from `<config_dir>/agent-odometer/config.json`.
     /// If the file doesn't exist, writes and returns the default. If it is
     /// malformed, warns and returns the default.
@@ -101,8 +120,12 @@ impl Config {
 
         let json = serde_json::to_string_pretty(self)?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)?;
+        std::fs::write(&tmp, &json)?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            // Windows cannot rename over an existing destination.
+            std::fs::write(&path, json)?;
+            let _ = std::fs::remove_file(tmp);
+        }
         Ok(())
     }
 }
@@ -121,6 +144,8 @@ mod tests {
             archive_roots: vec![dir.path().join("archived")],
             session_index_path: dir.path().join("session_index.jsonl"),
             claude_session_roots: vec![dir.path().join("claude-projects")],
+            performance_tracking_enabled: true,
+            performance_log_max_mb: 32,
         };
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -132,6 +157,8 @@ mod tests {
         assert_eq!(loaded.session_roots, cfg.session_roots);
         assert_eq!(loaded.archive_roots, cfg.archive_roots);
         assert_eq!(loaded.claude_session_roots, cfg.claude_session_roots);
+        assert!(loaded.performance_tracking_enabled);
+        assert_eq!(loaded.performance_log_max_mb, 32);
     }
 
     #[test]
@@ -146,6 +173,8 @@ mod tests {
         // claude_session_roots should fall back to <claude config dir>/projects.
         assert_eq!(cfg.claude_session_roots.len(), 1);
         assert!(cfg.claude_session_roots[0].ends_with("projects"));
+        assert!(!cfg.performance_tracking_enabled);
+        assert_eq!(cfg.performance_log_max_mb, 64);
     }
 
     #[test]
@@ -162,6 +191,15 @@ mod tests {
         let cfg = result.unwrap_or_else(|_| Config::default());
         // Falls back to default — session_roots should contain the .codex/sessions path.
         assert!(!cfg.session_roots.is_empty());
+    }
+
+    #[test]
+    fn performance_changes_do_not_change_session_sources() {
+        let first = Config::default();
+        let mut second = first.clone();
+        second.performance_tracking_enabled = true;
+        second.performance_log_max_mb = 16;
+        assert!(first.session_sources_equal(&second));
     }
 
     #[test]

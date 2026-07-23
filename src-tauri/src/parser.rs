@@ -2,7 +2,7 @@ use crate::model::{Session, TokenHistoryPoint, TokenTotals, TurnStatus};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,7 @@ pub struct SessionParser {
     pub current_turn_id: Option<String>,
     pub file_path: PathBuf,
     pub archived: bool,
+    seen_tool_ids: HashSet<String>,
 }
 
 /// Max characters retained for per-turn prompt / agent-message previews.
@@ -29,48 +30,80 @@ impl SessionParser {
             current_turn_id: None,
             file_path,
             archived,
+            seen_tool_ids: HashSet::new(),
         }
     }
 
     pub fn parse_to_end(&mut self) -> anyhow::Result<bool> {
         let file = std::fs::File::open(&self.file_path)
             .with_context(|| format!("opening {:?}", self.file_path))?;
+        if file.metadata()?.len() < self.byte_offset {
+            self.reset_for_replaced_file();
+        }
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(self.byte_offset))?;
 
         let mut updated = false;
-        let mut line = String::new();
+        let mut line = Vec::new();
 
         loop {
             let start = self.byte_offset;
             line.clear();
-            let n = reader.read_line(&mut line)?;
+            let n = reader.read_until(b'\n', &mut line)?;
             if n == 0 {
                 break;
             }
 
             // A partial trailing line has no terminating newline — leave byte_offset at its start.
-            if !line.ends_with('\n') {
+            if !line.ends_with(b"\n") {
                 break;
             }
 
             self.byte_offset = start + n as u64;
 
-            let trimmed = line.trim();
+            let trimmed = match std::str::from_utf8(&line) {
+                Ok(line) => line.trim(),
+                Err(error) => {
+                    tracing::warn!("skipping non-UTF-8 line at offset {}: {}", start, error);
+                    continue;
+                }
+            };
             if trimmed.is_empty() {
                 continue;
             }
 
-            match self.apply_line(trimmed) {
+            match self.apply_line_without_refresh(trimmed) {
                 Ok(()) => updated = true,
                 Err(e) => tracing::warn!("skipping unparseable line at offset {}: {}", start, e),
             }
         }
 
+        if updated {
+            if let Some(session) = self.session.as_mut() {
+                crate::telemetry::refresh_session(session);
+            }
+        }
         Ok(updated)
     }
 
+    fn reset_for_replaced_file(&mut self) {
+        self.session = None;
+        self.byte_offset = 0;
+        self.current_model = None;
+        self.current_service_tier = None;
+        self.current_turn_id = None;
+        self.seen_tool_ids.clear();
+    }
+
     pub fn apply_line(&mut self, line: &str) -> anyhow::Result<()> {
+        self.apply_line_without_refresh(line)?;
+        if let Some(session) = self.session.as_mut() {
+            crate::telemetry::refresh_session(session);
+        }
+        Ok(())
+    }
+
+    fn apply_line_without_refresh(&mut self, line: &str) -> anyhow::Result<()> {
         // Fast path: record types we discard wholesale (response_item, compacted)
         // account for the vast majority of bytes in a rollout file. When the line
         // has the exact leading shape Codex writes — {"timestamp":"<ts>","type":"<t>"
@@ -108,6 +141,7 @@ impl SessionParser {
 
         // Skip response_item entirely — it's bulky and carries no usage stats.
         if event_type == "response_item" {
+            self.handle_response_item(&root["payload"], last_event_at);
             return Ok(());
         }
 
@@ -124,6 +158,64 @@ impl SessionParser {
         }
 
         Ok(())
+    }
+
+    fn handle_response_item(&mut self, payload: &Value, timestamp: DateTime<Utc>) {
+        let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+        match item_type {
+            "function_call" => {
+                let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+                if call_id.is_empty() || !self.seen_tool_ids.insert(call_id.to_owned()) {
+                    return;
+                }
+                let name = payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let arguments = payload
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or(Value::Null);
+                if let Some(session) = self.session.as_mut() {
+                    crate::telemetry::observe_call(
+                        &mut session.tool_observations,
+                        crate::telemetry::ToolCallInput {
+                            call_id: call_id.to_owned(),
+                            turn_id: self.current_turn_id.clone(),
+                            harness: crate::model::Harness::Codex,
+                            model: self.current_model.clone(),
+                            timestamp,
+                            name: name.to_owned(),
+                            arguments: &arguments,
+                        },
+                    );
+                }
+            }
+            "function_call_output" => {
+                let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+                let output = payload.get("output").and_then(Value::as_str).unwrap_or("");
+                let failed = output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Exit code: "))
+                    .and_then(|code| code.trim().parse::<i32>().ok())
+                    .is_some_and(|code| code != 0);
+                if let Some(session) = self.session.as_mut() {
+                    crate::telemetry::observe_result(
+                        &mut session.tool_observations,
+                        call_id,
+                        if failed {
+                            crate::model::ToolOutcome::Failure
+                        } else {
+                            crate::model::ToolOutcome::Success
+                        },
+                        None,
+                        output.len() as u64,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_session_meta(
@@ -274,6 +366,11 @@ impl SessionParser {
             tokens_by_model: HashMap::new(),
             tokens_history: Vec::new(),
             turns: Vec::new(),
+            tool_observations: Vec::new(),
+            tool_metrics: Default::default(),
+            tool_metrics_by_model: Default::default(),
+            category_totals: Default::default(),
+            optimization_findings: Vec::new(),
         });
 
         Ok(())
@@ -529,6 +626,43 @@ impl SessionParser {
                     }
                 }
             }
+            "exec_command_end" => {
+                let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+                let failed = payload
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|code| code != 0)
+                    || payload.get("status").and_then(Value::as_str) == Some("failed");
+                let duration_ms = payload.get("duration").map(|duration| {
+                    let secs = duration.get("secs").and_then(Value::as_u64).unwrap_or(0);
+                    let nanos = duration.get("nanos").and_then(Value::as_u64).unwrap_or(0);
+                    secs.saturating_mul(1000).saturating_add(nanos / 1_000_000)
+                });
+                let output_bytes = payload
+                    .get("aggregated_output")
+                    .and_then(Value::as_str)
+                    .map(|value| value.len() as u64)
+                    .unwrap_or_else(|| {
+                        ["stdout", "stderr"]
+                            .iter()
+                            .filter_map(|key| payload.get(*key).and_then(Value::as_str))
+                            .map(|value| value.len() as u64)
+                            .sum()
+                    });
+                if let Some(session) = self.session.as_mut() {
+                    crate::telemetry::observe_result(
+                        &mut session.tool_observations,
+                        call_id,
+                        if failed {
+                            crate::model::ToolOutcome::Failure
+                        } else {
+                            crate::model::ToolOutcome::Success
+                        },
+                        duration_ms,
+                        output_bytes,
+                    );
+                }
+            }
             _ => {}
         }
 
@@ -647,6 +781,9 @@ impl SessionParser {
 /// missing `","type":"` separator, or any other record type. Correctness over
 /// cleverness: the fast path only fires when the line shape is unambiguous.
 fn fast_skip_timestamp(line: &str) -> Option<&str> {
+    if line.contains("\"type\":\"function_call") {
+        return None;
+    }
     let rest = line.strip_prefix("{\"timestamp\":\"")?;
     let ts_end = rest.find('"')?;
     let ts = &rest[..ts_end];

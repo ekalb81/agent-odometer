@@ -11,6 +11,65 @@ export interface TokenTotals {
   total_tokens: number;
 }
 
+export type ToolKind = 'read' | 'search' | 'mutation' | 'command' | 'other';
+export type ToolOutcome = 'pending' | 'success' | 'failure' | 'unknown';
+export type TaskCategory = 'planning' | 'exploration' | 'coding' | 'debugging' | 'testing' | 'review' | 'other';
+
+export interface ToolMetrics {
+  calls: number;
+  reads: number;
+  searches: number;
+  mutations: number;
+  commands: number;
+  other: number;
+  successes: number;
+  failures: number;
+  unknown: number;
+  mutation_targets: number;
+  one_shot_mutations: number;
+  retry_count: number;
+  duration_ms: number;
+  output_bytes: number;
+}
+
+export interface ToolObservation {
+  call_id: string;
+  turn_id: string | null;
+  harness: Harness;
+  model: string | null;
+  timestamp: string;
+  kind: ToolKind;
+  name: string;
+  target: string | null;
+  outcome: ToolOutcome;
+  duration_ms: number | null;
+  output_bytes: number;
+}
+
+export interface TurnClassification {
+  version: number;
+  category: TaskCategory;
+  confidence: number;
+  signals: string[];
+}
+
+export interface CategoryMetric {
+  turns: number;
+  tokens: TokenTotals;
+  tool_calls: number;
+  buckets: TierBucket[];
+}
+
+export interface OptimizationFinding {
+  version: number;
+  rule_id: string;
+  severity: string;
+  turn_id: string | null;
+  model: string | null;
+  evidence: string;
+  remediation: string;
+}
+
 export interface TurnInfo {
   turn_id: string;
   index: number;
@@ -27,6 +86,8 @@ export interface TurnInfo {
   user_message: string | null;
   last_agent_message: string | null;
   tokens: TokenTotals;
+  tool_metrics: ToolMetrics;
+  classification: TurnClassification;
 }
 
 export interface Session {
@@ -68,6 +129,11 @@ export interface Session {
     delta: TokenTotals;
   }[];
   turns: TurnInfo[];
+  tool_observations: ToolObservation[];
+  tool_metrics: ToolMetrics;
+  tool_metrics_by_model: Record<string, ToolMetrics>;
+  category_totals: Partial<Record<TaskCategory, CategoryMetric>>;
+  optimization_findings: OptimizationFinding[];
 }
 
 /** Token usage grouped by (model, service_tier); prices usage exactly without the full event history. */
@@ -81,6 +147,8 @@ export interface TierBucket {
 export interface RangeTotals {
   tokens: TokenTotals;
   buckets: TierBucket[];
+  tool_metrics: ToolMetrics;
+  tool_metrics_by_model: Record<string, ToolMetrics>;
 }
 
 /** Lightweight wire form of a Session for the list view and live updates. */
@@ -110,6 +178,10 @@ export interface SessionSummary {
   first_user_message: string | null;
   tokens_total: TokenTotals;
   buckets: TierBucket[];
+  tool_metrics: ToolMetrics;
+  tool_metrics_by_model: Record<string, ToolMetrics>;
+  category_totals: Partial<Record<TaskCategory, CategoryMetric>>;
+  optimization_findings_count: number;
 }
 
 /** Bulk-scan progress, from get_scan_status and "scan-progress" events. */
@@ -126,6 +198,16 @@ export interface Config {
   archive_roots: string[];
   session_index_path: string;
   claude_session_roots: string[];
+  performance_tracking_enabled: boolean;
+  performance_log_max_mb: number;
+}
+
+export interface PerformanceStatus {
+  enabled: boolean;
+  max_log_mb: number;
+  stored_bytes: number;
+  recorded_this_run: number;
+  dropped_this_run: number;
 }
 
 export interface ModelRate {
@@ -149,4 +231,49 @@ export interface RateCard {
   fallback_models: Record<string, string>;
   /** OpenAI API USD rates for Codex models — powers the est.-cost column. */
   api_models: Record<string, ModelRate>;
+}
+
+export interface ExternalEvent {
+  id: string;
+  timestamp: string;
+  scope: string | null;
+  source: string;
+  kind: string;
+  metadata: Record<string, string>;
+}
+
+export interface CorrelationObservation {
+  session_count: number;
+  tokens: TokenTotals;
+  buckets_by_harness: Partial<Record<Harness, TierBucket[]>>;
+  tool_metrics: ToolMetrics;
+}
+
+export interface CorrelationQuery {
+  events: ExternalEvent[];
+  before_days: number;
+  after_days: number;
+  exclude_confounded: boolean;
+  include_subagents: boolean;
+}
+
+export interface EventCorrelation {
+  event: ExternalEvent;
+  before: CorrelationObservation;
+  after: CorrelationObservation;
+  token_delta: number;
+  session_delta: number;
+  confounding_event_ids: string[];
+  warnings: string[];
+}
+
+export interface CorrelationResult { results: EventCorrelation[]; }
+
+export type GitOutcomeKind = 'kept' | 'reverted' | 'abandoned' | 'ambiguous' | 'not_evaluated';
+export interface GitOutcome {
+  session_id: string;
+  repository_scope: string | null;
+  kind: GitOutcomeKind;
+  commit_ids: string[];
+  evidence: string;
 }

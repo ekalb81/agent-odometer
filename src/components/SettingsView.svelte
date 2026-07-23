@@ -3,14 +3,16 @@
   import { rates } from '../lib/stores/rates';
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
-  import { setConfig, setRates, getBundledRates, addDefenderExclusions } from '../lib/ipc';
+  import { setConfig, setRates, getBundledRates, addDefenderExclusions, exportPerformanceData, getPerformanceStatus } from '../lib/ipc';
   import { getVersion } from '@tauri-apps/api/app';
   import { onMount } from 'svelte';
-  import type { RateCard, ModelRate } from '../lib/types';
+  import type { RateCard, ModelRate, PerformanceStatus } from '../lib/types';
+  import { configurePerformanceTracking } from '../lib/performance';
 
   let appVersion = $state('');
   onMount(() => {
     void getVersion().then((v) => (appVersion = v)).catch(() => {});
+    void refreshPerformanceStatus();
   });
 
   const themeOptions: { value: ThemePreference; label: string }[] = [
@@ -136,6 +138,8 @@
         archive_roots: editedArchiveRoots,
         session_index_path: editedIndexPath.trim(),
         claude_session_roots: editedClaudeRoots,
+        performance_tracking_enabled: $config.performance_tracking_enabled,
+        performance_log_max_mb: $config.performance_log_max_mb,
       });
       rootsDirty = false;
       rootsSavedAt = new Date().toLocaleTimeString();
@@ -144,6 +148,86 @@
     } finally {
       rootsSaving = false;
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Opt-in local performance measurements.
+  // ---------------------------------------------------------------------------
+  let performanceEnabled = $state(false);
+  let performanceMaxMb = $state(64);
+  let performanceDirty = $state(false);
+  let performanceSaving = $state(false);
+  let performanceSavedAt = $state<string | null>(null);
+  let performanceError = $state<string | null>(null);
+  let performanceStatus = $state<PerformanceStatus | null>(null);
+  let performanceExporting = $state(false);
+
+  $effect(() => {
+    const current = $config;
+    if (!performanceDirty) {
+      performanceEnabled = current.performance_tracking_enabled ?? false;
+      performanceMaxMb = current.performance_log_max_mb ?? 64;
+    }
+  });
+
+  function markPerformanceDirty() {
+    performanceDirty = true;
+    performanceSavedAt = null;
+    performanceError = null;
+  }
+
+  async function refreshPerformanceStatus() {
+    try {
+      performanceStatus = await getPerformanceStatus();
+    } catch {
+      performanceStatus = null;
+    }
+  }
+
+  async function savePerformanceSettings() {
+    const maxMb = Math.round(Number(performanceMaxMb));
+    if (!Number.isFinite(maxMb) || maxMb < 1 || maxMb > 1024) {
+      performanceError = 'Log size must be between 1 and 1024 MiB.';
+      return;
+    }
+    performanceSaving = true;
+    performanceError = null;
+    try {
+      const updatedConfig = {
+        ...$config,
+        performance_tracking_enabled: performanceEnabled,
+        performance_log_max_mb: maxMb,
+      };
+      await setConfig(updatedConfig);
+      config.set(updatedConfig);
+      configurePerformanceTracking(performanceEnabled);
+      performanceDirty = false;
+      performanceSavedAt = new Date().toLocaleTimeString();
+      await refreshPerformanceStatus();
+    } catch (error) {
+      performanceError = String(error);
+    } finally {
+      performanceSaving = false;
+    }
+  }
+
+  async function exportPerformance(format: 'jsonl' | 'csv') {
+    performanceExporting = true;
+    performanceError = null;
+    try {
+      await exportPerformanceData(format);
+      await refreshPerformanceStatus();
+    } catch (error) {
+      performanceError = String(error);
+    } finally {
+      performanceExporting = false;
+    }
+  }
+
+  function formatBytes(value: number): string {
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+    return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
   }
 
   // ---------------------------------------------------------------------------
@@ -554,10 +638,86 @@
     {/if}
   </section>
 
+  <!-- Opt-in application performance tracking -->
+  <section>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Performance tracking</h2>
+    <p class="text-xs text-ink-faint mb-3 max-w-3xl">
+      Records local timings and aggregate counts for startup, scans, cache behavior, parsing,
+      watchers, analytics IPC, exports, and UI loading/rendering. It never stores prompts, tool
+      arguments, session IDs, repository paths, or command output. Recording is off by default.
+    </p>
+    <div class="bg-card border border-edge rounded-lg px-4 py-3 max-w-3xl">
+      <div class="flex items-center gap-4 flex-wrap">
+        <label class="flex items-center gap-2 text-xs text-ink-2">
+          <input
+            type="checkbox"
+            bind:checked={performanceEnabled}
+            onchange={markPerformanceDirty}
+          />
+          Enable local performance tracking
+        </label>
+        <label class="flex items-center gap-2 text-xs text-ink-muted">
+          Segment size
+          <input
+            type="number"
+            min="1"
+            max="1024"
+            step="1"
+            bind:value={performanceMaxMb}
+            oninput={markPerformanceDirty}
+            class="w-20 text-right bg-app border border-edge rounded px-2 py-1 text-ink font-mono"
+          />
+          MiB
+        </label>
+        <button
+          onclick={savePerformanceSettings}
+          disabled={!performanceDirty || performanceSaving}
+          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
+        >{performanceSaving ? 'Saving…' : 'Save'}</button>
+        {#if performanceSavedAt && !performanceDirty}
+          <span class="text-xs text-pos">Saved at {performanceSavedAt}</span>
+        {/if}
+      </div>
+      <p class="text-[11px] text-ink-faint mt-2">
+        The recorder keeps a current and previous segment, so storage is bounded to approximately
+        twice the configured segment size.
+      </p>
+      <div class="flex items-center gap-2 flex-wrap mt-3 pt-3 border-t border-edgerow">
+        <button
+          onclick={() => exportPerformance('jsonl')}
+          disabled={performanceExporting || (performanceStatus?.stored_bytes ?? 0) === 0}
+          class="px-3 py-1.5 text-xs rounded bg-app border border-edge hover:bg-[var(--row-hover)] disabled:opacity-40"
+        >Export JSONL…</button>
+        <button
+          onclick={() => exportPerformance('csv')}
+          disabled={performanceExporting || (performanceStatus?.stored_bytes ?? 0) === 0}
+          class="px-3 py-1.5 text-xs rounded bg-app border border-edge hover:bg-[var(--row-hover)] disabled:opacity-40"
+        >Export CSV…</button>
+        <button
+          onclick={refreshPerformanceStatus}
+          disabled={performanceExporting}
+          class="px-2 py-1 text-xs text-accent-chipfg hover:underline"
+        >Refresh status</button>
+        {#if performanceStatus}
+          <span class="text-[11px] text-ink-faint ml-auto">
+            {formatBytes(performanceStatus.stored_bytes)} stored ·
+            {performanceStatus.recorded_this_run.toLocaleString()} recorded this run
+            {#if performanceStatus.dropped_this_run > 0}
+              · {performanceStatus.dropped_this_run.toLocaleString()} dropped
+            {/if}
+          </span>
+        {/if}
+      </div>
+      {#if performanceError}
+        <p class="text-xs text-red-500 mt-2">{performanceError}</p>
+      {/if}
+    </div>
+  </section>
+
   {#if isWindows}
-    <!-- Performance -->
+    <!-- Windows scan performance -->
     <section>
-      <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Performance</h2>
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Windows scan performance</h2>
       <p class="text-xs text-ink-faint mb-2 max-w-2xl">
         Windows Defender scans every session file as it's read, which usually dominates the first
         load of a large history. You can exclude the watched session folders above from Defender's
