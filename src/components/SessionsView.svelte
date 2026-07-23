@@ -870,10 +870,19 @@
     exportBusy = true;
     exportError = null;
     try {
+      const exportSessions = filtered;
+      const exportRanges = dateScoped
+        ? (await measureAsync(
+            'frontend.session_export_range_fetch',
+            () => sessionsInRanges([{ from: fromUtc, to: toUtc }], exportSessions.map((session) => session.id)),
+            { sessions: exportSessions.length, ranges: 1 },
+          ))[0]
+        : rangeTotals;
+      const exportProjection = projectSessions(exportSessions, $rates, exportRanges, dateScoped);
       const rows = measureSync(
         'frontend.session_export_build',
-        () => exportRows(sessionDisplayMap.values(), includeWorkingDirectory),
-        { sessions: sessionDisplayMap.size, format },
+        () => exportRows(exportProjection.values(), includeWorkingDirectory),
+        { sessions: exportProjection.size, format },
       );
       const content = format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows);
       await writeExport(

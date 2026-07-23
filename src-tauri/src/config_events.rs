@@ -63,22 +63,21 @@ fn roots() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-fn is_safe_config_path(path: &Path) -> bool {
-    let lower = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    if [
-        "/sessions/",
-        "/archived_sessions/",
-        "/cache/",
-        "/plugins/cache/",
-        "/logs/",
-        "/tmp/",
-    ]
-    .iter()
-    .any(|part| lower.contains(part))
-    {
+fn is_safe_config_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if components.iter().any(|component| {
+        matches!(
+            component.as_str(),
+            "sessions" | "archived_sessions" | "cache" | "logs" | "tmp"
+        )
+    }) {
         return false;
     }
     let name = path
@@ -86,12 +85,14 @@ fn is_safe_config_path(path: &Path) -> bool {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "config.toml" | "settings.json" | "settings.local.json" | "claude.md" | "agents.md"
-    ) || (lower.contains("/hooks/")
-        && path.extension().and_then(|value| value.to_str()) == Some("json"))
-        || (lower.contains("/skills/")
+    (components.len() == 1
+        && matches!(
+            name.as_str(),
+            "config.toml" | "settings.json" | "settings.local.json" | "claude.md" | "agents.md"
+        ))
+        || (components.first().is_some_and(|part| part == "hooks")
+            && path.extension().and_then(|value| value.to_str()) == Some("json"))
+        || (components.first().is_some_and(|part| part == "skills")
             && path.extension().and_then(|value| value.to_str()) == Some("md"))
 }
 
@@ -149,7 +150,7 @@ fn discover_snapshot(roots: &[(String, PathBuf)]) -> (Snapshot, HashMap<String, 
             });
         for path in direct
             .chain(nested)
-            .filter(|path| is_safe_config_path(path))
+            .filter(|path| is_safe_config_path(root, path))
         {
             if let Some(current) = snapshot_file(&path) {
                 let key = path.to_string_lossy().into_owned();
@@ -288,9 +289,10 @@ fn record_change(
     state: &Arc<AppState>,
     snapshot: &Arc<Mutex<Snapshot>>,
     harness: &str,
+    root: &Path,
     path: &Path,
 ) {
-    if !is_safe_config_path(path) {
+    if !is_safe_config_path(root, path) {
         return;
     }
     let key = path.to_string_lossy().into_owned();
@@ -342,10 +344,10 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
             let Ok(events) = result else { return };
             for event in events {
                 for path in &event.paths {
-                    if let Some((harness, _)) =
+                    if let Some((harness, root)) =
                         roots_cb.iter().find(|(_, root)| path.starts_with(root))
                     {
-                        record_change(&app_cb, &state_cb, &snapshot_cb, harness, path);
+                        record_change(&app_cb, &state_cb, &snapshot_cb, harness, root, path);
                     }
                 }
             }

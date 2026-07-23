@@ -7,6 +7,7 @@
   let error = $state<string | null>(null);
   let correlations = $state<Record<string, EventCorrelation>>({});
   const kinds: GitOutcomeKind[] = ['kept', 'reverted', 'abandoned', 'ambiguous', 'not_evaluated'];
+  const correlationBatchSize = 2_000;
 
   async function scan() {
     busy = true; error = null;
@@ -14,8 +15,18 @@
       outcomes = await scanGitOutcomes(24);
       const sessionIds = new Set(outcomes.map((outcome) => outcome.session_id));
       const events = (await listExternalEvents()).filter((event) => event.source === 'git' && sessionIds.has(event.metadata.session_id));
-      const result = await correlateEvents({ events, before_days: 7, after_days: 7, exclude_confounded: false, include_subagents: true });
-      correlations = Object.fromEntries(result.results.map((item) => [item.event.metadata.session_id, item]));
+      const results: EventCorrelation[] = [];
+      for (let offset = 0; offset < events.length; offset += correlationBatchSize) {
+        const batch = await correlateEvents({
+          events: events.slice(offset, offset + correlationBatchSize),
+          before_days: 7,
+          after_days: 7,
+          exclude_confounded: false,
+          include_subagents: true,
+        });
+        results.push(...batch.results);
+      }
+      correlations = Object.fromEntries(results.map((item) => [item.event.metadata.session_id, item]));
     }
     catch (reason) { error = String(reason); }
     finally { busy = false; }
