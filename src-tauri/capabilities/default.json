@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default capability for the main window: core APIs + event listener for our session/config/rates push events, plus updater check/install and app relaunch after an update.",
+  "description": "Default capability for the main window: core APIs + event listener for our session/config/rates push events, updater check/install, app relaunch, and the scoped release-notes URL.",
   "windows": ["main"],
   "permissions": [
     "core:default",
@@ -10,6 +10,14 @@
     "core:event:allow-unlisten",
     "core:webview:allow-internal-toggle-devtools",
     "updater:default",
-    "process:allow-restart"
+    "process:allow-restart",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        {
+          "url": "https://github.com/ekalb81/agent-odometer/releases"
+        }
+      ]
+    }
   ]
 }

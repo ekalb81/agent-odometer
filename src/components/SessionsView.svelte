@@ -161,7 +161,6 @@
   let rangeTotals = $state<Record<string, RangeTotals>>({});
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
   let rangeRequestGeneration = 0;
-  let lastTableRequestKey: string | null = null;
   // Debounce is only for coalescing live store flushes (~150ms apart). A
   // changed range is a discrete user action (preset click, committed input)
   // and fetches immediately.
@@ -178,21 +177,18 @@
     if (!active) {
       rangeTotals = {};
       lastTableRange = null;
-      lastTableRequestKey = null;
       return;
     }
     if (!from && !to) {
       rangeTotals = {};
       lastTableRange = null;
-      lastTableRequestKey = null;
       return;
     }
     const key = `${from}|${to}`;
-    const requestKey = `${key}|${filters.search}|${filters.model}|${filters.showActive}|${filters.showArchived}|${filters.showSubagents}|${sessionIds.length}`;
-    const delay = key === lastTableRange ? 250 : 0;
-    if (requestKey !== lastTableRequestKey) rangeTotals = {};
+    const rangeChanged = key !== lastTableRange;
+    const delay = rangeChanged ? 0 : 250;
+    if (rangeChanged) rangeTotals = {};
     lastTableRange = key;
-    lastTableRequestKey = requestKey;
     if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
     rangeFetchTimer = setTimeout(() => {
       rangeFetchTimer = null;
@@ -500,7 +496,6 @@
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
   let analyticsRequestGeneration = 0;
-  let lastAnalyticsRequestKey: string | null = null;
 
   const DAY_MS = 86_400_000;
   const MAX_CHART_BUCKETS = 14;
@@ -516,29 +511,24 @@
     return min;
   })());
 
-  // The chart window: the date filter when set, else a rolling last-7-days —
-  // the same definition as the "Last 7 days" preset, so picking that preset
-  // doesn't shift the numbers. A "To"-only filter reaches back to the earliest
-  // session so the band covers the same sessions as the list.
+  // The chart window follows the date filter. With no bounds, it starts at
+  // the earliest known session so "All time" means the same thing everywhere.
+  // A "To"-only filter also reaches back to the earliest session.
   const windowBounds = $derived((() => {
     void pulseGen; // stay fresh as time advances
     const endMs = toUtc ? new Date(toUtc).getTime() : Date.now();
     let startMs: number;
     if (fromUtc) {
       startMs = new Date(fromUtc).getTime();
-    } else if (toUtc) {
-      startMs = Number.isFinite(earliestStartMs) ? earliestStartMs : endMs - 7 * DAY_MS;
     } else {
-      startMs = endMs - 7 * DAY_MS;
+      startMs = Number.isFinite(earliestStartMs) ? earliestStartMs : endMs - DAY_MS;
     }
     if (startMs >= endMs) startMs = endMs - DAY_MS;
     return { startMs, endMs };
   })());
 
   // Card labels echo the filter pill's wording for the same bounds.
-  const windowLabel = $derived(
-    dateScoped ? rangeLabelFor(filters.dateFrom, filters.dateTo) : 'Last 7 days',
-  );
+  const windowLabel = $derived(rangeLabelFor(filters.dateFrom, filters.dateTo));
 
   let configEvents = $state<ExternalEvent[]>([]);
   let configEventsGeneration = 0;
@@ -584,19 +574,17 @@
       analyticsPrev = null;
       analyticsCurrent = null;
       lastAnalyticsRange = null;
-      lastAnalyticsRequestKey = null;
       return;
     }
     const key = `${fromUtc}|${toUtc}`;
-    const requestKey = `${key}|${filters.search}|${filters.model}|${filters.showActive}|${filters.showArchived}|${filters.showSubagents}|${sessionIds.length}`;
-    const delay = key === lastAnalyticsRange ? 250 : 0;
-    if (requestKey !== lastAnalyticsRequestKey) {
+    const rangeChanged = key !== lastAnalyticsRange;
+    const delay = rangeChanged ? 0 : 250;
+    if (rangeChanged) {
       analyticsBuckets = [];
       analyticsPrev = null;
       analyticsCurrent = null;
     }
     lastAnalyticsRange = key;
-    lastAnalyticsRequestKey = requestKey;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
     // Debounced so a burst of store flushes (150ms apart) coalesces into one
     // refresh. All ~16 windows go in a single batched call the backend
@@ -740,9 +728,8 @@
 
   // ---------------------------------------------------------------------------
   // Window-scoped stats for the rest of the analytics band. Every card reads
-  // from the same rollup map as the spend card (the date filter when set, else
-  // the rolling last 7 days) and the same non-date filters, so the band tells one
-  // consistent story. A session counts as active when it has usage in window.
+  // from the same rollup map as the spend card and the same non-date filters,
+  // so the band tells one consistent story.
   // ---------------------------------------------------------------------------
   // Rollup objects are recreated per fetch but reused across the store
   // flushes in between; caching their priced totals by identity keeps this
@@ -755,7 +742,6 @@
       byModel: [] as ReturnType<typeof aggregateModelMetrics>,
       credits: { billedTotal: 0, unlimitedCount: 0 },
       subagents: { count: 0, cost: 0 },
-      findingCount: 0,
       allUnlimited: false,
     };
     if (!data || !r) return out;
@@ -765,7 +751,6 @@
       const priced = priceRangeSession(data, s, r);
       if (!priced) continue;
       out.sessionCount++;
-      out.findingCount += rt.optimization_findings_count ?? 0;
       if (s.harness === 'codex') {
         if (s.credits_unlimited === true) out.credits.unlimitedCount++;
         else out.credits.billedTotal += priced.planCost;
@@ -785,14 +770,27 @@
     return out;
   })());
 
+  const findingSessions = $derived(
+    filteredNoDate
+      .map((session) => ({
+        session,
+        count: dateScoped
+          ? (analyticsCurrent?.[session.id]?.optimization_findings_count ?? 0)
+          : (session.optimization_findings_count ?? 0),
+      }))
+      .filter((item) => item.count > 0)
+      .sort((a, b) => b.count - a.count),
+  );
+  const findingCount = $derived(findingSessions.reduce((sum, item) => sum + item.count, 0));
+
   function deltaPct(cur: number, prev: number): number | null {
     if (prev <= 0) return null;
     const pct = Math.round(((cur - prev) / prev) * 100);
     // A near-empty previous window produces junk percentages — not worth a pill.
     return Math.abs(pct) > 500 ? null : pct;
   }
-  const costDelta = $derived(deltaPct(windowTotals.cost, prevTotals.cost));
-  const tokensDelta = $derived(deltaPct(windowTotals.tokens, prevTotals.tokens));
+  const costDelta = $derived(dateScoped ? deltaPct(windowTotals.cost, prevTotals.cost) : null);
+  const tokensDelta = $derived(dateScoped ? deltaPct(windowTotals.tokens, prevTotals.tokens) : null);
 
   // Area-chart geometry (viewBox 0 0 700 72, preserveAspectRatio none).
   const chart = $derived((() => {
@@ -921,6 +919,7 @@
   let exportBusy = $state(false);
   let exportError = $state<string | null>(null);
   let includeWorkingDirectory = $state(false);
+  let analyticsOpen = $state(false);
 
   async function exportView(format: 'csv' | 'json') {
     exportBusy = true;
@@ -1004,6 +1003,11 @@
 
   function selectSession(id: string) {
     selectedSessionId = id;
+  }
+
+  function reviewFindingSession(id: string) {
+    selectSession(id);
+    analyticsOpen = false;
   }
 
   function deselect() {
@@ -1154,7 +1158,7 @@
     </div>
   </div>
 
-  <details class="px-4 pb-3 flex-shrink-0">
+  <details class="px-4 pb-3 flex-shrink-0" bind:open={analyticsOpen}>
     <summary class="bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink">
       Analytics &amp; exports · {windowLabel}
     </summary>
@@ -1202,15 +1206,38 @@
       </details>
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
-      <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view · {windowStats.findingCount} optimization findings in {windowLabel}</summary>
-      {#if categoryRows.length === 0}<p class="text-xs text-ink-faint py-2">No classified turns.</p>{:else}
-        <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
-          <div class="section-label col-span-2">Harness / category</div><div class="section-label text-right">Turns</div><div class="section-label text-right">Tokens</div><div class="section-label text-right">Tools</div><div class="section-label text-right">Cost</div>
-          {#each categoryRows as row (`${row.harness}:${row.category}`)}
-            <div class="col-span-2 border-t border-edgerow pt-1"><span class="text-ink-faint">{row.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {row.category}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.turns}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{fmt.format(row.tokens.total_tokens)}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.calls}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{formatCredits(row.cost, row.currency)}</div>
-          {/each}
-        </div>
-      {/if}
+        <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view</summary>
+        {#if categoryRows.length === 0}<p class="text-xs text-ink-faint py-2">No classified turns.</p>{:else}
+          <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
+            <div class="section-label col-span-2">Harness / category</div><div class="section-label text-right">Turns</div><div class="section-label text-right">Tokens</div><div class="section-label text-right">Tools</div><div class="section-label text-right">Cost</div>
+            {#each categoryRows as row (`${row.harness}:${row.category}`)}
+              <div class="col-span-2 border-t border-edgerow pt-1"><span class="text-ink-faint">{row.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {row.category}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.turns}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{fmt.format(row.tokens.total_tokens)}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.calls}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{formatCredits(row.cost, row.currency)}</div>
+            {/each}
+          </div>
+        {/if}
+      </details>
+
+      <details class="bg-card border border-edge rounded-lg px-3 py-2">
+        <summary class="cursor-pointer text-xs font-semibold text-ink">Optimization findings · {findingCount} in {windowLabel}</summary>
+        {#if findingSessions.length === 0}
+          <p class="text-xs text-ink-faint py-2">No optimization findings in this view.</p>
+        {:else}
+          <p class="text-xs text-ink-muted py-2">
+            Local heuristics flag repeated, failed, or inefficient tool use. Select a session to review its evidence and suggested remediation.
+          </p>
+          <div class="flex max-h-48 flex-col gap-1 overflow-y-auto pr-1">
+            {#each findingSessions as item (item.session.id)}
+              <button
+                type="button"
+                class="flex items-center justify-between gap-3 rounded px-2 py-1.5 text-left text-xs hover:bg-[var(--row-hover)] transition-colors"
+                onclick={() => reviewFindingSession(item.session.id)}
+              >
+                <span class="truncate text-ink" title={sessionName(item.session)}>{sessionName(item.session)}</span>
+                <span class="flex-shrink-0 text-amber-500">{item.count} {item.count === 1 ? 'finding' : 'findings'} · review</span>
+              </button>
+            {/each}
+          </div>
+        {/if}
       </details>
 
       <ConfigTimeline {active} events={configEvents} />

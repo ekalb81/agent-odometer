@@ -5,15 +5,33 @@
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, addDefenderExclusions, exportPerformanceData, getPerformanceStatus } from '../lib/ipc';
   import { getVersion } from '@tauri-apps/api/app';
+  import { isTauri } from '@tauri-apps/api/core';
+  import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
   import type { RateCard, ModelRate, PerformanceStatus } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
 
+  const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
+
   let appVersion = $state('');
+  let releaseNotesError = $state<string | null>(null);
   onMount(() => {
     void getVersion().then((v) => (appVersion = v)).catch(() => {});
     void refreshPerformanceStatus();
   });
+
+  async function handleReleaseNotes() {
+    releaseNotesError = null;
+    try {
+      if (isTauri()) {
+        await openUrl(RELEASE_NOTES_URL);
+      } else {
+        window.open(RELEASE_NOTES_URL, '_blank', 'noopener,noreferrer');
+      }
+    } catch (error) {
+      releaseNotesError = String(error);
+    }
+  }
 
   const themeOptions: { value: ThemePreference; label: string }[] = [
     { value: 'system', label: 'System' },
@@ -431,12 +449,12 @@
     <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">About &amp; updates</h2>
     <div class="flex items-center gap-3 flex-wrap text-sm text-ink-2">
       <span>Odometer <span class="font-mono">{appVersion ? `v${appVersion}` : '…'}</span></span>
-      <a
-        href="https://github.com/ekalb81/agent-odometer/releases"
-        target="_blank"
-        rel="noopener noreferrer"
+      <button
+        type="button"
+        onclick={() => void handleReleaseNotes()}
         class="text-xs text-accent-chipfg hover:opacity-80 underline underline-offset-2 transition-colors"
-      >release notes</a>
+        aria-label="Open release notes in the default browser"
+      >release notes</button>
       {#if updaterStore.available}
         <button
           onclick={() => void updaterStore.install()}
@@ -453,13 +471,22 @@
           disabled={updaterStore.phase === 'checking'}
           class="px-3 py-1.5 text-xs font-medium rounded bg-app hover:bg-[var(--row-hover)] disabled:opacity-40 text-ink transition-colors"
         >
-          {updaterStore.phase === 'checking' ? 'Checking…' : 'Check for updates'}
+          {updaterStore.phase === 'checking'
+            ? 'Checking…'
+            : updaterStore.lastManualResult === 'uptodate'
+              ? 'Up to date'
+              : 'Check for updates'}
         </button>
         {#if updaterStore.lastManualResult === 'uptodate'}
-          <span class="text-xs text-pos">You're on the latest version.</span>
+          <span class="text-xs text-pos" role="status" aria-live="polite">
+            Odometer {appVersion ? `v${appVersion}` : ''} is the latest version.
+          </span>
         {:else if updaterStore.lastManualResult === 'failed'}
-          <span class="text-xs text-red-500">Check failed: {updaterStore.error}</span>
+          <span class="text-xs text-red-500" role="alert">Check failed: {updaterStore.error}</span>
         {/if}
+      {/if}
+      {#if releaseNotesError}
+        <span class="text-xs text-red-500" role="alert">Could not open release notes: {releaseNotesError}</span>
       {/if}
     </div>
   </section>

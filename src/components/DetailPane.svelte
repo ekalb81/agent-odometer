@@ -303,7 +303,7 @@
             <div><span class="text-ink-faint">Failures</span><div class="font-mono text-ink">{session.tool_metrics.failures}</div></div>
           </div>
           {#if session.optimization_findings?.length > 0}
-            <details>
+            <details open>
               <summary class="cursor-pointer text-[11px] text-amber-500">{session.optimization_findings.length} optimization findings</summary>
               <div class="mt-1.5 space-y-1.5">
                 {#each session.optimization_findings as finding (`${finding.rule_id}:${finding.turn_id ?? 'session'}:${finding.evidence}`)}
