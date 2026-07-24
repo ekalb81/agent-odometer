@@ -301,9 +301,9 @@
     collapsedParents = next;
   }
 
-  // Combined cost (session + all in-view descendant subagents) per row that
-  // has in-view children. Row cost stays per-thread; this feeds the Σ line.
-  const combinedCost = $derived((() => {
+  // Combined usage (session + all in-view descendant subagents) per row that
+  // has in-view children. Primary cells stay per-thread; these feed the Σ lines.
+  const combinedUsage = $derived((() => {
     const childrenOf = new Map<string, TrackedSession[]>();
     const ids = new Set(filtered.map((s) => s.id));
     for (const s of filtered) {
@@ -313,19 +313,29 @@
         else childrenOf.set(s.parent_thread_id, [s]);
       }
     }
-    const memo = new Map<string, number>();
-    const total = (id: string): number => {
-      const cached = memo.get(id);
+    const memo = new Map<string, { tokens: number; cost: number }>();
+    const total = (session: TrackedSession): { tokens: number; cost: number } => {
+      const cached = memo.get(session.id);
       if (cached !== undefined) return cached;
-      memo.set(id, costOf(id)); // pre-set guards against parent-id cycles
-      let sum = costOf(id);
-      for (const c of childrenOf.get(id) ?? []) sum += total(c.id);
-      memo.set(id, sum);
+      const own = {
+        tokens: sessionDisplayMap.get(session.id)?.tokens.total_tokens ?? session.tokens_total.total_tokens,
+        cost: costOf(session.id),
+      };
+      memo.set(session.id, own); // pre-set guards against parent-id cycles
+      let tokens = own.tokens;
+      let cost = own.cost;
+      for (const childSession of childrenOf.get(session.id) ?? []) {
+        const child = total(childSession);
+        tokens += child.tokens;
+        cost += child.cost;
+      }
+      const sum = { tokens, cost };
+      memo.set(session.id, sum);
       return sum;
     };
-    const out = new Map<string, number>();
+    const out = new Map<string, { tokens: number; cost: number }>();
     for (const s of filtered) {
-      if ((childrenOf.get(s.id)?.length ?? 0) > 0) out.set(s.id, total(s.id));
+      if ((childrenOf.get(s.id)?.length ?? 0) > 0) out.set(s.id, total(s));
     }
     return out;
   })());
@@ -1144,16 +1154,20 @@
     </div>
   </div>
 
-  <div class="px-4 pb-3 flex-shrink-0 flex flex-col gap-2">
-    {#if harness === 'all'}
+  <details class="px-4 pb-3 flex-shrink-0">
+    <summary class="bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink">
+      Analytics &amp; exports · {windowLabel}
+    </summary>
+    <div class="mt-2 flex flex-col gap-2">
+      {#if harness === 'all'}
       <div class="grid grid-cols-3 gap-2 text-xs">
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex credits</span><div class="font-mono font-semibold">{fmtAmount(windowTotals.codexCredits)}</div></div>
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex est. API USD</span><div class="font-mono font-semibold">{allUsdAvailable ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
       </div>
-    {/if}
+      {/if}
 
-    <details class="bg-card border border-edge rounded-lg px-3 py-2">
+      <details class="bg-card border border-edge rounded-lg px-3 py-2">
       <summary class="cursor-pointer text-xs font-semibold text-ink">Model comparison · {windowLabel} · {modelComparison.length} models</summary>
       {#if harness === 'all' && !allUsdAvailable}
         <p class="text-xs text-ink-faint py-3">Combined model shares are unavailable until both harnesses have USD rates.</p>
@@ -1185,9 +1199,9 @@
           </table>
         </div>
       {/if}
-    </details>
+      </details>
 
-    <details class="bg-card border border-edge rounded-lg px-3 py-2">
+      <details class="bg-card border border-edge rounded-lg px-3 py-2">
       <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view · {windowStats.findingCount} optimization findings in {windowLabel}</summary>
       {#if categoryRows.length === 0}<p class="text-xs text-ink-faint py-2">No classified turns.</p>{:else}
         <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
@@ -1197,18 +1211,19 @@
           {/each}
         </div>
       {/if}
-    </details>
+      </details>
 
-    <ConfigTimeline {active} events={configEvents} />
-    <GitOutcomes />
+      <ConfigTimeline {active} events={configEvents} />
+      <GitOutcomes />
 
-    <div class="flex items-center gap-2 text-xs">
-      <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('csv')}>Export CSV</button>
-      <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('json')}>Export JSON</button>
-      <label class="flex items-center gap-1.5 text-ink-muted"><input type="checkbox" bind:checked={includeWorkingDirectory} /> Include working directories</label>
-      {#if exportError}<span class="text-neg ml-auto" role="alert">{exportError}</span>{/if}
+      <div class="flex items-center gap-2 text-xs">
+        <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('csv')}>Export CSV</button>
+        <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('json')}>Export JSON</button>
+        <label class="flex items-center gap-1.5 text-ink-muted"><input type="checkbox" bind:checked={includeWorkingDirectory} /> Include working directories</label>
+        {#if exportError}<span class="text-neg ml-auto" role="alert">{exportError}</span>{/if}
+      </div>
     </div>
-  </div>
+  </details>
 
   <!-- Main split: table + detail pane -->
   <div class="flex-1 flex min-h-0 border-t border-edge">
@@ -1269,7 +1284,7 @@
               {@const rowTokens = display?.tokens ?? session.tokens_total}
               {@const sub = isSubagent(session)}
               {@const kids = childCounts.get(session.id) ?? 0}
-              {@const combined = combinedCost.get(session.id)}
+              {@const combined = combinedUsage.get(session.id)}
               {@const collapsed = collapsedParents.has(session.id)}
               {@const selected = selectedSessionId === session.id}
               <div
@@ -1311,7 +1326,15 @@
                 </span>
                 <span class="text-ink-muted font-mono text-xs">{fmtStarted(session.startedMs)}</span>
                 <span class="text-ink-muted font-mono text-xs truncate" title={session.model ?? ''}>{session.model ?? '—'}</span>
-                <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}</span>
+                <span class="text-right font-mono text-xs text-ink">
+                  {fmt.format(rowTokens.total_tokens)}
+                  {#if combined !== undefined}
+                    <span
+                      class="block text-[10px] text-ink-faint font-normal cursor-help"
+                      title="This session plus its subagent threads (in view)"
+                    >Σ {fmt.format(combined.tokens)}</span>
+                  {/if}
+                </span>
                 <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">
                   {allUsdAvailable ? fmtAmount(costOf(session.id)) : 'unavailable'}{#if allUsdAvailable && display && display.missingModels.length > 0}<span
                       class="text-amber-500 cursor-help"
@@ -1320,7 +1343,7 @@
                     <div
                       class="text-[10px] text-ink-faint font-normal cursor-help"
                       title="This session plus its subagent threads (in view)"
-                    >Σ {fmtAmount(combined)}</div>
+                    >Σ {fmtAmount(combined.cost)}</div>
                   {/if}
                 </span>
               </div>

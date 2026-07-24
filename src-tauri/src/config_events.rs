@@ -2,6 +2,7 @@ use crate::correlation::{project_scope_identity, ExternalEvent};
 use crate::store::AppState;
 use chrono::Utc;
 use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventResult};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,12 @@ pub struct ConfigWatcherHandle {
 type SnapshotValue = (String, u64);
 type Snapshot = HashMap<String, SnapshotValue>;
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SnapshotState {
+    entries: Snapshot,
+    roots: BTreeSet<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigRoot {
     harness: String,
@@ -35,13 +42,13 @@ fn data_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|path| path.join("agent-odometer"))
 }
 fn log_path() -> Option<PathBuf> {
-    data_dir().map(|path| path.join("config-events-v1.jsonl"))
+    data_dir().map(|path| path.join("config-events-v2.jsonl"))
 }
 fn previous_log_path() -> Option<PathBuf> {
-    data_dir().map(|path| path.join("config-events-v1.previous.jsonl"))
+    data_dir().map(|path| path.join("config-events-v2.previous.jsonl"))
 }
 fn snapshot_path() -> Option<PathBuf> {
-    data_dir().map(|path| path.join("config-snapshot-v1.json"))
+    data_dir().map(|path| path.join("config-snapshot-v2.json"))
 }
 
 fn stable_hash(bytes: &[u8]) -> String {
@@ -105,6 +112,45 @@ fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<
     out
 }
 
+fn normalized_root_path(path: &Path) -> String {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_owned();
+    if cfg!(windows) {
+        normalized.to_ascii_lowercase()
+    } else {
+        normalized
+    }
+}
+
+fn deduplicate_roots(roots: Vec<ConfigRoot>) -> Vec<ConfigRoot> {
+    let mut unique = BTreeMap::<String, ConfigRoot>::new();
+    for root in roots {
+        // The same physical surface can be both a global harness root and a
+        // project root (for example, a session started from the user's home
+        // directory). Track it once and prefer global attribution.
+        let key = format!(
+            "{}\0{}\0{}\0{}",
+            root.harness,
+            normalized_root_path(&root.path),
+            root.nested,
+            root.direct_names.join("\0")
+        );
+        match unique.get_mut(&key) {
+            Some(existing) if existing.scope.is_some() && root.scope.is_none() => {
+                *existing = root;
+            }
+            Some(_) => {}
+            None => {
+                unique.insert(key, root);
+            }
+        }
+    }
+    unique.into_values().collect()
+}
+
 fn roots(state: &AppState) -> Vec<ConfigRoot> {
     let home = dirs::home_dir();
     let codex = std::env::var_os("CODEX_HOME")
@@ -144,7 +190,7 @@ fn roots(state: &AppState) -> Vec<ConfigRoot> {
         })
         .collect();
     out.extend(project_roots(working_directories));
-    out
+    deduplicate_roots(out)
 }
 
 fn is_safe_config_path(root: &ConfigRoot, path: &Path) -> bool {
@@ -193,13 +239,14 @@ fn snapshot_file(path: &Path) -> Option<(String, u64)> {
     Some((stable_hash(&bytes), bytes.len() as u64))
 }
 
-fn load_snapshot() -> Option<Snapshot> {
+fn load_snapshot() -> SnapshotState {
     snapshot_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
 }
 
-fn save_snapshot(snapshot: &Snapshot) {
+fn save_snapshot(snapshot: &SnapshotState) {
     let Some(path) = snapshot_path() else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -271,6 +318,93 @@ fn snapshot_diff(
 
 fn tracked_root_for_path<'a>(path: &Path, roots: &'a [ConfigRoot]) -> Option<&'a ConfigRoot> {
     roots.iter().find(|root| is_safe_config_path(root, path))
+}
+
+fn root_identity(root: &ConfigRoot) -> String {
+    let scope = root.scope.as_deref().unwrap_or("global");
+    let raw = format!(
+        "{}\0{}\0{scope}\0{}\0{}",
+        root.harness,
+        normalized_root_path(&root.path),
+        root.nested,
+        root.direct_names.join("\0")
+    );
+    stable_hash(raw.as_bytes())
+}
+
+type SnapshotChange = (
+    String,
+    ConfigRoot,
+    Option<SnapshotValue>,
+    Option<SnapshotValue>,
+);
+
+fn merge_discovery(
+    observed: &SnapshotState,
+    latest: &mut SnapshotState,
+    current: &Snapshot,
+    root_by_key: &HashMap<String, ConfigRoot>,
+    roots: &[ConfigRoot],
+) -> Vec<SnapshotChange> {
+    let observed_entries = observed
+        .entries
+        .iter()
+        .filter(|(path, _)| {
+            tracked_root_for_path(Path::new(path), roots)
+                .is_some_and(|root| observed.roots.contains(&root_identity(root)))
+        })
+        .map(|(path, value)| (path.clone(), value.clone()))
+        .collect::<Snapshot>();
+    let current_entries = current
+        .iter()
+        .filter(|(path, _)| {
+            root_by_key
+                .get(*path)
+                .is_some_and(|root| observed.roots.contains(&root_identity(root)))
+        })
+        .map(|(path, value)| (path.clone(), value.clone()))
+        .collect::<Snapshot>();
+
+    let mut emitted = Vec::new();
+    for (key, old, new) in snapshot_diff(Some(&observed_entries), &current_entries) {
+        // A watcher or another discovery completed after this scan began.
+        // Never overwrite that newer persisted observation with stale scan data.
+        if latest.entries.get(&key) != old.as_ref() {
+            continue;
+        }
+        let path = PathBuf::from(&key);
+        let root = root_by_key
+            .get(&key)
+            .or_else(|| tracked_root_for_path(&path, roots));
+        let Some(root) = root else { continue };
+        match &new {
+            Some(value) => {
+                latest.entries.insert(key.clone(), value.clone());
+            }
+            None => {
+                latest.entries.remove(&key);
+            }
+        }
+        emitted.push((key, root.clone(), old, new));
+    }
+
+    // A project root discovered after the session scan is a baseline, not a
+    // burst of file creations. Merge its files silently. If a watcher already
+    // observed a newer value, retain that value instead of the scan result.
+    for (key, value) in current {
+        let Some(root) = root_by_key.get(key) else {
+            continue;
+        };
+        if observed.roots.contains(&root_identity(root)) {
+            continue;
+        }
+        if latest.entries.get(key) == observed.entries.get(key) {
+            latest.entries.insert(key.clone(), value.clone());
+        }
+    }
+    latest.roots.extend(roots.iter().map(root_identity));
+
+    emitted
 }
 
 pub fn load_events() -> Vec<ExternalEvent> {
@@ -374,65 +508,51 @@ fn event_for(
     }
 }
 
-fn record_change(
-    app: &AppHandle,
-    state: &Arc<AppState>,
-    snapshot: &Arc<Mutex<Snapshot>>,
-    root: &ConfigRoot,
-    path: &Path,
-) {
+fn record_change(app: &AppHandle, state: &Arc<AppState>, root: &ConfigRoot, path: &Path) {
     if !is_safe_config_path(root, path) {
         return;
     }
     let key = path.to_string_lossy().into_owned();
     let _io = event_io_lock().lock().unwrap();
-    // Read after taking the global writer lock so two watcher instances cannot
-    // publish an older pre-lock observation after a newer one.
+    // Reload under the global writer lock so overlapping startup/post-scan
+    // watchers always compare against and update the latest persisted state.
+    let mut snapshot = load_snapshot();
     let current = snapshot_file(path);
-    let (event, snapshot_copy) = {
-        let mut guard = snapshot.lock().unwrap();
-        let previous = guard.get(&key).cloned();
-        if previous == current {
-            return;
+    let previous = snapshot.entries.get(&key).cloned();
+    if previous == current {
+        return;
+    }
+    match &current {
+        Some(value) => {
+            snapshot.entries.insert(key, value.clone());
         }
-        let event = event_for(path, root, previous.as_ref(), current.as_ref());
-        match current {
-            Some(value) => {
-                guard.insert(key, value);
-            }
-            None => {
-                guard.remove(&key);
-            }
+        None => {
+            snapshot.entries.remove(&key);
         }
-        (event, guard.clone())
-    };
-    save_snapshot(&snapshot_copy);
-    append_event_locked(&event);
+    }
+    let tracked = snapshot.roots.contains(&root_identity(root));
+    save_snapshot(&snapshot);
+    let event = tracked.then(|| event_for(path, root, previous.as_ref(), current.as_ref()));
+    if let Some(event) = &event {
+        append_event_locked(event);
+    }
     drop(_io);
-    state.push_external_event(event.clone());
-    let _ = app.emit("config-event", event);
+    if let Some(event) = event {
+        state.push_external_event(event.clone());
+        let _ = app.emit("config-event", event);
+    }
 }
 
 pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatcherHandle> {
     let roots = roots(&state);
-    let previous = load_snapshot();
-    // A startup watcher is created before the session scan has discovered
-    // project scopes. Keep prior project entries untouched until the post-scan
-    // watcher can evaluate them, otherwise every launch would report false
-    // remove/create pairs for unchanged project files.
-    let tracked_previous = previous.as_ref().map(|snapshot| {
-        snapshot
-            .iter()
-            .filter(|(path, _)| tracked_root_for_path(Path::new(path), &roots).is_some())
-            .map(|(path, value)| (path.clone(), value.clone()))
-            .collect::<Snapshot>()
-    });
-    let snapshot = Arc::new(Mutex::new(previous.clone().unwrap_or_default()));
+    let observed = {
+        let _io = event_io_lock().lock().unwrap();
+        load_snapshot()
+    };
 
     let app_cb = app.clone();
     // AppState owns this watcher handle; avoid a strong-reference cycle.
     let state_cb = Arc::downgrade(&state);
-    let snapshot_cb = snapshot.clone();
     let roots_cb = roots.clone();
     let mut debouncer = new_debouncer(
         Duration::from_millis(500),
@@ -445,7 +565,7 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
             for event in events {
                 for path in &event.paths {
                     if let Some(root) = tracked_root_for_path(path, &roots_cb) {
-                        record_change(&app_cb, &state_cb, &snapshot_cb, root, path);
+                        record_change(&app_cb, &state_cb, root, path);
                     }
                 }
             }
@@ -474,46 +594,19 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
     // path if the watcher already observed a newer value while discovery ran.
     let baseline_app = app.clone();
     let baseline_state = state.clone();
-    let baseline_snapshot = snapshot.clone();
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
         let (current, root_by_key) = discover_snapshot(&roots);
         let discovered_files = current.len();
-        let changes = snapshot_diff(tracked_previous.as_ref(), &current);
-        let mut emitted = Vec::new();
         let _io = event_io_lock().lock().unwrap();
-        let snapshot_copy = {
-            let mut guard = baseline_snapshot.lock().unwrap();
-            if previous.is_none() {
-                *guard = current;
-            } else {
-                for (key, old, new) in changes {
-                    if guard.get(&key) != old.as_ref() {
-                        continue;
-                    }
-                    match &new {
-                        Some(value) => {
-                            guard.insert(key.clone(), value.clone());
-                        }
-                        None => {
-                            guard.remove(&key);
-                        }
-                    }
-                    emitted.push((key, old, new));
-                }
-            }
-            guard.clone()
-        };
-        save_snapshot(&snapshot_copy);
+        let mut latest = load_snapshot();
+        let emitted = merge_discovery(&observed, &mut latest, &current, &root_by_key, &roots);
+        save_snapshot(&latest);
         let change_count = emitted.len();
         let mut event_records = Vec::with_capacity(change_count);
-        for (key, old, current) in emitted {
-            let path = PathBuf::from(&key);
-            let root = root_by_key
-                .get(&key)
-                .or_else(|| tracked_root_for_path(&path, &roots));
-            let Some(root) = root else { continue };
-            let event = event_for(&path, root, old.as_ref(), current.as_ref());
+        for (key, root, old, current) in emitted {
+            let path = PathBuf::from(key);
+            let event = event_for(&path, &root, old.as_ref(), current.as_ref());
             append_event_locked(&event);
             event_records.push(event);
         }
@@ -540,9 +633,11 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
 #[cfg(test)]
 mod tests {
     use super::{
-        discover_snapshot, event_for, is_safe_config_path, project_roots, project_scope_identity,
-        snapshot_diff, tracked_root_for_path, ConfigRoot, Snapshot, CODEX_CONFIG_NAMES,
+        deduplicate_roots, discover_snapshot, event_for, is_safe_config_path, merge_discovery,
+        project_roots, project_scope_identity, root_identity, snapshot_diff, tracked_root_for_path,
+        ConfigRoot, Snapshot, SnapshotState, CODEX_CONFIG_NAMES,
     };
+    use std::collections::HashMap;
     use std::path::Path;
     use std::process::Command;
 
@@ -560,6 +655,122 @@ mod tests {
     fn first_snapshot_is_a_baseline() {
         let current = Snapshot::from([("config.toml".into(), ("a".into(), 1))]);
         assert!(snapshot_diff(None, &current).is_empty());
+    }
+
+    #[test]
+    fn newly_discovered_root_is_baselined_without_created_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = config_root(directory.path(), Some("synthetic-project"));
+        let path = directory
+            .path()
+            .join("config.toml")
+            .to_string_lossy()
+            .into_owned();
+        let current = Snapshot::from([(path.clone(), ("current".into(), 7))]);
+        let root_by_key = HashMap::from([(path.clone(), root.clone())]);
+        let observed = SnapshotState::default();
+        let mut latest = observed.clone();
+
+        let emitted = merge_discovery(
+            &observed,
+            &mut latest,
+            &current,
+            &root_by_key,
+            std::slice::from_ref(&root),
+        );
+
+        assert!(emitted.is_empty());
+        assert_eq!(latest.entries, current);
+        assert!(latest.roots.contains(&root_identity(&root)));
+    }
+
+    #[test]
+    fn known_root_reports_offline_creates_modifications_and_removals() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = config_root(directory.path(), Some("synthetic-project"));
+        let changed = directory
+            .path()
+            .join("config.toml")
+            .to_string_lossy()
+            .into_owned();
+        let removed = directory
+            .path()
+            .join("AGENTS.md")
+            .to_string_lossy()
+            .into_owned();
+        let created = directory
+            .path()
+            .join("skills/example/SKILL.md")
+            .to_string_lossy()
+            .into_owned();
+        let observed = SnapshotState {
+            entries: Snapshot::from([
+                (changed.clone(), ("old".into(), 1)),
+                (removed.clone(), ("gone".into(), 2)),
+            ]),
+            roots: [root_identity(&root)].into(),
+        };
+        let current = Snapshot::from([
+            (changed.clone(), ("new".into(), 3)),
+            (created.clone(), ("added".into(), 4)),
+        ]);
+        let root_by_key = HashMap::from([
+            (changed.clone(), root.clone()),
+            (created.clone(), root.clone()),
+        ]);
+        let mut latest = observed.clone();
+
+        let emitted = merge_discovery(
+            &observed,
+            &mut latest,
+            &current,
+            &root_by_key,
+            std::slice::from_ref(&root),
+        );
+
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(latest.entries, current);
+        assert!(emitted
+            .iter()
+            .any(|(key, _, old, new)| key == &created && old.is_none() && new.is_some()));
+        assert!(emitted
+            .iter()
+            .any(|(key, _, old, new)| key == &changed && old.is_some() && new.is_some()));
+        assert!(emitted
+            .iter()
+            .any(|(key, _, old, new)| key == &removed && old.is_some() && new.is_none()));
+    }
+
+    #[test]
+    fn stale_discovery_does_not_overwrite_a_newer_watcher_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = config_root(directory.path(), Some("synthetic-project"));
+        let path = directory
+            .path()
+            .join("config.toml")
+            .to_string_lossy()
+            .into_owned();
+        let observed = SnapshotState {
+            entries: Snapshot::from([(path.clone(), ("old".into(), 1))]),
+            roots: [root_identity(&root)].into(),
+        };
+        let current = Snapshot::from([(path.clone(), ("stale-scan".into(), 2))]);
+        let root_by_key = HashMap::from([(path.clone(), root.clone())]);
+        let mut latest = observed.clone();
+        latest
+            .entries
+            .insert(path.clone(), ("watcher-newer".into(), 3));
+
+        let emitted = merge_discovery(
+            &observed,
+            &mut latest,
+            &current,
+            &root_by_key,
+            std::slice::from_ref(&root),
+        );
+
+        assert!(emitted.is_empty());
+        assert_eq!(latest.entries[&path], ("watcher-newer".into(), 3));
     }
 
     #[test]
@@ -599,6 +810,17 @@ mod tests {
                 && root.path == directory.path()
                 && root.direct_names == ["CLAUDE.md"]
         }));
+    }
+
+    #[test]
+    fn duplicate_physical_roots_prefer_global_attribution() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = config_root(directory.path(), None);
+        let project = config_root(directory.path(), Some("synthetic-project"));
+
+        let roots = deduplicate_roots(vec![global.clone(), project]);
+
+        assert_eq!(roots, vec![global]);
     }
 
     #[test]
