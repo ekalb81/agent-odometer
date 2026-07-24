@@ -15,12 +15,19 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: write
+
+# Never let retries for the same tag race to create or upload one release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   preflight:
     name: Verify release versions
     runs-on: ubuntu-22.04
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -69,6 +76,82 @@ jobs:
 
           echo "Release version verified: $package_version"
 
+      - name: Verify tagged commit passed CI
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          successful_run_id="$(
+            gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${GITHUB_SHA}&status=completed&per_page=100" \
+              --jq '[.workflow_runs[] | select(.conclusion == "success")] | first | .id // empty'
+          )"
+
+          if [[ -z "$successful_run_id" ]]; then
+            echo "::error::The tagged commit ${GITHUB_SHA} does not have a successful completed CI run. Wait for CI to pass, then rerun this release workflow."
+            exit 1
+          fi
+
+          echo "Tagged commit passed CI in run ${successful_run_id}."
+
+      - name: Ensure mutable draft release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          release_state=''
+          status=0
+          release_state="$(
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
+              --jq '[.draft, .immutable] | @tsv' 2>&1
+          )" || status=$?
+
+          if [[ "$status" -eq 0 ]]; then
+            IFS=$'\t' read -r draft immutable <<< "$release_state"
+            if [[ "$draft" != 'true' || "$immutable" == 'true' ]]; then
+              echo "::error::Release ${GITHUB_REF_NAME} already exists and is not a mutable draft (draft=${draft}, immutable=${immutable}). Push a new release tag instead of publishing the release before CI uploads its assets."
+              exit 1
+            fi
+            echo "Using existing mutable draft release ${GITHUB_REF_NAME}."
+            exit 0
+          fi
+
+          if [[ "$release_state" != *'HTTP 404'* ]]; then
+            echo "::error::Could not inspect release ${GITHUB_REF_NAME}: ${release_state}"
+            exit "$status"
+          fi
+
+          release_notes="$(
+            printf '%s\n' \
+              '## Installation' \
+              '' \
+              'Download the installer for your platform:' \
+              '' \
+              '- **Windows**: the `.msi` (recommended) or `.exe`.' \
+              '- **macOS (Apple Silicon)**: the `.dmg`. Right-click → Open on first launch (the app is not notarized yet).' \
+              '- **Linux**: the `.AppImage` (single file, no install) or `.deb` (Debian/Ubuntu).' \
+              '' \
+              'Installed copies check for new releases on launch and offer a one-click update.' \
+              '' \
+              '## Changes' \
+              '' \
+              '<!-- Fill in release notes before publishing. -->'
+          )"
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "Odometer ${GITHUB_REF_NAME}" \
+            --notes "$release_notes"
+
   build:
     name: ${{ matrix.platform }} — ${{ matrix.label }}
     needs: preflight
@@ -90,6 +173,7 @@ jobs:
             rust_target: ''
 
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 30
 
     steps:
       - name: Checkout

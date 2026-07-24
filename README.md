@@ -127,12 +127,11 @@ git switch main
 git pull --ff-only origin main
 git tag -s vX.Y.Z -m "Odometer vX.Y.Z" main  # annotated tag signed with your Git signing key
 git push origin vX.Y.Z                        # triggers the cross-platform build
-gh release create vX.Y.Z --verify-tag --draft --title "Odometer vX.Y.Z" --notes "…"
 ```
 
-All three version fields (`package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`) must already equal `X.Y.Z`; the release workflow rejects a mismatched `vX.Y.Z` tag before any platform builds start. `git tag -s` creates an annotated, cryptographically signed Git tag; this Git signature is separate from the updater artifact signature.
+All three version fields (`package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`) must already equal `X.Y.Z`; the release workflow rejects a mismatched `vX.Y.Z` tag before any platform builds start. The tagged commit must also have a successful CI run. `git tag -s` creates an annotated, cryptographically signed Git tag; this Git signature is separate from the updater artifact signature.
 
-The workflow builds Windows/macOS/Linux bundles and uploads them (plus updater `.sig` files and `latest.json`) into the existing draft; review and publish it when the run completes. Create the draft immediately after pushing the tag and before the build reaches its upload step. `--verify-tag` is important: without it, `gh release create` can silently create a lightweight tag from the default branch. Since the repository went public, `GITHUB_TOKEN` can upload assets to an existing release but is blocked from creating one. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets. The in-app updater follows the latest published release. OS code signing/notarization is not configured yet. A manual Actions run is build-only: it validates the three internal versions and bundles every platform, but never creates a tag or GitHub release.
+The workflow creates or validates a mutable draft release during preflight, then builds Windows/macOS/Linux bundles and uploads them with updater `.sig` files and `latest.json`. Do not create or publish the GitHub release manually before the workflow finishes: a published release is immutable and cannot accept the generated assets. When the run succeeds, verify the complete asset set in the draft and then publish it. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets. The in-app updater follows the latest published release. OS code signing/notarization is not configured yet. A manual Actions run is build-only: it validates the three internal versions and bundles every platform, but never creates a tag or GitHub release.
 
 ## Contributing
 
