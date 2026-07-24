@@ -1,13 +1,13 @@
 name: CI
 
-# Runs on every PR and on push to the main branch. Verifies that:
+# Runs the fast validation path on every PR and on pushes to main. Verifies that:
 #   - the frontend type-checks (svelte-check)
 #   - the frontend builds (vite build)
-#   - the Rust crate compiles (cargo check)
+#   - the Rust crate is formatted and passes strict Clippy
 #   - all Rust tests pass (cargo test)
-# A parallel job measures Rust test coverage and uploads it to Codecov
-# (authenticated via GitHub OIDC; only functional while the repository is
-# public).
+# Main pushes and manual runs also verify the declared MSRV and measure Rust
+# test coverage. Coverage uploads to Codecov using GitHub OIDC and are only
+# functional while the repository is public.
 #
 # Runs on Linux only — these checks are platform-independent and Linux is
 # the fastest GitHub-hosted runner. The release workflow handles the
@@ -33,6 +33,7 @@ jobs:
   check:
     name: Check + test
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -108,7 +109,12 @@ jobs:
 
   msrv:
     name: Minimum supported Rust 1.88
+    # PRs already exercise the same source with stable Rust. Keep the slower
+    # compatibility build on main and explicit runs, where it still catches
+    # accidental MSRV drift without charging every intermediate PR commit.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -142,7 +148,11 @@ jobs:
 
   coverage:
     name: Coverage
+    # Coverage is informational (the upload is intentionally non-blocking), so
+    # publish it once changes land rather than rebuilding every PR revision.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
