@@ -24,6 +24,7 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Time-scoped answers** — filter by date range and the token/cost columns re-total to exactly that window ("what did I burn last week?").
 - **Export and compare** — save the exact filtered projection as CSV/JSON and compare every model's token mix, cost, calls, retries, failures, and one-shot mutation rate.
 - **Local efficiency signals** — normalized tool metrics, deterministic task categories, bounded optimization findings, configuration-change correlations, and opt-in local Git outcome scans never retain raw tool arguments or output.
+- **Tool impact comparison** — choose any observed tool provider or individual tool and compare turns where it was used with turns where it was not observed; when enough data exists, Odometer matches the baseline by harness, model, task category, and nearby time before comparing tokens and elapsed time.
 - **Opt-in performance evidence** — default-off local timings cover startup, scans/cache/parsers, analytics, exports, and UI work; logs are size-bounded and exportable as JSONL or CSV.
 - **Quick glance** — the tray menu mirrors today's tokens, Codex credits/API estimate, and Claude USD with native show, hide, settings, and quit controls.
 - **Light and dark** — follows your OS theme by default; switchable in Settings.

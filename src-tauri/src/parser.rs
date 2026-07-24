@@ -104,9 +104,9 @@ impl SessionParser {
     }
 
     fn apply_line_without_refresh(&mut self, line: &str) -> anyhow::Result<()> {
-        // Fast path: record types we discard wholesale (response_item, compacted)
-        // account for the vast majority of bytes in a rollout file. When the line
-        // has the exact leading shape Codex writes — {"timestamp":"<ts>","type":"<t>"
+        // Fast path: non-tool response_item records and compacted records account
+        // for the vast majority of bytes in a rollout file. When the line has the
+        // exact leading shape Codex writes — {"timestamp":"<ts>","type":"<t>"
         // — we can extract the timestamp and skip the full JSON parse entirely.
         // These lines must still advance last_event_at, hence the extraction.
         if let Some(ts) = fast_skip_timestamp(line) {
@@ -139,7 +139,7 @@ impl SessionParser {
             .unwrap_or("")
             .to_owned();
 
-        // Skip response_item entirely — it's bulky and carries no usage stats.
+        // Inspect only tool calls/results; all other response items are ignored.
         if event_type == "response_item" {
             self.handle_response_item(&root["payload"], last_event_at);
             return Ok(());
@@ -163,7 +163,7 @@ impl SessionParser {
     fn handle_response_item(&mut self, payload: &Value, timestamp: DateTime<Utc>) {
         let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         match item_type {
-            "function_call" => {
+            "function_call" | "custom_tool_call" => {
                 let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
                 if call_id.is_empty() || !self.seen_tool_ids.insert(call_id.to_owned()) {
                     return;
@@ -172,11 +172,15 @@ impl SessionParser {
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
-                let arguments = payload
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .and_then(|raw| serde_json::from_str(raw).ok())
-                    .unwrap_or(Value::Null);
+                let arguments = if item_type == "custom_tool_call" {
+                    payload.get("input").cloned().unwrap_or(Value::Null)
+                } else {
+                    payload
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .and_then(|raw| serde_json::from_str(raw).ok())
+                        .unwrap_or(Value::Null)
+                };
                 if let Some(session) = self.session.as_mut() {
                     crate::telemetry::observe_call(
                         &mut session.tool_observations,
@@ -192,14 +196,11 @@ impl SessionParser {
                     );
                 }
             }
-            "function_call_output" => {
+            "function_call_output" | "custom_tool_call_output" => {
                 let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
-                let output = payload.get("output").and_then(Value::as_str).unwrap_or("");
-                let failed = output
-                    .lines()
-                    .find_map(|line| line.strip_prefix("Exit code: "))
-                    .and_then(|code| code.trim().parse::<i32>().ok())
-                    .is_some_and(|code| code != 0);
+                let output = payload.get("output").unwrap_or(&Value::Null);
+                let failed = payload.get("status").and_then(Value::as_str) == Some("failed")
+                    || tool_output_failed(output);
                 if let Some(session) = self.session.as_mut() {
                     crate::telemetry::observe_result(
                         &mut session.tool_observations,
@@ -210,7 +211,8 @@ impl SessionParser {
                             crate::model::ToolOutcome::Success
                         },
                         None,
-                        output.len() as u64,
+                        Some(timestamp),
+                        serialized_len(output),
                     );
                 }
             }
@@ -659,6 +661,7 @@ impl SessionParser {
                             crate::model::ToolOutcome::Success
                         },
                         duration_ms,
+                        Some(event_ts),
                         output_bytes,
                     );
                 }
@@ -781,7 +784,7 @@ impl SessionParser {
 /// missing `","type":"` separator, or any other record type. Correctness over
 /// cleverness: the fast path only fires when the line shape is unambiguous.
 fn fast_skip_timestamp(line: &str) -> Option<&str> {
-    if line.contains("\"type\":\"function_call") {
+    if line.contains("\"type\":\"function_call") || line.contains("\"type\":\"custom_tool_call") {
         return None;
     }
     let rest = line.strip_prefix("{\"timestamp\":\"")?;
@@ -797,6 +800,35 @@ fn fast_skip_timestamp(line: &str) -> Option<&str> {
     match &after[..ty_end] {
         "response_item" | "compacted" => Some(ts),
         _ => None,
+    }
+}
+
+fn serialized_len(value: &Value) -> u64 {
+    match value {
+        Value::Null => 0,
+        Value::String(text) => text.len() as u64,
+        _ => serde_json::to_vec(value)
+            .map(|bytes| bytes.len() as u64)
+            .unwrap_or(0),
+    }
+}
+
+fn tool_output_failed(value: &Value) -> bool {
+    match value {
+        Value::String(text) => {
+            text.lines()
+                .find_map(|line| line.strip_prefix("Exit code: "))
+                .and_then(|code| code.trim().parse::<i32>().ok())
+                .is_some_and(|code| code != 0)
+                || text.trim_start().starts_with("Error:")
+        }
+        Value::Array(items) => items.iter().any(tool_output_failed),
+        Value::Object(map) => {
+            map.get("isError").and_then(Value::as_bool) == Some(true)
+                || map.get("is_error").and_then(Value::as_bool) == Some(true)
+                || map.get("text").is_some_and(tool_output_failed)
+        }
+        _ => false,
     }
 }
 

@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -28,6 +28,34 @@ export function sessionsInRanges(
   return invoke<Record<string, RangeTotals>[]>('sessions_in_ranges', {
     ranges,
     sessionIds: sessionIds ?? null,
+  });
+}
+
+export function listToolImpactTargets(
+  from: string | null,
+  to: string | null,
+  sessionIds?: string[],
+): Promise<ToolImpactTarget[]> {
+  return invoke<ToolImpactTarget[]>('list_tool_impact_targets', {
+    query: { from, to, session_ids: sessionIds ?? null },
+  });
+}
+
+export function compareToolImpact(
+  targetKind: ToolImpactTargetKind,
+  targetKey: string,
+  from: string | null,
+  to: string | null,
+  sessionIds?: string[],
+): Promise<ToolImpactResult> {
+  return invoke<ToolImpactResult>('compare_tool_impact', {
+    query: {
+      target_kind: targetKind,
+      target_key: targetKey,
+      from,
+      to,
+      session_ids: sessionIds ?? null,
+    },
   });
 }
 

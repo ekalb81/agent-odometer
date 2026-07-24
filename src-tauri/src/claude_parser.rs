@@ -160,7 +160,7 @@ impl ClaudeSessionParser {
 
         match record_type {
             "user" => {
-                self.handle_tool_results(&root);
+                self.handle_tool_results(&root, timestamp);
                 self.handle_user(&root, timestamp);
             }
             "assistant" => self.handle_assistant(&root, timestamp),
@@ -349,7 +349,7 @@ impl ClaudeSessionParser {
         self.current_turn_id = Some(turn_id);
     }
 
-    fn handle_tool_results(&mut self, root: &Value) {
+    fn handle_tool_results(&mut self, root: &Value, timestamp: Option<DateTime<Utc>>) {
         let Some(blocks) = root
             .get("message")
             .and_then(|message| message.get("content"))
@@ -391,6 +391,7 @@ impl ClaudeSessionParser {
                     crate::model::ToolOutcome::Success
                 },
                 None,
+                timestamp,
                 output_bytes,
             );
         }

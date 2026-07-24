@@ -290,6 +290,41 @@ mockIPC((cmd, payload) => {
       const { ranges } = payload as { ranges: { from: string | null; to: string | null }[] };
       return ranges.map((r) => rangeTotals(r.from, r.to));
     }
+    case 'list_tool_impact_targets':
+      return [
+        { kind: 'provider', key: 'alpha_server', label: 'alpha_server', turn_count: 8, call_count: 22 },
+        { kind: 'provider', key: 'code_graph', label: 'code_graph', turn_count: 5, call_count: 14 },
+        { kind: 'tool', key: 'mcp__alpha_server__code_search', label: 'mcp__alpha_server__code_search', turn_count: 7, call_count: 18 },
+        { kind: 'tool', key: 'exec_command', label: 'exec_command', turn_count: 6, call_count: 11 },
+        { kind: 'tool', key: 'mcp__code_graph__search', label: 'mcp__code_graph__search', turn_count: 5, call_count: 14 },
+      ];
+    case 'compare_tool_impact': {
+      const { query } = payload as {
+        query: { target_kind: 'provider' | 'tool'; target_key: string };
+      };
+      const cohort = (turns: number, tokens: number, duration: number, calls: number) => ({
+        turn_count: turns,
+        session_count: Math.max(1, Math.floor(turns / 2)),
+        completed_turn_count: turns,
+        duration_sample_count: turns,
+        total_duration_ms: duration * turns,
+        ttft_sample_count: 0,
+        total_ttft_ms: 0,
+        tokens: tok(tokens * turns),
+        buckets: [],
+        tool_metrics: toolMetrics(calls * turns),
+      });
+      return {
+        target_kind: query.target_kind,
+        target_key: query.target_key,
+        observed: cohort(8, 184_000, 420_000, 7),
+        baseline: cohort(21, 231_000, 510_000, 9),
+        matched_observed: cohort(6, 176_000, 390_000, 7),
+        matched_baseline: cohort(6, 224_000, 495_000, 9),
+        matched_pairs: 6,
+        warnings: ['Transcripts prove observed use, not whether the selected target was installed or available.'],
+      };
+    }
     case 'get_scan_status':
       return { done: FIXTURES.length, total: FIXTURES.length, complete: true, elapsed_ms: 1240 };
     case 'get_performance_status':

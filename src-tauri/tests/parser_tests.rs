@@ -183,6 +183,47 @@ fn normalizes_tool_calls_without_retaining_arguments_or_output() {
 }
 
 #[test]
+fn parses_custom_tool_calls_and_tags_nested_mcp_providers() {
+    let mut parser = parser::SessionParser::new(PathBuf::from("synthetic.jsonl"), false);
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:00Z","type":"session_meta","payload":{"id":"synthetic-custom-tool","timestamp":"2026-07-24T12:00:00Z","cwd":"C:\\synthetic","originator":"Codex Desktop","source":"app"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:01Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"await tools.mcp__alpha_server__code_search({});","call_id":"custom-1"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:01.750Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"custom-1","output":[{"type":"input_text","text":"Script completed"}]}}"#,
+        )
+        .unwrap();
+
+    let session = parser.session.unwrap();
+    assert_eq!(session.tool_observations.len(), 1);
+    let observation = &session.tool_observations[0];
+    assert_eq!(observation.name, "exec");
+    assert_eq!(observation.providers, vec!["alpha_server"]);
+    assert_eq!(
+        observation.effective_tools,
+        vec!["mcp__alpha_server__code_search"]
+    );
+    assert_eq!(observation.duration_ms, Some(750));
+    assert_eq!(
+        observation.outcome,
+        odometer_lib::model::ToolOutcome::Success
+    );
+    assert!(observation.output_bytes > 0);
+}
+
+#[test]
 fn populates_tokens_history_from_token_count_events() {
     let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
     // The fixture has 8 token_count events; the first has info: null, so 7 history points.

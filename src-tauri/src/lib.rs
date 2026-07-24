@@ -13,15 +13,16 @@ pub mod scanner;
 pub mod session_index;
 pub mod store;
 pub mod telemetry;
+pub mod tool_impact;
 pub mod tray;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, correlate_events, export_performance_data, get_bundled_rates,
-    get_config, get_performance_status, get_rates, get_scan_status, get_session_details,
-    list_external_events, list_sessions, open_task_in_chatgpt, record_frontend_performance,
-    reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges, set_config, set_rates,
-    set_tray_totals, write_export,
+    add_defender_exclusions, compare_tool_impact, correlate_events, export_performance_data,
+    get_bundled_rates, get_config, get_performance_status, get_rates, get_scan_status,
+    get_session_details, list_external_events, list_sessions, list_tool_impact_targets,
+    open_task_in_chatgpt, record_frontend_performance, reveal_in_file_manager, scan_git_outcomes,
+    sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -49,6 +50,8 @@ pub fn run() {
             list_sessions,
             get_session_details,
             sessions_in_ranges,
+            list_tool_impact_targets,
+            compare_tool_impact,
             get_scan_status,
             get_config,
             set_config,

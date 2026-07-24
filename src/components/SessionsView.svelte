@@ -25,6 +25,7 @@
   import DetailPane from './DetailPane.svelte';
   import ConfigTimeline from './ConfigTimeline.svelte';
   import GitOutcomes from './GitOutcomes.svelte';
+  import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
 
   interface Props {
@@ -529,6 +530,8 @@
 
   // Card labels echo the filter pill's wording for the same bounds.
   const windowLabel = $derived(rangeLabelFor(filters.dateFrom, filters.dateTo));
+  const impactFrom = $derived(new Date(windowBounds.startMs).toISOString());
+  const impactTo = $derived(new Date(windowBounds.endMs).toISOString());
 
   let configEvents = $state<ExternalEvent[]>([]);
   let configEventsGeneration = 0;
@@ -1164,7 +1167,7 @@
     </div>
   </div>
 
-  <details class="px-4 pb-3 flex-shrink-0" bind:open={analyticsOpen}>
+  <details class="px-4 pb-3 flex-shrink-0 max-h-[60vh] overflow-y-auto" bind:open={analyticsOpen}>
     <summary class="bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink">
       Analytics &amp; exports · {windowLabel}
     </summary>
@@ -1210,6 +1213,14 @@
         </div>
       {/if}
       </details>
+
+      <ToolImpact
+        active={active && analyticsOpen}
+        sessionIds={analyticsSessionIds}
+        from={impactFrom}
+        to={impactTo}
+        {windowLabel}
+      />
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
         <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view</summary>

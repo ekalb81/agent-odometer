@@ -348,6 +348,132 @@ pub async fn sessions_in_ranges(
     result
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct ToolImpactScopeQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub session_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct ToolImpactQuery {
+    pub target_kind: crate::tool_impact::ToolImpactTargetKind,
+    pub target_key: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub session_ids: Option<Vec<String>>,
+}
+
+type ToolImpactRange = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+fn parse_tool_impact_range(
+    from: Option<String>,
+    to: Option<String>,
+) -> Result<ToolImpactRange, String> {
+    let parse = |value: Option<String>| -> Result<Option<DateTime<Utc>>, String> {
+        value
+            .map(|timestamp| {
+                timestamp
+                    .parse()
+                    .map_err(|error| format!("invalid timestamp: {error}"))
+            })
+            .transpose()
+    };
+    let from = parse(from)?;
+    let to = parse(to)?;
+    if from.zip(to).is_some_and(|(from, to)| from > to) {
+        return Err("comparison start must not be after its end".into());
+    }
+    Ok((from, to))
+}
+
+fn tool_impact_sessions(
+    app_state: &Arc<AppState>,
+    session_ids: Option<Vec<String>>,
+) -> Vec<Arc<Session>> {
+    match session_ids {
+        Some(ids) => ids
+            .into_iter()
+            .filter_map(|id| {
+                app_state
+                    .sessions
+                    .get(&id)
+                    .map(|entry| entry.value().clone())
+            })
+            .collect(),
+        None => app_state
+            .sessions
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect(),
+    }
+}
+
+#[tauri::command]
+pub async fn list_tool_impact_targets(
+    state: State<'_, Arc<AppState>>,
+    query: ToolImpactScopeQuery,
+) -> Result<Vec<crate::tool_impact::ToolImpactTarget>, String> {
+    let started = Instant::now();
+    let (from, to) = parse_tool_impact_range(query.from, query.to)?;
+    let app_state = state.inner().clone();
+    let sessions = tool_impact_sessions(&app_state, query.session_ids);
+    let session_count = sessions.len();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::tool_impact::list_targets(&sessions, from, to)
+    })
+    .await
+    .map_err(|error| error.to_string());
+    app_state.performance.record_backend(
+        "ipc.list_tool_impact_targets",
+        started,
+        result.is_ok(),
+        BTreeMap::from([("sessions".into(), session_count.to_string())]),
+    );
+    result
+}
+
+#[tauri::command]
+pub async fn compare_tool_impact(
+    state: State<'_, Arc<AppState>>,
+    query: ToolImpactQuery,
+) -> Result<crate::tool_impact::ToolImpactResult, String> {
+    let started = Instant::now();
+    let target_key = query.target_key.trim().to_ascii_lowercase();
+    let max_length = match query.target_kind {
+        crate::tool_impact::ToolImpactTargetKind::Provider => 64,
+        crate::tool_impact::ToolImpactTargetKind::Tool => 128,
+    };
+    if target_key.is_empty()
+        || target_key.len() > max_length
+        || !target_key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return Err(format!(
+            "target key must be 1-{max_length} letters, numbers, underscores, hyphens, or periods"
+        ));
+    }
+    let (from, to) = parse_tool_impact_range(query.from, query.to)?;
+
+    let app_state = state.inner().clone();
+    let sessions = tool_impact_sessions(&app_state, query.session_ids);
+    let session_count = sessions.len();
+    let target_kind = query.target_kind;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::tool_impact::compare(&sessions, target_kind, &target_key, from, to)
+    })
+    .await
+    .map_err(|error| error.to_string());
+    app_state.performance.record_backend(
+        "ipc.compare_tool_impact",
+        started,
+        result.is_ok(),
+        BTreeMap::from([("sessions".into(), session_count.to_string())]),
+    );
+    result
+}
+
 fn range_has_data(range: &RangeTotals) -> bool {
     range.tokens.total_tokens != 0 || range.tool_metrics.calls != 0
 }

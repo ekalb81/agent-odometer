@@ -57,6 +57,14 @@ pub struct ToolObservation {
     pub timestamp: DateTime<Utc>,
     pub kind: ToolKind,
     pub name: String,
+    /// Normalized MCP server names inferred from the tool name or an
+    /// orchestration payload. Values are bounded and contain no arguments.
+    #[serde(default)]
+    pub providers: Vec<String>,
+    /// Effective tool names inferred from the direct call or an orchestration
+    /// payload. Values are bounded and contain no arguments or source text.
+    #[serde(default)]
+    pub effective_tools: Vec<String>,
     /// Stable hashed identity; raw arguments and paths are never retained.
     pub target: Option<String>,
     pub outcome: ToolOutcome,
@@ -737,6 +745,8 @@ mod tests {
                 timestamp: format!("2026-01-01T00:00:0{second}Z").parse().unwrap(),
                 kind: ToolKind::Read,
                 name: "read".into(),
+                providers: Vec::new(),
+                effective_tools: vec!["read".into()],
                 target: Some("read:synthetic".into()),
                 outcome: ToolOutcome::Success,
                 duration_ms: None,

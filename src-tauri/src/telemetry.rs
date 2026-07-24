@@ -78,6 +78,91 @@ pub fn normalized_target(name: &str, arguments: &Value) -> Option<String> {
     }
 }
 
+fn collect_mcp_providers(text: &str, providers: &mut Vec<String>) {
+    let mut remaining = text;
+    while let Some(start) = remaining.find("mcp__") {
+        let candidate = &remaining[start + 5..];
+        let Some(end) = candidate.find("__") else {
+            break;
+        };
+        let provider = &candidate[..end];
+        if !provider.is_empty()
+            && provider.len() <= 64
+            && provider
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            let provider = provider.to_ascii_lowercase();
+            if !providers.contains(&provider) && providers.len() < 16 {
+                providers.push(provider);
+            }
+        }
+        remaining = &candidate[end + 2..];
+    }
+}
+
+/// Add a bounded, normalized tool identifier without retaining arguments or
+/// orchestration source.
+fn push_tool_identifier(value: &str, tools: &mut Vec<String>) {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        return;
+    }
+    let value = value.to_ascii_lowercase();
+    if !tools.contains(&value) && tools.len() < 32 {
+        tools.push(value);
+    }
+}
+
+fn collect_orchestrated_tools(source: &str, tools: &mut Vec<String>) {
+    let mut remaining = source;
+    while let Some(start) = remaining.find("tools.") {
+        let candidate = &remaining[start + 6..];
+        let end = candidate
+            .bytes()
+            .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
+            .unwrap_or(candidate.len());
+        push_tool_identifier(&candidate[..end], tools);
+        remaining = &candidate[end..];
+    }
+}
+
+/// Returns bounded effective tool identifiers only. For orchestration wrappers,
+/// the nested tool names replace the generic wrapper name.
+pub fn effective_tools(name: &str, arguments: &Value) -> Vec<String> {
+    let mut tools = Vec::new();
+    if let Some(source) = arguments
+        .get("input")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.as_str())
+    {
+        collect_orchestrated_tools(source, &mut tools);
+    }
+    if tools.is_empty() {
+        push_tool_identifier(name, &mut tools);
+    }
+    tools
+}
+
+/// Returns bounded MCP server identifiers only. Raw orchestration source,
+/// arguments, paths, and tool output are never retained.
+pub fn tool_providers(name: &str, arguments: &Value) -> Vec<String> {
+    let mut providers = Vec::new();
+    collect_mcp_providers(name, &mut providers);
+    if let Some(source) = arguments
+        .get("input")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.as_str())
+    {
+        collect_mcp_providers(source, &mut providers);
+    }
+    providers
+}
+
 pub struct ToolCallInput<'a> {
     pub call_id: String,
     pub turn_id: Option<String>,
@@ -96,6 +181,8 @@ pub fn observe_call(observations: &mut Vec<ToolObservation>, input: ToolCallInpu
         return;
     }
     let target = normalized_target(&input.name, input.arguments);
+    let providers = tool_providers(&input.name, input.arguments);
+    let effective_tools = effective_tools(&input.name, input.arguments);
     observations.push(ToolObservation {
         call_id: input.call_id,
         turn_id: input.turn_id,
@@ -104,6 +191,8 @@ pub fn observe_call(observations: &mut Vec<ToolObservation>, input: ToolCallInpu
         timestamp: input.timestamp,
         kind: classify_tool(&input.name),
         name: input.name,
+        providers,
+        effective_tools,
         target,
         outcome: ToolOutcome::Pending,
         duration_ms: None,
@@ -116,6 +205,7 @@ pub fn observe_result(
     call_id: &str,
     outcome: ToolOutcome,
     duration_ms: Option<u64>,
+    completed_at: Option<DateTime<Utc>>,
     output_bytes: u64,
 ) {
     if let Some(item) = observations
@@ -124,8 +214,14 @@ pub fn observe_result(
         .find(|item| item.call_id == call_id)
     {
         item.outcome = outcome;
-        if duration_ms.is_some() {
-            item.duration_ms = duration_ms;
+        let elapsed_ms = completed_at.and_then(|completed| {
+            (completed - item.timestamp)
+                .num_milliseconds()
+                .try_into()
+                .ok()
+        });
+        if duration_ms.is_some() || (item.duration_ms.is_none() && elapsed_ms.is_some()) {
+            item.duration_ms = duration_ms.or(elapsed_ms);
         }
         item.output_bytes = item.output_bytes.max(output_bytes);
     }
@@ -496,6 +592,8 @@ mod tests {
             timestamp: ts,
             kind: ToolKind::Mutation,
             name: "edit".into(),
+            providers: Vec::new(),
+            effective_tools: vec!["edit".into()],
             target: Some(target.into()),
             outcome: ToolOutcome::Success,
             duration_ms: None,
@@ -520,6 +618,8 @@ mod tests {
                 timestamp: ts,
                 kind: ToolKind::Read,
                 name: "read".into(),
+                providers: Vec::new(),
+                effective_tools: vec!["read".into()],
                 target: Some("read:abc".into()),
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
@@ -598,6 +698,8 @@ mod tests {
             timestamp: DateTime::from_timestamp(id as i64, 0).unwrap(),
             kind,
             name: "synthetic".into(),
+            providers: Vec::new(),
+            effective_tools: vec!["synthetic".into()],
             target: target.map(str::to_owned),
             outcome,
             duration_ms: None,
@@ -679,5 +781,39 @@ mod tests {
             );
         }
         assert!(result.iter().all(|item| item.evidence.len() < 160));
+    }
+
+    #[test]
+    fn classifies_tools_and_hashes_targets() {
+        assert_eq!(classify_tool("Read"), ToolKind::Read);
+    }
+
+    #[test]
+    fn extracts_providers_and_effective_tools_from_direct_and_orchestrated_calls() {
+        let direct_name = "mcp__alpha_server__code_search";
+        assert_eq!(
+            tool_providers(direct_name, &Value::Null),
+            vec!["alpha_server"]
+        );
+        assert_eq!(
+            effective_tools(direct_name, &Value::Null),
+            vec!["mcp__alpha_server__code_search"]
+        );
+
+        let arguments = serde_json::json!({
+            "input": "await tools.mcp__alpha_server__code_search({}); await tools.exec_command({}); await tools.mcp__beta__lookup({});"
+        });
+        assert_eq!(
+            tool_providers("exec", &arguments),
+            vec!["alpha_server", "beta"]
+        );
+        assert_eq!(
+            effective_tools("exec", &arguments),
+            vec![
+                "mcp__alpha_server__code_search",
+                "exec_command",
+                "mcp__beta__lookup"
+            ]
+        );
     }
 }

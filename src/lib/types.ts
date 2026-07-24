@@ -40,6 +40,8 @@ export interface ToolObservation {
   timestamp: string;
   kind: ToolKind;
   name: string;
+  providers: string[];
+  effective_tools: string[];
   target: string | null;
   outcome: ToolOutcome;
   duration_ms: number | null;
@@ -151,6 +153,40 @@ export interface RangeTotals {
   tool_metrics: ToolMetrics;
   tool_metrics_by_model: Record<string, ToolMetrics>;
   optimization_findings_count: number;
+}
+
+export interface ToolImpactCohort {
+  turn_count: number;
+  session_count: number;
+  completed_turn_count: number;
+  duration_sample_count: number;
+  total_duration_ms: number;
+  ttft_sample_count: number;
+  total_ttft_ms: number;
+  tokens: TokenTotals;
+  buckets: TierBucket[];
+  tool_metrics: ToolMetrics;
+}
+
+export type ToolImpactTargetKind = 'provider' | 'tool';
+
+export interface ToolImpactTarget {
+  kind: ToolImpactTargetKind;
+  key: string;
+  label: string;
+  turn_count: number;
+  call_count: number;
+}
+
+export interface ToolImpactResult {
+  target_kind: ToolImpactTargetKind;
+  target_key: string;
+  observed: ToolImpactCohort;
+  baseline: ToolImpactCohort;
+  matched_observed: ToolImpactCohort;
+  matched_baseline: ToolImpactCohort;
+  matched_pairs: number;
+  warnings: string[];
 }
 
 /** Lightweight wire form of a Session for the list view and live updates. */

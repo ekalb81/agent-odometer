@@ -41,6 +41,7 @@ Saving watched-root settings persists the new config, stops the old watcher, cle
 | `src-tauri/src/rates.rs` | Bundled rate card and user override persistence |
 | `src-tauri/src/store.rs` | Concurrent in-memory session state and watcher handle |
 | `src-tauri/src/telemetry.rs` | Cross-harness normalized tool metrics, classifier, and deterministic optimization findings |
+| `src-tauri/src/tool_impact.rs` | Provider/tool target discovery, observed-use cohorts, and matched observational baselines |
 | `src-tauri/src/correlation.rs` | Source-agnostic batched event/window attribution and metric observations |
 | `src-tauri/src/config_events.rs` | Dedicated safe configuration resolver, snapshot, watcher, and versioned event log |
 | `src-tauri/src/git_outcomes.rs` | Opt-in read-only local commit correlation through `gix` |
@@ -54,7 +55,7 @@ Rollouts are append-only JSONL envelopes. Aggregate parsing currently cares abou
 - `turn_context`: active model, reasoning effort, collaboration mode, and turn identity.
 - `event_msg`: first user message, task lifecycle (including abort/rollback), thread settings/service tier, token counts, context window, plan, and credit balance.
 
-Irrelevant `response_item` records are deliberately skipped because they dominate rollout size. Function calls/results selectively fall through to full parsing for normalized telemetry; only call identity, tool name/kind, hashed target identity, outcome, duration, and output byte count survive. The structural fast path still skips every other `response_item`/`compacted` line while advancing `last_event_at`.
+Irrelevant `response_item` records are deliberately skipped because they dominate rollout size. Legacy `function_call` and current `custom_tool_call` records selectively fall through to full parsing for normalized telemetry; only call identity, tool name/kind, bounded MCP provider tags, bounded effective tool names, hashed target identity, outcome, duration, and output byte count survive. Provider and effective-tool tags are inferred from direct names and executed orchestration payloads, but the payload itself is discarded. The structural fast path still skips every other `response_item`/`compacted` line while advancing `last_event_at`.
 
 `SessionParser.byte_offset` advances only after a newline-terminated record. This is essential: the watcher may observe a file while its final JSON record is still being written.
 
@@ -101,6 +102,8 @@ The frontend batches incoming `session-updated` events into ~150ms flushes befor
 Sessions cross the wire in two shapes. `SessionSummary` (list rows, live updates) carries metadata, cumulative totals, and per-(model, service_tier) `TierBucket`s — credit math is linear per (model, tier), so buckets price usage exactly without the event history. The full `Session` (turns + `tokens_history`) is fetched per-id via `get_session_details` when a session is selected. This matters at scale: a real 704-session corpus serializes to ~195 MB as full sessions but ~1 MB as summaries, and an active session's live update drops from ~2 MB to ~1 KB per emit.
 
 Date-scoped numbers come from the batched `sessions_in_ranges` command. The frontend passes the filtered session IDs, and chronological histories use binary partitioning to visit only each window's relevant slice. It returns per-session `RangeTotals` (tokens, tier buckets, and compact tool metrics). The table, analytics, model comparison, export, tray, and generic correlation engine reuse those maps rather than starting per-row scans.
+
+`list_tool_impact_targets` discovers provider and individual-tool choices from the same filtered sessions and time window. `compare_tool_impact` then builds turn-level observed and not-observed cohorts for the selected target. When at least three comparisons are available, the UI uses nearest-in-time pairs with the same harness, model, and deterministic task category. This is observational: transcripts prove use, but cannot prove whether an unused target was installed or available, and whole overlapping turns are included because token events do not carry turn IDs.
 
 Configuration tracking resolves global harness roots plus project scopes derived from session working directories (using the containing Git worktree when available). Only known settings/instruction files and bounded hook/skill trees are watched. Events retain hashes, sizes, a size-only safe diff, and a hashed path identity; they never persist config values or raw paths. The watcher is rebuilt after each session scan so newly discovered project scopes and settings-root changes share the same coverage. Config markers appear on the existing spend chart and the timeline reports before/after tokens, turns, active session duration, tool metrics, samples, and confounds through the source-agnostic correlation engine.
 
