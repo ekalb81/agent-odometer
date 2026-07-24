@@ -645,7 +645,9 @@
     codexCredits: number;
     codexApiUsd: number;
     claudeUsd: number;
-    completeUsd: boolean;
+    // False means at least one configured fallback rate was used; the estimate
+    // remains usable and should be labeled, not discarded as unavailable.
+    allRatesDirect: boolean;
   };
   type RangeSessionPrice = {
     tokens: number;
@@ -696,7 +698,7 @@
       codexCredits: 0,
       codexApiUsd: 0,
       claudeUsd: 0,
-      completeUsd: allUsdAvailable,
+      allRatesDirect: allUsdAvailable,
     };
     if (!data || !r) return out;
     for (const s of filteredNoDate) {
@@ -706,17 +708,17 @@
       if (s.harness === 'codex') {
         out.codexCredits += priced.planCost;
         out.codexApiUsd += priced.apiCost ?? 0;
-        if (!priced.apiComplete) out.completeUsd = false;
+        if (!priced.apiComplete) out.allRatesDirect = false;
       } else {
         out.claudeUsd += priced.planCost;
-        if (!priced.planComplete || harnessCurrency(r, s.harness) !== 'USD') out.completeUsd = false;
+        if (!priced.planComplete || harnessCurrency(r, s.harness) !== 'USD') out.allRatesDirect = false;
       }
     }
     out.cost = harness === 'codex'
       ? (showApiCost ? out.codexApiUsd : out.codexCredits)
       : harness === 'claude_code'
         ? out.claudeUsd
-        : allUsdAvailable && out.completeUsd
+        : allUsdAvailable
           ? out.codexApiUsd + out.claudeUsd
           : 0;
     return out;
@@ -863,7 +865,11 @@
   );
   const spendCardNote = $derived(
     harness === 'all'
-      ? (windowTotals.completeUsd ? 'Codex + Claude USD' : 'unavailable · missing direct rates')
+      ? !allUsdAvailable
+        ? 'unavailable · configure USD rates'
+        : windowTotals.allRatesDirect
+          ? 'Codex + Claude USD'
+          : 'estimate · fallback rates used'
       : harness === 'codex'
       ? (windowStats.allUnlimited ? 'à la carte · all sessions unlimited' : 'OpenAI API rates')
       : 'Anthropic API rates',
@@ -1045,7 +1051,7 @@
         <div>
           <div class="text-[11px] text-ink-muted font-medium">{spendCardLabel}</div>
           <div class="text-[30px] font-bold tracking-[-0.03em] font-mono mt-0.5 {showApiCost ? 'text-accent-cost' : 'text-ink'}">
-            {harness === 'all' && !windowTotals.completeUsd ? 'Unavailable' : fmtMoney(windowTotals.cost)}
+            {harness === 'all' && !allUsdAvailable ? 'Unavailable' : fmtMoney(windowTotals.cost)}
           </div>
         </div>
         {#if costDelta !== null}
