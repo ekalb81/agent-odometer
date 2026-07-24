@@ -22,7 +22,7 @@ serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
 chrono         = { version = "0.4", features = ["serde"] }
 notify         = "8"
-notify-debouncer-full = "0.6"   # pairs with notify 8.x
+notify-debouncer-full = "0.7"   # pairs with notify 8.x
 dashmap        = "6"
 anyhow         = "1"
 tracing        = "0.1"
