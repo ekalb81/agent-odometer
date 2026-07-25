@@ -12,4 +12,7 @@ export const config = writable<Config>({
   instructions_enabled: false,
   instructions_tab_visible: true,
   instruction_roots: [],
+  turn_receipts_enabled: false,
+  turn_receipts_codex: true,
+  turn_receipts_claude: true,
 });

@@ -351,6 +351,7 @@ mod tests {
             tokens_total: TokenTotals::default(),
             tokens_by_model: StdHashMap::new(),
             tokens_history: Vec::new(),
+            rate_limits_history: Vec::new(),
             turns: Vec::new(),
             tool_observations: Vec::new(),
             tool_metrics: Default::default(),

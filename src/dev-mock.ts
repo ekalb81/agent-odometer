@@ -222,6 +222,7 @@ function details(f: Fixture): Session {
     latest_context_tokens: Math.round((s.context_window ?? 200_000) * 0.54),
     tokens_by_model: { [f.model]: tok(f.total) },
     tokens_history: history,
+    rate_limits_history: [],
     turns,
     tool_observations: [],
     optimization_findings: [],
@@ -343,6 +344,9 @@ mockIPC((cmd, payload) => {
         instructions_enabled: true,
         instructions_tab_visible: true,
         instruction_roots: [{ path: '/home/dev/projects', recursive: true }],
+        turn_receipts_enabled: false,
+        turn_receipts_codex: true,
+        turn_receipts_claude: true,
       };
     case 'list_instruction_files': {
       const root = '/home/dev/projects/demo';

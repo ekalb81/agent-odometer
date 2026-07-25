@@ -467,6 +467,7 @@ mod tests {
             tokens_total: totals(tokens),
             tokens_by_model: HashMap::new(),
             tokens_history: Vec::new(),
+            rate_limits_history: Vec::new(),
             turns: vec![TurnInfo {
                 turn_id: turn_id.clone(),
                 index: 1,

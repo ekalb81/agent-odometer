@@ -224,6 +224,26 @@ pub struct TokenHistoryPoint {
     pub delta: TokenTotals,
 }
 
+/// One provider-reported subscription-usage window. The value is deliberately
+/// kept as a percentage reported by the harness; Odometer does not derive a
+/// quota charge from tokens or an assumed subscription cap.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub window_minutes: Option<u64>,
+    pub resets_at: Option<DateTime<Utc>>,
+}
+
+/// Account-wide rate-limit snapshot attached to a Codex token event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateLimitSnapshotPoint {
+    pub timestamp: DateTime<Utc>,
+    pub turn_id: Option<String>,
+    pub limit_id: Option<String>,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
@@ -303,6 +323,10 @@ pub struct Session {
     pub tokens_total: TokenTotals,
     pub tokens_by_model: HashMap<String, TokenTotals>,
     pub tokens_history: Vec<TokenHistoryPoint>,
+    /// Provider-reported account quota snapshots. Full sessions only: list
+    /// summaries intentionally omit this history.
+    #[serde(default)]
+    pub rate_limits_history: Vec<RateLimitSnapshotPoint>,
     pub turns: Vec<TurnInfo>,
     #[serde(default)]
     pub tool_observations: Vec<ToolObservation>,
@@ -663,6 +687,7 @@ mod tests {
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
             tokens_history: history,
+            rate_limits_history: Vec::new(),
             turns: Vec::new(),
             tool_observations: Vec::new(),
             tool_metrics: ToolMetrics::default(),

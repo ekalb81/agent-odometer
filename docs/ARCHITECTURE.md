@@ -9,7 +9,7 @@ Odometer is a local companion to agent CLI harnesses — the ChatGPT desktop app
 
 Every session carries a `harness` tag (`codex` | `claude_code`). All three scopes share one session store, `SessionsView`, detail pane, filter predicates, pricing projection, and model aggregate. The All scope never adds plan credits to USD.
 
-The frontend starts at `src/main.ts` and `src/App.svelte`. The native process starts at `src-tauri/src/main.rs`, which calls `src-tauri/src/lib.rs::run`.
+The frontend starts at `src/main.ts` and `src/App.svelte`. The native process starts at `src-tauri/src/main.rs`. Normal launches call `src-tauri/src/lib.rs::run`; an explicitly installed harness hook exits through the headless `turn_receipts::try_run_cli` path before Tauri starts.
 
 ## Startup and live-update flow
 
@@ -21,7 +21,35 @@ The frontend starts at `src/main.ts` and `src/App.svelte`. The native process st
 6. `App.svelte` invokes `list_sessions`, `get_config`, and `get_rates`, then subscribes to update/removal events.
 7. The watcher debounces filesystem activity, incrementally parses complete appended records, updates the `DashMap`, and emits Tauri events.
 
-Saving watched-root settings persists the new config, stops the old watcher, clears state, restarts the watcher, kicks off the same background rescan, and emits `config-updated`. Performance-only settings are applied live and deliberately skip the restart/rescan path.
+Saving watched-root settings persists the new config, stops the old watcher, clears state, restarts the watcher, kicks off the same background rescan, and emits `config-updated`. Performance and turn-receipt settings apply without restarting watchers or rescanning the corpus; receipt setup additionally performs its bounded harness-config transaction.
+
+## Opt-in turn-receipt flow
+
+Turn receipts are a separate, default-off freshness path; they do not replace the watcher:
+
+1. Settings transactionally adds one identifiable `Stop` command to the selected user-level Codex
+   `hooks.json` and/or Claude Code `settings.json`. Existing JSON and unrelated hook handlers are
+   retained. Disable removes only handlers containing Odometer's integration ID.
+2. Codex/Claude passes bounded JSON on stdin, including the session and transcript path. The helper
+   exits before Tauri startup, checks that the feature and harness remain enabled, and validates the
+   canonical transcript path against the configured roots.
+3. The helper parses the exact transcript synchronously, selects the supplied Codex `turn_id` or the
+   latest completed Claude turn, and emits the common `{ "continue": true, "systemMessage": ... }`
+   `Stop` response. Every failure is fail-open and never returns a continuation decision.
+4. The ordinary 250 ms filesystem watcher still updates the dashboard and remains the universal
+   path for users who never enable receipts. A later watcher pass is harmless because parser cursors
+   and cumulative reconciliation remain idempotent.
+
+Codex `rate_limits.primary` and `secondary` snapshots are retained only on full sessions. A receipt
+compares the final snapshot for the turn with the prior turn's snapshot when the limit/reset identity
+is stable. It reports the delta in percentage points as **observed**, `no measurable change` when the
+provider value is unchanged, or `unavailable/window changed` rather than inventing precision. These
+snapshots are account-wide and can include concurrent activity or rolling-window expiry.
+
+The hook process cannot execute frontend TypeScript, so `turn_receipts.rs` contains a deliberately
+narrow mirror of the existing subset-aware token formula and documented Fast-tier multipliers. Its
+focused Rust tests are a parity gate; the dashboard remains the owner of interactive and date-scoped
+pricing.
 
 ## Backend modules
 
@@ -47,6 +75,8 @@ Saving watched-root settings persists the new config, stops the old watcher, cle
 | `src-tauri/src/git_outcomes.rs` | Opt-in read-only local commit correlation through `gix` |
 | `src-tauri/src/instructions.rs` | Opt-in bounded instruction discovery, hierarchy, warning signals, and allowlisted preview reads |
 | `src-tauri/src/tray.rs` | Native tray lifecycle, menu events, and projected today labels |
+| `src-tauri/src/harness_integration.rs` | Transactional install/remove/status for Odometer-owned harness hooks |
+| `src-tauri/src/turn_receipts.rs` | Headless fail-open hook entry point, targeted parse, receipt/quota formatting |
 
 ## Parser model
 
@@ -154,7 +184,7 @@ Claude Code sessions are resolved below `$CLAUDE_CONFIG_DIR`, falling back to `~
 
 - `$CLAUDE_CONFIG_DIR/projects`
 
-User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`.
+User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`. Enabled turn receipts also keep independent bounded `turn-receipt-status-codex.json` and `turn-receipt-status-claude-code.json` health records under the OS local-data directory; they contain no session IDs or paths. Reads retain compatibility with the earlier shared development-format file.
 
 Session files can contain full prompts, responses, system/developer instructions, local paths, and tool output. Keep processing local, avoid logging message bodies, and use synthetic/redacted test data. Tauri capabilities in `src-tauri/capabilities/default.json` should remain narrowly scoped.
 
@@ -165,6 +195,8 @@ Session files can contain full prompts, responses, system/developer instructions
 - Sessions are keyed only by ID. Duplicate IDs found under multiple roots overwrite according to scan traversal order.
 - An invalid envelope timestamp falls back to the current time and can affect ordering.
 - `forked_from_id` is represented in the model/UI but may be absent when the source rollout does not provide or the parser does not extract it.
+- Claude Code's `Stop` payload does not include subscription rate-limit windows, so its first receipt version shows tokens and API-rate estimates but no per-turn subscription delta. Codex quota values come from its transcript snapshots.
+- Hook commands parse one transcript from disk in a short-lived process. Very large transcripts can make a receipt late or unavailable, but the harness turn still completes and the dashboard watcher remains unaffected.
 - Frontend behavior is checked by TypeScript/Svelte validation and manual Tauri runs; no frontend unit-test framework is configured.
 
 ## Safe extension patterns
