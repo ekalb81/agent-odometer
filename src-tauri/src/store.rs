@@ -62,6 +62,8 @@ pub struct AppState {
     pub scan_elapsed_ms: AtomicU64,
     /// Identifies the configuration generation allowed to publish scan work.
     pub scan_generation: AtomicU64,
+    /// Identifies the instruction-inventory scan allowed to publish results.
+    instruction_scan_generation: AtomicU64,
     /// Serializes configuration transitions so watcher/scan generations cannot interleave.
     pub config_transition: Mutex<()>,
     pub watcher: Mutex<Option<WatcherHandle>>,
@@ -84,6 +86,7 @@ impl AppState {
             scan_elapsed_ms: AtomicU64::new(0),
             // Startup watcher events and the initial bulk scan share generation 1.
             scan_generation: AtomicU64::new(1),
+            instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
@@ -109,17 +112,55 @@ impl AppState {
             + 1
     }
 
+    pub fn begin_instruction_scan(&self) -> u64 {
+        // Starting a new generation must serialize with allowlist publication.
+        // Otherwise an older scan could pass its generation check, lose the
+        // race to this increment, and still replace the allowlist afterward.
+        let _paths = self.instruction_paths.lock().unwrap();
+        self.instruction_scan_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1
+    }
+
+    pub fn cancel_instruction_scan(&self) -> u64 {
+        // Cancellation and publication share the allowlist lock so a cancelled
+        // generation cannot publish after this method returns.
+        let _paths = self.instruction_paths.lock().unwrap();
+        self.instruction_scan_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub fn cancel_instruction_scan_and_clear_paths(&self) -> u64 {
+        let mut paths = self.instruction_paths.lock().unwrap();
+        let cancelled = self
+            .instruction_scan_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        paths.clear();
+        cancelled
+    }
+
+    pub fn instruction_scan_is_current(&self, generation: u64) -> bool {
+        self.instruction_scan_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            == generation
+    }
+
     pub fn clear_sessions(&self) {
         self.session_paths.clear();
         self.sessions.clear();
     }
 
-    pub fn replace_instruction_paths(&self, paths: impl IntoIterator<Item = String>) {
-        *self.instruction_paths.lock().unwrap() = paths.into_iter().collect();
-    }
-
-    pub fn clear_instruction_paths(&self) {
-        self.instruction_paths.lock().unwrap().clear();
+    pub fn publish_instruction_paths_if_current(
+        &self,
+        generation: u64,
+        paths: impl IntoIterator<Item = String>,
+    ) -> bool {
+        let mut allowed = self.instruction_paths.lock().unwrap();
+        if !self.instruction_scan_is_current(generation) {
+            return false;
+        }
+        *allowed = paths.into_iter().collect();
+        true
     }
 
     pub fn instruction_path_allowed(&self, path: &Path) -> bool {
@@ -266,6 +307,7 @@ mod tests {
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
             scan_generation: AtomicU64::new(1),
+            instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
@@ -338,6 +380,33 @@ mod tests {
         state.clear_sessions();
         assert!(!state.publish_scanned_session(stale, &path, session("a", 1)));
         assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn instruction_scan_generation_cancels_prior_work() {
+        let state = state();
+        let first = state.begin_instruction_scan();
+        assert!(state.instruction_scan_is_current(first));
+        let second = state.begin_instruction_scan();
+        assert!(!state.instruction_scan_is_current(first));
+        assert!(state.instruction_scan_is_current(second));
+        assert_eq!(state.cancel_instruction_scan(), second);
+        assert!(!state.instruction_scan_is_current(second));
+    }
+
+    #[test]
+    fn cancelled_instruction_scan_cannot_repopulate_cleared_paths() {
+        let state = state();
+        let path = PathBuf::from("C:/projects/removed/AGENTS.md");
+        let path_key = path_key(&path);
+        let scan = state.begin_instruction_scan();
+        assert!(state.publish_instruction_paths_if_current(scan, [path_key.clone()]));
+        assert!(state.instruction_path_allowed(&path));
+
+        assert_eq!(state.cancel_instruction_scan_and_clear_paths(), scan);
+        assert!(!state.instruction_path_allowed(&path));
+        assert!(!state.publish_instruction_paths_if_current(scan, [path_key]));
+        assert!(!state.instruction_path_allowed(&path));
     }
 
     #[test]

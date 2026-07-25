@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionContent, TurnReceiptIntegrationStatus } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, TurnReceiptIntegrationStatus } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -79,6 +79,10 @@ export function setConfig(config: Config): Promise<void> {
 
 export function listInstructionFiles(): Promise<InstructionInventory> {
   return invoke<InstructionInventory>('list_instruction_files');
+}
+
+export function cancelInstructionScan(): Promise<number> {
+  return invoke<number>('cancel_instruction_scan');
 }
 
 export function readInstructionFile(path: string): Promise<InstructionContent> {
@@ -184,6 +188,12 @@ export function onSessionRemoved(cb: (sessionId: string) => void): Promise<Unlis
 
 export function onScanProgress(cb: (status: ScanStatus) => void): Promise<UnlistenFn> {
   return listen<ScanStatus>('scan-progress', (event) => cb(event.payload));
+}
+
+export function onInstructionScanProgress(
+  cb: (status: InstructionScanProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<InstructionScanProgress>('instruction-scan-progress', (event) => cb(event.payload));
 }
 
 export function onRatesUpdated(cb: (rates: RateCard) => void): Promise<UnlistenFn> {

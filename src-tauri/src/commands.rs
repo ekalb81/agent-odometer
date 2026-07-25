@@ -19,26 +19,56 @@ pub fn list_external_events(
 
 #[tauri::command]
 pub async fn list_instruction_files(
+    app: AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::instructions::InstructionInventory, String> {
     let started = Instant::now();
-    let config = Config::load().map_err(|error| error.to_string())?;
+    let (config, scan_id) = {
+        // Capture the durable roots and allocate their scan generation in the
+        // same config transition. A settings save can therefore only happen
+        // wholly before or wholly after this snapshot.
+        let _transition = state.config_transition.lock().unwrap();
+        let config = Config::load().map_err(|error| error.to_string())?;
+        let scan_id = state.begin_instruction_scan();
+        (config, scan_id)
+    };
     let sessions = state
         .sessions
         .iter()
-        .map(|entry| entry.value().as_ref().clone())
+        .filter_map(|entry| {
+            let session = entry.value();
+            session.working_directory.as_ref().map(|working_directory| {
+                crate::instructions::InstructionSessionContext {
+                    working_directory: std::path::PathBuf::from(working_directory),
+                    last_event_at: session.last_event_at,
+                }
+            })
+        })
         .collect::<Vec<_>>();
     let app_state = state.inner().clone();
+    let scan_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::instructions::discover(&config, &sessions)
+        crate::instructions::discover_with_progress(
+            &config,
+            &sessions,
+            scan_id,
+            |progress| {
+                let _ = app.emit("instruction-scan-progress", progress);
+            },
+            || !scan_state.instruction_scan_is_current(scan_id),
+        )
     })
     .await
     .map_err(|error| error.to_string())?
     .map_err(|error| error.to_string());
     if let Ok(inventory) = &result {
-        app_state.replace_instruction_paths(inventory.files.iter().map(|file| {
-            crate::instructions::normalized_path_key(std::path::Path::new(&file.path))
-        }));
+        let paths = inventory
+            .files
+            .iter()
+            .map(|file| crate::instructions::normalized_path_key(std::path::Path::new(&file.path)))
+            .collect::<Vec<_>>();
+        let _transition = app_state.config_transition.lock().unwrap();
+        app_state.publish_instruction_paths_if_current(scan_id, paths);
     }
     app_state.performance.record_backend(
         "ipc.list_instruction_files",
@@ -56,7 +86,15 @@ pub async fn list_instruction_files(
     result
 }
 
+#[tauri::command]
+pub fn cancel_instruction_scan(state: State<'_, Arc<AppState>>) -> u64 {
+    state.cancel_instruction_scan()
+}
+
 fn validate_instruction_access(state: &AppState, path: &std::path::Path) -> Result<(), String> {
+    // Keep the enabled flag and the discovered-path allowlist coherent with
+    // any settings transition that revokes instruction roots.
+    let _transition = state.config_transition.lock().unwrap();
     let config = Config::load().map_err(|error| error.to_string())?;
     if !config.instructions_enabled {
         return Err("instruction inventory is disabled".into());
@@ -636,7 +674,7 @@ pub fn set_config(
             .map_err(|error| error.to_string())?;
         config.save().map_err(|e| e.to_string())?;
         if instruction_sources_changed {
-            state.clear_instruction_paths();
+            state.cancel_instruction_scan_and_clear_paths();
             let previous_watcher = state
                 .config_watcher
                 .lock()
@@ -684,7 +722,7 @@ pub fn set_config(
         .transpose()
         .map_err(|error| error.to_string())?;
     config.save().map_err(|e| e.to_string())?;
-    state.clear_instruction_paths();
+    state.cancel_instruction_scan_and_clear_paths();
     if let Some(transaction) = integration {
         transaction.commit();
     }
