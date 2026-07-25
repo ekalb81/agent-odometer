@@ -506,6 +506,7 @@ mod tests {
                     "search".into()
                 }],
                 target: None,
+                resource_id: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: Some(500),
                 output_bytes: 10,
