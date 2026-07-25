@@ -28,6 +28,8 @@ jobs:
     name: Verify release versions
     runs-on: ubuntu-22.04
     timeout-minutes: 5
+    outputs:
+      release_id: ${{ steps.release.outputs.release_id }}
 
     steps:
       - name: Checkout
@@ -100,6 +102,7 @@ jobs:
           echo "Tagged commit passed CI in run ${successful_run_id}."
 
       - name: Ensure mutable draft release
+        id: release
         if: github.event_name == 'push'
         shell: bash
         env:
@@ -107,26 +110,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          release_state=''
-          status=0
-          release_state="$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" \
-              --jq '[.draft, .immutable] | @tsv' 2>&1
-          )" || status=$?
+          # GitHub's releases/tags endpoint does not return draft releases.
+          # Enumerate releases instead, then pin every matrix job to the exact
+          # release ID so parallel builders cannot create split drafts.
+          mapfile -t matches < <(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | [.id, .draft, .immutable, .target_commitish] | @tsv"
+          )
 
-          if [[ "$status" -eq 0 ]]; then
-            IFS=$'\t' read -r draft immutable <<< "$release_state"
-            if [[ "$draft" != 'true' || "$immutable" == 'true' ]]; then
-              echo "::error::Release ${GITHUB_REF_NAME} already exists and is not a mutable draft (draft=${draft}, immutable=${immutable}). Push a new release tag instead of publishing the release before CI uploads its assets."
-              exit 1
-            fi
-            echo "Using existing mutable draft release ${GITHUB_REF_NAME}."
-            exit 0
+          if (( ${#matches[@]} > 1 )); then
+            echo "::error::Multiple releases already use tag ${GITHUB_REF_NAME}; remove the duplicates before retrying."
+            exit 1
           fi
 
-          if [[ "$release_state" != *'HTTP 404'* ]]; then
-            echo "::error::Could not inspect release ${GITHUB_REF_NAME}: ${release_state}"
-            exit "$status"
+          if (( ${#matches[@]} == 1 )); then
+            IFS=$'\t' read -r release_id draft immutable target_commitish <<< "${matches[0]}"
+            if [[ "$draft" != 'true' || "$immutable" == 'true' || "$target_commitish" != "$GITHUB_SHA" ]]; then
+              echo "::error::Release ${GITHUB_REF_NAME} is not the expected mutable draft (draft=${draft}, immutable=${immutable}, target=${target_commitish})."
+              exit 1
+            fi
+            echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+            echo "Using mutable draft release ${release_id} for ${GITHUB_REF_NAME}."
+            exit 0
           fi
 
           release_notes="$(
@@ -143,20 +148,29 @@ jobs:
               '' \
               '## Changes' \
               '' \
-              '<!-- Fill in release notes before publishing. -->'
+              '- Repair in-app update checks after the malformed v0.6.1 updater manifest.' \
+              '- Validate updater field types, signed platform mappings, asset digests, and exact release ownership before publication.' \
+              '- Pin every platform build to one draft release and serialize uploads so updater manifests cannot split or race.'
           )"
-          gh release create "$GITHUB_REF_NAME" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --draft \
-            --title "Odometer ${GITHUB_REF_NAME}" \
-            --notes "$release_notes"
+          release_id="$(
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f target_commitish="$GITHUB_SHA" \
+              -f name="Odometer ${GITHUB_REF_NAME}" \
+              -f body="$release_notes" \
+              -F draft=true \
+              -F prerelease=false \
+              --jq '.id'
+          )"
+          echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
+          echo "Created mutable draft release ${release_id} for ${GITHUB_REF_NAME}."
 
   build:
     name: ${{ matrix.platform }} — ${{ matrix.label }}
     needs: preflight
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - platform: macos-latest
@@ -237,6 +251,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          releaseId: ${{ needs.preflight.outputs.release_id }}
           tagName: ${{ github.ref_name }}
           releaseName: 'Odometer ${{ github.ref_name }}'
           releaseBody: |
@@ -252,7 +267,61 @@ jobs:
 
             ## Changes
 
-            <!-- Fill in release notes before publishing. -->
+            - Repair in-app update checks after the malformed v0.6.1 updater manifest.
+            - Validate updater field types, signed platform mappings, asset digests, and exact release ownership before publication.
+            - Pin every platform build to one draft release and serialize uploads so updater manifests cannot split or race.
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  validate:
+    name: Validate updater release
+    if: github.event_name == 'push'
+    needs: [preflight, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Validate draft assets and updater manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.preflight.outputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          matching_releases="$(
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | .id"
+          )"
+          if [[ "$(printf '%s\n' "$matching_releases" | sed '/^$/d' | wc -l)" -ne 1 ]]; then
+            echo "::error::Expected exactly one release for ${GITHUB_REF_NAME}."
+            exit 1
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json
+          latest_asset_id="$(
+            jq -r '[.assets[] | select(.name == "latest.json")] | if length == 1 then .[0].id else empty end' release.json
+          )"
+          if [[ -z "$latest_asset_id" ]]; then
+            echo "::error::Expected exactly one latest.json asset."
+            exit 1
+          fi
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            "repos/${GITHUB_REPOSITORY}/releases/assets/${latest_asset_id}" > latest.json
+
+          package_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).version')"
+          node scripts/validate-updater-manifest.mjs \
+            latest.json \
+            release.json \
+            "$package_version" \
+            "$GITHUB_SHA"
