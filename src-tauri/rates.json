@@ -1,10 +1,10 @@
 {
-  "version": 5,
+  "version": 6,
   "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
-  "fetched_at": "2026-07-19",
-  "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. api_models holds the same Codex models at OpenAI API USD prices (developers.openai.com/api/docs/pricing, fetched 2026-07-19) for the est.-cost column; gpt-5.5-cyber, gpt-5.2, and codex-auto-review are not on the public API page and are derived via the exact 25-credits-per-USD ratio the rest of the card follows. Claude models are priced in USD per the Anthropic API price list (cached_input is the 0.1x cache-read rate; thinking is billed as ordinary output). Cache writes (1.25x) are not modeled, so USD estimates are slight underestimates. api_models is not editable in the Settings UI yet; edit this file or the on-disk rates.json override.",
+  "fetched_at": "2026-07-25",
+  "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. api_models holds the same Codex models at OpenAI API USD prices (developers.openai.com/api/docs/pricing, fetched 2026-07-25) for the est.-cost column; gpt-5.5-cyber, gpt-5.2, and codex-auto-review are not on the public API page and are derived via the exact 25-credits-per-USD ratio the rest of the card follows. Claude models are priced in USD per the Anthropic API price list (fetched 2026-07-25; cached_input is the 0.1x cache-read rate; thinking is billed as ordinary output). Cache writes (1.25x) are not modeled, so USD estimates are slight underestimates. gpt-5.3-codex-spark is explicitly unpriced because OpenAI lists its research-preview rates as not final; its usage is excluded instead of fallback-priced. api_models and unpriced_models are not editable in the Settings UI yet; edit this file or the on-disk rates.json override.",
   "currencies": {
     "codex": "credits",
     "claude_code": "USD"
@@ -13,6 +13,9 @@
     "codex": "gpt-5.6-sol",
     "claude_code": "claude-opus-4-8"
   },
+  "unpriced_models": [
+    "gpt-5.3-codex-spark"
+  ],
   "models": {
     "gpt-5.6-sol":    { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
     "gpt-5.6-terra":  { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
@@ -25,13 +28,15 @@
     "gpt-5.2":        { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
     "codex-auto-review": { "input": 43.75, "cached_input": 4.375, "output": 350.0, "reasoning": 350.0 },
 
+    "claude-opus-5":     { "input":  5.0, "cached_input": 0.50, "output": 25.0, "reasoning": 25.0 },
     "claude-fable-5":    { "input": 10.0, "cached_input": 1.00, "output": 50.0, "reasoning": 50.0 },
     "claude-opus-4-8":   { "input":  5.0, "cached_input": 0.50, "output": 25.0, "reasoning": 25.0 },
     "claude-opus-4-7":   { "input":  5.0, "cached_input": 0.50, "output": 25.0, "reasoning": 25.0 },
     "claude-opus-4-6":   { "input":  5.0, "cached_input": 0.50, "output": 25.0, "reasoning": 25.0 },
     "claude-sonnet-5":   { "input":  3.0, "cached_input": 0.30, "output": 15.0, "reasoning": 15.0 },
     "claude-sonnet-4-6": { "input":  3.0, "cached_input": 0.30, "output": 15.0, "reasoning": 15.0 },
-    "claude-haiku-4-5":  { "input":  1.0, "cached_input": 0.10, "output":  5.0, "reasoning":  5.0 }
+    "claude-haiku-4-5":          { "input":  1.0, "cached_input": 0.10, "output":  5.0, "reasoning":  5.0 },
+    "claude-haiku-4-5-20251001": { "input":  1.0, "cached_input": 0.10, "output":  5.0, "reasoning":  5.0 }
   },
   "api_models": {
     "gpt-5.6-sol":    { "input": 5.00, "cached_input": 0.500, "output": 30.0, "reasoning": 30.0 },

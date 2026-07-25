@@ -273,6 +273,7 @@
   let ratesFallbackModels = $state<Record<string, string>>({});
   // API USD rates for Codex models; not editable here yet, carried through.
   let ratesApiModels = $state<Record<string, ModelRate>>({});
+  let ratesUnpricedModels = $state<string[]>([]);
 
   // New-model form.
   let newName = $state('');
@@ -308,6 +309,7 @@
     ratesCurrencies = { ...(r.currencies ?? {}) };
     ratesFallbackModels = { ...(r.fallback_models ?? {}) };
     ratesApiModels = { ...(r.api_models ?? {}) };
+    ratesUnpricedModels = [...(r.unpriced_models ?? [])];
     dirty = false;
   });
 
@@ -363,6 +365,7 @@
       currencies: ratesCurrencies,
       fallback_models: ratesFallbackModels,
       api_models: ratesApiModels,
+      unpriced_models: ratesUnpricedModels,
     };
   }
 

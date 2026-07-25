@@ -12,12 +12,14 @@ export interface ModelCredit {
   model: string;
   cost: number;
   fallbackUsed: boolean;
+  unpriced: boolean;
 }
 
 export interface SessionCredits {
   total: number;
   byModel: ModelCredit[];
   missingModels: string[];
+  unpricedModels: string[];
 }
 
 /** Currency label for a harness, falling back to the card-wide currency. */
@@ -28,6 +30,10 @@ export function harnessCurrency(rates: RateCard, harness: Harness): string {
 /** Fallback model for a harness, falling back to the card-wide fallback. */
 function fallbackModelFor(rates: RateCard, harness: Harness): string {
   return rates.fallback_models?.[harness] ?? rates.fallback_model;
+}
+
+function isUnpricedModel(rates: RateCard, model: string | null): boolean {
+  return model !== null && (rates.unpriced_models ?? []).includes(model);
 }
 
 export function fallbackModelName(rates: RateCard, harness: Harness): string {
@@ -68,14 +74,18 @@ export function tokensCost(
   serviceTier: string | null = null,
   harness: Harness = 'codex',
   table: Record<string, ModelRate> = rates.models,
-): { cost: number; fallbackUsed: boolean } {
+): { cost: number; fallbackUsed: boolean; unpriced: boolean } {
+  if (isUnpricedModel(rates, model)) {
+    return { cost: 0, fallbackUsed: false, unpriced: true };
+  }
   const directRate = model ? table[model] : undefined;
   const fallbackUsed = directRate === undefined;
   const rate = directRate ?? table[fallbackModelFor(rates, harness)];
-  if (!rate) return { cost: 0, fallbackUsed };
+  if (!rate) return { cost: 0, fallbackUsed, unpriced: false };
   return {
     cost: eventCost(tokens, rate, serviceTierMultiplier(model, serviceTier)),
     fallbackUsed,
+    unpriced: false,
   };
 }
 
@@ -89,7 +99,7 @@ export function creditsFromBuckets(
   rates: RateCard,
   harness: Harness,
 ): SessionCredits {
-  return bucketsCost(buckets, rates.models, fallbackModelFor(rates, harness));
+  return bucketsCost(buckets, rates.models, fallbackModelFor(rates, harness), rates.unpriced_models);
 }
 
 /**
@@ -103,21 +113,29 @@ export function apiCostFromBuckets(
   harness: Harness,
 ): SessionCredits | null {
   if (Object.keys(rates.api_models ?? {}).length === 0) return null;
-  return bucketsCost(buckets, rates.api_models, fallbackModelFor(rates, harness));
+  return bucketsCost(buckets, rates.api_models, fallbackModelFor(rates, harness), rates.unpriced_models);
 }
 
 function bucketsCost(
   buckets: TierBucket[],
   table: Record<string, ModelRate>,
   fallbackName: string,
+  unpricedModelNames: string[] = [],
 ): SessionCredits {
   const byModelMap = new Map<string, number>();
   const missingModels = new Set<string>();
+  const unpricedModels = new Set<string>();
+  const unpriced = new Set(unpricedModelNames);
   let total = 0;
 
   const fallbackRate = table[fallbackName];
 
   for (const b of buckets) {
+    if (unpriced.has(b.model)) {
+      unpricedModels.add(b.model);
+      byModelMap.set(b.model, byModelMap.get(b.model) ?? 0);
+      continue;
+    }
     const directRate = table[b.model];
     if (directRate === undefined) missingModels.add(b.model);
     const rate = directRate ?? fallbackRate;
@@ -133,9 +151,11 @@ function bucketsCost(
     byModel: Array.from(byModelMap, ([model, cost]) => ({
       model,
       cost,
-      fallbackUsed: table[model] === undefined,
+      fallbackUsed: table[model] === undefined && !unpriced.has(model),
+      unpriced: unpriced.has(model),
     })),
     missingModels: Array.from(missingModels),
+    unpricedModels: Array.from(unpricedModels),
   };
 }
 
@@ -147,24 +167,31 @@ export function computeSummaryCredits(summary: SessionSummary, rates: RateCard):
 /** All-time OpenAI-API-rate cost for a full session (drawer). Null when unconfigured. */
 export function computeSessionApiCost(session: Session, rates: RateCard): SessionCredits | null {
   if (Object.keys(rates.api_models ?? {}).length === 0) return null;
-  return historyCost(session, rates.api_models, fallbackModelFor(rates, session.harness));
+  return historyCost(session, rates.api_models, fallbackModelFor(rates, session.harness), rates.unpriced_models);
 }
 
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {
   if (session.tokens_history.length > 0) {
-    return historyCost(session, rates.models, fallbackModelFor(rates, session.harness));
+    return historyCost(session, rates.models, fallbackModelFor(rates, session.harness), rates.unpriced_models);
   }
   const entries = Object.entries(session.tokens_by_model);
 
   if (entries.length === 0) {
-    return { total: 0, byModel: [], missingModels: [] };
+    return { total: 0, byModel: [], missingModels: [], unpricedModels: [] };
   }
 
   const byModel: ModelCredit[] = [];
   const missingModels: string[] = [];
+  const unpricedModels: string[] = [];
   let total = 0;
 
   for (const [model, totals] of entries) {
+    const unpriced = isUnpricedModel(rates, model);
+    if (unpriced) {
+      unpricedModels.push(model);
+      byModel.push({ model, cost: 0, fallbackUsed: false, unpriced: true });
+      continue;
+    }
     const directRate = rates.models[model];
     const fallbackRate = rates.models[fallbackModelFor(rates, session.harness)];
     const fallbackUsed = directRate === undefined;
@@ -177,32 +204,40 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
 
     if (!rate) {
       // Neither the model nor the fallback exists in the rate card.
-      byModel.push({ model, cost: 0, fallbackUsed });
+      byModel.push({ model, cost: 0, fallbackUsed, unpriced: false });
       continue;
     }
 
     const cost = eventCost(totals, rate);
 
     total += cost;
-    byModel.push({ model, cost, fallbackUsed });
+    byModel.push({ model, cost, fallbackUsed, unpriced: false });
   }
 
-  return { total, byModel, missingModels };
+  return { total, byModel, missingModels, unpricedModels };
 }
 
 function historyCost(
   session: Session,
   table: Record<string, ModelRate>,
   fallbackName: string,
+  unpricedModelNames: string[] = [],
 ): SessionCredits {
   const byModelMap = new Map<string, number>();
   const missingModels = new Set<string>();
+  const unpricedModels = new Set<string>();
+  const unpriced = new Set(unpricedModelNames);
   let total = 0;
 
   const fallbackRate = table[fallbackName];
 
   for (const ev of session.tokens_history) {
     if (!ev.model) continue;
+    if (unpriced.has(ev.model)) {
+      unpricedModels.add(ev.model);
+      byModelMap.set(ev.model, byModelMap.get(ev.model) ?? 0);
+      continue;
+    }
 
     const directRate = table[ev.model];
     const fallbackUsed = directRate === undefined;
@@ -224,9 +259,11 @@ function historyCost(
     byModel: Array.from(byModelMap, ([model, cost]) => ({
       model,
       cost,
-      fallbackUsed: table[model] === undefined,
+      fallbackUsed: table[model] === undefined && !unpriced.has(model),
+      unpriced: unpriced.has(model),
     })),
     missingModels: Array.from(missingModels),
+    unpricedModels: Array.from(unpricedModels),
   };
 }
 

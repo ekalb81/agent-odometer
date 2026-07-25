@@ -269,6 +269,8 @@ export interface RateCard {
   fallback_models: Record<string, string>;
   /** OpenAI API USD rates for Codex models — powers the est.-cost column. */
   api_models: Record<string, ModelRate>;
+  /** Known models without a published price; excluded rather than fallback-priced. */
+  unpriced_models: string[];
 }
 
 export interface ExternalEvent {

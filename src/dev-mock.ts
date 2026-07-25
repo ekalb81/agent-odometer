@@ -228,7 +228,7 @@ function details(f: Fixture): Session {
 }
 
 const RATES: RateCard = {
-  version: 5,
+  version: 6,
   currency: 'credits',
   unit: 'per_1m_tokens',
   source_url: 'https://example.invalid/rates',
@@ -252,6 +252,7 @@ const RATES: RateCard = {
     'gpt-5.6-luna': { input: 0.18, cached_input: 0.018, output: 1.44, reasoning: 1.44 },
     'gpt-5.5': { input: 1, cached_input: 0.1, output: 8, reasoning: 8 },
   },
+  unpriced_models: ['gpt-5.3-codex-spark'],
 };
 
 function rangeTotals(from: string | null, to: string | null): Record<string, RangeTotals> {

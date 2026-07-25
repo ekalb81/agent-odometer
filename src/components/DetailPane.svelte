@@ -139,7 +139,7 @@
   // api_models when the pane is in API-USD mode, plan credits otherwise —
   // so per-turn amounts reconcile with the displayed total.
   const turnCostById = $derived((() => {
-    const m = new Map<string, { cost: number; fallbackUsed: boolean }>();
+    const m = new Map<string, { cost: number; fallbackUsed: boolean; unpriced: boolean }>();
     if (!session || !$rates) return m;
     const table =
       session.harness === 'codex' && sessionApiCost
@@ -157,7 +157,7 @@
   );
   const maxTurnCost = $derived(turnCosts.reduce((m, t) => Math.max(m, t.cost), 0));
 
-  function turnCost(turnId: string): { cost: number; fallbackUsed: boolean } | null {
+  function turnCost(turnId: string): { cost: number; fallbackUsed: boolean; unpriced: boolean } | null {
     return turnCostById.get(turnId) ?? null;
   }
 
@@ -355,7 +355,9 @@
                     <span class="flex items-center gap-1.5 flex-shrink-0">
                       {#if credit}
                         <span class="font-mono text-pos">{fmtMoney(credit.cost)}</span>
-                        {#if credit.fallbackUsed && turn.tokens.total_tokens > 0}
+                        {#if credit.unpriced && turn.tokens.total_tokens > 0}
+                          <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
+                        {:else if credit.fallbackUsed && turn.tokens.total_tokens > 0}
                           <span class="text-amber-500" title="Fallback rate used (model not in rate card)">⚠</span>
                         {/if}
                       {:else}
@@ -453,7 +455,9 @@
                   <tr class="border-b border-edgerow">
                     <td class="py-1 pr-2 font-mono text-ink-2 max-w-[110px] truncate" title={modelName}>
                       {modelName}
-                      {#if modelCredit?.fallbackUsed}
+                      {#if modelCredit?.unpriced}
+                        <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
+                      {:else if modelCredit?.fallbackUsed}
                         <span class="text-amber-500" title="Fallback rate used ({$rates ? fallbackModelName($rates, session.harness) : '—'})">⚠</span>
                       {/if}
                     </td>
@@ -476,6 +480,11 @@
                 Est. API cost: <span class="text-accent-cost">{formatCredits(sessionApiCost.total, 'USD')}</span>
                 at OpenAI API rates{#if session.plan_type}&nbsp;— informational on the {session.plan_type} plan{/if}
               </p>
+              {#if sessionApiCost.unpricedModels.length > 0}
+                <p class="mt-1 text-[11px] text-amber-500">
+                  Excludes models without a published rate: {sessionApiCost.unpricedModels.join(', ')}
+                </p>
+              {/if}
             {/if}
           </div>
 

@@ -34,6 +34,7 @@ export interface SessionProjection<T extends SessionSummary = SessionSummary> {
   displayCost: number;
   currency: string;
   missingModels: string[];
+  unpricedModels: string[];
 }
 
 const projectionCache = new WeakMap<SessionSummary, {
@@ -50,6 +51,7 @@ export interface ModelMetric {
   cost: number;
   currency: string;
   fallbackUsed: boolean;
+  unpriced: boolean;
   tools: ToolMetrics;
 }
 
@@ -186,6 +188,7 @@ export function projectSession<T extends SessionSummary>(
       displayCost: 0,
       currency: session.harness === 'claude_code' ? 'USD' : 'credits',
       missingModels: [],
+      unpricedModels: [],
     };
     projectionCache.set(session, { rates, range, dateScoped, value });
     return value;
@@ -197,7 +200,9 @@ export function projectSession<T extends SessionSummary>(
     : computeSummaryCredits(session, rates);
   const api = apiCostFromBuckets(buckets, rates, session.harness);
   const useApi = usesApiPricing(session, rates);
-  const directApiCost = api && api.missingModels.length === 0 ? api.total : null;
+  const directApiCost = api && api.missingModels.length === 0 && api.unpricedModels.length === 0
+    ? api.total
+    : null;
 
   const value: SessionProjection<T> = {
     session,
@@ -209,6 +214,7 @@ export function projectSession<T extends SessionSummary>(
     displayCost: useApi ? (api?.total ?? 0) : plan.total,
     currency: useApi ? 'USD' : harnessCurrency(rates, session.harness),
     missingModels: useApi ? (api?.missingModels ?? []) : plan.missingModels,
+    unpricedModels: useApi ? (api?.unpricedModels ?? []) : plan.unpricedModels,
   };
   projectionCache.set(session, { rates, range, dateScoped, value });
   return value;
@@ -231,6 +237,7 @@ function priceBucket(bucket: TierBucket, harness: Harness, rates: RateCard): {
   cost: number;
   currency: string;
   fallbackUsed: boolean;
+  unpriced: boolean;
 } {
   const useApi = harness === 'codex' && Object.keys(rates.api_models ?? {}).length > 0;
   const priced = useApi
@@ -240,6 +247,7 @@ function priceBucket(bucket: TierBucket, harness: Harness, rates: RateCard): {
     cost: priced?.total ?? 0,
     currency: useApi ? 'USD' : harnessCurrency(rates, harness),
     fallbackUsed: (priced?.missingModels.length ?? 0) > 0,
+    unpriced: (priced?.unpricedModels.length ?? 0) > 0,
   };
 }
 
@@ -266,6 +274,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
           cost: 0,
           currency: priced.currency,
           fallbackUsed: false,
+          unpriced: false,
           tools: zeroToolMetrics(),
         };
         grouped.set(key, metric);
@@ -273,13 +282,15 @@ export function aggregateModelMetrics<T extends SessionSummary>(
       addTotals(metric.tokens, bucket.tokens);
       metric.cost += priced.cost;
       metric.fallbackUsed ||= priced.fallbackUsed;
+      metric.unpriced ||= priced.unpriced;
     }
     for (const [model, tools] of Object.entries(range.tool_metrics_by_model ?? {})) {
       const key = `${session.harness}\0${model}`;
       let metric = grouped.get(key);
       if (!metric) {
         metric = { harness: session.harness, model, tokens: zeroTotals(), cost: 0,
-          currency: displayCurrency(session, rates), fallbackUsed: false, tools: zeroToolMetrics() };
+          currency: displayCurrency(session, rates), fallbackUsed: false, unpriced: false,
+          tools: zeroToolMetrics() };
         grouped.set(key, metric);
       }
       addToolMetrics(metric.tools, tools);
@@ -298,7 +309,15 @@ export function exportRows<T extends SessionSummary>(
   projections: Iterable<SessionProjection<T>>,
   includeWorkingDirectory = false,
 ): Record<string, string | number | boolean | null>[] {
-  return [...projections].map(({ session, tokens, planCost, apiCost, currency, missingModels }) => {
+  return [...projections].map(({
+    session,
+    tokens,
+    planCost,
+    apiCost,
+    currency,
+    missingModels,
+    unpricedModels,
+  }) => {
     const row: Record<string, string | number | boolean | null> = {
       id: session.id,
       harness: session.harness,
@@ -319,6 +338,7 @@ export function exportRows<T extends SessionSummary>(
       claude_estimated_usd: session.harness === 'claude_code' ? planCost : null,
       display_currency: currency,
       fallback_models: missingModels.join(';'),
+      unpriced_models: unpricedModels.join(';'),
     };
     if (includeWorkingDirectory) row.working_directory = session.working_directory;
     return row;

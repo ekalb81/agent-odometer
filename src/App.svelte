@@ -68,6 +68,7 @@
         );
         let tokens = 0; let codexCredits = 0; let codexApi = 0; let claudeUsd = 0;
         let unlimited = 0; let missingCredits = false; let missingApi = false; let missingClaude = false;
+        let unpricedCredits = false; let unpricedApi = false; let unpricedClaude = false;
         for (const session of sessionsStore.map.values()) {
           const range = ranges[session.id]; if (!range) continue;
           tokens += range.tokens.total_tokens;
@@ -75,16 +76,19 @@
           if (session.harness === 'codex') {
             if (session.credits_unlimited) unlimited++; else codexCredits += plan.total;
             missingCredits ||= plan.missingModels.length > 0;
+            unpricedCredits ||= plan.unpricedModels.length > 0;
             const api = apiCostFromBuckets(range.buckets, rateCard, session.harness);
             codexApi += api?.total ?? 0; missingApi ||= !api || api.missingModels.length > 0;
+            unpricedApi ||= (api?.unpricedModels.length ?? 0) > 0;
           } else {
             claudeUsd += plan.total; missingClaude ||= plan.missingModels.length > 0;
+            unpricedClaude ||= plan.unpricedModels.length > 0;
           }
         }
-        const creditText = unlimited > 0 && codexCredits === 0 ? `unlimited (${unlimited})` : `${codexCredits.toFixed(2)}${unlimited ? ` + ${unlimited} unlimited` : ''}${missingCredits ? ' · fallback' : ''}`;
+        const creditText = unlimited > 0 && codexCredits === 0 ? `unlimited (${unlimited})` : `${codexCredits.toFixed(2)}${unlimited ? ` + ${unlimited} unlimited` : ''}${unpricedCredits ? ' · excludes unpriced' : missingCredits ? ' · fallback' : ''}`;
         await setTrayTotals({ tokens: tokens.toLocaleString(), codex_credits: creditText,
-          codex_api_usd: missingApi ? 'unavailable · missing direct rate' : formatCredits(codexApi, 'USD'),
-          claude_usd: `${formatCredits(claudeUsd, 'USD')}${missingClaude ? ' · fallback' : ''}` });
+          codex_api_usd: missingApi ? 'unavailable · missing direct rate' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
+          claude_usd: `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}` });
       } catch (error) { console.error('tray totals refresh failed:', error); }
     }, 250);
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);

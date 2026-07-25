@@ -648,16 +648,17 @@
     codexCredits: number;
     codexApiUsd: number;
     claudeUsd: number;
-    // False means at least one configured fallback rate was used; the estimate
-    // remains usable and should be labeled, not discarded as unavailable.
-    allRatesDirect: boolean;
+    fallbackModels: string[];
+    unpricedModels: string[];
   };
   type RangeSessionPrice = {
     tokens: number;
     planCost: number;
-    planComplete: boolean;
+    planFallbackModels: string[];
+    planUnpricedModels: string[];
     apiCost: number | null;
-    apiComplete: boolean;
+    apiFallbackModels: string[];
+    apiUnpricedModels: string[];
   };
   const rangePriceCache = new WeakMap<object, {
     rates: unknown;
@@ -685,9 +686,11 @@
     const value: RangeSessionPrice = {
       tokens: totals.tokens.total_tokens,
       planCost: plan.total,
-      planComplete: plan.missingModels.length === 0,
+      planFallbackModels: plan.missingModels,
+      planUnpricedModels: plan.unpricedModels,
       apiCost: api?.total ?? null,
-      apiComplete: Boolean(api && api.missingModels.length === 0),
+      apiFallbackModels: api?.missingModels ?? [],
+      apiUnpricedModels: api?.unpricedModels ?? [],
     };
     cached.perSession.set(session.id, value);
     return value;
@@ -701,7 +704,8 @@
       codexCredits: 0,
       codexApiUsd: 0,
       claudeUsd: 0,
-      allRatesDirect: allUsdAvailable,
+      fallbackModels: [],
+      unpricedModels: [],
     };
     if (!data || !r) return out;
     for (const s of filteredNoDate) {
@@ -711,10 +715,12 @@
       if (s.harness === 'codex') {
         out.codexCredits += priced.planCost;
         out.codexApiUsd += priced.apiCost ?? 0;
-        if (!priced.apiComplete) out.allRatesDirect = false;
+        out.fallbackModels.push(...priced.apiFallbackModels);
+        out.unpricedModels.push(...priced.apiUnpricedModels);
       } else {
         out.claudeUsd += priced.planCost;
-        if (!priced.planComplete || harnessCurrency(r, s.harness) !== 'USD') out.allRatesDirect = false;
+        out.fallbackModels.push(...priced.planFallbackModels);
+        out.unpricedModels.push(...priced.planUnpricedModels);
       }
     }
     out.cost = harness === 'codex'
@@ -724,6 +730,8 @@
         : allUsdAvailable
           ? out.codexApiUsd + out.claudeUsd
           : 0;
+    out.fallbackModels = [...new Set(out.fallbackModels)].sort();
+    out.unpricedModels = [...new Set(out.unpricedModels)].sort();
     return out;
   }
 
@@ -870,13 +878,31 @@
     harness === 'all'
       ? !allUsdAvailable
         ? 'unavailable · configure USD rates'
-        : windowTotals.allRatesDirect
-          ? 'Codex + Claude USD'
-          : 'estimate · fallback rates used'
+        : windowTotals.unpricedModels.length > 0
+          ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
+          : windowTotals.fallbackModels.length > 0
+            ? `estimate · ${windowTotals.fallbackModels.length} fallback rate${windowTotals.fallbackModels.length === 1 ? '' : 's'} used`
+            : 'Codex + Claude USD'
       : harness === 'codex'
-      ? (windowStats.allUnlimited ? 'à la carte · all sessions unlimited' : 'OpenAI API rates')
-      : 'Anthropic API rates',
+      ? (windowTotals.unpricedModels.length > 0
+          ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
+          : windowTotals.fallbackModels.length > 0
+            ? `estimate · ${windowTotals.fallbackModels.length} fallback rate${windowTotals.fallbackModels.length === 1 ? '' : 's'} used`
+            : windowStats.allUnlimited ? 'à la carte · all sessions unlimited' : 'OpenAI API rates')
+      : windowTotals.unpricedModels.length > 0
+        ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
+        : windowTotals.fallbackModels.length > 0
+          ? `estimate · ${windowTotals.fallbackModels.length} fallback rate${windowTotals.fallbackModels.length === 1 ? '' : 's'} used`
+          : 'Anthropic API rates',
   );
+  const spendCardNoteTitle = $derived([
+    windowTotals.fallbackModels.length > 0
+      ? `Fallback rate used for: ${windowTotals.fallbackModels.join(', ')}`
+      : '',
+    windowTotals.unpricedModels.length > 0
+      ? `Excluded because no published rate is available: ${windowTotals.unpricedModels.join(', ')}`
+      : '',
+  ].filter(Boolean).join('\n'));
 
   const modelComparison = $derived(windowStats.byModel);
   const modelComparisonCostTotal = $derived(
@@ -1062,7 +1088,7 @@
             {costDelta >= 0 ? '▲' : '▼'} {Math.abs(costDelta)}% vs previous {windowLabel === 'Last 7 days' ? 'week' : 'period'}
           </span>
         {/if}
-        <span class="ml-auto text-[11px] text-ink-faint whitespace-nowrap">{spendCardNote}</span>
+        <span class="ml-auto text-[11px] text-ink-faint whitespace-nowrap cursor-help" title={spendCardNoteTitle}>{spendCardNote}</span>
       </div>
       <svg width="100%" height="72" viewBox="0 0 700 72" preserveAspectRatio="none" class="mt-2 block" aria-hidden="true">
         {#if chart.line}
@@ -1193,7 +1219,7 @@
             <tbody>
               {#each modelComparison as metric (`${metric.harness}:${metric.model}`)}
                 <tr class="border-t border-edgerow">
-                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{metric.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {metric.model}{#if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
+                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{metric.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {metric.model}{#if metric.unpriced}<span class="text-amber-500" title="Excluded because no published rate is available"> ◇</span>{:else if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
                   <td class="text-right">{fmt.format(metric.tokens.input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.cached_input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.output_tokens)}</td>
@@ -1380,7 +1406,9 @@
                   {/if}
                 </span>
                 <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">
-                  {allUsdAvailable ? fmtAmount(costOf(session.id)) : 'unavailable'}{#if allUsdAvailable && display && display.missingModels.length > 0}<span
+                  {allUsdAvailable ? fmtAmount(costOf(session.id)) : 'unavailable'}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span
+                      class="text-amber-500 cursor-help"
+                      title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span
                       class="text-amber-500 cursor-help"
                       title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}
                   {#if allUsdAvailable && combined !== undefined}

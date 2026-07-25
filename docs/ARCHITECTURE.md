@@ -81,7 +81,7 @@ Subagent transcripts (`.../<session>/subagents/agent-<id>.jsonl`) carry the pare
 
 Anthropic usage reports `input_tokens` excluding cache traffic, while the viewer's `TokenTotals` treats cached input as a subset of input. The mapping is `input = input + cache_read + cache_creation`, `cached = cache_read`, `reasoning = 0` (thinking is billed as ordinary output). Cache writes are priced at the plain input rate, a slight underestimate of the 1.25x write premium. There is no cumulative counter in the file; totals accumulate from per-message deltas, and sidechain usage counts toward the enclosing turn.
 
-The rate card prices Codex models in credits and Claude models in USD; `currencies` and `fallback_models` on the card map each harness to its display currency and fallback rate so the two never mix. A third table, `api_models`, holds the same Codex models at OpenAI API USD prices — it powers the Codex tab's informational "Est. $" column and the detail pane's est.-API-cost figures, priced from the same (model, tier) buckets as the credit math.
+The rate card prices Codex models in credits and Claude models in USD; `currencies` and `fallback_models` on the card map each harness to its display currency and fallback rate so the two never mix. A third table, `api_models`, holds the same Codex models at OpenAI API USD prices — it powers the Codex tab's informational "Est. $" column and the detail pane's est.-API-cost figures, priced from the same (model, tier) buckets as the credit math. `unpriced_models` identifies known models without a published rate; their usage is excluded and labeled rather than priced with the fallback. Other unknown model IDs still use the configured harness fallback and surface the exact IDs in the UI.
 
 ## IPC and frontend state
 

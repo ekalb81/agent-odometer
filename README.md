@@ -63,7 +63,7 @@ Costs are computed from token counts against a bundled, editable rate card (per 
 
 - **Codex** usage is priced in plan credits per the OpenAI Codex rate card, with documented Fast-mode multipliers applied per event. A second column estimates the same usage at OpenAI **API** USD rates — informational if you're on a subscription, but useful for comparison.
 - **Claude Code** usage is priced at Anthropic API USD rates. Cache reads are billed at the cached-input rate; cache *writes* (1.25×) aren't modeled, so estimates run slightly low. Thinking tokens are billed as ordinary output, matching Anthropic's billing.
-- Unknown models fall back to a configurable per-harness fallback rate and are flagged in the UI.
+- Unknown models fall back to a configurable per-harness fallback rate and are flagged in the UI. Models explicitly listed as unpriced are excluded and named instead of being assigned an unrelated fallback price.
 
 Edit any rate under **Settings → Rate card**; your overrides persist and automatically inherit newly bundled models on upgrades.
 

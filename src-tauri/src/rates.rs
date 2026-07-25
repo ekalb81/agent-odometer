@@ -38,6 +38,10 @@ pub struct RateCard {
     /// alongside the plan-credit rates in `models`.
     #[serde(default)]
     pub api_models: HashMap<String, ModelRate>,
+    /// Models known to have no published price. Their usage is excluded from
+    /// estimates instead of being priced with an unrelated fallback model.
+    #[serde(default)]
+    pub unpriced_models: Vec<String>,
 }
 
 fn rates_path() -> Option<PathBuf> {
@@ -122,6 +126,13 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     for (model, rate) in bundled.api_models {
         disk.api_models.entry(model).or_insert(rate);
     }
+    for model in bundled.unpriced_models {
+        let user_supplied_rate =
+            disk.models.contains_key(&model) || disk.api_models.contains_key(&model);
+        if !user_supplied_rate && !disk.unpriced_models.contains(&model) {
+            disk.unpriced_models.push(model);
+        }
+    }
     disk.version = bundled.version;
     disk.source_url = bundled.source_url;
     disk.fetched_at = bundled.fetched_at;
@@ -153,7 +164,8 @@ mod tests {
             fallback_model: "gpt-old".into(),
             currencies: HashMap::new(),
             fallback_models: HashMap::new(),
-            api_models: HashMap::new(),
+            api_models: HashMap::from([("preview-covered".into(), rate(7.0))]),
+            unpriced_models: vec!["preview-old".into()],
         };
         let bundled = RateCard {
             version: 3,
@@ -166,6 +178,7 @@ mod tests {
             currencies: HashMap::from([("claude_code".into(), "USD".into())]),
             fallback_models: HashMap::from([("claude_code".into(), "claude-new".into())]),
             api_models: HashMap::from([("gpt-old".into(), rate(0.04))]),
+            unpriced_models: vec!["preview-new".into(), "preview-covered".into()],
         };
 
         let merged = merge_older_override(disk, bundled);
@@ -179,5 +192,33 @@ mod tests {
         assert_eq!(merged.currencies["claude_code"], "USD");
         assert_eq!(merged.fallback_models["claude_code"], "claude-new");
         assert_eq!(merged.api_models["gpt-old"].input, 0.04);
+        assert_eq!(merged.unpriced_models, ["preview-old", "preview-new"]);
+        assert_eq!(merged.api_models["preview-covered"].input, 7.0);
+    }
+
+    #[test]
+    fn bundled_card_prices_current_claude_ids_and_excludes_unpriced_preview() {
+        let card = RateCard::load_bundled().expect("bundled rate card should parse");
+
+        let opus = &card.models["claude-opus-5"];
+        assert_eq!(opus.input, 5.0);
+        assert_eq!(opus.cached_input, 0.5);
+        assert_eq!(opus.output, 25.0);
+        assert_eq!(opus.reasoning, 25.0);
+
+        let dated_haiku = &card.models["claude-haiku-4-5-20251001"];
+        assert_eq!(dated_haiku.input, 1.0);
+        assert_eq!(dated_haiku.cached_input, 0.1);
+        assert_eq!(dated_haiku.output, 5.0);
+        assert_eq!(dated_haiku.reasoning, 5.0);
+
+        assert!(card
+            .models
+            .contains_key(&card.fallback_models["claude_code"]));
+        assert!(card
+            .unpriced_models
+            .contains(&"gpt-5.3-codex-spark".to_string()));
+        assert!(!card.models.contains_key("gpt-5.3-codex-spark"));
+        assert!(!card.api_models.contains_key("gpt-5.3-codex-spark"));
     }
 }

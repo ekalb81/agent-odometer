@@ -757,6 +757,7 @@ pub fn get_rates() -> RateCard {
         currencies: std::collections::HashMap::new(),
         fallback_models: std::collections::HashMap::new(),
         api_models: std::collections::HashMap::new(),
+        unpriced_models: Vec::new(),
     })
 }
 
@@ -775,6 +776,7 @@ pub fn get_bundled_rates() -> RateCard {
         currencies: std::collections::HashMap::new(),
         fallback_models: std::collections::HashMap::new(),
         api_models: std::collections::HashMap::new(),
+        unpriced_models: Vec::new(),
     })
 }
 
