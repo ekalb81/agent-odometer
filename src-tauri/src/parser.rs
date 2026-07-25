@@ -1,4 +1,6 @@
-use crate::model::{Session, TokenHistoryPoint, TokenTotals, TurnStatus};
+use crate::model::{
+    RateLimitSnapshotPoint, RateLimitWindow, Session, TokenHistoryPoint, TokenTotals, TurnStatus,
+};
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -367,6 +369,7 @@ impl SessionParser {
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
             tokens_history: Vec::new(),
+            rate_limits_history: Vec::new(),
             turns: Vec::new(),
             tool_observations: Vec::new(),
             tool_metrics: Default::default(),
@@ -677,16 +680,18 @@ impl SessionParser {
         payload: Value,
         event_ts: DateTime<Utc>,
     ) -> anyhow::Result<()> {
-        let info = match payload.get("info") {
-            Some(v) if !v.is_null() => v,
-            // The first token_count event in a session commonly has info: null.
-            _ => return Ok(()),
-        };
-
-        let total_usage = info.get("total_token_usage").map(parse_token_totals);
-        let last_usage = info.get("last_token_usage").map(parse_token_totals);
+        // The first token_count event commonly has info:null while still
+        // carrying an account rate-limit snapshot. Keep quota parsing live in
+        // that case instead of returning early.
+        let info = payload.get("info").filter(|value| !value.is_null());
+        let total_usage = info
+            .and_then(|value| value.get("total_token_usage"))
+            .map(parse_token_totals);
+        let last_usage = info
+            .and_then(|value| value.get("last_token_usage"))
+            .map(parse_token_totals);
         let context_window = info
-            .get("model_context_window")
+            .and_then(|value| value.get("model_context_window"))
             .and_then(Value::as_u64)
             .map(|v| v as u32);
         let model = self.current_model.clone();
@@ -767,6 +772,22 @@ impl SessionParser {
                             }
                         }
                     }
+                }
+                let primary = rate_limits.get("primary").and_then(parse_rate_limit_window);
+                let secondary = rate_limits
+                    .get("secondary")
+                    .and_then(parse_rate_limit_window);
+                if primary.is_some() || secondary.is_some() {
+                    s.rate_limits_history.push(RateLimitSnapshotPoint {
+                        timestamp: event_ts,
+                        turn_id,
+                        limit_id: rate_limits
+                            .get("limit_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        primary,
+                        secondary,
+                    });
                 }
             }
         }
@@ -885,6 +906,38 @@ fn parse_token_totals(v: &Value) -> TokenTotals {
             .unwrap_or(0),
         total_tokens: v.get("total_tokens").and_then(Value::as_u64).unwrap_or(0),
     }
+}
+
+fn parse_rate_limit_window(value: &Value) -> Option<RateLimitWindow> {
+    let used_percent = value
+        .get("used_percent")
+        .or_else(|| value.get("used_percentage"))
+        .or_else(|| value.get("usedPercent"))
+        .and_then(Value::as_f64)?;
+    if !used_percent.is_finite() {
+        return None;
+    }
+    let window_minutes = value
+        .get("window_minutes")
+        .or_else(|| value.get("window_duration_mins"))
+        .or_else(|| value.get("windowDurationMins"))
+        .and_then(Value::as_u64);
+    let resets_at = value
+        .get("resets_at")
+        .or_else(|| value.get("resetsAt"))
+        .and_then(parse_rate_limit_reset);
+    Some(RateLimitWindow {
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
+}
+
+fn parse_rate_limit_reset(value: &Value) -> Option<DateTime<Utc>> {
+    if let Some(seconds) = value.as_i64() {
+        return DateTime::from_timestamp(seconds, 0);
+    }
+    value.as_str()?.parse().ok()
 }
 
 fn add_token_totals(dst: &mut TokenTotals, src: &TokenTotals) {

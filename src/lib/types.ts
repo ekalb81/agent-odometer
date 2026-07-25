@@ -104,6 +104,20 @@ export interface TurnInfo {
   classification: TurnClassification;
 }
 
+export interface RateLimitWindow {
+  used_percent: number;
+  window_minutes: number | null;
+  resets_at: string | null;
+}
+
+export interface RateLimitSnapshotPoint {
+  timestamp: string;
+  turn_id: string | null;
+  limit_id: string | null;
+  primary: RateLimitWindow | null;
+  secondary: RateLimitWindow | null;
+}
+
 export interface Session {
   id: string;
   harness: Harness;
@@ -142,6 +156,7 @@ export interface Session {
     total_tokens: number;
     delta: TokenTotals;
   }[];
+  rate_limits_history: RateLimitSnapshotPoint[];
   turns: TurnInfo[];
   tool_observations: ToolObservation[];
   tool_metrics: ToolMetrics;
@@ -254,6 +269,9 @@ export interface Config {
   instructions_enabled: boolean;
   instructions_tab_visible: boolean;
   instruction_roots: InstructionRoot[];
+  turn_receipts_enabled: boolean;
+  turn_receipts_codex: boolean;
+  turn_receipts_claude: boolean;
 }
 
 export interface InstructionRoot {
@@ -308,6 +326,24 @@ export interface InstructionInventory {
 export interface InstructionContent {
   path: string;
   content: string;
+}
+
+export interface HarnessIntegrationStatus {
+  requested: boolean;
+  installed: boolean;
+  config_path: string;
+  detail: string;
+  last_run_at: string | null;
+  last_run_success: boolean | null;
+  last_receipt: string | null;
+  last_run_detail: string | null;
+}
+
+export interface TurnReceiptIntegrationStatus {
+  enabled: boolean;
+  executable_path: string;
+  codex: HarnessIntegrationStatus;
+  claude_code: HarnessIntegrationStatus;
 }
 
 export interface PerformanceStatus {

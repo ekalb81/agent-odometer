@@ -573,9 +573,33 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
     result
 }
 
-/// Persists a new configuration and emits "config-updated". Non-session
-/// changes apply live. Session-source changes also clear the session cache,
-/// restart watchers, and rescan in the background.
+/// Reports whether each requested harness hook is actually installed and the
+/// last bounded, local hook result. This makes setup observable without
+/// exposing transcript contents or arbitrary configuration data.
+#[tauri::command]
+pub fn get_turn_receipt_status(
+) -> Result<crate::harness_integration::TurnReceiptIntegrationStatus, String> {
+    let config = Config::load().map_err(|error| error.to_string())?;
+    Ok(crate::harness_integration::status(&config))
+}
+
+/// Reconciles the installed handlers with the already-saved opt-in settings.
+/// It is intentionally separate from startup so Odometer never repairs or
+/// writes harness configuration merely because the app was opened.
+#[tauri::command]
+pub fn repair_turn_receipt_integrations(
+) -> Result<crate::harness_integration::TurnReceiptIntegrationStatus, String> {
+    let config = Config::load().map_err(|error| error.to_string())?;
+    let transaction =
+        crate::harness_integration::sync(&config).map_err(|error| error.to_string())?;
+    transaction.commit();
+    Ok(crate::harness_integration::status(&config))
+}
+
+/// Persists a new configuration and emits "config-updated". Non-source
+/// changes apply live; receipt changes also transactionally reconcile their
+/// harness hooks. Session-source changes clear the session cache, restart
+/// watchers, and rescan in the background.
 #[tauri::command]
 pub fn set_config(
     app: AppHandle,
@@ -595,6 +619,8 @@ pub fn set_config(
         || previous.instruction_roots != config.instruction_roots;
     let instruction_settings_changed = instruction_sources_changed
         || previous.instructions_tab_visible != config.instructions_tab_visible;
+    let receipt_settings_changed =
+        crate::harness_integration::receipt_settings_changed(&previous, &config);
     // Non-session changes take effect immediately and do not force a full
     // corpus rescan. Instruction-source changes replace only the safe config watcher.
     if !session_sources_changed {
@@ -604,6 +630,10 @@ pub fn set_config(
                     .map_err(|error| error.to_string())
             })
             .transpose()?;
+        let integration = receipt_settings_changed
+            .then(|| crate::harness_integration::sync(&config))
+            .transpose()
+            .map_err(|error| error.to_string())?;
         config.save().map_err(|e| e.to_string())?;
         if instruction_sources_changed {
             state.clear_instruction_paths();
@@ -614,6 +644,9 @@ pub fn set_config(
                 .replace(config_watcher_replacement.expect("replacement was staged"));
             drop(previous_watcher);
         }
+        if let Some(transaction) = integration {
+            transaction.commit();
+        }
         state.performance.configure(
             config.performance_tracking_enabled,
             config.performance_log_max_mb,
@@ -623,6 +656,8 @@ pub fn set_config(
         state.performance.record_backend(
             if instruction_settings_changed {
                 "settings.save_instructions"
+            } else if receipt_settings_changed {
+                "settings.save_turn_receipts"
             } else {
                 "settings.save_performance"
             },
@@ -644,8 +679,15 @@ pub fn set_config(
         config.session_index_path.clone(),
     )
     .map_err(|e| e.to_string())?;
+    let integration = receipt_settings_changed
+        .then(|| crate::harness_integration::sync(&config))
+        .transpose()
+        .map_err(|error| error.to_string())?;
     config.save().map_err(|e| e.to_string())?;
     state.clear_instruction_paths();
+    if let Some(transaction) = integration {
+        transaction.commit();
+    }
     state.performance.configure(
         config.performance_tracking_enabled,
         config.performance_log_max_mb,

@@ -3,12 +3,12 @@
   import { rates } from '../lib/stores/rates';
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
-  import { setConfig, setRates, getBundledRates, addDefenderExclusions, exportPerformanceData, getPerformanceStatus } from '../lib/ipc';
+  import { setConfig, setRates, getBundledRates, addDefenderExclusions, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations } from '../lib/ipc';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
-  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot } from '../lib/types';
+  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, TurnReceiptIntegrationStatus } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
 
   const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
@@ -21,6 +21,7 @@
   onMount(() => {
     void getVersion().then((v) => (appVersion = v)).catch(() => {});
     void refreshPerformanceStatus();
+    void refreshTurnReceiptStatus();
   });
 
   async function handleReleaseNotes() {
@@ -251,6 +252,86 @@
     } finally {
       instructionsSaving = false;
     }
+  }
+
+  // Opt-in harness turn receipts.
+  // ---------------------------------------------------------------------------
+  let turnReceiptsEnabled = $state(false);
+  let turnReceiptsCodex = $state(true);
+  let turnReceiptsClaude = $state(true);
+  let turnReceiptsDirty = $state(false);
+  let turnReceiptsSaving = $state(false);
+  let turnReceiptsSavedAt = $state<string | null>(null);
+  let turnReceiptsError = $state<string | null>(null);
+  let turnReceiptStatus = $state<TurnReceiptIntegrationStatus | null>(null);
+
+  $effect(() => {
+    const current = $config;
+    if (!turnReceiptsDirty) {
+      turnReceiptsEnabled = current.turn_receipts_enabled ?? false;
+      turnReceiptsCodex = current.turn_receipts_codex ?? true;
+      turnReceiptsClaude = current.turn_receipts_claude ?? true;
+    }
+  });
+
+  function markTurnReceiptsDirty() {
+    turnReceiptsDirty = true;
+    turnReceiptsSavedAt = null;
+    turnReceiptsError = null;
+  }
+
+  async function refreshTurnReceiptStatus() {
+    try {
+      turnReceiptStatus = await getTurnReceiptStatus();
+    } catch {
+      turnReceiptStatus = null;
+    }
+  }
+
+  async function saveTurnReceipts() {
+    if (turnReceiptsEnabled && !turnReceiptsCodex && !turnReceiptsClaude) {
+      turnReceiptsError = 'Select at least one harness, or turn the feature off.';
+      return;
+    }
+    turnReceiptsSaving = true;
+    turnReceiptsError = null;
+    try {
+      const updatedConfig = {
+        ...$config,
+        turn_receipts_enabled: turnReceiptsEnabled,
+        turn_receipts_codex: turnReceiptsCodex,
+        turn_receipts_claude: turnReceiptsClaude,
+      };
+      await setConfig(updatedConfig);
+      config.set(updatedConfig);
+      turnReceiptsDirty = false;
+      turnReceiptsSavedAt = new Date().toLocaleTimeString();
+      await refreshTurnReceiptStatus();
+    } catch (error) {
+      turnReceiptsError = String(error);
+      await refreshTurnReceiptStatus();
+    } finally {
+      turnReceiptsSaving = false;
+    }
+  }
+
+  async function repairTurnReceipts() {
+    turnReceiptsSaving = true;
+    turnReceiptsError = null;
+    try {
+      turnReceiptStatus = await repairTurnReceiptIntegrations();
+    } catch (error) {
+      turnReceiptsError = String(error);
+      await refreshTurnReceiptStatus();
+    } finally {
+      turnReceiptsSaving = false;
+    }
+  }
+
+  function formatHookRun(value: string | null): string {
+    if (!value) return 'No receipt observed yet';
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? value : `Last observed ${date.toLocaleString()}`;
   }
 
   // ---------------------------------------------------------------------------
@@ -854,6 +935,122 @@
           <p class="text-xs text-red-500 mt-2" role="alert">{instructionsError}</p>
         {/if}
       </div>
+    </div>
+  </section>
+
+  <!-- Opt-in harness turn receipts -->
+  <section>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Turn receipts</h2>
+    <p class="text-xs text-ink-faint mb-3 max-w-3xl">
+      Show a compact token, estimated cost, and available subscription-usage receipt after each
+      completed agent turn. Odometer adds an identifiable <span class="font-mono">Stop</span> hook
+      only for the harnesses you select. This is off by default; while off, Odometer does not run a
+      receipt helper, read extra transcript data, poll accounts, or change harness behavior.
+    </p>
+    <div class="bg-card border border-edge rounded-lg px-4 py-3 max-w-3xl space-y-3">
+      <label class="flex items-start gap-2 text-xs text-ink-2">
+        <input
+          type="checkbox"
+          bind:checked={turnReceiptsEnabled}
+          onchange={markTurnReceiptsDirty}
+          class="mt-0.5"
+        />
+        <span>
+          <span class="font-medium text-ink">Enable turn receipts</span>
+          <span class="block text-[11px] text-ink-faint mt-0.5">
+            Hook failures are fail-open: they never keep an agent turn running or block completion.
+          </span>
+        </span>
+      </label>
+
+      <div class="flex items-center gap-5 pl-5 flex-wrap">
+        <label class="flex items-center gap-2 text-xs text-ink-2">
+          <input
+            type="checkbox"
+            bind:checked={turnReceiptsCodex}
+            onchange={markTurnReceiptsDirty}
+            disabled={!turnReceiptsEnabled}
+          />
+          Codex
+        </label>
+        <label class="flex items-center gap-2 text-xs text-ink-2">
+          <input
+            type="checkbox"
+            bind:checked={turnReceiptsClaude}
+            onchange={markTurnReceiptsDirty}
+            disabled={!turnReceiptsEnabled}
+          />
+          Claude Code
+        </label>
+      </div>
+
+      <div class="flex items-center gap-3 flex-wrap">
+        <button
+          onclick={saveTurnReceipts}
+          disabled={!turnReceiptsDirty || turnReceiptsSaving}
+          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
+        >{turnReceiptsSaving ? 'Saving…' : 'Save setup'}</button>
+        <button
+          onclick={repairTurnReceipts}
+          disabled={turnReceiptsSaving || turnReceiptsDirty}
+          class="px-3 py-1.5 text-xs rounded bg-app border border-edge hover:bg-[var(--row-hover)] disabled:opacity-40"
+        >Repair setup</button>
+        <button
+          onclick={refreshTurnReceiptStatus}
+          disabled={turnReceiptsSaving}
+          class="px-2 py-1 text-xs text-accent-chipfg hover:underline disabled:opacity-40"
+        >Refresh status</button>
+        {#if turnReceiptsSavedAt && !turnReceiptsDirty}
+          <span class="text-xs text-pos">Saved at {turnReceiptsSavedAt}</span>
+        {/if}
+      </div>
+
+      {#if turnReceiptsError}
+        <p class="text-xs text-red-500">{turnReceiptsError}</p>
+      {/if}
+
+      {#if turnReceiptStatus}
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1">
+          {#each [
+            { label: 'Codex', value: turnReceiptStatus.codex },
+            { label: 'Claude Code', value: turnReceiptStatus.claude_code },
+          ] as item}
+            <div class="bg-app border border-edgerow rounded-md px-3 py-2 min-w-0">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-xs font-medium text-ink">{item.label}</span>
+                <span class:text-pos={item.value.installed && item.value.requested}
+                  class:text-ink-faint={!item.value.installed || !item.value.requested}
+                  class="text-[11px]">
+                  {item.value.installed ? 'Hook installed' : 'No hook installed'}
+                </span>
+              </div>
+              <p class="text-[11px] text-ink-faint mt-1">{item.value.detail}</p>
+              <p class="text-[11px] text-ink-faint mt-1 font-mono break-all">{item.value.config_path}</p>
+              <p class="text-[11px] mt-2"
+                class:text-pos={item.value.last_run_success === true}
+                class:text-red-500={item.value.last_run_success === false}
+                class:text-ink-faint={item.value.last_run_success === null}>
+                {formatHookRun(item.value.last_run_at)}
+              </p>
+              {#if item.value.last_run_detail}
+                <p class="text-[11px] text-red-500 mt-1">{item.value.last_run_detail}</p>
+              {/if}
+              {#if item.value.last_receipt}
+                <pre class="text-[11px] text-ink-2 whitespace-pre-wrap mt-1 font-mono">{item.value.last_receipt}</pre>
+              {/if}
+            </div>
+          {/each}
+        </div>
+        {#if turnReceiptStatus.enabled && turnReceiptStatus.codex.requested}
+          <p class="text-[11px] text-ink-faint">
+            Codex requires explicit trust for new or changed command hooks. Open
+            <span class="font-mono">/hooks</span> in Codex after setup. Start a new task if the
+            current harness session does not reload configuration automatically.
+          </p>
+        {/if}
+      {:else}
+         <p class="text-[11px] text-ink-faint">Status is available in the installed desktop app.</p>
+       {/if}
     </div>
   </section>
 

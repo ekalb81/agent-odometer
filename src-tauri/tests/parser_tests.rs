@@ -88,6 +88,35 @@ fn first_token_count_event_with_null_info_does_not_crash() {
 }
 
 #[test]
+fn captures_granular_rate_limit_snapshot_even_when_usage_info_is_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rate-limits.jsonl");
+    let contents = concat!(
+        r#"{"timestamp":"2026-07-25T12:00:00Z","type":"session_meta","payload":{"id":"rate-session","timestamp":"2026-07-25T12:00:00Z"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-25T12:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-25T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":38.17,"window_minutes":300,"resets_at":1784998800},"secondary":{"usedPercent":12.08,"windowDurationMins":10080,"resetsAt":1785603600},"plan_type":"plus","credits":{"unlimited":false,"balance":25.0}}}}"#,
+        "\n",
+    );
+    std::fs::write(&path, contents).unwrap();
+
+    let session = parser::parse_file(&path, false).unwrap().unwrap();
+    assert_eq!(session.plan_type.as_deref(), Some("plus"));
+    assert_eq!(session.rate_limits_history.len(), 1);
+    let point = &session.rate_limits_history[0];
+    assert_eq!(point.turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(point.limit_id.as_deref(), Some("codex"));
+    assert_eq!(point.primary.as_ref().unwrap().used_percent, 38.17);
+    assert_eq!(point.primary.as_ref().unwrap().window_minutes, Some(300));
+    assert_eq!(point.secondary.as_ref().unwrap().used_percent, 12.08);
+    assert_eq!(
+        point.secondary.as_ref().unwrap().window_minutes,
+        Some(10_080)
+    );
+}
+
+#[test]
 fn archived_flag_is_propagated() {
     let s = parser::parse_file(&fixture(), true).unwrap().unwrap();
     assert!(s.archived);

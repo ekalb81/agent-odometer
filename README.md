@@ -26,6 +26,7 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Tool impact comparison** — choose any observed tool provider or individual tool and compare turns where it was used with turns where it was not observed; when enough data exists, Odometer matches the baseline by harness, model, task category, and nearby time before comparing tokens and elapsed time.
 - **Optional instruction inventory** — enable a hideable Instructions tab to find `AGENTS.md` and `CLAUDE.md` files across global, observed-project, and explicitly configured roots; review nested effective chains, deterministic warning signals, sanitized Markdown previews, and linked before/after usage evidence. Discovery is read-only and off by default.
 - **Opt-in performance evidence** — default-off local timings cover startup, scans/cache/parsers, analytics, exports, and UI work; logs are size-bounded and exportable as JSONL or CSV.
+- **Opt-in turn receipts** — add a reversible Codex or Claude Code `Stop` hook that shows the completed turn's tokens and estimated cost inside the harness. Codex receipts also preserve provider-reported quota precision and label per-turn changes as account-wide observations.
 - **Quick glance** — the tray menu mirrors today's tokens, Codex credits/API estimate, and Claude USD with native show, hide, settings, and quit controls.
 - **Light and dark** — follows your OS theme by default; switchable in Settings.
 
@@ -55,9 +56,31 @@ Custom locations can be added under **Settings → Watched roots**.
 
 The separate **Settings → Instruction inventory** section accepts project or project-container roots and lets each root scan only that folder or include subfolders. Recursive discovery skips common dependency, generated-output, and VCS directories instead of crawling every file on the machine.
 
+### Turn receipts
+
+Turn receipts are disabled by default. To enable them, open **Settings → Turn receipts**, select
+Codex and/or Claude Code, and choose **Save setup**. Odometer adds one identifiable `Stop` hook to
+the selected user-level harness configuration while preserving unrelated settings and hooks.
+
+- In Codex, open `/hooks` once after setup to inspect and trust the command. New or changed
+  non-managed hooks do not run until Codex records that trust.
+- In Claude Code, use `/hooks` to inspect the installed command.
+- Start a new harness task if an existing session does not reload configuration automatically.
+- **Refresh status** shows the exact configuration file, whether the hook is present, its last run,
+  and the last receipt. **Repair setup** reconciles missing or stale Odometer-owned entries.
+
+The helper receives the harness-provided transcript path, verifies that it is a JSONL file inside
+Odometer's configured roots, and parses that exact file. It exits successfully on every error and
+never asks the agent to continue. Turning the feature off removes only Odometer-owned hook entries;
+when disabled, the ordinary watcher/UI path is unchanged and no receipt helper runs.
+
 ## Privacy
 
 Session files contain your prompts, the agents' replies, tool output, and local file paths. Odometer processes them entirely locally and stores nothing outside your machine: settings and rate overrides live under the OS config directory, while the scan cache and redacted configuration-event hashes live under the OS cache/data directories. Tool telemetry stores hashed target identities and byte counts, never raw arguments or output. Optional application performance tracking is off by default and stores only operation timings, success flags, and aggregate counts — never prompts, session IDs, paths, commands, tool arguments, or output. Its rotating local JSONL can be exported from Settings. Treat the session files themselves as sensitive — don't share or commit them.
+
+When turn receipts are enabled, Odometer stores one bounded local health record per harness: the
+last run time, success state, and rendered receipt or a sanitized error category. It does not store
+the hook's session ID, transcript path, prompt, or response.
 
 ## How costs are estimated
 

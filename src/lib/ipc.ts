@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionContent } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionContent, TurnReceiptIntegrationStatus } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -87,6 +87,14 @@ export function readInstructionFile(path: string): Promise<InstructionContent> {
 
 export function openInstructionFile(path: string): Promise<void> {
   return invoke<void>('open_instruction_file', { path });
+}
+
+export function getTurnReceiptStatus(): Promise<TurnReceiptIntegrationStatus> {
+  return invoke<TurnReceiptIntegrationStatus>('get_turn_receipt_status');
+}
+
+export function repairTurnReceiptIntegrations(): Promise<TurnReceiptIntegrationStatus> {
+  return invoke<TurnReceiptIntegrationStatus>('repair_turn_receipt_integrations');
 }
 
 export function getRates(): Promise<RateCard> {

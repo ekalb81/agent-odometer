@@ -32,6 +32,16 @@ pub struct Config {
     /// User-selected project or project-container roots for instruction discovery.
     #[serde(default)]
     pub instruction_roots: Vec<InstructionRoot>,
+    /// Show a compact cost/usage receipt after completed harness turns.
+    /// Default-off: when false the helper exits without reading transcripts.
+    #[serde(default)]
+    pub turn_receipts_enabled: bool,
+    /// Install the receipt hook for Codex when the feature is enabled.
+    #[serde(default = "default_true")]
+    pub turn_receipts_codex: bool,
+    /// Install the receipt hook for Claude Code when the feature is enabled.
+    #[serde(default = "default_true")]
+    pub turn_receipts_claude: bool,
 }
 
 fn default_true() -> bool {
@@ -50,7 +60,7 @@ fn default_claude_session_roots() -> Vec<PathBuf> {
     vec![claude_config_dir().join("projects")]
 }
 
-fn claude_config_dir() -> PathBuf {
+pub(crate) fn claude_config_dir() -> PathBuf {
     let configured = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
@@ -61,7 +71,7 @@ fn resolve_claude_config_dir(configured: Option<PathBuf>, home: Option<PathBuf>)
     configured.unwrap_or_else(|| home.unwrap_or_else(|| PathBuf::from(".")).join(".claude"))
 }
 
-fn codex_home_dir() -> PathBuf {
+pub(crate) fn codex_home_dir() -> PathBuf {
     let configured = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
@@ -85,6 +95,9 @@ impl Default for Config {
             instructions_enabled: false,
             instructions_tab_visible: true,
             instruction_roots: Vec::new(),
+            turn_receipts_enabled: false,
+            turn_receipts_codex: true,
+            turn_receipts_claude: true,
         }
     }
 }
@@ -175,6 +188,9 @@ mod tests {
                 path: dir.path().join("projects"),
                 recursive: true,
             }],
+            turn_receipts_enabled: true,
+            turn_receipts_codex: true,
+            turn_receipts_claude: false,
         };
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -191,6 +207,9 @@ mod tests {
         assert!(loaded.instructions_enabled);
         assert!(!loaded.instructions_tab_visible);
         assert_eq!(loaded.instruction_roots, cfg.instruction_roots);
+        assert!(loaded.turn_receipts_enabled);
+        assert!(loaded.turn_receipts_codex);
+        assert!(!loaded.turn_receipts_claude);
     }
 
     #[test]
@@ -210,6 +229,9 @@ mod tests {
         assert!(!cfg.instructions_enabled);
         assert!(cfg.instructions_tab_visible);
         assert!(cfg.instruction_roots.is_empty());
+        assert!(!cfg.turn_receipts_enabled);
+        assert!(cfg.turn_receipts_codex);
+        assert!(cfg.turn_receipts_claude);
     }
 
     #[test]
@@ -234,6 +256,15 @@ mod tests {
         let mut second = first.clone();
         second.performance_tracking_enabled = true;
         second.performance_log_max_mb = 16;
+        assert!(first.session_sources_equal(&second));
+    }
+
+    #[test]
+    fn receipt_changes_do_not_change_session_sources() {
+        let first = Config::default();
+        let mut second = first.clone();
+        second.turn_receipts_enabled = true;
+        second.turn_receipts_claude = false;
         assert!(first.session_sources_equal(&second));
     }
 
