@@ -43,6 +43,7 @@ export interface ToolObservation {
   providers: string[];
   effective_tools: string[];
   target: string | null;
+  resource_id?: string | null;
   outcome: ToolOutcome;
   duration_ms: number | null;
   output_bytes: number;
@@ -66,11 +67,21 @@ export interface OptimizationFinding {
   version: number;
   rule_id: string;
   severity: string;
+  confidence?: string;
   turn_id: string | null;
   model: string | null;
   timestamp: string | null;
   evidence: string;
   remediation: string;
+  occurrences?: number;
+  avoidable_calls?: number;
+}
+
+export interface OptimizationSummary {
+  findings: number;
+  warnings: number;
+  likely_avoidable_calls: number;
+  by_rule: Record<string, number>;
 }
 
 export interface TurnInfo {
@@ -153,6 +164,7 @@ export interface RangeTotals {
   tool_metrics: ToolMetrics;
   tool_metrics_by_model: Record<string, ToolMetrics>;
   optimization_findings_count: number;
+  optimization_summary?: OptimizationSummary;
 }
 
 export interface ToolImpactCohort {
@@ -220,6 +232,7 @@ export interface SessionSummary {
   tool_metrics_by_model: Record<string, ToolMetrics>;
   category_totals: Partial<Record<TaskCategory, CategoryMetric>>;
   optimization_findings_count: number;
+  optimization_summary?: OptimizationSummary;
 }
 
 /** Bulk-scan progress, from get_scan_status and "scan-progress" events. */

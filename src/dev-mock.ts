@@ -163,6 +163,7 @@ function summary(f: Fixture): SessionSummary {
     tool_metrics_by_model: { [f.model]: toolMetrics(f.turns * 3) },
     category_totals: { coding: { turns: f.turns, tokens: tok(f.total), tool_calls: f.turns * 3, buckets: buckets(f) } },
     optimization_findings_count: 0,
+    optimization_summary: { findings: 0, warnings: 0, likely_avoidable_calls: 0, by_rule: {} },
   };
 }
 
@@ -273,6 +274,7 @@ function rangeTotals(from: string | null, to: string | null): Record<string, Ran
       tool_metrics: toolMetrics(Math.round(f.turns * 3 * fraction)),
       tool_metrics_by_model: { [f.model]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
       optimization_findings_count: 0,
+      optimization_summary: { findings: 0, warnings: 0, likely_avoidable_calls: 0, by_rule: {} },
     };
   }
   return out;

@@ -1082,6 +1082,7 @@ mod tests {
             },
             tool_metrics_by_model: Default::default(),
             optimization_findings_count: 0,
+            optimization_summary: Default::default(),
         };
         assert!(range_has_data(&range));
     }

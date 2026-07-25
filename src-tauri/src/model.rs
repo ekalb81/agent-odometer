@@ -67,6 +67,11 @@ pub struct ToolObservation {
     pub effective_tools: Vec<String>,
     /// Stable hashed identity; raw arguments and paths are never retained.
     pub target: Option<String>,
+    /// Stable hashed identity for the underlying resource, excluding read
+    /// selectors such as line ranges. This lets a mutation invalidate prior
+    /// reads without retaining the resource name or path.
+    #[serde(default)]
+    pub resource_id: Option<String>,
     pub outcome: ToolOutcome,
     pub duration_ms: Option<u64>,
     pub output_bytes: u64,
@@ -157,12 +162,44 @@ pub struct OptimizationFinding {
     pub version: u32,
     pub rule_id: String,
     pub severity: String,
+    /// Analyzer confidence, not a quality score: high, medium, or low.
+    #[serde(default)]
+    pub confidence: String,
     pub turn_id: Option<String>,
     pub model: Option<String>,
     #[serde(default)]
     pub timestamp: Option<DateTime<Utc>>,
     pub evidence: String,
     pub remediation: String,
+    /// Number of observations represented by this finding.
+    #[serde(default)]
+    pub occurrences: u64,
+    /// Conservative estimate of calls that could likely have been avoided.
+    #[serde(default)]
+    pub avoidable_calls: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct OptimizationSummary {
+    pub findings: u64,
+    pub warnings: u64,
+    pub likely_avoidable_calls: u64,
+    pub by_rule: BTreeMap<String, u64>,
+}
+
+impl OptimizationSummary {
+    pub fn from_findings<'a>(findings: impl IntoIterator<Item = &'a OptimizationFinding>) -> Self {
+        let mut out = Self::default();
+        for finding in findings {
+            out.findings += 1;
+            if finding.severity == "warning" {
+                out.warnings += 1;
+            }
+            out.likely_avoidable_calls += finding.avoidable_calls;
+            *out.by_rule.entry(finding.rule_id.clone()).or_default() += 1;
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -309,6 +346,8 @@ pub struct RangeTotals {
     pub tool_metrics_by_model: BTreeMap<String, ToolMetrics>,
     #[serde(default)]
     pub optimization_findings_count: u64,
+    #[serde(default)]
+    pub optimization_summary: OptimizationSummary,
 }
 
 /// Lightweight wire form of a Session for the list view and live update
@@ -350,10 +389,13 @@ pub struct SessionSummary {
     pub category_totals: BTreeMap<TaskCategory, CategoryMetric>,
     #[serde(default)]
     pub optimization_findings_count: u64,
+    #[serde(default)]
+    pub optimization_summary: OptimizationSummary,
 }
 
 impl SessionSummary {
     pub fn of(s: &Session) -> Self {
+        let optimization_summary = OptimizationSummary::from_findings(&s.optimization_findings);
         Self {
             id: s.id.clone(),
             harness: s.harness,
@@ -384,6 +426,7 @@ impl SessionSummary {
             tool_metrics_by_model: s.tool_metrics_by_model.clone(),
             category_totals: s.category_totals.clone(),
             optimization_findings_count: s.optimization_findings.len() as u64,
+            optimization_summary,
         }
     }
 }
@@ -532,7 +575,7 @@ impl Session {
                     },
                 ))
             };
-            let optimization_findings_count = self
+            let selected_findings: Vec<_> = self
                 .optimization_findings
                 .iter()
                 .filter(|finding| match finding.timestamp {
@@ -542,7 +585,9 @@ impl Session {
                     }
                     None => from.is_none() && to.is_none(),
                 })
-                .count() as u64;
+                .collect();
+            let optimization_findings_count = selected_findings.len() as u64;
+            let optimization_summary = OptimizationSummary::from_findings(selected_findings);
 
             buckets.sort_by(|a, b| {
                 a.model
@@ -555,6 +600,7 @@ impl Session {
                 tool_metrics,
                 tool_metrics_by_model,
                 optimization_findings_count,
+                optimization_summary,
             });
         }
         results
@@ -748,6 +794,7 @@ mod tests {
                 providers: Vec::new(),
                 effective_tools: vec!["read".into()],
                 target: Some("read:synthetic".into()),
+                resource_id: Some("synthetic".into()),
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
                 output_bytes: 0,
@@ -761,6 +808,9 @@ mod tests {
         assert_eq!(partial.optimization_findings_count, 0);
         let all = s.range_totals(None, None);
         assert_eq!(all.optimization_findings_count, 1);
+        assert_eq!(all.optimization_summary.findings, 1);
+        assert_eq!(all.optimization_summary.likely_avoidable_calls, 2);
+        assert_eq!(all.optimization_summary.by_rule["repeated-read"], 1);
     }
 
     #[test]

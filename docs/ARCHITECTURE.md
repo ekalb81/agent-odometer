@@ -114,7 +114,7 @@ Inventory reads are fail-closed: the UI must refresh discovery first, only disco
 
 Warnings are deterministic review signals rather than semantic verdicts. Duplicates share an exact normalized-content hash; possible conflicts are opposite `always`/`must` versus `never`/`must not`/`do not` directives within one effective ancestor chain; oversized files exceed 64 KiB or 800 lines; possibly stale files are unchanged for 180 days while their project has agent activity in the last 30 days. Selecting a file filters redacted configuration events by its normalized path identity and reuses the existing seven-day before/after correlation view.
 
-Optimization findings are timestamped at the observation that triggered them. `RangeTotals.optimization_findings_count` therefore scopes precomputed findings by date without rerunning the analyzer for every analytics window.
+Optimization findings are timestamped at the observation that triggered them. `RangeTotals.optimization_findings_count` therefore scopes precomputed findings by date without rerunning the analyzer for every analytics window. The analyzer keeps exact read-request identity separate from the private resource identity: ranges/pages are distinct requests, while a mutation of the same resource resets prior-read streaks. Volatile polling reads and neutral tool ratios are not optimization findings. Findings carry confidence, occurrence count, and a conservative likely-avoidable-call estimate; compact summaries expose severity and rule breakdowns without shipping full observations to the list view.
 
 `src/lib/types.ts` manually mirrors Rust's serialized structs. Rust field or serialization changes therefore require an explicit TypeScript update.
 
