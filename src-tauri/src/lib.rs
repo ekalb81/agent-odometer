@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_events;
 pub mod correlation;
 pub mod git_outcomes;
+pub mod instructions;
 pub mod model;
 pub mod parser;
 pub mod performance;
@@ -20,9 +21,10 @@ pub mod watcher;
 use commands::{
     add_defender_exclusions, compare_tool_impact, correlate_events, export_performance_data,
     get_bundled_rates, get_config, get_performance_status, get_rates, get_scan_status,
-    get_session_details, list_external_events, list_sessions, list_tool_impact_targets,
-    open_task_in_chatgpt, record_frontend_performance, reveal_in_file_manager, scan_git_outcomes,
-    sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
+    get_session_details, list_external_events, list_instruction_files, list_sessions,
+    list_tool_impact_targets, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
+    record_frontend_performance, reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges,
+    set_config, set_rates, set_tray_totals, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -63,6 +65,9 @@ pub fn run() {
             add_defender_exclusions,
             write_export,
             list_external_events,
+            list_instruction_files,
+            read_instruction_file,
+            open_instruction_file,
             correlate_events,
             scan_git_outcomes,
             set_tray_totals,
@@ -111,7 +116,7 @@ pub fn run() {
             *state_for_setup.watcher.lock().unwrap() = Some(handle);
 
             let config_watcher_started = Instant::now();
-            match config_events::start(app.handle().clone(), state_for_setup.clone()) {
+            match config_events::start(app.handle().clone(), state_for_setup.clone(), &config) {
                 Ok(handle) => {
                     *state_for_setup.config_watcher.lock().unwrap() = Some(handle);
                     state_for_setup.performance.record_backend(

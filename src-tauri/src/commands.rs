@@ -18,6 +18,90 @@ pub fn list_external_events(
 }
 
 #[tauri::command]
+pub async fn list_instruction_files(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::instructions::InstructionInventory, String> {
+    let started = Instant::now();
+    let config = Config::load().map_err(|error| error.to_string())?;
+    let sessions = state
+        .sessions
+        .iter()
+        .map(|entry| entry.value().as_ref().clone())
+        .collect::<Vec<_>>();
+    let app_state = state.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::instructions::discover(&config, &sessions)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|error| error.to_string());
+    if let Ok(inventory) = &result {
+        app_state.replace_instruction_paths(inventory.files.iter().map(|file| {
+            crate::instructions::normalized_path_key(std::path::Path::new(&file.path))
+        }));
+    }
+    app_state.performance.record_backend(
+        "ipc.list_instruction_files",
+        started,
+        result.is_ok(),
+        BTreeMap::from([(
+            "files".into(),
+            result
+                .as_ref()
+                .map(|inventory| inventory.files.len())
+                .unwrap_or(0)
+                .to_string(),
+        )]),
+    );
+    result
+}
+
+fn validate_instruction_access(state: &AppState, path: &std::path::Path) -> Result<(), String> {
+    let config = Config::load().map_err(|error| error.to_string())?;
+    if !config.instructions_enabled {
+        return Err("instruction inventory is disabled".into());
+    }
+    if !state.instruction_path_allowed(path) {
+        return Err("refresh the instruction inventory before opening this file".into());
+    }
+    crate::instructions::validate_instruction_path(path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn read_instruction_file(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+) -> Result<crate::instructions::InstructionContent, String> {
+    let path = std::path::PathBuf::from(path);
+    validate_instruction_access(&state, &path)?;
+    crate::instructions::read_content(&path).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn open_instruction_file(state: State<'_, Arc<AppState>>, path: String) -> Result<(), String> {
+    let path = std::path::PathBuf::from(path);
+    validate_instruction_access(&state, &path)?;
+
+    #[cfg(target_os = "linux")]
+    let command = std::process::Command::new("xdg-open").arg(&path).spawn();
+
+    #[cfg(target_os = "macos")]
+    let command = std::process::Command::new("open").arg(&path).spawn();
+
+    #[cfg(target_os = "windows")]
+    let command = std::process::Command::new("explorer").arg(&path).spawn();
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let command: Result<(), std::io::Error> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ));
+
+    command.map(|_| ()).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub fn get_performance_status(
     state: State<'_, Arc<AppState>>,
 ) -> crate::performance::PerformanceStatus {
@@ -489,7 +573,7 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
     result
 }
 
-/// Persists a new configuration and emits "config-updated". Performance-only
+/// Persists a new configuration and emits "config-updated". Non-session
 /// changes apply live. Session-source changes also clear the session cache,
 /// restart watchers, and rescan in the background.
 #[tauri::command]
@@ -503,12 +587,33 @@ pub fn set_config(
     if !(1..=1_024).contains(&config.performance_log_max_mb) {
         return Err("performance log size must be between 1 and 1024 MiB".into());
     }
+    crate::instructions::validate_instruction_roots(&config.instruction_roots)
+        .map_err(|error| error.to_string())?;
     let previous = Config::load().map_err(|e| e.to_string())?;
     let session_sources_changed = !previous.session_sources_equal(&config);
-    // Performance-only changes take effect immediately and do not restart
-    // watchers or force a full corpus rescan.
+    let instruction_sources_changed = previous.instructions_enabled != config.instructions_enabled
+        || previous.instruction_roots != config.instruction_roots;
+    let instruction_settings_changed = instruction_sources_changed
+        || previous.instructions_tab_visible != config.instructions_tab_visible;
+    // Non-session changes take effect immediately and do not force a full
+    // corpus rescan. Instruction-source changes replace only the safe config watcher.
     if !session_sources_changed {
+        let config_watcher_replacement = instruction_sources_changed
+            .then(|| {
+                crate::config_events::start(app.clone(), state.inner().clone(), &config)
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
         config.save().map_err(|e| e.to_string())?;
+        if instruction_sources_changed {
+            state.clear_instruction_paths();
+            let previous_watcher = state
+                .config_watcher
+                .lock()
+                .unwrap()
+                .replace(config_watcher_replacement.expect("replacement was staged"));
+            drop(previous_watcher);
+        }
         state.performance.configure(
             config.performance_tracking_enabled,
             config.performance_log_max_mb,
@@ -516,7 +621,11 @@ pub fn set_config(
         app.emit("config-updated", &config)
             .map_err(|e| e.to_string())?;
         state.performance.record_backend(
-            "settings.save_performance",
+            if instruction_settings_changed {
+                "settings.save_instructions"
+            } else {
+                "settings.save_performance"
+            },
             started,
             true,
             BTreeMap::new(),
@@ -536,6 +645,7 @@ pub fn set_config(
     )
     .map_err(|e| e.to_string())?;
     config.save().map_err(|e| e.to_string())?;
+    state.clear_instruction_paths();
     state.performance.configure(
         config.performance_tracking_enabled,
         config.performance_log_max_mb,
@@ -650,7 +760,8 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
         // watcher with one that also covers project-scoped Codex/Claude
         // configuration surfaces. This same path runs after settings changes.
         let config_watcher_started = Instant::now();
-        let config_watcher_result = crate::config_events::start(app.clone(), state.clone());
+        let config_watcher_result =
+            crate::config_events::start(app.clone(), state.clone(), &config);
         let config_watcher_ok = config_watcher_result.is_ok();
         match config_watcher_result {
             Ok(replacement) => {

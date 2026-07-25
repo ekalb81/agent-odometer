@@ -4,8 +4,8 @@
   import { rates } from '../lib/stores/rates';
   import type { EventCorrelation, ExternalEvent } from '../lib/types';
 
-  interface Props { active?: boolean; events: ExternalEvent[]; }
-  let { active = true, events }: Props = $props();
+  interface Props { active?: boolean; events: ExternalEvent[]; title?: string; }
+  let { active = true, events, title = 'Configuration timeline' }: Props = $props();
   let correlations = $state<EventCorrelation[]>([]);
   let loading = $state(false);
   let requestGeneration = 0;
@@ -61,7 +61,7 @@
 
 {#if loading || events.length > 0 || error}
   <details class="bg-card border border-edge rounded-lg px-3 py-2">
-    <summary class="cursor-pointer text-xs font-semibold text-ink">Configuration timeline · {events.length} recent changes</summary>
+    <summary class="cursor-pointer text-xs font-semibold text-ink">{title} · {events.length} recent changes</summary>
     {#if loading}<p class="text-xs text-ink-faint py-2">Loading local change history…</p>{/if}
     {#if error}<p class="text-xs text-neg py-2">{error}</p>{/if}
     <div class="mt-2 max-h-56 overflow-y-auto space-y-1.5">

@@ -36,6 +36,8 @@ struct ConfigRoot {
     scope: Option<String>,
     direct_names: &'static [&'static str],
     nested: bool,
+    recursive_direct_names: bool,
+    dynamic_scope: bool,
 }
 
 fn data_dir() -> Option<PathBuf> {
@@ -86,6 +88,8 @@ fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<
             scope: scope.clone(),
             direct_names: &["AGENTS.md"],
             nested: false,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         });
         out.push(ConfigRoot {
             harness: "claude_code".into(),
@@ -93,6 +97,8 @@ fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<
             scope: scope.clone(),
             direct_names: &["CLAUDE.md"],
             nested: false,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         });
         out.push(ConfigRoot {
             harness: "codex".into(),
@@ -100,6 +106,8 @@ fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<
             scope: scope.clone(),
             direct_names: CODEX_CONFIG_NAMES,
             nested: true,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         });
         out.push(ConfigRoot {
             harness: "claude_code".into(),
@@ -107,6 +115,8 @@ fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<
             scope,
             direct_names: CLAUDE_CONFIG_NAMES,
             nested: true,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         });
     }
     out
@@ -132,10 +142,12 @@ fn deduplicate_roots(roots: Vec<ConfigRoot>) -> Vec<ConfigRoot> {
         // project root (for example, a session started from the user's home
         // directory). Track it once and prefer global attribution.
         let key = format!(
-            "{}\0{}\0{}\0{}",
+            "{}\0{}\0{}\0{}\0{}\0{}",
             root.harness,
             normalized_root_path(&root.path),
             root.nested,
+            root.recursive_direct_names,
+            root.dynamic_scope,
             root.direct_names.join("\0")
         );
         match unique.get_mut(&key) {
@@ -151,7 +163,7 @@ fn deduplicate_roots(roots: Vec<ConfigRoot>) -> Vec<ConfigRoot> {
     unique.into_values().collect()
 }
 
-fn roots(state: &AppState) -> Vec<ConfigRoot> {
+fn roots(state: &AppState, config: &crate::config::Config) -> Vec<ConfigRoot> {
     let home = dirs::home_dir();
     let codex = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
@@ -167,6 +179,8 @@ fn roots(state: &AppState) -> Vec<ConfigRoot> {
             scope: None,
             direct_names: CODEX_CONFIG_NAMES,
             nested: true,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         });
     }
     if let Some(path) = claude {
@@ -176,6 +190,8 @@ fn roots(state: &AppState) -> Vec<ConfigRoot> {
             scope: None,
             direct_names: CLAUDE_CONFIG_NAMES,
             nested: true,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         });
     }
     let working_directories: BTreeSet<PathBuf> = state
@@ -190,6 +206,28 @@ fn roots(state: &AppState) -> Vec<ConfigRoot> {
         })
         .collect();
     out.extend(project_roots(working_directories));
+    if config.instructions_enabled {
+        for configured in &config.instruction_roots {
+            out.push(ConfigRoot {
+                harness: "codex".into(),
+                path: configured.path.clone(),
+                scope: None,
+                direct_names: &["AGENTS.md"],
+                nested: false,
+                recursive_direct_names: configured.recursive,
+                dynamic_scope: true,
+            });
+            out.push(ConfigRoot {
+                harness: "claude_code".into(),
+                path: configured.path.clone(),
+                scope: None,
+                direct_names: &["CLAUDE.md"],
+                nested: false,
+                recursive_direct_names: configured.recursive,
+                dynamic_scope: true,
+            });
+        }
+    }
     deduplicate_roots(out)
 }
 
@@ -210,12 +248,35 @@ fn is_safe_config_path(root: &ConfigRoot, path: &Path) -> bool {
     }) {
         return false;
     }
+    if root.recursive_direct_names
+        && components.iter().any(|component| {
+            matches!(
+                component.as_str(),
+                ".git"
+                    | ".hg"
+                    | ".svn"
+                    | ".next"
+                    | ".svelte-kit"
+                    | "node_modules"
+                    | "target"
+                    | "dist"
+                    | "build"
+                    | "out"
+                    | "bin"
+                    | "obj"
+                    | "vendor"
+                    | "coverage"
+            )
+        })
+    {
+        return false;
+    }
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    (components.len() == 1
+    ((components.len() == 1 || root.recursive_direct_names)
         && root
             .direct_names
             .iter()
@@ -269,21 +330,42 @@ fn discover_snapshot(roots: &[ConfigRoot]) -> (Snapshot, HashMap<String, ConfigR
         if !root.path.exists() {
             continue;
         }
-        let direct = root.direct_names.iter().map(|name| root.path.join(name));
-        let nested = [root.path.join("hooks"), root.path.join("skills")]
-            .into_iter()
-            .filter(|_| root.nested)
-            .filter(|path| path.exists())
-            .flat_map(|path| {
-                WalkDir::new(path)
+        let mut candidates = root
+            .direct_names
+            .iter()
+            .map(|name| root.path.join(name))
+            .collect::<Vec<_>>();
+        if root.nested {
+            for path in [root.path.join("hooks"), root.path.join("skills")]
+                .into_iter()
+                .filter(|path| path.exists())
+            {
+                candidates.extend(
+                    WalkDir::new(path)
+                        .follow_links(false)
+                        .into_iter()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.file_type().is_file())
+                        .map(|entry| entry.into_path()),
+                );
+            }
+        }
+        if root.recursive_direct_names {
+            candidates.extend(
+                WalkDir::new(&root.path)
                     .follow_links(false)
+                    .max_depth(48)
                     .into_iter()
+                    .filter_entry(|entry| {
+                        crate::instructions::should_watch_instruction_entry(entry)
+                    })
                     .filter_map(Result::ok)
                     .filter(|entry| entry.file_type().is_file())
-                    .map(|entry| entry.into_path())
-            });
-        for path in direct
-            .chain(nested)
+                    .map(|entry| entry.into_path()),
+            );
+        }
+        for path in candidates
+            .into_iter()
             .filter(|path| is_safe_config_path(root, path))
         {
             if let Some(current) = snapshot_file(&path) {
@@ -323,10 +405,12 @@ fn tracked_root_for_path<'a>(path: &Path, roots: &'a [ConfigRoot]) -> Option<&'a
 fn root_identity(root: &ConfigRoot) -> String {
     let scope = root.scope.as_deref().unwrap_or("global");
     let raw = format!(
-        "{}\0{}\0{scope}\0{}\0{}",
+        "{}\0{}\0{scope}\0{}\0{}\0{}\0{}",
         root.harness,
         normalized_root_path(&root.path),
         root.nested,
+        root.recursive_direct_names,
+        root.dynamic_scope,
         root.direct_names.join("\0")
     );
     stable_hash(raw.as_bytes())
@@ -475,10 +559,7 @@ fn event_for(
     };
     let mut metadata = BTreeMap::new();
     metadata.insert("harness".into(), root.harness.clone());
-    metadata.insert(
-        "path_id".into(),
-        stable_hash(path.to_string_lossy().as_bytes()),
-    );
+    metadata.insert("path_id".into(), crate::instructions::path_identity(path));
     if let Some((hash, size)) = previous {
         metadata.insert("previous_hash".into(), hash.clone());
         metadata.insert("previous_size".into(), size.to_string());
@@ -501,7 +582,13 @@ fn event_for(
             metadata["path_id"]
         ),
         timestamp,
-        scope: root.scope.clone(),
+        scope: if root.dynamic_scope {
+            path.parent()
+                .map(project_scope)
+                .map(|scope| project_scope_identity(&scope.to_string_lossy()))
+        } else {
+            root.scope.clone()
+        },
         source: "config".into(),
         kind: kind.into(),
         metadata,
@@ -543,8 +630,12 @@ fn record_change(app: &AppHandle, state: &Arc<AppState>, root: &ConfigRoot, path
     }
 }
 
-pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatcherHandle> {
-    let roots = roots(&state);
+pub fn start(
+    app: AppHandle,
+    state: Arc<AppState>,
+    config: &crate::config::Config,
+) -> anyhow::Result<ConfigWatcherHandle> {
+    let roots = roots(&state, config);
     let observed = {
         let _io = event_io_lock().lock().unwrap();
         load_snapshot()
@@ -573,8 +664,14 @@ pub fn start(app: AppHandle, state: Arc<AppState>) -> anyhow::Result<ConfigWatch
     )?;
     let mut watched = BTreeSet::new();
     for root in &roots {
-        if root.path.exists() && watched.insert((root.path.clone(), false)) {
-            if let Err(error) = debouncer.watch(&root.path, RecursiveMode::NonRecursive) {
+        let recursive_root = root.recursive_direct_names;
+        if root.path.exists() && watched.insert((root.path.clone(), recursive_root)) {
+            let mode = if recursive_root {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            if let Err(error) = debouncer.watch(&root.path, mode) {
                 tracing::warn!("could not watch config root {:?}: {}", root.path, error);
             }
         }
@@ -648,6 +745,8 @@ mod tests {
             scope: scope.map(project_scope_identity),
             direct_names: CODEX_CONFIG_NAMES,
             nested: true,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         }
     }
 
@@ -864,6 +963,8 @@ mod tests {
             scope: None,
             direct_names: CODEX_CONFIG_NAMES,
             nested: true,
+            recursive_direct_names: false,
+            dynamic_scope: false,
         }]);
         assert_eq!(snapshot.len(), 2);
         assert!(snapshot.keys().all(|key| !key.contains("sessions")));
@@ -897,6 +998,32 @@ mod tests {
         assert!(!is_safe_config_path(
             &config_root,
             &root.join("nested/config.toml")
+        ));
+    }
+
+    #[test]
+    fn recursive_instruction_roots_admit_only_supported_files_outside_ignored_trees() {
+        let root = Path::new("/tmp/synthetic-projects");
+        let config_root = ConfigRoot {
+            harness: "codex".into(),
+            path: root.to_path_buf(),
+            scope: None,
+            direct_names: &["AGENTS.md"],
+            nested: false,
+            recursive_direct_names: true,
+            dynamic_scope: true,
+        };
+        assert!(is_safe_config_path(
+            &config_root,
+            &root.join("project/packages/app/AGENTS.md")
+        ));
+        assert!(!is_safe_config_path(
+            &config_root,
+            &root.join("project/packages/app/CLAUDE.md")
+        ));
+        assert!(!is_safe_config_path(
+            &config_root,
+            &root.join("project/node_modules/pkg/AGENTS.md")
         ));
     }
 

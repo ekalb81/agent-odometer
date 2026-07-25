@@ -338,13 +338,64 @@ mockIPC((cmd, payload) => {
         claude_session_roots: ['/home/dev/.claude/projects'],
         performance_tracking_enabled: false,
         performance_log_max_mb: 64,
+        instructions_enabled: true,
+        instructions_tab_visible: true,
+        instruction_roots: [{ path: '/home/dev/projects', recursive: true }],
       };
+    case 'list_instruction_files': {
+      const root = '/home/dev/projects/demo';
+      return {
+        files: [
+          {
+            id: 'mock-agents-root', path_id: 'mock-agents-root', path: `${root}/AGENTS.md`,
+            directory: root, file_name: 'AGENTS.md', harnesses: ['codex'],
+            root_path: '/home/dev/projects', root_source: 'configured', root_recursive: true,
+            project_path: root, project_scope: 'mock-project', relative_path: 'demo/AGENTS.md',
+            depth: 2, size: 240, line_count: 9, modified_at: new Date(now - DAY).toISOString(),
+            content_hash: 'mock-content-root', parent_id: null, effective_ids: ['mock-agents-root'], warnings: [],
+          },
+          {
+            id: 'mock-agents-app', path_id: 'mock-agents-app', path: `${root}/packages/app/AGENTS.md`,
+            directory: `${root}/packages/app`, file_name: 'AGENTS.md', harnesses: ['codex'],
+            root_path: '/home/dev/projects', root_source: 'configured', root_recursive: true,
+            project_path: root, project_scope: 'mock-project', relative_path: 'demo/packages/app/AGENTS.md',
+            depth: 4, size: 138, line_count: 5, modified_at: new Date(now - 2 * DAY).toISOString(),
+            content_hash: 'mock-content-app', parent_id: 'mock-agents-root',
+            effective_ids: ['mock-agents-root', 'mock-agents-app'],
+            warnings: [{ kind: 'possible_conflict', severity: 'warning', message: 'Possible opposite directives in the effective chain: run tests.', related_paths: [`${root}/AGENTS.md`] }],
+          },
+          {
+            id: 'mock-claude-root', path_id: 'mock-claude-root', path: `${root}/CLAUDE.md`,
+            directory: root, file_name: 'CLAUDE.md', harnesses: ['claude_code'],
+            root_path: '/home/dev/projects', root_source: 'configured', root_recursive: true,
+            project_path: root, project_scope: 'mock-project', relative_path: 'demo/CLAUDE.md',
+            depth: 2, size: 190, line_count: 7, modified_at: new Date(now - 3 * DAY).toISOString(),
+            content_hash: 'mock-content-claude', parent_id: null, effective_ids: ['mock-claude-root'], warnings: [],
+          },
+        ],
+        roots: [{ path: '/home/dev/projects', source: 'configured', recursive: true, exists: true }],
+        truncated: false,
+        scanned_at: new Date().toISOString(),
+      };
+    }
+    case 'read_instruction_file': {
+      const { path } = payload as { path: string };
+      const nested = path.includes('/packages/app/');
+      const claude = path.endsWith('CLAUDE.md');
+      const content = claude
+        ? '# Claude Code instructions\n\n- Keep changes focused.\n- Run the relevant checks.\n'
+        : nested
+          ? '# Package instructions\n\nNever run tests.\n\nUse the package-level validation command.\n'
+          : '# Project instructions\n\nAlways run tests.\n\n## Boundaries\n\n- Keep filesystem access in Rust.\n- Keep presentation in Svelte.\n';
+      return { path, content };
+    }
     case 'get_rates':
     case 'get_bundled_rates':
       return RATES;
     case 'set_rates':
     case 'set_config':
     case 'reveal_in_file_manager':
+    case 'open_instruction_file':
     case 'open_task_in_chatgpt':
     case 'write_export':
     case 'export_performance_data':

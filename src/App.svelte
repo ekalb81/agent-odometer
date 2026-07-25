@@ -2,10 +2,11 @@
   import { onMount } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
+  import InstructionsView from './components/InstructionsView.svelte';
   import Filters from './components/Filters.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, addDefenderExclusions, sessionsInRanges, setTrayTotals, onOpenSettings } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, addDefenderExclusions, sessionsInRanges, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
   import { updaterStore } from './lib/stores/updater.svelte';
@@ -18,7 +19,7 @@
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from './lib/credits';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
 
-  type View = 'all' | 'codex' | 'claude' | 'settings';
+  type View = 'all' | 'codex' | 'claude' | 'instructions' | 'settings';
   let activeView: View = $state('all');
   let appVersion = $state('');
   const appStarted = performance.now();
@@ -48,6 +49,20 @@
         )
       : [],
   );
+
+  $effect(() => {
+    const current = $config;
+    if (activeView === 'instructions' && (!current.instructions_enabled || !current.instructions_tab_visible)) {
+      activeView = 'settings';
+    }
+  });
+
+  async function hideInstructionsTab() {
+    const updated = { ...$config, instructions_tab_visible: false };
+    await setConfig(updated);
+    config.set(updated);
+    activeView = 'all';
+  }
 
   let trayRefreshGeneration = $state(0);
   let trayTimer: ReturnType<typeof setTimeout> | null = null;
@@ -457,6 +472,11 @@
       <button class={tabClass(activeView === 'claude', 'bg-[#e8935a]')} onclick={() => (activeView = 'claude')}>
         Claude Code
       </button>
+      {#if $config.instructions_enabled && $config.instructions_tab_visible}
+        <button class={tabClass(activeView === 'instructions', 'bg-ink !text-app')} onclick={() => (activeView = 'instructions')}>
+          Instructions
+        </button>
+      {/if}
       <button class={tabClass(activeView === 'settings', 'bg-ink !text-app')} onclick={() => (activeView = 'settings')}>
         Settings
       </button>
@@ -501,8 +521,11 @@
         onfilterschange={(f) => (filtersByScope.claude_code = f)}
       />
     </div>
+    {#if activeView === 'instructions'}
+      <InstructionsView onhide={hideInstructionsTab} />
+    {/if}
     {#if activeView === 'settings'}
-      <SettingsView />
+      <SettingsView onopeninstructions={() => (activeView = 'instructions')} />
     {/if}
   </main>
 

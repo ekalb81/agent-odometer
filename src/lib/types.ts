@@ -238,6 +238,63 @@ export interface Config {
   claude_session_roots: string[];
   performance_tracking_enabled: boolean;
   performance_log_max_mb: number;
+  instructions_enabled: boolean;
+  instructions_tab_visible: boolean;
+  instruction_roots: InstructionRoot[];
+}
+
+export interface InstructionRoot {
+  path: string;
+  recursive: boolean;
+}
+
+export interface InstructionWarning {
+  kind: 'duplicate' | 'possible_conflict' | 'oversized' | 'possibly_stale' | string;
+  severity: 'info' | 'warning' | string;
+  message: string;
+  related_paths: string[];
+}
+
+export interface InstructionFile {
+  id: string;
+  path_id: string;
+  path: string;
+  directory: string;
+  file_name: string;
+  harnesses: string[];
+  root_path: string;
+  root_source: 'global' | 'configured' | 'observed' | string;
+  root_recursive: boolean;
+  project_path: string | null;
+  project_scope: string | null;
+  relative_path: string;
+  depth: number;
+  size: number;
+  line_count: number | null;
+  modified_at: string | null;
+  content_hash: string | null;
+  parent_id: string | null;
+  effective_ids: string[];
+  warnings: InstructionWarning[];
+}
+
+export interface InstructionRootSummary {
+  path: string;
+  source: string;
+  recursive: boolean;
+  exists: boolean;
+}
+
+export interface InstructionInventory {
+  files: InstructionFile[];
+  roots: InstructionRootSummary[];
+  truncated: boolean;
+  scanned_at: string;
+}
+
+export interface InstructionContent {
+  path: string;
+  content: string;
 }
 
 export interface PerformanceStatus {
