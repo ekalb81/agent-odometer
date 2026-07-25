@@ -1,6 +1,6 @@
 {
   "name": "agent-odometer",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,6 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check:updater-manifest": "node --test scripts/validate-updater-manifest.test.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
