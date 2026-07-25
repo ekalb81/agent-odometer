@@ -4,6 +4,7 @@
   import DOMPurify from 'dompurify';
   import ConfigTimeline from './ConfigTimeline.svelte';
   import {
+    cancelInstructionScan,
     listExternalEvents,
     listInstructionFiles,
     onConfigEvent,
@@ -11,6 +12,7 @@
     readInstructionFile,
     revealInFileManager,
   } from '../lib/ipc';
+  import { instructionScanStore } from '../lib/stores/instructionScan.svelte';
   import type { ExternalEvent, InstructionFile, InstructionInventory } from '../lib/types';
 
   interface Props { onhide: () => void | Promise<void>; }
@@ -20,6 +22,7 @@
   let selectedId = $state<string | null>(null);
   let content = $state<string | null>(null);
   let loading = $state(false);
+  let cancelRequested = $state(false);
   let contentLoading = $state(false);
   let error = $state<string | null>(null);
   let contentError = $state<string | null>(null);
@@ -30,6 +33,8 @@
   let previewMode = $state<'preview' | 'raw'>('preview');
   let configEvents = $state<ExternalEvent[]>([]);
   let contentGeneration = 0;
+
+  const scanProgress = $derived(instructionScanStore.status);
 
   const selected = $derived(
     inventory?.files.find((file) => file.id === selectedId) ?? null,
@@ -124,8 +129,34 @@
     return `${(value / 1024 / 1024).toFixed(1)} MiB`;
   }
 
+  function formatDuration(value: number): string {
+    if (value < 1_000) return `${value} ms`;
+    if (value < 60_000) return `${(value / 1_000).toFixed(value < 10_000 ? 1 : 0)} s`;
+    return `${Math.floor(value / 60_000)}m ${Math.round((value % 60_000) / 1_000)}s`;
+  }
+
+  function scanStatusText(): string {
+    if (!scanProgress || scanProgress.phase === 'preparing') return 'Preparing project roots…';
+    if (scanProgress.phase === 'analyzing') {
+      return `Analyzing ${scanProgress.files_found.toLocaleString()} instruction files…`;
+    }
+    const root = scanProgress.roots_total === 0
+      ? 'No scan roots'
+      : `Root ${Math.min(scanProgress.roots_done + 1, scanProgress.roots_total)} of ${scanProgress.roots_total}`;
+    return `${root} · ${scanProgress.entries_visited.toLocaleString()} entries · ${scanProgress.files_found.toLocaleString()} files · ${formatDuration(scanProgress.elapsed_ms)}`;
+  }
+
+  function truncationMessage(inventory: InstructionInventory): string {
+    if (inventory.truncation_reason === 'entry_limit') {
+      return `Scan stopped after ${inventory.entries_visited.toLocaleString()} filesystem entries. Narrow or split large recursive roots.`;
+    }
+    return 'Results stopped at the 10,000-instruction-file safety limit.';
+  }
+
   async function refresh() {
     loading = true;
+    cancelRequested = false;
+    instructionScanStore.clearCurrent();
     error = null;
     try {
       const [nextInventory, events] = await Promise.all([
@@ -138,9 +169,25 @@
         selectedId = nextInventory.files[0]?.id ?? null;
       }
     } catch (reason) {
-      error = String(reason);
+      if (!String(reason).toLocaleLowerCase().includes('instruction scan cancelled')) {
+        error = String(reason);
+      }
     } finally {
       loading = false;
+      cancelRequested = false;
+      instructionScanStore.clearCurrent();
+    }
+  }
+
+  async function cancelScan() {
+    cancelRequested = true;
+    try {
+      const scanId = await cancelInstructionScan();
+      instructionScanStore.clearThrough(scanId);
+    }
+    catch (reason) {
+      cancelRequested = false;
+      error = String(reason);
     }
   }
 
@@ -190,18 +237,25 @@
   onMount(() => {
     void refresh();
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    let configUnlisten: (() => void) | undefined;
     onConfigEvent((event) => {
       if (!disposed && event.source === 'config') {
         configEvents = [...configEvents.filter((item) => item.id !== event.id), event];
       }
     }).then((dispose) => {
       if (disposed) dispose();
-      else unlisten = dispose;
+      else configUnlisten = dispose;
     }).catch(() => {});
     return () => {
       disposed = true;
-      unlisten?.();
+      configUnlisten?.();
+      if (loading) {
+        void cancelInstructionScan()
+          .then((scanId) => instructionScanStore.clearThrough(scanId))
+          .catch(() => instructionScanStore.clearCurrent());
+      } else {
+        instructionScanStore.clearCurrent();
+      }
     };
   });
 </script>
@@ -216,12 +270,20 @@
             {inventory?.files.length ?? 0} files · read-only
           </p>
         </div>
-        <button
-          type="button"
-          onclick={() => void refresh()}
-          disabled={loading}
-          class="ml-auto px-2.5 py-1 text-xs rounded border border-edge bg-card hover:bg-[var(--row-hover)] disabled:opacity-40"
-        >{loading ? 'Scanning…' : 'Refresh'}</button>
+        {#if loading}
+          <button
+            type="button"
+            onclick={() => void cancelScan()}
+            disabled={cancelRequested}
+            class="ml-auto px-2.5 py-1 text-xs rounded border border-edge bg-card hover:bg-[var(--row-hover)] disabled:opacity-40"
+          >{cancelRequested ? 'Cancelling…' : 'Cancel'}</button>
+        {:else}
+          <button
+            type="button"
+            onclick={() => void refresh()}
+            class="ml-auto px-2.5 py-1 text-xs rounded border border-edge bg-card hover:bg-[var(--row-hover)]"
+          >Refresh</button>
+        {/if}
         <button
           type="button"
           onclick={() => void hideTab()}
@@ -229,6 +291,13 @@
           title="Hide this tab; discovery remains enabled"
         >Hide tab</button>
       </div>
+      {#if loading}
+        <p class="text-[11px] text-ink-faint" role="status">{scanStatusText()}</p>
+      {:else if inventory}
+        <p class="text-[10px] text-ink-faint">
+          Scanned {inventory.entries_visited.toLocaleString()} entries in {formatDuration(inventory.elapsed_ms)}
+        </p>
+      {/if}
       <input
         type="search"
         bind:value={query}
@@ -251,7 +320,7 @@
         </label>
       </div>
       {#if inventory?.truncated}
-        <p class="text-[11px] text-amber-500">Results stopped at the 10,000-file safety limit.</p>
+        <p class="text-[11px] text-amber-500">{truncationMessage(inventory)}</p>
       {/if}
       {#if error}<p class="text-xs text-neg" role="alert">{error}</p>{/if}
     </div>

@@ -6,15 +6,16 @@
   import Filters from './components/Filters.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, addDefenderExclusions, sessionsInRanges, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, onInstructionScanProgress, addDefenderExclusions, sessionsInRanges, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
+  import { instructionScanStore } from './lib/stores/instructionScan.svelte';
   import { updaterStore } from './lib/stores/updater.svelte';
   import './lib/stores/theme.svelte'; // applies data-theme on import
   import { rates } from './lib/stores/rates';
   import { config } from './lib/stores/config';
   import { getVersion } from '@tauri-apps/api/app';
-  import type { SessionSummary } from './lib/types';
+  import type { InstructionScanProgress, SessionSummary } from './lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from './lib/credits';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
@@ -214,6 +215,23 @@
       ($config.claude_session_roots?.length ?? 0),
   );
 
+  const instructionScanStatus = $derived(instructionScanStore.status);
+  const instructionScanActive = $derived(
+    instructionScanStatus !== null &&
+      instructionScanStatus.phase !== 'complete' &&
+      instructionScanStatus.phase !== 'cancelled',
+  );
+
+  function instructionScanLabel(status: InstructionScanProgress): string {
+    if (status.phase === 'preparing') return 'Scanning instructions… preparing roots';
+    if (status.phase === 'analyzing') {
+      return `Scanning instructions… analyzing ${status.files_found.toLocaleString()} files`;
+    }
+    if (status.roots_total === 0) return 'Scanning instructions…';
+    const root = Math.min(status.roots_done + 1, status.roots_total);
+    return `Scanning instructions… root ${root}/${status.roots_total} · ${status.entries_visited.toLocaleString()} entries · ${status.files_found.toLocaleString()} files`;
+  }
+
   // Ticks every 5s so "Last event 12s ago" stays fresh without any events.
   let nowTick = $state(Date.now());
   let tickTimer: ReturnType<typeof setInterval> | null = null;
@@ -308,6 +326,9 @@
           scanEventRevision += 1;
           scanStore.set(status);
         })),
+        attach('instruction-scan-progress', onInstructionScanProgress((status) => {
+          if (!disposed) instructionScanStore.set(status);
+        })),
         attach('rates-updated', onRatesUpdated((card) => {
           if (disposed) return;
           ratesEventRevision += 1;
@@ -328,7 +349,11 @@
             newConfig.session_index_path,
             newConfig.claude_session_roots,
           ]);
+          const instructionSourcesChanged =
+            previous.instructions_enabled !== newConfig.instructions_enabled ||
+            JSON.stringify(previous.instruction_roots) !== JSON.stringify(newConfig.instruction_roots);
           config.set(newConfig);
+          if (instructionSourcesChanged) instructionScanStore.clearCurrent();
           configurePerformanceTracking(newConfig.performance_tracking_enabled);
           if (sourcesChanged) void reloadSessions('frontend.config_list_sessions');
         })),
@@ -547,6 +572,15 @@
       <span class="flex items-center gap-[5px]">
         <span class="w-1.5 h-1.5 rounded-full bg-pos"></span>
         Watching {watchedRoots} {watchedRoots === 1 ? 'root' : 'roots'}
+      </span>
+    {/if}
+    {#if instructionScanActive && instructionScanStatus}
+      <span class="flex items-center gap-1.5 min-w-0" role="status">
+        <svg class="w-3 h-3 animate-spin flex-shrink-0" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />
+          <path d="M22 12a10 10 0 0 0-10-10" stroke="currentColor" stroke-width="4" stroke-linecap="round" />
+        </svg>
+        <span class="truncate">{instructionScanLabel(instructionScanStatus)}</span>
       </span>
     {/if}
     {#if lastEventLabel}

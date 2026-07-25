@@ -320,7 +320,21 @@ export interface InstructionInventory {
   files: InstructionFile[];
   roots: InstructionRootSummary[];
   truncated: boolean;
+  truncation_reason: 'entry_limit' | 'file_limit' | string | null;
+  entries_visited: number;
+  elapsed_ms: number;
   scanned_at: string;
+}
+
+export interface InstructionScanProgress {
+  scan_id: number;
+  phase: 'preparing' | 'scanning' | 'analyzing' | 'complete' | string;
+  roots_done: number;
+  roots_total: number;
+  entries_visited: number;
+  files_found: number;
+  elapsed_ms: number;
+  truncated: boolean;
 }
 
 export interface InstructionContent {
