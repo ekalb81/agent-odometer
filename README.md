@@ -2,7 +2,6 @@
 
 [![CI](https://github.com/ekalb81/agent-odometer/actions/workflows/ci.yml/badge.svg)](https://github.com/ekalb81/agent-odometer/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/ekalb81/agent-odometer)](https://github.com/ekalb81/agent-odometer/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/ekalb81/agent-odometer/total)](https://github.com/ekalb81/agent-odometer/releases)
 [![Coverage](https://codecov.io/github/ekalb81/agent-odometer/branch/main/graph/badge.svg?token=FtbdQEOLFu)](https://codecov.io/github/ekalb81/agent-odometer)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
@@ -23,8 +22,9 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Live** — sessions update in the list while your agents are still running.
 - **Time-scoped answers** — filter by date range and the token/cost columns re-total to exactly that window ("what did I burn last week?").
 - **Export and compare** — save the exact filtered projection as CSV/JSON and compare every model's token mix, cost, calls, retries, failures, and one-shot mutation rate.
-- **Local efficiency signals** — normalized tool metrics, deterministic task categories, bounded optimization findings, configuration-change correlations, and opt-in local Git outcome scans never retain raw tool arguments or output.
+- **Local efficiency signals** — normalized tool metrics, deterministic task categories, prioritized optimization opportunities with turn-level evidence and next actions, configuration-change correlations, and opt-in local Git outcome scans never retain raw tool arguments or output.
 - **Tool impact comparison** — choose any observed tool provider or individual tool and compare turns where it was used with turns where it was not observed; when enough data exists, Odometer matches the baseline by harness, model, task category, and nearby time before comparing tokens and elapsed time.
+- **Optional instruction inventory** — enable a hideable Instructions tab to find `AGENTS.md` and `CLAUDE.md` files across global, observed-project, and explicitly configured roots; review nested effective chains, deterministic warning signals, sanitized Markdown previews, and linked before/after usage evidence. Discovery is read-only and off by default.
 - **Opt-in performance evidence** — default-off local timings cover startup, scans/cache/parsers, analytics, exports, and UI work; logs are size-bounded and exportable as JSONL or CSV.
 - **Quick glance** — the tray menu mirrors today's tokens, Codex credits/API estimate, and Claude USD with native show, hide, settings, and quit controls.
 - **Light and dark** — follows your OS theme by default; switchable in Settings.
@@ -53,6 +53,8 @@ If Codex or Claude Code is installed with default paths, there is nothing to con
 
 Custom locations can be added under **Settings → Watched roots**.
 
+The separate **Settings → Instruction inventory** section accepts project or project-container roots and lets each root scan only that folder or include subfolders. Recursive discovery skips common dependency, generated-output, and VCS directories instead of crawling every file on the machine.
+
 ## Privacy
 
 Session files contain your prompts, the agents' replies, tool output, and local file paths. Odometer processes them entirely locally and stores nothing outside your machine: settings and rate overrides live under the OS config directory, while the scan cache and redacted configuration-event hashes live under the OS cache/data directories. Tool telemetry stores hashed target identities and byte counts, never raw arguments or output. Optional application performance tracking is off by default and stores only operation timings, success flags, and aggregate counts — never prompts, session IDs, paths, commands, tool arguments, or output. Its rotating local JSONL can be exported from Settings. Treat the session files themselves as sensitive — don't share or commit them.
@@ -73,7 +75,7 @@ Edit any rate under **Settings → Rate card**; your overrides persist and autom
 
 Built with Tauri 2 + Rust (filesystem, parsing, IPC) and Svelte 5 + TypeScript + Tailwind (UI). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for data flow, wire contracts, invariants, and known limitations.
 
-Prerequisites: Node.js 22, stable Rust (MSRV 1.77), and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
+Prerequisites: Node.js 22, Rust 1.88 or later, and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```powershell
 npm ci

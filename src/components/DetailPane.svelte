@@ -3,6 +3,12 @@
   import { rates } from '../lib/stores/rates';
   import { computeSessionApiCost, computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
+  import {
+    findingAvoidableCalls,
+    findingConfidence,
+    groupOptimizationFindings,
+    summarizeOptimizationFindings,
+  } from '../lib/optimization';
   import Sparkline from './Sparkline.svelte';
 
   interface Props {
@@ -65,10 +71,24 @@
   // Newest turn first.
   const turnsDesc = $derived(session ? [...session.turns].sort((a, b) => b.index - a.index) : []);
   const turnsAsc = $derived(session ? [...session.turns].sort((a, b) => a.index - b.index) : []);
+  const findingGroups = $derived(
+    session ? groupOptimizationFindings(session.optimization_findings ?? []) : [],
+  );
+  const findingSummary = $derived(
+    summarizeOptimizationFindings(session?.optimization_findings ?? []),
+  );
+  const turnIndexById = $derived(
+    new Map((session?.turns ?? []).map((turn) => [turn.turn_id, turn.index])),
+  );
 
   let expandedTurn = $state<string | null>(null);
   function toggleTurn(id: string) {
     expandedTurn = expandedTurn === id ? null : id;
+  }
+
+  function focusFindingTurn(id: string) {
+    expandedTurn = id;
+    setTimeout(() => document.getElementById(`turn-${id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
   }
   // Collapse the expanded turn when switching sessions — but not on live
   // refreshes of the same session, which replace the object while it's busy.
@@ -303,15 +323,54 @@
             <div><span class="text-ink-faint">Failures</span><div class="font-mono text-ink">{session.tool_metrics.failures}</div></div>
           </div>
           {#if session.optimization_findings?.length > 0}
-            <details open>
-              <summary class="cursor-pointer text-[11px] text-amber-500">{session.optimization_findings.length} optimization findings</summary>
-              <div class="mt-1.5 space-y-1.5">
-                {#each session.optimization_findings as finding (`${finding.rule_id}:${finding.turn_id ?? 'session'}:${finding.evidence}`)}
-                  <div class="text-[11px] bg-card border border-edge rounded px-2 py-1.5">
-                    <div class="font-semibold text-ink">{finding.rule_id.replaceAll('-', ' ')}</div>
-                    <div class="text-ink-muted">{finding.evidence}</div>
-                    <div class="text-ink-2">{finding.remediation}</div>
-                  </div>
+            <details class="rounded-lg border border-edge bg-card px-2.5 py-2">
+              <summary class="cursor-pointer text-[11px] text-ink">
+                <span class="font-semibold">Optimization opportunities</span>
+                <span class="ml-1 text-amber-500">· {findingSummary.findings}</span>
+                {#if findingSummary.likely_avoidable_calls > 0}
+                  <span class="ml-1 text-ink-muted">· ~{fmt(findingSummary.likely_avoidable_calls)} calls</span>
+                {/if}
+              </summary>
+              <div class="mt-2 space-y-2">
+                <p class="text-[10px] leading-relaxed text-ink-faint">
+                  Deterministic local heuristics, not a quality score. Each item links the observed evidence to a specific next step.
+                </p>
+                <div class="flex flex-wrap gap-1 text-[10px]">
+                  {#if findingSummary.warnings > 0}
+                    <span class="rounded-full bg-amber-500/10 px-2 py-0.5 text-amber-500">{findingSummary.warnings} need attention</span>
+                  {/if}
+                  <span class="rounded-full bg-panel px-2 py-0.5 text-ink-muted">{findingGroups.length} pattern{findingGroups.length === 1 ? '' : 's'}</span>
+                </div>
+                {#each findingGroups as group (group.ruleId)}
+                  <details class="rounded border border-edgerow bg-panel px-2 py-1.5">
+                    <summary class="cursor-pointer text-[11px]">
+                      <span class="font-semibold text-ink">{group.title}</span>
+                      <span class="text-ink-muted"> · {group.findings.length}</span>
+                      {#if group.avoidableCalls > 0}
+                        <span class="text-amber-500"> · ~{fmt(group.avoidableCalls)} calls</span>
+                      {/if}
+                    </summary>
+                    <div class="mt-1.5 max-h-72 space-y-1.5 overflow-y-auto pr-1">
+                      {#each group.findings as finding (`${finding.rule_id}:${finding.turn_id ?? 'session'}:${finding.evidence}`)}
+                        {@const turnIndex = finding.turn_id ? turnIndexById.get(finding.turn_id) : undefined}
+                        {@const avoidableCalls = findingAvoidableCalls(finding)}
+                        <div class="rounded border border-edgerow bg-card px-2 py-2 text-[11px]">
+                          <div class="mb-1 flex flex-wrap items-center gap-1.5 text-[10px]">
+                            <span class="rounded-full px-1.5 py-px {finding.severity === 'warning' ? 'bg-amber-500/10 text-amber-500' : 'bg-accent-chipbg text-accent-chipfg'}">
+                              {finding.severity === 'warning' ? 'Needs attention' : 'Opportunity'}
+                            </span>
+                            <span class="text-ink-faint">{findingConfidence(finding)} confidence</span>
+                            {#if avoidableCalls > 0}<span class="text-amber-500">~{fmt(avoidableCalls)} avoidable call{avoidableCalls === 1 ? '' : 's'}</span>{/if}
+                            {#if turnIndex !== undefined && finding.turn_id}
+                              <button type="button" class="ml-auto text-accent hover:underline" onclick={() => focusFindingTurn(finding.turn_id!)}>Turn #{turnIndex}</button>
+                            {/if}
+                          </div>
+                          <div class="text-ink-muted"><span class="font-medium text-ink-2">Evidence:</span> {finding.evidence}</div>
+                          <div class="mt-0.5 text-ink-2"><span class="font-medium text-ink">Try:</span> {finding.remediation}</div>
+                        </div>
+                      {/each}
+                    </div>
+                  </details>
                 {/each}
               </div>
             </details>
@@ -327,7 +386,7 @@
             {#each turnsDesc as turn (turn.turn_id)}
               {@const credit = turnCost(turn.turn_id)}
               {@const isOpen = expandedTurn === turn.turn_id}
-              <div class="bg-card border border-edge rounded-lg overflow-hidden">
+              <div id={`turn-${turn.turn_id}`} class="bg-card border border-edge rounded-lg overflow-hidden scroll-mt-3">
                 <button
                   type="button"
                   class="w-full text-left px-3 py-2 hover:bg-[var(--row-hover)] transition-colors"

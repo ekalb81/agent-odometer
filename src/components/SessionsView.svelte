@@ -8,6 +8,7 @@
   import type { ExternalEvent, Harness, RangeTotals, RateCard, Session } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
   import { rangeLabelFor } from '../lib/dateRange';
+  import { findingRuleTitle, optimizationSummaryOrCount } from '../lib/optimization';
   import {
     aggregateModelMetrics,
     addTotals,
@@ -787,14 +788,40 @@
     filteredNoDate
       .map((session) => ({
         session,
-        count: dateScoped
-          ? (analyticsCurrent?.[session.id]?.optimization_findings_count ?? 0)
-          : (session.optimization_findings_count ?? 0),
+        summary: dateScoped
+          ? optimizationSummaryOrCount(
+              analyticsCurrent?.[session.id]?.optimization_summary,
+              analyticsCurrent?.[session.id]?.optimization_findings_count ?? 0,
+            )
+          : optimizationSummaryOrCount(
+              session.optimization_summary,
+              session.optimization_findings_count ?? 0,
+            ),
       }))
-      .filter((item) => item.count > 0)
-      .sort((a, b) => b.count - a.count),
+      .filter((item) => item.summary.findings > 0)
+      .sort((a, b) =>
+        b.summary.warnings - a.summary.warnings
+          || b.summary.likely_avoidable_calls - a.summary.likely_avoidable_calls
+          || b.summary.findings - a.summary.findings,
+      ),
   );
-  const findingCount = $derived(findingSessions.reduce((sum, item) => sum + item.count, 0));
+  const findingRollup = $derived((() => {
+    const out = { findings: 0, warnings: 0, likelyAvoidableCalls: 0, byRule: {} as Record<string, number> };
+    for (const item of findingSessions) {
+      out.findings += item.summary.findings;
+      out.warnings += item.summary.warnings;
+      out.likelyAvoidableCalls += item.summary.likely_avoidable_calls;
+      for (const [rule, count] of Object.entries(item.summary.by_rule)) {
+        out.byRule[rule] = (out.byRule[rule] ?? 0) + count;
+      }
+    }
+    return out;
+  })());
+  const findingRuleRows = $derived(
+    Object.entries(findingRollup.byRule)
+      .map(([rule, count]) => ({ rule, count, title: findingRuleTitle(rule) }))
+      .sort((a, b) => b.count - a.count || a.title.localeCompare(b.title)),
+  );
 
   function deltaPct(cur: number, prev: number): number | null {
     if (prev <= 0) return null;
@@ -1261,22 +1288,45 @@
       </details>
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
-        <summary class="cursor-pointer text-xs font-semibold text-ink">Optimization findings · {findingCount} in {windowLabel}</summary>
+        <summary class="cursor-pointer text-xs font-semibold text-ink">
+          Optimization opportunities · {findingRollup.findings} across {findingSessions.length} session{findingSessions.length === 1 ? '' : 's'}
+        </summary>
         {#if findingSessions.length === 0}
-          <p class="text-xs text-ink-faint py-2">No optimization findings in this view.</p>
+          <p class="text-xs text-ink-faint py-2">No evidence-backed optimization opportunities in {windowLabel.toLowerCase()}.</p>
         {:else}
-          <p class="text-xs text-ink-muted py-2">
-            Local heuristics flag repeated, failed, or inefficient tool use. Select a session to review its evidence and suggested remediation.
+          <p class="text-xs leading-relaxed text-ink-muted py-2">
+            Prioritized local heuristics—not a quality score. Counts describe observed patterns; open a session to inspect turn-level evidence and the recommended next action.
           </p>
+          <div class="mb-2 flex flex-wrap gap-1.5 text-[10px]">
+            {#if findingRollup.warnings > 0}
+              <span class="rounded-full bg-amber-500/10 px-2 py-0.5 text-amber-500">{findingRollup.warnings} need attention</span>
+            {/if}
+            {#if findingRollup.likelyAvoidableCalls > 0}
+              <span class="rounded-full bg-accent-chipbg px-2 py-0.5 text-accent-chipfg">~{fmt.format(findingRollup.likelyAvoidableCalls)} likely avoidable calls</span>
+            {/if}
+            {#each findingRuleRows as row (row.rule)}
+              <span class="rounded-full bg-panel px-2 py-0.5 text-ink-muted">{row.title} {row.count}</span>
+            {/each}
+          </div>
           <div class="flex max-h-48 flex-col gap-1 overflow-y-auto pr-1">
             {#each findingSessions as item (item.session.id)}
               <button
                 type="button"
-                class="flex items-center justify-between gap-3 rounded px-2 py-1.5 text-left text-xs hover:bg-[var(--row-hover)] transition-colors"
+                class="flex items-center justify-between gap-3 rounded px-2 py-2 text-left text-xs hover:bg-[var(--row-hover)] transition-colors"
                 onclick={() => reviewFindingSession(item.session.id)}
+                aria-label={`Review optimization evidence for ${sessionName(item.session)}`}
               >
-                <span class="truncate text-ink" title={sessionName(item.session)}>{sessionName(item.session)}</span>
-                <span class="flex-shrink-0 text-amber-500">{item.count} {item.count === 1 ? 'finding' : 'findings'} · review</span>
+                <span class="min-w-0">
+                  <span class="block truncate font-medium text-ink" title={sessionName(item.session)}>{sessionName(item.session)}</span>
+                  <span class="block truncate text-[10px] text-ink-faint">
+                    {Object.entries(item.summary.by_rule).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([rule, count]) => `${findingRuleTitle(rule)} ${count}`).join(' · ') || 'Detailed evidence available'}
+                  </span>
+                </span>
+                <span class="flex flex-shrink-0 items-center gap-2 text-[10px]">
+                  {#if item.summary.warnings > 0}<span class="text-amber-500">{item.summary.warnings} warning{item.summary.warnings === 1 ? '' : 's'}</span>{/if}
+                  {#if item.summary.likely_avoidable_calls > 0}<span class="text-accent">~{fmt.format(item.summary.likely_avoidable_calls)} calls</span>{/if}
+                  <span class="text-ink-muted">{item.summary.findings} signal{item.summary.findings === 1 ? '' : 's'} ›</span>
+                </span>
               </button>
             {/each}
           </div>

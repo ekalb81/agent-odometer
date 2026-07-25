@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionRoot {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub recursive: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub session_roots: Vec<PathBuf>,
@@ -16,6 +23,19 @@ pub struct Config {
     /// Per-segment limit; the recorder keeps the current and previous segment.
     #[serde(default = "default_performance_log_max_mb")]
     pub performance_log_max_mb: u64,
+    /// Enables the read-only instruction inventory and its bounded file reads.
+    #[serde(default)]
+    pub instructions_enabled: bool,
+    /// Keeps discovery enabled while allowing the navigation tab to be hidden.
+    #[serde(default = "default_true")]
+    pub instructions_tab_visible: bool,
+    /// User-selected project or project-container roots for instruction discovery.
+    #[serde(default)]
+    pub instruction_roots: Vec<InstructionRoot>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_performance_log_max_mb() -> u64 {
@@ -62,6 +82,9 @@ impl Default for Config {
             claude_session_roots: default_claude_session_roots(),
             performance_tracking_enabled: false,
             performance_log_max_mb: default_performance_log_max_mb(),
+            instructions_enabled: false,
+            instructions_tab_visible: true,
+            instruction_roots: Vec::new(),
         }
     }
 }
@@ -146,6 +169,12 @@ mod tests {
             claude_session_roots: vec![dir.path().join("claude-projects")],
             performance_tracking_enabled: true,
             performance_log_max_mb: 32,
+            instructions_enabled: true,
+            instructions_tab_visible: false,
+            instruction_roots: vec![InstructionRoot {
+                path: dir.path().join("projects"),
+                recursive: true,
+            }],
         };
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -159,6 +188,9 @@ mod tests {
         assert_eq!(loaded.claude_session_roots, cfg.claude_session_roots);
         assert!(loaded.performance_tracking_enabled);
         assert_eq!(loaded.performance_log_max_mb, 32);
+        assert!(loaded.instructions_enabled);
+        assert!(!loaded.instructions_tab_visible);
+        assert_eq!(loaded.instruction_roots, cfg.instruction_roots);
     }
 
     #[test]
@@ -175,6 +207,9 @@ mod tests {
         assert!(cfg.claude_session_roots[0].ends_with("projects"));
         assert!(!cfg.performance_tracking_enabled);
         assert_eq!(cfg.performance_log_max_mb, 64);
+        assert!(!cfg.instructions_enabled);
+        assert!(cfg.instructions_tab_visible);
+        assert!(cfg.instruction_roots.is_empty());
     }
 
     #[test]

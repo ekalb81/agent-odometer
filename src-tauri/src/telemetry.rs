@@ -7,13 +7,12 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 pub const CLASSIFIER_VERSION: u32 = 1;
-pub const ANALYZER_VERSION: u32 = 2;
+pub const ANALYZER_VERSION: u32 = 3;
 pub const REPEATED_READ_THRESHOLD: usize = 3;
 pub const CORRECTIVE_MUTATION_THRESHOLD: usize = 2;
 pub const REPEATED_FAILURE_THRESHOLD: usize = 2;
-pub const HIGH_TOOL_CHURN_THRESHOLD: usize = 20;
+pub const HIGH_TOOL_CHURN_THRESHOLD: usize = 40;
 pub const EXCESSIVE_OUTPUT_BYTES_THRESHOLD: u64 = 1024 * 1024;
-pub const RATIO_EVIDENCE_MIN_CALLS: u64 = 8;
 
 pub fn classify_tool(name: &str) -> ToolKind {
     let value = name.to_ascii_lowercase();
@@ -53,29 +52,44 @@ fn stable_hash(value: &str) -> String {
     format!("{:016x}", hash)
 }
 
-pub fn normalized_target(name: &str, arguments: &Value) -> Option<String> {
-    let candidate = [
+fn resource_candidate(arguments: &Value) -> Option<&str> {
+    [
         "path",
         "file_path",
         "target",
         "workdir",
         "cwd",
+        "uri",
+        "ref_id",
+        "document_id",
+        "spreadsheet_id",
         "command",
         "query",
     ]
     .iter()
     .find_map(|key| arguments.get(*key))
     .and_then(|value| value.as_str())
-    .unwrap_or_else(|| arguments.as_str().unwrap_or(""));
-    if candidate.is_empty() {
-        None
+    .or_else(|| arguments.as_str())
+    .filter(|candidate| !candidate.is_empty())
+}
+
+pub fn normalized_resource(arguments: &Value) -> Option<String> {
+    resource_candidate(arguments).map(stable_hash)
+}
+
+pub fn normalized_target(name: &str, arguments: &Value) -> Option<String> {
+    let kind = classify_tool(name);
+    let resource = normalized_resource(arguments)?;
+    let identity = if matches!(kind, ToolKind::Read | ToolKind::Search) {
+        // A read's line/page/range selectors are part of the request identity.
+        // The separate resource_id still lets a mutation invalidate every read
+        // of the underlying private resource.
+        let request = serde_json::to_string(arguments).unwrap_or_default();
+        stable_hash(&format!("{name}\0{request}"))
     } else {
-        Some(format!(
-            "{}:{}",
-            classify_tool(name).as_str(),
-            stable_hash(candidate)
-        ))
-    }
+        resource
+    };
+    Some(format!("{}:{identity}", kind.as_str()))
 }
 
 fn collect_mcp_providers(text: &str, providers: &mut Vec<String>) {
@@ -183,6 +197,7 @@ pub fn observe_call(observations: &mut Vec<ToolObservation>, input: ToolCallInpu
     let target = normalized_target(&input.name, input.arguments);
     let providers = tool_providers(&input.name, input.arguments);
     let effective_tools = effective_tools(&input.name, input.arguments);
+    let resource_id = normalized_resource(input.arguments);
     observations.push(ToolObservation {
         call_id: input.call_id,
         turn_id: input.turn_id,
@@ -194,6 +209,7 @@ pub fn observe_call(observations: &mut Vec<ToolObservation>, input: ToolCallInpu
         providers,
         effective_tools,
         target,
+        resource_id,
         outcome: ToolOutcome::Pending,
         duration_ms: None,
         output_bytes: 0,
@@ -341,6 +357,15 @@ pub fn classify_turn(text: &str, tool: &ToolMetrics) -> TurnClassification {
     }
 }
 
+#[derive(Default)]
+struct ReadStreak {
+    current: usize,
+    max: usize,
+    timestamp: Option<DateTime<Utc>>,
+    model: Option<String>,
+    tool_name: String,
+}
+
 pub fn findings<'a>(
     observations: impl IntoIterator<Item = &'a ToolObservation>,
 ) -> Vec<OptimizationFinding> {
@@ -351,8 +376,13 @@ pub fn findings<'a>(
         let turn = item.turn_id.clone().unwrap_or_else(|| "session".into());
         turn_calls.entry(turn.clone()).or_default().push(item);
         if let Some(target) = &item.target {
+            let resource = item
+                .resource_id
+                .clone()
+                .or_else(|| target.rsplit_once(':').map(|(_, hash)| hash.to_owned()))
+                .unwrap_or_else(|| target.clone());
             target_activity
-                .entry((turn.clone(), target.clone()))
+                .entry((turn.clone(), resource))
                 .or_default()
                 .push(item);
             groups
@@ -363,39 +393,63 @@ pub fn findings<'a>(
     }
     let mut out = Vec::new();
 
-    // Re-reads are actionable only when they occur in one uninterrupted
-    // segment. A mutation of the same target is a relevant context change and
-    // resets the counter; reads in later turns are evaluated independently.
-    for ((turn, target), mut items) in target_activity {
+    // Re-reads are actionable only when the exact same successful request
+    // occurs in one uninterrupted segment. Different line/page selectors are
+    // different requests. A mutation of the private resource resets every
+    // request streak; reads in later turns are evaluated independently.
+    for ((turn, resource), mut items) in target_activity {
         items.sort_by_key(|item| item.timestamp);
-        let model = items.iter().rev().find_map(|item| item.model.clone());
-        let mut reads = 0;
-        let mut max_reads = 0;
-        let mut finding_timestamp = None;
+        let mut streaks: BTreeMap<String, ReadStreak> = BTreeMap::new();
         for item in &items {
             match item.kind {
-                ToolKind::Read => {
-                    reads += 1;
-                    if reads > max_reads {
-                        max_reads = reads;
-                        finding_timestamp = Some(item.timestamp);
+                ToolKind::Read
+                    if item.outcome == ToolOutcome::Success && !is_volatile_read(&item.name) =>
+                {
+                    if let Some(target) = &item.target {
+                        let entry = streaks.entry(target.clone()).or_insert_with(|| ReadStreak {
+                            tool_name: item.name.clone(),
+                            ..Default::default()
+                        });
+                        entry.current += 1;
+                        if entry.current > entry.max {
+                            entry.max = entry.current;
+                            entry.timestamp = Some(item.timestamp);
+                            entry.model = item.model.clone();
+                            entry.tool_name = item.name.clone();
+                        }
                     }
                 }
-                ToolKind::Mutation => reads = 0,
+                ToolKind::Mutation => {
+                    for streak in streaks.values_mut() {
+                        streak.current = 0;
+                    }
+                }
                 _ => {}
             }
         }
-        if max_reads >= REPEATED_READ_THRESHOLD {
-            out.push(OptimizationFinding {
-                version: ANALYZER_VERSION,
-                rule_id: "repeated-read".into(),
-                severity: "info".into(),
-                turn_id: (turn != "session").then_some(turn.clone()),
-                model,
-                timestamp: finding_timestamp,
-                evidence: format!("{max_reads} uninterrupted reads of {target}"),
-                remediation: "Reuse the prior result until the target changes".into(),
-            });
+        for (_, streak) in streaks {
+            if streak.max >= REPEATED_READ_THRESHOLD {
+                out.push(OptimizationFinding {
+                    version: ANALYZER_VERSION,
+                    rule_id: "repeated-read".into(),
+                    severity: "info".into(),
+                    confidence: "high".into(),
+                    turn_id: (turn != "session").then_some(turn.clone()),
+                    model: streak.model,
+                    timestamp: streak.timestamp,
+                    evidence: format!(
+                        "{} identical successful {} requests to private target #{}",
+                        streak.max,
+                        streak.tool_name,
+                        short_private_id(&resource)
+                    ),
+                    remediation:
+                        "Reuse the prior result until the resource changes, or request the needed ranges together"
+                            .into(),
+                    occurrences: streak.max as u64,
+                    avoidable_calls: streak.max.saturating_sub(1) as u64,
+                });
+            }
         }
     }
 
@@ -404,89 +458,137 @@ pub fn findings<'a>(
             .iter()
             .filter(|item| item.outcome == ToolOutcome::Failure)
             .count();
-        let rule = if kind == "mutation" && items.len() >= CORRECTIVE_MUTATION_THRESHOLD {
+        let rule = if kind == "mutation"
+            && items.len() >= CORRECTIVE_MUTATION_THRESHOLD
+            && failures > 0
+        {
             Some((
                 "corrective-mutation",
                 "warning",
-                "Repeated mutations of the same target",
+                "Inspect the first mutation error and validate the intended change before retrying",
             ))
         } else if failures >= REPEATED_FAILURE_THRESHOLD {
             Some((
                 "repeated-failure",
                 "warning",
-                "Repeated failures for the same target",
-            ))
+                "Stop retrying unchanged input; inspect the first error, adjust the tool request, then retry once",
+                ))
         } else {
             None
         };
         if let Some((rule_id, severity, message)) = rule {
+            let resource = items
+                .last()
+                .and_then(|item| item.resource_id.as_deref())
+                .unwrap_or_else(|| {
+                    target
+                        .rsplit_once(':')
+                        .map_or(target.as_str(), |(_, id)| id)
+                });
             out.push(OptimizationFinding {
                 version: ANALYZER_VERSION,
                 rule_id: rule_id.into(),
                 severity: severity.into(),
+                confidence: "high".into(),
                 turn_id: (turn != "session").then_some(turn),
                 model: items.last().and_then(|item| item.model.clone()),
                 timestamp: items.last().map(|item| item.timestamp),
-                evidence: format!("{} calls to {}", items.len(), target),
+                evidence: format!(
+                    "{} {} attempts to private target #{}; {failures} failed",
+                    items.len(),
+                    items.last().map_or("tool", |item| item.name.as_str()),
+                    short_private_id(resource)
+                ),
                 remediation: message.into(),
+                occurrences: items.len() as u64,
+                avoidable_calls: failures.saturating_sub(1) as u64,
             });
         }
     }
     for (turn, items) in turn_calls {
         let metrics = metrics(items.iter().copied());
-        if items.len() > HIGH_TOOL_CHURN_THRESHOLD {
+        if items.len() > HIGH_TOOL_CHURN_THRESHOLD
+            && (metrics.retry_count >= 4 || metrics.failures >= 4)
+        {
             out.push(OptimizationFinding {
                 version: ANALYZER_VERSION,
                 rule_id: "high-tool-churn".into(),
                 severity: "info".into(),
+                confidence: "medium".into(),
                 turn_id: (turn != "session").then_some(turn.clone()),
                 model: items.last().and_then(|item| item.model.clone()),
                 timestamp: items.last().map(|item| item.timestamp),
-                evidence: format!("{} tool calls", items.len()),
-                remediation: "Batch compatible work and narrow intermediate output".into(),
+                evidence: format!(
+                    "{} tool calls with {} retries and {} failures",
+                    items.len(),
+                    metrics.retry_count,
+                    metrics.failures
+                ),
+                remediation:
+                    "Review the failing or retried path first, then batch compatible independent calls"
+                        .into(),
+                occurrences: items.len() as u64,
+                // This turn-wide signal overlaps target-specific retry findings;
+                // keep it out of the avoidable-call total to prevent double counting.
+                avoidable_calls: 0,
             });
         }
-        if metrics.output_bytes > EXCESSIVE_OUTPUT_BYTES_THRESHOLD {
+        let command_output_bytes: u64 = items
+            .iter()
+            .filter(|item| item.kind == ToolKind::Command)
+            .map(|item| item.output_bytes)
+            .sum();
+        let command_calls = items
+            .iter()
+            .filter(|item| item.kind == ToolKind::Command)
+            .count();
+        if command_output_bytes > EXCESSIVE_OUTPUT_BYTES_THRESHOLD {
             out.push(OptimizationFinding {
                 version: ANALYZER_VERSION,
                 rule_id: "excessive-command-output".into(),
                 severity: "warning".into(),
+                confidence: "high".into(),
                 turn_id: (turn != "session").then_some(turn.clone()),
                 model: items.last().and_then(|item| item.model.clone()),
                 timestamp: items.last().map(|item| item.timestamp),
-                evidence: format!("{} captured output bytes", metrics.output_bytes),
-                remediation: "Filter, paginate, or summarize command output at the source".into(),
-            });
-        }
-        if metrics.calls >= RATIO_EVIDENCE_MIN_CALLS {
-            let mutations = metrics.mutations.max(1);
-            let decided = metrics.successes + metrics.failures;
-            let read_edit_ratio = metrics.reads as f64 / mutations as f64;
-            let failure_rate = if decided == 0 {
-                0.0
-            } else {
-                metrics.failures as f64 / decided as f64
-            };
-            out.push(OptimizationFinding {
-                version: ANALYZER_VERSION,
-                rule_id: "tool-ratio-evidence".into(),
-                severity: "info".into(),
-                turn_id: (turn != "session").then_some(turn),
-                model: items.last().and_then(|item| item.model.clone()),
-                timestamp: items.last().map(|item| item.timestamp),
                 evidence: format!(
-                    "read/edit {:.2}; success/failure {}/{}",
-                    read_edit_ratio, metrics.successes, metrics.failures
+                    "{:.1} MiB captured across {command_calls} command calls",
+                    command_output_bytes as f64 / (1024.0 * 1024.0)
                 ),
-                remediation: if failure_rate >= 0.5 {
-                    "Review the failing tool path; ratios are evidence, not a quality score".into()
-                } else {
-                    "Use this ratio as context; no universal target is implied".into()
-                },
+                remediation: "Filter, paginate, or summarize command output at the source".into(),
+                occurrences: command_calls as u64,
+                avoidable_calls: 0,
             });
         }
     }
+    out.sort_by(|a, b| {
+        (b.severity == "warning")
+            .cmp(&(a.severity == "warning"))
+            .then_with(|| b.avoidable_calls.cmp(&a.avoidable_calls))
+            .then_with(|| a.timestamp.cmp(&b.timestamp))
+            .then_with(|| a.rule_id.cmp(&b.rule_id))
+    });
     out
+}
+
+fn is_volatile_read(name: &str) -> bool {
+    let value = name.to_ascii_lowercase();
+    [
+        "status",
+        "wait",
+        "poll",
+        "terminal",
+        "get_goal",
+        "list_agents",
+        "read_thread",
+    ]
+    .iter()
+    .any(|term| value.contains(term))
+}
+
+fn short_private_id(value: &str) -> String {
+    let tail: String = value.chars().rev().take(8).collect();
+    tail.chars().rev().collect()
 }
 
 pub fn category_totals(turns: &[crate::model::TurnInfo]) -> BTreeMap<TaskCategory, CategoryMetric> {
@@ -579,6 +681,18 @@ mod tests {
         assert_eq!(target, normalized_target("edit_file", &args).unwrap());
         assert!(!target.contains("private"));
         assert!(!target.contains("secret"));
+        assert_eq!(normalized_resource(&args), normalized_resource(&args));
+    }
+
+    #[test]
+    fn read_ranges_have_distinct_request_ids_but_share_a_resource() {
+        let first = serde_json::json!({"path":"C:/private/example.rs","offset":1,"limit":50});
+        let second = serde_json::json!({"path":"C:/private/example.rs","offset":51,"limit":50});
+        assert_ne!(
+            normalized_target("read_file", &first),
+            normalized_target("read_file", &second)
+        );
+        assert_eq!(normalized_resource(&first), normalized_resource(&second));
     }
 
     #[test]
@@ -595,6 +709,7 @@ mod tests {
             providers: Vec::new(),
             effective_tools: vec!["edit".into()],
             target: Some(target.into()),
+            resource_id: Some(target.into()),
             outcome: ToolOutcome::Success,
             duration_ms: None,
             output_bytes: 0,
@@ -621,6 +736,7 @@ mod tests {
                 providers: Vec::new(),
                 effective_tools: vec!["read".into()],
                 target: Some("read:abc".into()),
+                resource_id: Some("abc".into()),
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
                 output_bytes: 0,
@@ -701,6 +817,12 @@ mod tests {
             providers: Vec::new(),
             effective_tools: vec!["synthetic".into()],
             target: target.map(str::to_owned),
+            resource_id: target.map(|target| {
+                target
+                    .rsplit_once(':')
+                    .map_or(target, |(_, resource)| resource)
+                    .to_owned()
+            }),
             outcome,
             duration_ms: None,
             output_bytes,
@@ -773,7 +895,6 @@ mod tests {
             "corrective-mutation",
             "repeated-failure",
             "excessive-command-output",
-            "tool-ratio-evidence",
         ] {
             assert!(
                 result.iter().any(|item| item.rule_id == rule),
@@ -815,5 +936,46 @@ mod tests {
                 "mcp__beta__lookup"
             ]
         );
+    }
+
+    #[test]
+    fn analyzer_does_not_treat_successful_iterative_edits_as_corrections() {
+        let items = vec![
+            observation(
+                1,
+                ToolKind::Mutation,
+                Some("mutation:a"),
+                ToolOutcome::Success,
+                0,
+            ),
+            observation(
+                2,
+                ToolKind::Mutation,
+                Some("mutation:a"),
+                ToolOutcome::Success,
+                0,
+            ),
+        ];
+        assert!(!findings(&items)
+            .iter()
+            .any(|item| item.rule_id == "corrective-mutation"));
+    }
+
+    #[test]
+    fn analyzer_excludes_volatile_reads_and_neutral_ratios() {
+        let volatile: Vec<_> = (1..=8)
+            .map(|id| {
+                let mut item = observation(
+                    id,
+                    ToolKind::Read,
+                    Some("read:status"),
+                    ToolOutcome::Success,
+                    0,
+                );
+                item.name = "read_thread_terminal".into();
+                item
+            })
+            .collect();
+        assert!(findings(&volatile).is_empty());
     }
 }

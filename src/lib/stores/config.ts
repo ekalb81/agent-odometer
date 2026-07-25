@@ -9,4 +9,7 @@ export const config = writable<Config>({
   claude_session_roots: [],
   performance_tracking_enabled: false,
   performance_log_max_mb: 64,
+  instructions_enabled: false,
+  instructions_tab_visible: true,
+  instruction_roots: [],
 });

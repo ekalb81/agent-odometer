@@ -45,6 +45,7 @@ Saving watched-root settings persists the new config, stops the old watcher, cle
 | `src-tauri/src/correlation.rs` | Source-agnostic batched event/window attribution and metric observations |
 | `src-tauri/src/config_events.rs` | Dedicated safe configuration resolver, snapshot, watcher, and versioned event log |
 | `src-tauri/src/git_outcomes.rs` | Opt-in read-only local commit correlation through `gix` |
+| `src-tauri/src/instructions.rs` | Opt-in bounded instruction discovery, hierarchy, warning signals, and allowlisted preview reads |
 | `src-tauri/src/tray.rs` | Native tray lifecycle, menu events, and projected today labels |
 
 ## Parser model
@@ -107,7 +108,13 @@ Date-scoped numbers come from the batched `sessions_in_ranges` command. The fron
 
 Configuration tracking resolves global harness roots plus project scopes derived from session working directories (using the containing Git worktree when available). Only known settings/instruction files and bounded hook/skill trees are watched. Events retain hashes, sizes, a size-only safe diff, and a hashed path identity; they never persist config values or raw paths. The watcher is rebuilt after each session scan so newly discovered project scopes and settings-root changes share the same coverage. Config markers appear on the existing spend chart and the timeline reports before/after tokens, turns, active session duration, tool metrics, samples, and confounds through the source-agnostic correlation engine.
 
-Optimization findings are timestamped at the observation that triggered them. `RangeTotals.optimization_findings_count` therefore scopes precomputed findings by date without rerunning the analyzer for every analytics window.
+The optional Instructions view is deliberately separate from that redacted event pipeline. When enabled, `instructions.rs` inventories the known global harness folders, Git worktrees inferred from session working directories, and user-configured roots. Each configured root is folder-only or recursive; recursive walks do not follow links, are depth/file bounded, and skip common VCS, dependency, and generated-output trees. The wire model keeps harness ownership as a list of strings so future harness definitions do not require replacing the inventory contract, although only Codex `AGENTS.md` and Claude Code `CLAUDE.md` are admitted today.
+
+Inventory reads are fail-closed: the UI must refresh discovery first, only discovered regular files with supported names enter the in-memory allowlist, symbolic links are rejected, and preview content is capped at 1 MiB. The frontend renders Markdown with Marked and sanitizes the HTML with DOMPurify; active links, remote media, embedded forms, scripts, styles, SVG, and other executable/remote surfaces are removed. Opening a file uses the platform's default application only after the same backend allowlist check.
+
+Warnings are deterministic review signals rather than semantic verdicts. Duplicates share an exact normalized-content hash; possible conflicts are opposite `always`/`must` versus `never`/`must not`/`do not` directives within one effective ancestor chain; oversized files exceed 64 KiB or 800 lines; possibly stale files are unchanged for 180 days while their project has agent activity in the last 30 days. Selecting a file filters redacted configuration events by its normalized path identity and reuses the existing seven-day before/after correlation view.
+
+Optimization findings are timestamped at the observation that triggered them. `RangeTotals.optimization_findings_count` therefore scopes precomputed findings by date without rerunning the analyzer for every analytics window. The analyzer keeps exact read-request identity separate from the private resource identity: ranges/pages are distinct requests, while a mutation of the same resource resets prior-read streaks. Volatile polling reads and neutral tool ratios are not optimization findings. Findings carry confidence, occurrence count, and a conservative likely-avoidable-call estimate; compact summaries expose severity and rule breakdowns without shipping full observations to the list view.
 
 `src/lib/types.ts` manually mirrors Rust's serialized structs. Rust field or serialization changes therefore require an explicit TypeScript update.
 

@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionContent } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -75,6 +75,18 @@ export function getConfig(): Promise<Config> {
 
 export function setConfig(config: Config): Promise<void> {
   return invoke<void>('set_config', { config });
+}
+
+export function listInstructionFiles(): Promise<InstructionInventory> {
+  return invoke<InstructionInventory>('list_instruction_files');
+}
+
+export function readInstructionFile(path: string): Promise<InstructionContent> {
+  return invoke<InstructionContent>('read_instruction_file', { path });
+}
+
+export function openInstructionFile(path: string): Promise<void> {
+  return invoke<void>('open_instruction_file', { path });
 }
 
 export function getRates(): Promise<RateCard> {

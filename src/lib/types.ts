@@ -43,6 +43,7 @@ export interface ToolObservation {
   providers: string[];
   effective_tools: string[];
   target: string | null;
+  resource_id?: string | null;
   outcome: ToolOutcome;
   duration_ms: number | null;
   output_bytes: number;
@@ -66,11 +67,21 @@ export interface OptimizationFinding {
   version: number;
   rule_id: string;
   severity: string;
+  confidence?: string;
   turn_id: string | null;
   model: string | null;
   timestamp: string | null;
   evidence: string;
   remediation: string;
+  occurrences?: number;
+  avoidable_calls?: number;
+}
+
+export interface OptimizationSummary {
+  findings: number;
+  warnings: number;
+  likely_avoidable_calls: number;
+  by_rule: Record<string, number>;
 }
 
 export interface TurnInfo {
@@ -153,6 +164,7 @@ export interface RangeTotals {
   tool_metrics: ToolMetrics;
   tool_metrics_by_model: Record<string, ToolMetrics>;
   optimization_findings_count: number;
+  optimization_summary?: OptimizationSummary;
 }
 
 export interface ToolImpactCohort {
@@ -220,6 +232,7 @@ export interface SessionSummary {
   tool_metrics_by_model: Record<string, ToolMetrics>;
   category_totals: Partial<Record<TaskCategory, CategoryMetric>>;
   optimization_findings_count: number;
+  optimization_summary?: OptimizationSummary;
 }
 
 /** Bulk-scan progress, from get_scan_status and "scan-progress" events. */
@@ -238,6 +251,63 @@ export interface Config {
   claude_session_roots: string[];
   performance_tracking_enabled: boolean;
   performance_log_max_mb: number;
+  instructions_enabled: boolean;
+  instructions_tab_visible: boolean;
+  instruction_roots: InstructionRoot[];
+}
+
+export interface InstructionRoot {
+  path: string;
+  recursive: boolean;
+}
+
+export interface InstructionWarning {
+  kind: 'duplicate' | 'possible_conflict' | 'oversized' | 'possibly_stale' | string;
+  severity: 'info' | 'warning' | string;
+  message: string;
+  related_paths: string[];
+}
+
+export interface InstructionFile {
+  id: string;
+  path_id: string;
+  path: string;
+  directory: string;
+  file_name: string;
+  harnesses: string[];
+  root_path: string;
+  root_source: 'global' | 'configured' | 'observed' | string;
+  root_recursive: boolean;
+  project_path: string | null;
+  project_scope: string | null;
+  relative_path: string;
+  depth: number;
+  size: number;
+  line_count: number | null;
+  modified_at: string | null;
+  content_hash: string | null;
+  parent_id: string | null;
+  effective_ids: string[];
+  warnings: InstructionWarning[];
+}
+
+export interface InstructionRootSummary {
+  path: string;
+  source: string;
+  recursive: boolean;
+  exists: boolean;
+}
+
+export interface InstructionInventory {
+  files: InstructionFile[];
+  roots: InstructionRootSummary[];
+  truncated: boolean;
+  scanned_at: string;
+}
+
+export interface InstructionContent {
+  path: string;
+  content: string;
 }
 
 export interface PerformanceStatus {

@@ -66,6 +66,7 @@ pub struct AppState {
     pub config_transition: Mutex<()>,
     pub watcher: Mutex<Option<WatcherHandle>>,
     pub config_watcher: Mutex<Option<ConfigWatcherHandle>>,
+    instruction_paths: Mutex<HashSet<String>>,
     session_paths: DashMap<String, PathSessionState>,
     pub external_events: Mutex<ExternalEventStore>,
     pub performance: crate::performance::PerformanceRecorder,
@@ -86,6 +87,7 @@ impl AppState {
             config_transition: Mutex::new(()),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
+            instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(
                 crate::config_events::load_events(),
@@ -110,6 +112,21 @@ impl AppState {
     pub fn clear_sessions(&self) {
         self.session_paths.clear();
         self.sessions.clear();
+    }
+
+    pub fn replace_instruction_paths(&self, paths: impl IntoIterator<Item = String>) {
+        *self.instruction_paths.lock().unwrap() = paths.into_iter().collect();
+    }
+
+    pub fn clear_instruction_paths(&self) {
+        self.instruction_paths.lock().unwrap().clear();
+    }
+
+    pub fn instruction_path_allowed(&self, path: &Path) -> bool {
+        self.instruction_paths
+            .lock()
+            .unwrap()
+            .contains(&path_key(path))
     }
 
     /// Publishes a bulk-scan result unless the live watcher already observed
@@ -252,6 +269,7 @@ mod tests {
             config_transition: Mutex::new(()),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
+            instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(Vec::new())),
             performance: crate::performance::PerformanceRecorder::default(),

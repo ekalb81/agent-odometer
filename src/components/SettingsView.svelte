@@ -8,10 +8,13 @@
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
-  import type { RateCard, ModelRate, PerformanceStatus } from '../lib/types';
+  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
 
   const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
+
+  interface Props { onopeninstructions?: () => void; }
+  let { onopeninstructions = () => {} }: Props = $props();
 
   let appVersion = $state('');
   let releaseNotesError = $state<string | null>(null);
@@ -152,12 +155,11 @@
     rootsSaveError = null;
     try {
       await setConfig({
+        ...$config,
         session_roots: editedSessionRoots,
         archive_roots: editedArchiveRoots,
         session_index_path: editedIndexPath.trim(),
         claude_session_roots: editedClaudeRoots,
-        performance_tracking_enabled: $config.performance_tracking_enabled,
-        performance_log_max_mb: $config.performance_log_max_mb,
       });
       rootsDirty = false;
       rootsSavedAt = new Date().toLocaleTimeString();
@@ -165,6 +167,89 @@
       rootsSaveError = String(e);
     } finally {
       rootsSaving = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Opt-in read-only instruction inventory.
+  // ---------------------------------------------------------------------------
+  let instructionsEnabled = $state(false);
+  let instructionsTabVisible = $state(true);
+  let editedInstructionRoots = $state<InstructionRoot[]>([]);
+  let newInstructionRoot = $state('');
+  let newInstructionRootRecursive = $state(true);
+  let instructionsDirty = $state(false);
+  let instructionsSaving = $state(false);
+  let instructionsSavedAt = $state<string | null>(null);
+  let instructionsError = $state<string | null>(null);
+
+  $effect(() => {
+    const current = $config;
+    if (!instructionsDirty) {
+      instructionsEnabled = current.instructions_enabled ?? false;
+      instructionsTabVisible = current.instructions_tab_visible ?? true;
+      editedInstructionRoots = (current.instruction_roots ?? []).map((root) => ({ ...root }));
+    }
+  });
+
+  const hasDuplicateInstructionRoots = $derived((() => {
+    const normalized = editedInstructionRoots.map((root) =>
+      root.path.replaceAll('\\', '/').replace(/\/$/, '').toLocaleLowerCase(),
+    );
+    return new Set(normalized).size !== normalized.length;
+  })());
+
+  function markInstructionsDirty() {
+    instructionsDirty = true;
+    instructionsSavedAt = null;
+    instructionsError = null;
+  }
+
+  function addInstructionRoot() {
+    const path = newInstructionRoot.trim();
+    if (!path) return;
+    editedInstructionRoots = [
+      ...editedInstructionRoots,
+      { path, recursive: newInstructionRootRecursive },
+    ];
+    newInstructionRoot = '';
+    markInstructionsDirty();
+  }
+
+  function removeInstructionRoot(index: number) {
+    editedInstructionRoots = editedInstructionRoots.filter((_, candidate) => candidate !== index);
+    markInstructionsDirty();
+  }
+
+  function setInstructionRootRecursive(index: number, recursive: boolean) {
+    editedInstructionRoots = editedInstructionRoots.map((root, candidate) =>
+      candidate === index ? { ...root, recursive } : root,
+    );
+    markInstructionsDirty();
+  }
+
+  async function saveInstructionSettings() {
+    if (hasDuplicateInstructionRoots) {
+      instructionsError = 'Remove duplicate instruction roots before saving.';
+      return;
+    }
+    instructionsSaving = true;
+    instructionsError = null;
+    try {
+      const updated = {
+        ...$config,
+        instructions_enabled: instructionsEnabled,
+        instructions_tab_visible: instructionsTabVisible,
+        instruction_roots: editedInstructionRoots,
+      };
+      await setConfig(updated);
+      config.set(updated);
+      instructionsDirty = false;
+      instructionsSavedAt = new Date().toLocaleTimeString();
+    } catch (reason) {
+      instructionsError = String(reason);
+    } finally {
+      instructionsSaving = false;
     }
   }
 
@@ -666,6 +751,110 @@
     {#if hasDuplicateRoots}
       <p class="text-xs text-amber-500">Warning: duplicate paths detected in the lists above.</p>
     {/if}
+  </section>
+
+  <!-- Opt-in instruction inventory -->
+  <section>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Instruction inventory</h2>
+    <p class="text-xs text-ink-faint mb-3 max-w-3xl">
+      Finds supported agent instruction files locally and provides a read-only hierarchy, effective
+      chain, warnings, Markdown preview, and change-impact history. Global harness folders and
+      projects already observed in session history are included automatically. Add container roots
+      below for projects that have not appeared in Odometer yet.
+    </p>
+    <div class="bg-card border border-edge rounded-lg px-4 py-3 max-w-4xl">
+      <div class="flex items-center gap-5 flex-wrap">
+        <label class="flex items-center gap-2 text-xs text-ink-2">
+          <input
+            type="checkbox"
+            bind:checked={instructionsEnabled}
+            onchange={markInstructionsDirty}
+          />
+          Enable instruction inventory
+        </label>
+        <label class="flex items-center gap-2 text-xs text-ink-muted">
+          <input
+            type="checkbox"
+            bind:checked={instructionsTabVisible}
+            onchange={markInstructionsDirty}
+          />
+          Show Instructions tab
+        </label>
+        <button
+          onclick={saveInstructionSettings}
+          disabled={!instructionsDirty || instructionsSaving}
+          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
+        >{instructionsSaving ? 'Saving…' : 'Save'}</button>
+        <button
+          onclick={onopeninstructions}
+          disabled={!$config.instructions_enabled || !$config.instructions_tab_visible || instructionsDirty}
+          class="px-3 py-1.5 text-xs rounded border border-edge bg-app hover:bg-[var(--row-hover)] disabled:opacity-40"
+        >Open Instructions</button>
+        {#if instructionsSavedAt && !instructionsDirty}
+          <span class="text-xs text-pos">Saved at {instructionsSavedAt}</span>
+        {/if}
+      </div>
+      <p class="text-[11px] text-ink-faint mt-2">
+        Turning this off hides the tab, stops configured-root instruction watching, and denies file
+        preview/open requests. Hiding only the tab leaves discovery and change tracking enabled.
+      </p>
+
+      <div class="mt-4 pt-3 border-t border-edgerow">
+        <div class="flex items-baseline justify-between gap-3 mb-2">
+          <div>
+            <h3 class="text-xs font-semibold text-ink">Additional discovery roots</h3>
+            <p class="text-[11px] text-ink-faint">Choose folder-only or recursive discovery per path. Generated and dependency folders are skipped.</p>
+          </div>
+          <span class="text-[10px] text-ink-faint">AGENTS.md · CLAUDE.md</span>
+        </div>
+        <ul class="border border-edge rounded-lg divide-y divide-edge overflow-hidden">
+          {#if editedInstructionRoots.length === 0}
+            <li class="px-3 py-2 text-xs text-ink-faint italic">No additional roots configured</li>
+          {:else}
+            {#each editedInstructionRoots as root, index}
+              <li class="flex items-center gap-3 px-3 py-2">
+                <span class="flex-1 min-w-0 font-mono text-xs text-ink-2 break-all">{root.path}</span>
+                <label class="flex items-center gap-1.5 text-[11px] text-ink-muted flex-shrink-0">
+                  <input
+                    type="checkbox"
+                    checked={root.recursive}
+                    onchange={(event) => setInstructionRootRecursive(index, event.currentTarget.checked)}
+                  />
+                  Include subfolders
+                </label>
+                <button
+                  onclick={() => removeInstructionRoot(index)}
+                  class="px-1.5 py-0.5 text-xs text-ink-faint hover:text-red-500"
+                  aria-label="Remove {root.path}"
+                >Remove</button>
+              </li>
+            {/each}
+          {/if}
+          <li class="flex items-center gap-2 px-3 py-2 flex-wrap">
+            <input
+              type="text"
+              bind:value={newInstructionRoot}
+              onkeydown={(event) => { if (event.key === 'Enter') addInstructionRoot(); }}
+              placeholder="D:\projects"
+              class="flex-1 min-w-[260px] bg-app border border-edge rounded px-2 py-1 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
+            />
+            <label class="flex items-center gap-1.5 text-[11px] text-ink-muted">
+              <input type="checkbox" bind:checked={newInstructionRootRecursive} /> Include subfolders
+            </label>
+            <button
+              onclick={addInstructionRoot}
+              class="px-2.5 py-1 text-xs rounded bg-accent-tab text-white hover:opacity-90"
+            >Add</button>
+          </li>
+        </ul>
+        {#if hasDuplicateInstructionRoots}
+          <p class="text-xs text-amber-500 mt-2">Duplicate paths must be removed before saving.</p>
+        {/if}
+        {#if instructionsError}
+          <p class="text-xs text-red-500 mt-2" role="alert">{instructionsError}</p>
+        {/if}
+      </div>
+    </div>
   </section>
 
   <!-- Opt-in application performance tracking -->
