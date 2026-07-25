@@ -27,7 +27,7 @@ dashmap        = "6"
 anyhow         = "1"
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dirs           = "5"
+dirs           = "6"
 walkdir        = "2"
 rayon          = "1"
 tauri-plugin-updater = "2"
