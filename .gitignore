@@ -1,5 +1,6 @@
 node_modules/
 dist/
+coverage/
 .svelte-kit/
 .DS_Store
 

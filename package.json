@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
+    "test": "vitest run && node --test scripts/validate-frontend-coverage.test.mjs",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage && node --test scripts/validate-frontend-coverage.test.mjs && node scripts/validate-frontend-coverage.mjs",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:updater-manifest": "node --test scripts/validate-updater-manifest.test.mjs",
     "tauri": "tauri"
@@ -22,13 +25,19 @@
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5",
     "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^7.0.0",
+    "@testing-library/svelte": "^5.4.2",
+    "@testing-library/user-event": "^14.6.1",
+    "@vitest/coverage-v8": "^4.1.10",
     "autoprefixer": "^10",
+    "jsdom": "^29.1.1",
     "postcss": "^8",
     "svelte": "^5",
     "svelte-check": "^4",
     "tailwindcss": "^3",
     "typescript": "^5",
-    "vite": "^6.4.3"
+    "vite": "^6.4.3",
+    "vitest": "^4.1.10"
   },
   "license": "MIT"
 }

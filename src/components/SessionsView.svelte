@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
+  import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
@@ -17,6 +18,7 @@
     filterSessions,
     isSubagent,
     projectSessions,
+    repositoryLabel,
     rowsToCsv,
     sessionName,
     toUtcIso,
@@ -28,6 +30,8 @@
   import GitOutcomes from './GitOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
+  import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository } from '../lib/sessionGrid';
+  import SessionGridControls from './SessionGridControls.svelte';
 
   interface Props {
     harness?: ViewScope;
@@ -94,7 +98,7 @@
   // Sort state — 3-state (asc → desc → cleared). Cleared shows the
   // day-grouped view ordered by start time.
   // ---------------------------------------------------------------------------
-  type SortKey = 'name' | 'started' | 'model' | 'total' | 'cost' | null;
+  type SortKey = SessionGridColumnId | null;
   type SortDir = 'asc' | 'desc';
 
   let sortKey = $state<SortKey>(null);
@@ -241,9 +245,30 @@
       case 'started':
         cmp = a.startedMs - b.startedMs;
         break;
+      case 'repository':
+        cmp = (repositoryLabel(a) ?? '').localeCompare(repositoryLabel(b) ?? '');
+        break;
       case 'model':
         cmp = (a.model ?? '').localeCompare(b.model ?? '');
         break;
+      case 'input': {
+        const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
+        const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
+        cmp = at.input_tokens - bt.input_tokens;
+        break;
+      }
+      case 'cached': {
+        const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
+        const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
+        cmp = at.cached_input_tokens - bt.cached_input_tokens;
+        break;
+      }
+      case 'output': {
+        const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
+        const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
+        cmp = at.output_tokens - bt.output_tokens;
+        break;
+      }
       case 'total': {
         const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
         const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
@@ -369,6 +394,9 @@
   }
 
   const groups = $derived((() => {
+    if (sessionGridStore.groupByRepository) {
+      return groupSessionsByRepository(displayed);
+    }
     if (sortKey !== null) return [{ label: null as string | null, sessions: displayed }];
     const out: { label: string | null; sessions: TrackedSession[] }[] = [];
     for (const s of displayed) {
@@ -458,16 +486,6 @@
     return () => resize.disconnect();
   });
 
-  /** Started column: time-of-day for today/yesterday, date otherwise. */
-  function fmtStarted(startedMs: number): string {
-    if (startedMs >= dayBoundaries.yesterday) {
-      const d = new Date(startedMs);
-      const pad = (n: number) => String(n).padStart(2, '0');
-      return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    }
-    return fmtMonthDay(startedMs);
-  }
-
   // Children per parent id → "N subagents" chips on parent rows.
   const childCounts = $derived((() => {
     const m = new Map<string, number>();
@@ -477,9 +495,12 @@
     return m;
   })());
 
-  const filteredTotal = $derived(
-    filtered.reduce((sum, s) => sum + (sessionDisplayMap.get(s.id)?.tokens.total_tokens ?? 0), 0),
-  );
+  const filteredTokenTotals = $derived(filtered.reduce((sum, s) => {
+    const tokens = sessionDisplayMap.get(s.id)?.tokens ?? s.tokens_total;
+    addTotals(sum, tokens);
+    return sum;
+  }, zeroTotals()));
+  const filteredTotal = $derived(filteredTokenTotals.total_tokens);
 
   // Money total for the pinned totals row (matches the column semantics).
   const costTotal = $derived(filtered.reduce((sum, s) => sum + costOf(s.id), 0));
@@ -1095,7 +1116,8 @@
   wideQuery.addEventListener('change', onWideChange);
   onDestroy(() => wideQuery.removeEventListener('change', onWideChange));
 
-  const gridCols = 'grid-template-columns: minmax(0,2.4fr) 0.9fr 1.1fr 1fr 0.8fr;';
+  const visibleColumns = $derived(sessionGridStore.columns);
+  const gridCols = $derived(`grid-template-columns: ${visibleColumns.map((column) => column.width).join(' ')};`);
 </script>
 
 <div class="flex flex-col h-full overflow-hidden">
@@ -1220,7 +1242,11 @@
     </div>
   </div>
 
-  <details class="px-4 pb-3 flex-shrink-0 max-h-[60vh] overflow-y-auto" bind:open={analyticsOpen}>
+  <details
+    class="px-4 pb-3 min-h-0 max-h-[60vh] overflow-y-auto"
+    bind:open={analyticsOpen}
+    data-testid="analytics-panel"
+  >
     <summary class="bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink">
       Analytics &amp; exports · {windowLabel}
     </summary>
@@ -1333,7 +1359,7 @@
         {/if}
       </details>
 
-      <ConfigTimeline {active} events={configEvents} />
+      <ConfigTimeline active={active && analyticsOpen} events={configEvents} />
       <GitOutcomes />
 
       <div class="flex items-center gap-2 text-xs">
@@ -1345,8 +1371,10 @@
     </div>
   </details>
 
+  <SessionGridControls />
+
   <!-- Main split: table + detail pane -->
-  <div class="flex-1 flex min-h-0 border-t border-edge">
+  <div class="flex-1 flex min-h-48 border-t border-edge" data-testid="session-grid-region">
     <div class="flex-1 min-w-0 flex flex-col bg-tablebg {isWide ? 'border-r border-edge' : ''}">
       {#if allSessions.length === 0}
         <div class="flex flex-col items-center justify-center h-full gap-3 text-ink-faint px-6 text-center">
@@ -1386,11 +1414,11 @@
             style={gridCols}
             role="row"
           >
-            <span role="columnheader" aria-sort={ariaSortAttr('name')} class="text-left"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('name')}>Name{caretFor('name')}</button></span>
-            <span role="columnheader" aria-sort={ariaSortAttr('started')} class="text-left"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('started')}>Started{caretFor('started')}</button></span>
-            <span role="columnheader" aria-sort={ariaSortAttr('model')} class="text-left"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('model')}>Model{caretFor('model')}</button></span>
-            <span role="columnheader" aria-sort={ariaSortAttr('total')} class="text-right"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('total')}>Total tok{caretFor('total')}</button></span>
-            <span role="columnheader" aria-sort={ariaSortAttr('cost')} class="text-right"><button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort('cost')}>{harness === 'all' ? 'Est. USD' : showApiCost ? 'Est. $' : 'Cost'}{caretFor('cost')}</button></span>
+            {#each visibleColumns as column (column.id)}
+              <span role="columnheader" aria-sort={ariaSortAttr(column.id)} class={column.align === 'right' ? 'text-right' : 'text-left'}>
+                <button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort(column.id)}>{column.id === 'cost' ? (harness === 'all' ? 'Est. USD' : showApiCost ? 'Est. $' : 'Cost') : column.label}{caretFor(column.id)}</button>
+              </span>
+            {/each}
           </div>
 
           <div aria-hidden="true" style:height={`${virtualList.top}px`}></div>
@@ -1422,52 +1450,33 @@
                 onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}
                 aria-label="Select session {name}"
               >
-                <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-[var(--row-name)]'}" title={name}>
-                  {#if combined !== undefined}
-                    <button
-                      class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center"
-                      onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.id); }}
-                      aria-expanded={!collapsed}
-                      aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}"
-                    >{collapsed ? '▸' : '▾'}</button>
+                {#each visibleColumns as column (column.id)}
+                  {#if column.id === 'name'}
+                    <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-[var(--row-name)]'}" title={name}>
+                      {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
+                      {#if sub}<span class="text-[var(--subagent-chip-fg)] font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
+                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}
+                      {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)] ml-1 whitespace-nowrap">archived</span>{/if}
+                      {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{session.harness === 'codex' ? 'Codex' : 'Claude'}</span>{/if}
+                    </span>
+                  {:else if column.id === 'started'}
+                    <span class="text-ink-muted font-mono text-xs" title={`UTC: ${session.started_at}`}>{formatStartedLocal(session.startedMs)}</span>
+                  {:else if column.id === 'repository'}
+                    <span class="text-ink-muted text-xs truncate" title={session.working_directory ? 'Recorded project folder' : 'No repository recorded for this session'}>{repositoryLabel(session) ?? 'No repository recorded'}</span>
+                  {:else if column.id === 'model'}
+                    <span class="text-ink-muted font-mono text-xs truncate" title={session.model ?? ''}>{session.model ?? '—'}</span>
+                  {:else if column.id === 'input'}
+                    <span class="text-right font-mono text-xs text-ink" title={rowTokens.input_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.input_tokens)}</span>
+                  {:else if column.id === 'cached'}
+                    <span class="text-right font-mono text-xs text-ink" title={rowTokens.cached_input_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.cached_input_tokens)}</span>
+                  {:else if column.id === 'output'}
+                    <span class="text-right font-mono text-xs text-ink" title={rowTokens.output_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.output_tokens)}</span>
+                  {:else if column.id === 'total'}
+                    <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmt.format(combined.tokens)}</span>{/if}</span>
+                  {:else if column.id === 'cost'}
+                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{allUsdAvailable ? fmtAmount(costOf(session.id)) : 'unavailable'}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmtAmount(combined.cost)}</div>{/if}</span>
                   {/if}
-                  {#if sub}<span class="text-[var(--subagent-chip-fg)] font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
-                  {#if sub}
-                    <span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">subagent</span>
-                  {:else if kids > 0}
-                    <span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>
-                  {/if}
-                  {#if session.archived}
-                    <span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)] ml-1 whitespace-nowrap">archived</span>
-                  {/if}
-                  {#if harness === 'all'}
-                    <span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{session.harness === 'codex' ? 'Codex' : 'Claude'}</span>
-                  {/if}
-                </span>
-                <span class="text-ink-muted font-mono text-xs">{fmtStarted(session.startedMs)}</span>
-                <span class="text-ink-muted font-mono text-xs truncate" title={session.model ?? ''}>{session.model ?? '—'}</span>
-                <span class="text-right font-mono text-xs text-ink">
-                  {fmt.format(rowTokens.total_tokens)}
-                  {#if combined !== undefined}
-                    <span
-                      class="block text-[10px] text-ink-faint font-normal cursor-help"
-                      title="This session plus its subagent threads (in view)"
-                    >Σ {fmt.format(combined.tokens)}</span>
-                  {/if}
-                </span>
-                <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">
-                  {allUsdAvailable ? fmtAmount(costOf(session.id)) : 'unavailable'}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span
-                      class="text-amber-500 cursor-help"
-                      title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span
-                      class="text-amber-500 cursor-help"
-                      title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}
-                  {#if allUsdAvailable && combined !== undefined}
-                    <div
-                      class="text-[10px] text-ink-faint font-normal cursor-help"
-                      title="This session plus its subagent threads (in view)"
-                    >Σ {fmtAmount(combined.cost)}</div>
-                  {/if}
-                </span>
+                {/each}
               </div>
             {/if}
           {/each}
@@ -1478,10 +1487,15 @@
             class="grid px-5 py-2 items-center border-t border-edge bg-panel font-semibold sticky bottom-0"
             style={gridCols}
           >
-            <span class="section-label">Totals · in view</span>
-            <span></span><span></span>
-            <span class="text-right font-mono text-xs text-ink">{fmt.format(filteredTotal)}</span>
-            <span class="text-right font-mono text-xs text-accent-cost">{allUsdAvailable ? fmtAmount(costTotal) : 'unavailable'}</span>
+            {#each visibleColumns as column (column.id)}
+              {#if column.id === 'name'}<span class="section-label">Totals · in view</span>
+              {:else if column.id === 'input'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.input_tokens)}</span>
+              {:else if column.id === 'cached'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.cached_input_tokens)}</span>
+              {:else if column.id === 'output'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.output_tokens)}</span>
+              {:else if column.id === 'total'}<span class="text-right font-mono text-xs text-ink">{fmt.format(filteredTotal)}</span>
+              {:else if column.id === 'cost'}<span class="text-right font-mono text-xs text-accent-cost">{allUsdAvailable ? fmtAmount(costTotal) : 'unavailable'}</span>
+              {:else}<span></span>{/if}
+            {/each}
           </div>
         </div>
       {/if}

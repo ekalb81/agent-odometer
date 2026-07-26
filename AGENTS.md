@@ -50,7 +50,7 @@ Claude Code sessions (`claude_parser.rs`) have their own invariants:
 - Subagent transcripts (`agent-*.jsonl` / under a `subagents` dir) reuse the parent's `sessionId`; they must be keyed by file stem with `parent_thread_id` set, never by the record `sessionId`, or they clobber the parent session.
 - Sessions carry `harness: claude_code`; the per-harness `currencies`/`fallback_models` maps on the rate card keep Codex credits and Claude USD estimates separate.
 
-Parser integration tests and fixtures live in `src-tauri/tests/`; small Rust unit tests live beside their modules. There is currently no frontend unit-test runner, so do not invent an `npm test` command.
+Frontend unit and component tests use Vitest with jsdom and Svelte Testing Library; run them with `npm test`. `npm run test:coverage` enforces the explicit source-backed coverage slice in `scripts/validate-frontend-coverage.mjs`; expand its manifest only alongside meaningful tests for the added files. Parser integration tests and fixtures live in `src-tauri/tests/`; small Rust unit tests live beside their modules.
 
 ## Validation
 
@@ -58,6 +58,7 @@ Match CI before handing off:
 
 ```powershell
 npm run check
+npm test
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings

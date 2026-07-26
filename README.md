@@ -110,6 +110,8 @@ npm run tauri dev
 | `npm run tauri dev` | Run the desktop app with hot reload |
 | `npm run dev` | Frontend dev server only (port 1420; no native IPC — a fixture mock supplies demo data in plain browsers) |
 | `npm run check` | Type-check TypeScript and Svelte |
+| `npm test` | Run frontend unit and component tests with Vitest |
+| `npm run test:coverage` | Run frontend tests and enforce the source-backed initial coverage slice |
 | `npm run build` | Build the frontend into `dist/` |
 | `npm run tauri build` | Build and bundle the desktop app |
 
@@ -117,13 +119,14 @@ Match CI before handing off:
 
 ```powershell
 npm run check
+npm test
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-Parser integration tests and synthetic fixtures live in `src-tauri/tests/`; never commit real session data. Set `RUST_LOG` (e.g. `$env:RUST_LOG = 'odometer_lib=info'`) for native tracing.
+Frontend tests live beside the modules and components they cover as `*.test.ts`. Parser integration tests and synthetic fixtures live in `src-tauri/tests/`; never commit real session data. Set `RUST_LOG` (e.g. `$env:RUST_LOG = 'odometer_lib=info'`) for native tracing.
 
 ### Repository layout
 
