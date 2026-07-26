@@ -10,9 +10,13 @@ export default defineConfig({
     include: ['src/**/*.test.{ts,svelte.ts}'],
     coverage: {
       provider: 'v8',
-      reporter: ['text', 'html'],
-      include: ['src/**/*.{ts,svelte}'],
-      exclude: ['src/**/*.test.{ts,svelte.ts}', 'src/test/**', 'src/vite-env.d.ts'],
+      reporter: ['json'],
+      reportsDirectory: './coverage/frontend',
+      include: [
+        'src/components/SessionGridControls.svelte',
+        'src/lib/sessionGrid.ts',
+        'src/lib/stores/sessionGrid.svelte.ts',
+      ],
     },
   },
 });

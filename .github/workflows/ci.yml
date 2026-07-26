@@ -76,8 +76,8 @@ jobs:
       - name: Frontend type-check
         run: npm run check
 
-      - name: Frontend tests
-        run: npm test
+      - name: Frontend tests and coverage gate
+        run: npm run test:coverage
 
       - name: Updater manifest validator tests
         run: npm run check:updater-manifest

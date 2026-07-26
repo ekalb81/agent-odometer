@@ -111,7 +111,7 @@ npm run tauri dev
 | `npm run dev` | Frontend dev server only (port 1420; no native IPC — a fixture mock supplies demo data in plain browsers) |
 | `npm run check` | Type-check TypeScript and Svelte |
 | `npm test` | Run frontend unit and component tests with Vitest |
-| `npm run test:coverage` | Run frontend tests with an HTML/text coverage report |
+| `npm run test:coverage` | Run frontend tests and enforce the source-backed initial coverage slice |
 | `npm run build` | Build the frontend into `dist/` |
 | `npm run tauri build` | Build and bundle the desktop app |
 

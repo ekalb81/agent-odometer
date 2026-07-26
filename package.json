@@ -7,9 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "vitest run",
+    "test": "vitest run && node --test scripts/validate-frontend-coverage.test.mjs",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage",
+    "test:coverage": "vitest run --coverage && node --test scripts/validate-frontend-coverage.test.mjs && node scripts/validate-frontend-coverage.mjs",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:updater-manifest": "node --test scripts/validate-updater-manifest.test.mjs",
     "tauri": "tauri"
