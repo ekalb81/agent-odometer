@@ -25,7 +25,7 @@ export function groupSessionsByRepository<T extends Pick<
   SessionSummary,
   'id' | 'parent_thread_id' | 'working_directory'
 >>(sessions: T[]): { label: string; sessions: T[] }[] {
-  const groups = new Map<string, T[]>();
+  const groups = new Map<string, { label: string; sessions: T[] }>();
   const byId = new Map(sessions.map((session) => [session.id, session]));
 
   for (const session of sessions) {
@@ -39,14 +39,22 @@ export function groupSessionsByRepository<T extends Pick<
       if (!parent) break;
       anchor = parent;
     }
-    const label = repositoryLabel(anchor) ?? 'No repository recorded';
-    const group = groups.get(label);
-    if (group) group.push(session);
-    else groups.set(label, [session]);
+    const workingDirectory = anchor.working_directory;
+    const normalized = workingDirectory?.replace(/\\/g, '/').replace(/\/+$/, '') ?? '';
+    const windowsStyle = Boolean(workingDirectory && (/\\/.test(workingDirectory) || /^[A-Za-z]:[\\/]/.test(workingDirectory)));
+    // The full normalized path is an internal identity only; display remains
+    // the privacy-safe final segment. Prefix missing paths to avoid collisions
+    // with a real directory whose name happens to match the fallback label.
+    const key = workingDirectory
+      ? `path:${windowsStyle ? normalized.toLowerCase() : normalized}`
+      : 'missing:';
+    const group = groups.get(key);
+    if (group) group.sessions.push(session);
+    else groups.set(key, {
+      label: repositoryLabel(anchor) ?? 'No repository recorded',
+      sessions: [session],
+    });
   }
 
-  return [...groups.entries()].map(([label, groupedSessions]) => ({
-    label,
-    sessions: groupedSessions,
-  }));
+  return [...groups.values()];
 }

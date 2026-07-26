@@ -14,6 +14,7 @@ export default defineConfig({
       reportsDirectory: './coverage/frontend',
       include: [
         'src/components/SessionGridControls.svelte',
+        'src/lib/configTimeline.ts',
         'src/lib/sessionGrid.ts',
         'src/lib/stores/sessionGrid.svelte.ts',
       ],

@@ -17,19 +17,30 @@ describe('session grid formatting', () => {
   });
 
   it('derives a privacy-safe repository label without exposing the path', () => {
-    expect(repositoryLabel({ working_directory: 'D:\\projects\\agent-odometer' })).toBe('agent-odometer');
+    expect(repositoryLabel({ working_directory: 'C:\\workspace\\sample-repository' })).toBe('sample-repository');
     expect(repositoryLabel({ working_directory: '/home/demo/work/repository' })).toBe('repository');
     expect(repositoryLabel({ working_directory: null })).toBeNull();
   });
 
   it('groups sessions by repository while keeping subagents with their parent', () => {
-    const parent = { id: 'parent', parent_thread_id: null, working_directory: 'D:\\projects\\alpha' };
-    const child = { id: 'child', parent_thread_id: 'parent', working_directory: 'D:\\projects\\beta' };
+    const parent = { id: 'parent', parent_thread_id: null, working_directory: 'C:\\workspace\\alpha' };
+    const child = { id: 'child', parent_thread_id: 'parent', working_directory: 'C:\\workspace\\beta' };
     const unscoped = { id: 'unscoped', parent_thread_id: null, working_directory: null };
 
     expect(groupSessionsByRepository([parent, child, unscoped])).toEqual([
       { label: 'alpha', sessions: [parent, child] },
       { label: 'No repository recorded', sessions: [unscoped] },
+    ]);
+  });
+
+  it('keeps distinct repositories separate when their folder labels match', () => {
+    const client = { id: 'client', parent_thread_id: null, working_directory: 'C:\\clients\\shared-name' };
+    const personal = { id: 'personal', parent_thread_id: null, working_directory: 'D:\\personal\\shared-name' };
+    const clientVariant = { id: 'client-variant', parent_thread_id: null, working_directory: 'c:/CLIENTS/shared-name/' };
+
+    expect(groupSessionsByRepository([client, personal, clientVariant])).toEqual([
+      { label: 'shared-name', sessions: [client, clientVariant] },
+      { label: 'shared-name', sessions: [personal] },
     ]);
   });
 

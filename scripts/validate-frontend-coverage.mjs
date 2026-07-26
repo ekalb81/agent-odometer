@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
   'src/components/SessionGridControls.svelte',
+  'src/lib/configTimeline.ts',
   'src/lib/sessionGrid.ts',
   'src/lib/stores/sessionGrid.svelte.ts',
 ];
