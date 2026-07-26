@@ -52,11 +52,17 @@ pub struct EventCorrelation {
     pub event: ExternalEvent,
     pub before: CorrelationObservation,
     pub after: CorrelationObservation,
+    pub after_window_end: DateTime<Utc>,
+    pub after_window_complete: bool,
+    pub minimum_session_count: u64,
+    pub sample_ready: bool,
     pub token_delta: i64,
     pub session_delta: i64,
     pub confounding_event_ids: Vec<String>,
     pub warnings: Vec<String>,
 }
+
+const MINIMUM_SESSION_COUNT: u64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct CorrelationResult {
@@ -209,6 +215,14 @@ fn add_range(
 }
 
 pub fn correlate<S: Borrow<Session>>(sessions: &[S], query: CorrelationQuery) -> CorrelationResult {
+    correlate_at(sessions, query, Utc::now())
+}
+
+fn correlate_at<S: Borrow<Session>>(
+    sessions: &[S],
+    query: CorrelationQuery,
+    now: DateTime<Utc>,
+) -> CorrelationResult {
     let windows: Vec<_> = query
         .events
         .iter()
@@ -315,7 +329,11 @@ pub fn correlate<S: Borrow<Session>>(sessions: &[S], query: CorrelationQuery) ->
         if excluded[index] {
             warnings.push("sample excluded because another event overlaps the window".into());
         }
-        if before.session_count < 3 || after.session_count < 3 {
+        let after_window_end = windows[index].1 .1.expect("bounded window");
+        let after_window_complete = now >= after_window_end;
+        let sample_ready = before.session_count >= MINIMUM_SESSION_COUNT
+            && after.session_count >= MINIMUM_SESSION_COUNT;
+        if !sample_ready {
             warnings.push("low sample size; do not interpret the delta as causal".into());
         }
         if !confounding_event_ids.is_empty() && !query.exclude_confounded {
@@ -323,6 +341,10 @@ pub fn correlate<S: Borrow<Session>>(sessions: &[S], query: CorrelationQuery) ->
         }
         results.push(EventCorrelation {
             event,
+            after_window_end,
+            after_window_complete,
+            minimum_session_count: MINIMUM_SESSION_COUNT,
+            sample_ready,
             token_delta: after.tokens.total_tokens as i64 - before.tokens.total_tokens as i64,
             session_delta: after.session_count as i64 - before.session_count as i64,
             before,
@@ -471,6 +493,30 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("excluded")));
+        assert!(!result.results[0].sample_ready);
+        assert_eq!(result.results[0].minimum_session_count, 3);
+    }
+
+    #[test]
+    fn reports_when_the_after_window_is_still_collecting_data() {
+        let event_time = "2026-01-02T00:00:00Z";
+        let result = correlate_at(
+            &[] as &[Session],
+            CorrelationQuery {
+                events: vec![event("e", event_time, None)],
+                before_days: 7,
+                after_days: 7,
+                exclude_confounded: false,
+                include_subagents: true,
+            },
+            "2026-01-03T00:00:00Z".parse().unwrap(),
+        );
+        let comparison = &result.results[0];
+        assert_eq!(
+            comparison.after_window_end,
+            "2026-01-09T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert!(!comparison.after_window_complete);
     }
 
     #[test]

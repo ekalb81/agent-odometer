@@ -423,6 +423,10 @@ export interface EventCorrelation {
   event: ExternalEvent;
   before: CorrelationObservation;
   after: CorrelationObservation;
+  after_window_end: string;
+  after_window_complete: boolean;
+  minimum_session_count: number;
+  sample_ready: boolean;
   token_delta: number;
   session_delta: number;
   confounding_event_ids: string[];
