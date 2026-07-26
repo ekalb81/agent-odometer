@@ -395,6 +395,8 @@ pub struct SessionSummary {
     pub originator: Option<String>,
     pub source: Option<String>,
     pub cli_version: Option<String>,
+    #[serde(default)]
+    pub model_provider: Option<String>,
     pub model: Option<String>,
     pub service_tier: Option<String>,
     pub plan_type: Option<String>,
@@ -436,6 +438,7 @@ impl SessionSummary {
             originator: s.originator.clone(),
             source: s.source.clone(),
             cli_version: s.cli_version.clone(),
+            model_provider: s.model_provider.clone(),
             model: s.model.clone(),
             service_tier: s.service_tier.clone(),
             plan_type: s.plan_type.clone(),

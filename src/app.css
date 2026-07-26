@@ -49,6 +49,11 @@
   --subagent-chip-fg: #b6a3f5;
   --archived-chip-bg: #2a2e37;
   --archived-chip-fg: #8b93a2;
+  --provider-openai-row: rgba(16, 163, 127, 0.16);
+  --provider-anthropic-row: rgba(217, 119, 87, 0.16);
+  --provider-google-row: rgba(66, 133, 244, 0.16);
+  --provider-xai-row: rgba(180, 185, 194, 0.13);
+  --provider-other-row: rgba(139, 108, 240, 0.14);
 }
 
 :root[data-theme='light'] {
@@ -77,6 +82,11 @@
   --subagent-chip-fg: #8a5cd6;
   --archived-chip-bg: #f1efe9;
   --archived-chip-fg: #6f7280;
+  --provider-openai-row: rgba(16, 163, 127, 0.11);
+  --provider-anthropic-row: rgba(191, 86, 54, 0.11);
+  --provider-google-row: rgba(66, 133, 244, 0.1);
+  --provider-xai-row: rgba(75, 85, 99, 0.08);
+  --provider-other-row: rgba(110, 83, 190, 0.09);
 }
 
 /* ---------------------------------------------------------------------------

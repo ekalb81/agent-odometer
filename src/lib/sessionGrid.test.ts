@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository } from './sessionGrid';
+import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository, modelProviderVisual } from './sessionGrid';
 import { projectSession, repositoryLabel, zeroToolMetrics, zeroTotals } from './sessionProjection';
 import type { RangeTotals, SessionSummary, TokenTotals } from './types';
 
@@ -14,6 +14,13 @@ describe('session grid formatting', () => {
   it('distinguishes unavailable token categories from measured values', () => {
     expect(formatTokenCategory(0, 'en-US')).toBe('—');
     expect(formatTokenCategory(12_345, 'en-US')).toBe('12,345');
+  });
+
+  it('maps model providers to a bounded palette with harness fallback', () => {
+    expect(modelProviderVisual({ harness: 'codex', model_provider: 'openai' })).toMatchObject({ key: 'openai', label: 'OpenAI' });
+    expect(modelProviderVisual({ harness: 'claude_code', model_provider: null })).toMatchObject({ key: 'anthropic', label: 'Anthropic' });
+    expect(modelProviderVisual({ harness: 'codex', model_provider: 'gemini' })).toMatchObject({ key: 'google', label: 'Google' });
+    expect(modelProviderVisual({ harness: 'codex', model_provider: 'local-provider' })).toMatchObject({ key: 'other', label: 'local-provider' });
   });
 
   it('derives a privacy-safe repository label without exposing the path', () => {
@@ -52,6 +59,7 @@ describe('session grid formatting', () => {
       parent_thread_id: null, agent_path: null, agent_nickname: null, file_path: 'fixture.jsonl',
       archived: false, started_at: '2026-01-01T00:00:00Z', last_event_at: '2026-01-01T00:01:00Z',
       working_directory: null, originator: null, source: null, cli_version: null, model: null,
+      model_provider: null,
       service_tier: null, plan_type: null, credits_unlimited: null, credits_balance: null,
       context_window: null, total_turns: 0, first_user_message: null, tokens_total: allTime,
       buckets: [], tool_metrics: zeroToolMetrics(), tool_metrics_by_model: {}, category_totals: {},

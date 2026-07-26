@@ -30,7 +30,7 @@
   import GitOutcomes from './GitOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
-  import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository } from '../lib/sessionGrid';
+  import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository, modelProviderVisual } from '../lib/sessionGrid';
   import SessionGridControls from './SessionGridControls.svelte';
 
   interface Props {
@@ -1435,6 +1435,7 @@
               {@const combined = combinedUsage.get(session.id)}
               {@const collapsed = collapsedParents.has(session.id)}
               {@const selected = selectedSessionId === session.id}
+              {@const providerVisual = modelProviderVisual(session)}
               <div
                 role="button"
                 tabindex="0"
@@ -1445,7 +1446,8 @@
                          : isPulsing(session.lastUpdatedAt)
                            ? 'bg-accent-rowbg animate-pulse'
                            : 'hover:bg-[var(--row-hover)]'}"
-                style={gridCols}
+                style={`${gridCols}${sessionGridStore.colorByModelProvider ? `; background-image: linear-gradient(90deg, ${providerVisual.tint}, transparent 24%)` : ''}`}
+                data-model-provider={providerVisual.key}
                 onclick={() => selectSession(session.id)}
                 onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}
                 aria-label="Select session {name}"
@@ -1464,7 +1466,10 @@
                   {:else if column.id === 'repository'}
                     <span class="text-ink-muted text-xs truncate" title={session.working_directory ? 'Recorded project folder' : 'No repository recorded for this session'}>{repositoryLabel(session) ?? 'No repository recorded'}</span>
                   {:else if column.id === 'model'}
-                    <span class="text-ink-muted font-mono text-xs truncate" title={session.model ?? ''}>{session.model ?? '—'}</span>
+                    <span class="text-ink-muted font-mono text-xs truncate flex items-center gap-1.5" title={`${session.model ?? 'Unknown model'} · ${providerVisual.label}`}>
+                      {#if sessionGridStore.colorByModelProvider}<span class="inline-block size-2 rounded-full flex-shrink-0" style:background-color={providerVisual.tint} aria-hidden="true"></span>{/if}
+                      <span class="truncate">{session.model ?? '—'}</span>
+                    </span>
                   {:else if column.id === 'input'}
                     <span class="text-right font-mono text-xs text-ink" title={rowTokens.input_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.input_tokens)}</span>
                   {:else if column.id === 'cached'}
