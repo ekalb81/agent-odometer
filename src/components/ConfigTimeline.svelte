@@ -1,7 +1,14 @@
 <script lang="ts">
   import { correlateEvents } from '../lib/ipc';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from '../lib/credits';
+  import {
+    comparisonReady,
+    nextCorrelationBoundaryDelay,
+    rapidRevertLabels,
+    readyUsageContext,
+  } from '../lib/configTimeline';
   import { rates } from '../lib/stores/rates';
+  import { sessionsStore } from '../lib/stores/sessions.svelte';
   import type { EventCorrelation, ExternalEvent } from '../lib/types';
 
   interface Props { active?: boolean; events: ExternalEvent[]; title?: string; }
@@ -10,6 +17,7 @@
   let loading = $state(false);
   let requestGeneration = 0;
   let error = $state<string | null>(null);
+<<<<<<< HEAD
   const RAPID_REVERT_MS = 5 * 60_000;
   let displayEvents = $derived(events.slice(-50).reverse());
   let revertLabels = $derived.by(() => rapidRevertLabels(events.slice(-50)));
@@ -39,19 +47,47 @@
     }
     return labels;
   }
+=======
+  let boundaryRefresh = $state(0);
+  let displayEvents = $derived(events.slice(-50).reverse());
+  let revertLabels = $derived.by(() => rapidRevertLabels(events.slice(-50)));
+>>>>>>> origin/main
 
   $effect(() => {
     const generation = ++requestGeneration;
     const source = events;
-    if (!active) return;
+    // Correlations depend on the current session corpus as well as the event
+    // list. Store mutations replace this Map, providing a bounded refresh key.
+    void sessionsStore.map;
+    void boundaryRefresh;
+    if (!active) {
+      loading = false;
+      return;
+    }
     loading = true;
     error = null;
-    const recent = source.slice(-50).reverse();
-    (recent.length > 0 ? correlateEvents({ events: recent, before_days: 7, after_days: 7, exclude_confounded: false, include_subagents: true }) : Promise.resolve({ results: [] }))
-      .then((result) => { if (active && generation === requestGeneration) correlations = result.results; })
-      .catch((reason) => { if (generation === requestGeneration) error = String(reason); })
-      .finally(() => { if (generation === requestGeneration) loading = false; });
-    return () => { if (generation === requestGeneration) requestGeneration += 1; };
+    let boundaryTimer: ReturnType<typeof setTimeout> | null = null;
+    const requestTimer = setTimeout(() => {
+      const recent = source.slice(-50).reverse();
+      (recent.length > 0 ? correlateEvents({ events: recent, before_days: 7, after_days: 7, exclude_confounded: false, include_subagents: true }) : Promise.resolve({ results: [] }))
+        .then((result) => {
+          if (!active || generation !== requestGeneration) return;
+          correlations = result.results;
+          const delay = nextCorrelationBoundaryDelay(result.results);
+          if (delay !== null) {
+            boundaryTimer = setTimeout(() => {
+              if (active && generation === requestGeneration) boundaryRefresh += 1;
+            }, delay);
+          }
+        })
+        .catch((reason) => { if (generation === requestGeneration) error = String(reason); })
+        .finally(() => { if (generation === requestGeneration) loading = false; });
+    }, 250);
+    return () => {
+      if (generation === requestGeneration) requestGeneration += 1;
+      clearTimeout(requestTimer);
+      if (boundaryTimer !== null) clearTimeout(boundaryTimer);
+    };
   });
 
   function costs(item: EventCorrelation): string {
@@ -69,6 +105,7 @@
     return `credits ${after.credits - before.credits >= 0 ? '+' : ''}${(after.credits - before.credits).toFixed(2)} · Codex ${formatCredits(after.codexUsd - before.codexUsd, 'USD')} · Claude ${formatCredits(after.claudeUsd - before.claudeUsd, 'USD')}`;
   }
 
+<<<<<<< HEAD
   function usageContext(item: EventCorrelation): string {
     const tokensPerTurn = (observation: EventCorrelation['before']) =>
       observation.turn_count > 0 ? observation.tokens.total_tokens / observation.turn_count : null;
@@ -98,6 +135,14 @@
     return `${sessions} · ${turns}`;
   }
 
+=======
+  function countContext(item: EventCorrelation): string {
+    const sessions = `${item.before.session_count.toLocaleString()} → ${item.after.session_count.toLocaleString()} sessions`;
+    const turns = `${item.before.turn_count.toLocaleString()} → ${item.after.turn_count.toLocaleString()} turns`;
+    return `${sessions} · ${turns}`;
+  }
+
+>>>>>>> origin/main
   function collectingContext(item: EventCorrelation): string {
     const end = new Date(item.after_window_end);
     const remainingMs = Math.max(0, end.getTime() - Date.now());
@@ -106,9 +151,12 @@
     return `After period still collecting data until ${end.toLocaleString()} (${remaining}).`;
   }
 
+<<<<<<< HEAD
   function comparisonReady(item: EventCorrelation): boolean {
     return item.after_window_complete && item.sample_ready;
   }
+=======
+>>>>>>> origin/main
 </script>
 
 {#if loading || events.length > 0 || error}
@@ -124,6 +172,10 @@
           <div class="text-ink-faint">{event.scope ? 'project' : 'global'} · {event.metadata.safe_diff ?? 'redacted content change'}</div>
           {#if revertLabels.has(event.id)}<div class="text-amber-500">{revertLabels.get(event.id)}</div>{/if}
           {#if correlation}
+<<<<<<< HEAD
+=======
+            {@const usage = readyUsageContext(correlation)}
+>>>>>>> origin/main
             <div class="text-ink-2">Observed samples · {countContext(correlation)}</div>
             {#if !correlation.after_window_complete}
               <div class="mt-1 rounded border border-edge bg-panel px-2 py-1 text-ink-muted">{collectingContext(correlation)} Comparisons use seven full days on each side.</div>
@@ -133,7 +185,11 @@
             {:else}
               <div class="text-ink-faint">Outcome deltas hidden until the after period is complete and both sides contain at least {correlation.minimum_session_count} sessions.</div>
             {/if}
+<<<<<<< HEAD
             <div class="text-ink-muted">{usageContext(correlation)}</div>
+=======
+            {#if usage}<div class="text-ink-muted">{usage}</div>{/if}
+>>>>>>> origin/main
             {#if correlation.warnings.length > 0}<div class="text-amber-500">{correlation.warnings.join(' · ')}</div>{/if}
           {/if}
         </div>
