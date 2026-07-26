@@ -115,7 +115,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   msrv:
-    name: Minimum supported Rust 1.88
+    name: Minimum supported Rust
     # PRs already exercise the same source with stable Rust. Keep the slower
     # compatibility build on main and explicit runs, where it still catches
     # accidental MSRV drift without charging every intermediate PR commit.
@@ -127,14 +127,38 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Read declared MSRV
+        id: msrv
+        shell: bash
+        run: |
+          version="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::src-tauri/Cargo.toml must declare package.rust-version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup declared MSRV
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      - name: Report installed MSRV
+        shell: bash
+        run: |
+          rustc --version
+          installed="$(rustc --version | awk '{print $2}')"
+          declared="${{ steps.msrv.outputs.version }}"
+          case "$installed" in
+            "$declared"|"$declared".*) ;;
+            *) echo "::error::Expected Rust $declared.x, installed $installed."; exit 1 ;;
+          esac
 
       - name: Cache Cargo
         uses: swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
-          key: msrv-linux-1.88
+          key: msrv-linux-${{ steps.msrv.outputs.version }}
 
       - name: Install Linux system deps
         run: |
