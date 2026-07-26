@@ -43,6 +43,31 @@ function assetIdFromUpdaterUrl(url) {
   return match ? Number(match[1]) : null;
 }
 
+export function rewriteUpdaterManifestUrls(manifest, release) {
+  requireObject(manifest, 'Updater manifest');
+  requireObject(manifest.platforms, 'manifest.platforms');
+  requireObject(release, 'Release metadata');
+  if (!Array.isArray(release.assets)) {
+    throw new Error('release.assets must be an array');
+  }
+
+  const assetsById = new Map(release.assets.map((asset) => [asset.id, asset]));
+  const assetsByUrl = new Map(release.assets.map((asset) => [asset.browser_download_url, asset]));
+  for (const [platform, entry] of Object.entries(manifest.platforms)) {
+    requireObject(entry, `manifest.platforms.${platform}`);
+    if (typeof entry.url !== 'string') {
+      throw new Error(`${platform}.url must be a string`);
+    }
+    const assetId = assetIdFromUpdaterUrl(entry.url);
+    const asset = (assetId === null ? null : assetsById.get(assetId)) ?? assetsByUrl.get(entry.url);
+    if (!asset || typeof asset.browser_download_url !== 'string') {
+      throw new Error(`${platform}.url does not reference an asset in this release`);
+    }
+    entry.url = asset.browser_download_url;
+  }
+  return manifest;
+}
+
 export function validateUpdaterManifest(manifest, release, expectedVersion, expectedSha) {
   requireObject(manifest, 'Updater manifest');
   requireObject(release, 'Release metadata');
@@ -104,7 +129,6 @@ export function validateUpdaterManifest(manifest, release, expectedVersion, expe
     throw new Error(`updater platform set mismatch; missing=[${missingPlatforms.join(', ')}] unexpected=[${unexpectedPlatforms.join(', ')}]`);
   }
 
-  const assetIds = new Set(release.assets.map((asset) => asset.id));
   const browserUrls = new Set(release.assets.map((asset) => asset.browser_download_url));
   for (const [platform, entry] of Object.entries(manifest.platforms)) {
     requireObject(entry, `manifest.platforms.${platform}`);
@@ -123,8 +147,10 @@ export function validateUpdaterManifest(manifest, release, expectedVersion, expe
     if (parsed.protocol !== 'https:') {
       throw new Error(`${platform}.url must use HTTPS`);
     }
-    const assetId = assetIdFromUpdaterUrl(entry.url);
-    if ((assetId === null || !assetIds.has(assetId)) && !browserUrls.has(entry.url)) {
+    if (parsed.hostname !== 'github.com' || !parsed.pathname.includes(`/releases/download/${release.tag_name}/`)) {
+      throw new Error(`${platform}.url must use a public GitHub release download URL`);
+    }
+    if (!browserUrls.has(entry.url)) {
       throw new Error(`${platform}.url does not reference an asset in this release`);
     }
   }
@@ -135,13 +161,21 @@ function readJson(path) {
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const [manifestPath, releasePath, expectedVersion, expectedSha] = process.argv.slice(2);
+  const [manifestPath, releasePath, expectedVersion, expectedSha, mode] = process.argv.slice(2);
   if (!manifestPath || !releasePath || !expectedVersion || !expectedSha) {
     console.error('Usage: node scripts/validate-updater-manifest.mjs <latest.json> <release.json> <version> <sha>');
     process.exit(2);
   }
   try {
-    validateUpdaterManifest(readJson(manifestPath), readJson(releasePath), expectedVersion, expectedSha);
+    const manifest = readJson(manifestPath);
+    const release = readJson(releasePath);
+    if (mode === '--rewrite') {
+      rewriteUpdaterManifestUrls(manifest, release);
+      fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    } else if (mode !== undefined) {
+      throw new Error(`Unknown mode: ${mode}`);
+    }
+    validateUpdaterManifest(manifest, release, expectedVersion, expectedSha);
     console.log(`Validated v${expectedVersion} updater manifest and release assets.`);
   } catch (error) {
     console.error(`Updater manifest validation failed: ${error.message}`);

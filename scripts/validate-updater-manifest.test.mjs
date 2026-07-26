@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { validateUpdaterManifest } from './validate-updater-manifest.mjs';
+import { rewriteUpdaterManifestUrls, validateUpdaterManifest } from './validate-updater-manifest.mjs';
 
 const VERSION = '0.6.2';
 const SHA = '0123456789abcdef0123456789abcdef01234567';
@@ -43,7 +43,7 @@ function fixture() {
   ];
   const platforms = Object.fromEntries(platformNames.map((name, index) => [name, {
     signature: 'signed',
-    url: `https://api.github.com/repos/example/app/releases/assets/${assets[(index % (assets.length - 1)) + 1].id}`,
+    url: assets[(index % (assets.length - 1)) + 1].browser_download_url,
   }]));
   return {
     manifest: { version: VERSION, notes: 'Release notes', pub_date: '2026-07-25T23:00:13.471Z', platforms },
@@ -54,6 +54,29 @@ function fixture() {
 test('accepts a complete Tauri updater manifest', () => {
   const { manifest, release } = fixture();
   assert.doesNotThrow(() => validateUpdaterManifest(manifest, release, VERSION, SHA));
+});
+
+test('rewrites API asset URLs to public release downloads for every platform', () => {
+  const { manifest, release } = fixture();
+  for (const [index, entry] of Object.values(manifest.platforms).entries()) {
+    entry.url = `https://api.github.com/repos/example/app/releases/assets/${release.assets[(index % (release.assets.length - 1)) + 1].id}`;
+  }
+
+  rewriteUpdaterManifestUrls(manifest, release);
+
+  assert.doesNotThrow(() => validateUpdaterManifest(manifest, release, VERSION, SHA));
+  for (const entry of Object.values(manifest.platforms)) {
+    assert.match(entry.url, new RegExp(`^https://github\\.com/example/app/releases/download/v${VERSION}/`));
+  }
+});
+
+test('rejects API asset URLs in a published manifest', () => {
+  const { manifest, release } = fixture();
+  manifest.platforms['windows-x86_64'].url = `https://api.github.com/repos/example/app/releases/assets/${release.assets[1].id}`;
+  assert.throws(
+    () => validateUpdaterManifest(manifest, release, VERSION, SHA),
+    /must use a public GitHub release download URL/,
+  );
 });
 
 test('rejects notes serialized as a sequence', () => {
@@ -79,6 +102,6 @@ test('rejects updater URLs outside the validated release', () => {
   manifest.platforms['windows-x86_64'].url = 'https://example.com/unverified.msi';
   assert.throws(
     () => validateUpdaterManifest(manifest, release, VERSION, SHA),
-    /does not reference an asset in this release/,
+    /must use a public GitHub release download URL/,
   );
 });

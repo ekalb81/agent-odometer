@@ -324,4 +324,24 @@ jobs:
             latest.json \
             release.json \
             "$package_version" \
+            "$GITHUB_SHA" \
+            --rewrite
+
+          # tauri-action v1 emits authenticated API asset URLs for draft
+          # releases. Replace latest.json with the validated public-download
+          # form before publication so installed clients receive binaries,
+          # not GitHub API metadata.
+          gh release upload "$GITHUB_REF_NAME" latest.json --clobber
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json
+          latest_asset_id="$(
+            jq -r '[.assets[] | select(.name == "latest.json")] | if length == 1 then .[0].id else empty end' release.json
+          )"
+          gh api \
+            -H 'Accept: application/octet-stream' \
+            "repos/${GITHUB_REPOSITORY}/releases/assets/${latest_asset_id}" > published-latest.json
+          node scripts/validate-updater-manifest.mjs \
+            published-latest.json \
+            release.json \
+            "$package_version" \
             "$GITHUB_SHA"
