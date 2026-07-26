@@ -26,4 +26,19 @@ describe('SessionGridControls', () => {
     expect(screen.getByRole('checkbox', { name: 'Cached' })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Group by repository' })).not.toBeChecked();
   });
+<<<<<<< HEAD
+=======
+
+  it('shows the current persisted column order after a move', async () => {
+    const user = userEvent.setup();
+    const { container } = render(SessionGridControls);
+    await user.click(screen.getByText('Columns'));
+
+    await user.click(screen.getByRole('button', { name: 'Move Repository left' }));
+
+    const order = [...container.querySelectorAll<HTMLElement>('[data-column-id]')]
+      .map((element) => element.dataset.columnId);
+    expect(order.slice(0, 4)).toEqual(['name', 'repository', 'started', 'model']);
+  });
+>>>>>>> origin/main
 });

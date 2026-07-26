@@ -1,5 +1,13 @@
 <script lang="ts">
   import { SESSION_GRID_COLUMNS, sessionGridStore } from '../lib/stores/sessionGrid.svelte';
+<<<<<<< HEAD
+=======
+
+  const controlColumns = $derived([
+    ...sessionGridStore.columns,
+    ...SESSION_GRID_COLUMNS.filter((column) => !sessionGridStore.columnIds.includes(column.id)),
+  ]);
+>>>>>>> origin/main
 </script>
 
 <div class="px-4 py-2 border-t border-edge flex items-center gap-3 text-xs bg-panel">
@@ -18,9 +26,15 @@
         <span class="section-label">Session grid</span>
         <button class="text-ink-faint hover:text-ink" onclick={() => sessionGridStore.reset()} title="Reset grid columns to defaults" aria-label="Reset grid columns to defaults">↺ Reset</button>
       </div>
+<<<<<<< HEAD
       {#each SESSION_GRID_COLUMNS as column (column.id)}
         {@const visible = sessionGridStore.columnIds.includes(column.id)}
         <div class="flex items-center gap-1.5 py-0.5">
+=======
+      {#each controlColumns as column (column.id)}
+        {@const visible = sessionGridStore.columnIds.includes(column.id)}
+        <div class="flex items-center gap-1.5 py-0.5" data-column-id={column.id}>
+>>>>>>> origin/main
           <input
             id={`column-${column.id}`}
             type="checkbox"

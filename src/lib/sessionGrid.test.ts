@@ -17,14 +17,23 @@ describe('session grid formatting', () => {
   });
 
   it('derives a privacy-safe repository label without exposing the path', () => {
+<<<<<<< HEAD
     expect(repositoryLabel({ working_directory: 'D:\\projects\\agent-odometer' })).toBe('agent-odometer');
+=======
+    expect(repositoryLabel({ working_directory: 'C:\\workspace\\sample-repository' })).toBe('sample-repository');
+>>>>>>> origin/main
     expect(repositoryLabel({ working_directory: '/home/demo/work/repository' })).toBe('repository');
     expect(repositoryLabel({ working_directory: null })).toBeNull();
   });
 
   it('groups sessions by repository while keeping subagents with their parent', () => {
+<<<<<<< HEAD
     const parent = { id: 'parent', parent_thread_id: null, working_directory: 'D:\\projects\\alpha' };
     const child = { id: 'child', parent_thread_id: 'parent', working_directory: 'D:\\projects\\beta' };
+=======
+    const parent = { id: 'parent', parent_thread_id: null, working_directory: 'C:\\workspace\\alpha' };
+    const child = { id: 'child', parent_thread_id: 'parent', working_directory: 'C:\\workspace\\beta' };
+>>>>>>> origin/main
     const unscoped = { id: 'unscoped', parent_thread_id: null, working_directory: null };
 
     expect(groupSessionsByRepository([parent, child, unscoped])).toEqual([
@@ -33,6 +42,20 @@ describe('session grid formatting', () => {
     ]);
   });
 
+<<<<<<< HEAD
+=======
+  it('keeps distinct repositories separate when their folder labels match', () => {
+    const client = { id: 'client', parent_thread_id: null, working_directory: 'C:\\clients\\shared-name' };
+    const personal = { id: 'personal', parent_thread_id: null, working_directory: 'D:\\personal\\shared-name' };
+    const clientVariant = { id: 'client-variant', parent_thread_id: null, working_directory: 'c:/CLIENTS/shared-name/' };
+
+    expect(groupSessionsByRepository([client, personal, clientVariant])).toEqual([
+      { label: 'shared-name', sessions: [client, clientVariant] },
+      { label: 'shared-name', sessions: [personal] },
+    ]);
+  });
+
+>>>>>>> origin/main
   it('uses range token categories when the grid is date scoped', () => {
     const allTime: TokenTotals = { input_tokens: 100, cached_input_tokens: 40, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 120 };
     const scoped: TokenTotals = { input_tokens: 12, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1, total_tokens: 15 };
