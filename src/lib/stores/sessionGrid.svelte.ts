@@ -35,6 +35,7 @@ const DEFAULT_COLUMN_IDS = SESSION_GRID_COLUMNS.map((column) => column.id);
 interface StoredPreferences {
   columns?: unknown;
   groupByRepository?: unknown;
+  colorByModelProvider?: unknown;
 }
 
 function validColumns(value: unknown): SessionGridColumnId[] | null {
@@ -45,15 +46,16 @@ function validColumns(value: unknown): SessionGridColumnId[] | null {
   return unique;
 }
 
-function loadPreferences(): { columns: SessionGridColumnId[]; groupByRepository: boolean } {
+function loadPreferences(): { columns: SessionGridColumnId[]; groupByRepository: boolean; colorByModelProvider: boolean } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '{}') as StoredPreferences;
     return {
       columns: validColumns(parsed.columns) ?? [...DEFAULT_COLUMN_IDS],
       groupByRepository: parsed.groupByRepository === true,
+      colorByModelProvider: parsed.colorByModelProvider === true,
     };
   } catch {
-    return { columns: [...DEFAULT_COLUMN_IDS], groupByRepository: false };
+    return { columns: [...DEFAULT_COLUMN_IDS], groupByRepository: false, colorByModelProvider: false };
   }
 }
 
@@ -61,9 +63,10 @@ function createSessionGridStore() {
   const saved = loadPreferences();
   let columnIds = $state<SessionGridColumnId[]>(saved.columns);
   let groupByRepository = $state(saved.groupByRepository);
+  let colorByModelProvider = $state(saved.colorByModelProvider);
 
   function persist() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ columns: columnIds, groupByRepository }));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ columns: columnIds, groupByRepository, colorByModelProvider }));
   }
 
   function setVisible(id: SessionGridColumnId, visible: boolean) {
@@ -89,9 +92,15 @@ function createSessionGridStore() {
     persist();
   }
 
+  function setColorByModelProvider(next: boolean) {
+    colorByModelProvider = next;
+    persist();
+  }
+
   function reset() {
     columnIds = [...DEFAULT_COLUMN_IDS];
     groupByRepository = false;
+    colorByModelProvider = false;
     persist();
   }
 
@@ -105,9 +114,13 @@ function createSessionGridStore() {
     get groupByRepository() {
       return groupByRepository;
     },
+    get colorByModelProvider() {
+      return colorByModelProvider;
+    },
     setVisible,
     move,
     setGroupByRepository,
+    setColorByModelProvider,
     reset,
   };
 }

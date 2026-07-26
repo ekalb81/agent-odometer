@@ -17,14 +17,17 @@ describe('SessionGridControls', () => {
     await user.click(screen.getByText('Columns'));
     await user.click(screen.getByRole('checkbox', { name: 'Cached' }));
     await user.click(screen.getByRole('checkbox', { name: 'Group by repository' }));
+    await user.click(screen.getByRole('checkbox', { name: 'Color by model provider' }));
 
     expect(sessionGridStore.columnIds).not.toContain('cached');
     expect(sessionGridStore.groupByRepository).toBe(true);
+    expect(sessionGridStore.colorByModelProvider).toBe(true);
     expect(localStorage.getItem('sessionGridPreferences.v1')).toContain('groupByRepository');
 
     await user.click(screen.getByRole('button', { name: 'Reset grid columns to defaults' }));
     expect(screen.getByRole('checkbox', { name: 'Cached' })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Group by repository' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Color by model provider' })).not.toBeChecked();
   });
 
   it('shows the current persisted column order after a move', async () => {

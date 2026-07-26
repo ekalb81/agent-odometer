@@ -233,6 +233,7 @@ export interface SessionSummary {
   originator: string | null;
   source: string | null;
   cli_version: string | null;
+  model_provider: string | null;
   model: string | null;
   service_tier: string | null;
   plan_type: string | null;

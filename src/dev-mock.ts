@@ -149,6 +149,7 @@ function summary(f: Fixture): SessionSummary {
     originator: f.harness === 'codex' ? 'chatgpt' : 'cli',
     source: f.parent ? 'subagent' : null,
     cli_version: '1.4.2',
+    model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
     model: f.model,
     service_tier: null,
     plan_type: f.unlimited ? 'pro' : null,
