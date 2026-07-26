@@ -894,16 +894,18 @@
       }));
   })());
 
-  // Cost by model — aggregated from the same window as the spend card, top four.
+  // Cost by model — aggregated from the same window as the spend card.
+  let showAllCostModels = $state(false);
+  const modelSpendListId = $derived(`model-spend-list-${harness}`);
   const costByModel = $derived((() => {
     const sorted = windowStats.byModel;
     const max = sorted[0]?.cost ?? 0;
-    const rows = sorted.slice(0, 4).map((m) => ({
+    const rows = (showAllCostModels ? sorted : sorted.slice(0, 4)).map((m) => ({
       model: `${harness === 'all' ? `${m.harness} · ` : ''}${m.model}`,
       cost: m.cost,
       pct: max > 0 ? Math.max(2, Math.round((m.cost / max) * 100)) : 0,
     }));
-    return { rows, more: Math.max(0, sorted.length - 4) };
+    return { rows, hidden: Math.max(0, sorted.length - 4) };
   })());
 
   // Money formatting for analytics: USD gets the $ prefix, plan credits get
@@ -1171,19 +1173,29 @@
         <div class="text-[11px] text-ink-faint">No priced usage in this window</div>
       {:else}
         <div class="flex flex-col gap-2.5 text-xs">
-          {#each costByModel.rows as row, i (row.model)}
-            <div>
-              <div class="flex justify-between mb-1 gap-2">
-                <span class="font-mono text-[11px] text-ink-2 truncate" title={row.model}>{row.model}</span>
-                <span class="font-semibold font-mono text-ink whitespace-nowrap">{fmtMoney(row.cost)}</span>
+          <div id={modelSpendListId} class="flex flex-col gap-2.5">
+            {#each costByModel.rows as row, i (row.model)}
+              <div>
+                <div class="flex justify-between mb-1 gap-2">
+                  <span class="font-mono text-[11px] text-ink-2 truncate" title={row.model}>{row.model}</span>
+                  <span class="font-semibold font-mono text-ink whitespace-nowrap">{fmtMoney(row.cost)}</span>
+                </div>
+                <div class="h-[6px] bg-track rounded-[3px]">
+                  <div class="h-[6px] rounded-[3px]" style="width: {row.pct}%; background: var(--bar-{(i % 4) + 1});"></div>
+                </div>
               </div>
-              <div class="h-[6px] bg-track rounded-[3px]">
-                <div class="h-[6px] rounded-[3px]" style="width: {row.pct}%; background: var(--bar-{i + 1});"></div>
-              </div>
-            </div>
-          {/each}
-          {#if costByModel.more > 0}
-            <div class="text-[10px] text-ink-faint">+{costByModel.more} more</div>
+            {/each}
+          </div>
+          {#if costByModel.hidden > 0}
+            <button
+              type="button"
+              class="w-fit text-[10px] text-ink-faint hover:text-ink underline underline-offset-2 transition-colors"
+              aria-expanded={showAllCostModels}
+              aria-controls={modelSpendListId}
+              onclick={() => { showAllCostModels = !showAllCostModels; }}
+            >
+              {showAllCostModels ? 'Show less' : `+${costByModel.hidden} more`}
+            </button>
           {/if}
         </div>
       {/if}
