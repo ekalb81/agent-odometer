@@ -2,6 +2,7 @@ name: CI
 
 # Runs the fast validation path on every PR and on pushes to main. Verifies that:
 #   - the frontend type-checks (svelte-check)
+#   - the frontend unit and component tests pass (Vitest)
 #   - the frontend builds (vite build)
 #   - the Rust crate is formatted and passes strict Clippy
 #   - all Rust tests pass (cargo test)
@@ -74,6 +75,9 @@ jobs:
 
       - name: Frontend type-check
         run: npm run check
+
+      - name: Frontend tests
+        run: npm test
 
       - name: Updater manifest validator tests
         run: npm run check:updater-manifest

@@ -121,6 +121,15 @@ export function sessionName(session: Pick<
   return session.id.slice(0, 8);
 }
 
+/** A privacy-preserving project label for list views. Session summaries retain
+ * the working directory for local actions, but the grid never needs to expose
+ * the full path: its final segment is stable for display and grouping. */
+export function repositoryLabel(session: Pick<SessionSummary, 'working_directory'>): string | null {
+  if (!session.working_directory) return null;
+  const parts = session.working_directory.replace(/\\/g, '/').split('/').filter(Boolean);
+  return parts.at(-1) || null;
+}
+
 export function filterSessions<T extends SessionSummary>(
   sessions: Iterable<T>,
   scope: ViewScope,
