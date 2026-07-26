@@ -20,3 +20,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # The MSRV job installs the version declared by Cargo.toml through the
+    # stable action entrypoint. A Dependabot action-ref bump must never change
+    # the compiler compatibility floor being tested.
+    ignore:
+      - dependency-name: dtolnay/rust-toolchain
