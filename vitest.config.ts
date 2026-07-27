@@ -13,9 +13,11 @@ export default defineConfig({
       reporter: ['json'],
       reportsDirectory: './coverage/frontend',
       include: [
+        'src/components/SessionContextMenu.svelte',
         'src/components/SessionGridControls.svelte',
         'src/lib/configTimeline.ts',
         'src/lib/sessionGrid.ts',
+        'src/lib/sessionExport.ts',
         'src/lib/stores/sessionGrid.svelte.ts',
       ],
     },

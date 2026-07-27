@@ -3,8 +3,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/SessionContextMenu.svelte',
   'src/components/SessionGridControls.svelte',
   'src/lib/configTimeline.ts',
+  'src/lib/sessionExport.ts',
   'src/lib/sessionGrid.ts',
   'src/lib/stores/sessionGrid.svelte.ts',
 ];
