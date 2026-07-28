@@ -642,6 +642,7 @@ mod tests {
         };
         let session = Session {
             id: "session".into(),
+            storage_id: "codex:thread:session".into(),
             harness: Harness::Codex,
             thread_name: None,
             forked_from_id: None,
@@ -649,12 +650,14 @@ mod tests {
             agent_path: None,
             agent_nickname: None,
             file_path: "fixture.jsonl".into(),
+            source_availability: Default::default(),
             archived: false,
             started_at: started,
             last_event_at: completed,
             working_directory: None,
             originator: None,
             source: None,
+            subagent_id_is_path_fallback: false,
             history_mode: None,
             memory_mode: None,
             cli_version: None,
@@ -706,6 +709,7 @@ mod tests {
             fallback_models: HashMap::new(),
             api_models: HashMap::from([("gpt-test".into(), rate(3.5))]),
             unpriced_models: Vec::new(),
+            pricing_catalog: Default::default(),
         };
         (session, rates)
     }

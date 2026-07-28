@@ -15,6 +15,34 @@ pub enum Harness {
     ClaudeCode,
 }
 
+/// Whether Odometer can currently read the transcript that supplied this
+/// session. Durable storage retains the parsed session even after a source is
+/// no longer available, so this is deliberately distinct from `archived`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAvailability {
+    #[default]
+    Present,
+    Missing,
+}
+
+/// Stable identity for a provider session. Unlike `Session::id`, this is
+/// namespaced by harness and is safe to use as a durable storage key.
+pub fn storage_id_for_session(harness: Harness, provider_session_id: &str) -> String {
+    match harness {
+        Harness::Codex => format!("codex:thread:{provider_session_id}"),
+        Harness::ClaudeCode => format!("claude_code:session:{provider_session_id}"),
+    }
+}
+
+/// Stable identity for a Claude Code subagent transcript. Claude records use
+/// the parent `sessionId`, so the provider `agentId` distinguishes siblings.
+/// `agent_id` may be a filename-stem fallback for historical transcripts that
+/// did not record an `agentId`.
+pub fn storage_id_for_claude_subagent(parent_session_id: &str, agent_id: &str) -> String {
+    format!("claude_code:subagent:{parent_session_id}:{agent_id}")
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
@@ -218,6 +246,11 @@ pub struct TokenHistoryPoint {
     /// None only if no turn_context had set a model yet.
     pub model: Option<String>,
     pub service_tier: Option<String>,
+    /// Complete input-token count reported for this provider request. This is
+    /// kept separate from `delta`, which can include a reconciliation
+    /// remainder when a resumed rollout first becomes observable.
+    #[serde(default)]
+    pub request_input_tokens: Option<u64>,
     /// Cumulative total_tokens at this event — drives the sparkline.
     pub total_tokens: u64,
     /// last_token_usage for this event — the per-call delta. All zeros if absent.
@@ -287,6 +320,10 @@ pub struct TurnInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
+    /// Durable, harness-namespaced identity. This never incorporates a source
+    /// path, allowing a transcript to move or temporarily disappear.
+    #[serde(default)]
+    pub storage_id: String,
     #[serde(default)]
     pub harness: Harness,
     pub thread_name: Option<String>,
@@ -295,12 +332,21 @@ pub struct Session {
     pub agent_path: Option<String>,
     pub agent_nickname: Option<String>,
     pub file_path: String,
+    /// Filesystem availability of `file_path`; retained sessions can be
+    /// missing their original source without being deleted from storage.
+    #[serde(default)]
+    pub source_availability: SourceAvailability,
     pub archived: bool,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub last_event_at: chrono::DateTime<chrono::Utc>,
     pub working_directory: Option<String>,
     pub originator: Option<String>,
     pub source: Option<String>,
+    /// True only when a Claude subagent lacked a provider `agentId` and its
+    /// filename stem had to supply the identity. Durable reconciliation may
+    /// use event lineage across source renames only for this legacy case.
+    #[serde(default)]
+    pub subagent_id_is_path_fallback: bool,
     pub history_mode: Option<String>,
     pub memory_mode: Option<String>,
     pub cli_version: Option<String>,
@@ -381,6 +427,8 @@ pub struct RangeTotals {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
+    #[serde(default)]
+    pub storage_id: String,
     pub harness: Harness,
     pub thread_name: Option<String>,
     pub forked_from_id: Option<String>,
@@ -388,6 +436,8 @@ pub struct SessionSummary {
     pub agent_path: Option<String>,
     pub agent_nickname: Option<String>,
     pub file_path: String,
+    #[serde(default)]
+    pub source_availability: SourceAvailability,
     pub archived: bool,
     pub started_at: DateTime<Utc>,
     pub last_event_at: DateTime<Utc>,
@@ -424,6 +474,7 @@ impl SessionSummary {
         let optimization_summary = OptimizationSummary::from_findings(&s.optimization_findings);
         Self {
             id: s.id.clone(),
+            storage_id: s.effective_storage_id(),
             harness: s.harness,
             thread_name: s.thread_name.clone(),
             forked_from_id: s.forked_from_id.clone(),
@@ -431,6 +482,7 @@ impl SessionSummary {
             agent_path: s.agent_path.clone(),
             agent_nickname: s.agent_nickname.clone(),
             file_path: s.file_path.clone(),
+            source_availability: s.source_availability,
             archived: s.archived,
             started_at: s.started_at,
             last_event_at: s.last_event_at,
@@ -491,6 +543,22 @@ where
 }
 
 impl Session {
+    /// Returns the persisted storage identity, deriving a compatible key for
+    /// sessions serialized before this field existed.
+    pub fn effective_storage_id(&self) -> String {
+        if !self.storage_id.is_empty() {
+            return self.storage_id.clone();
+        }
+
+        if self.harness == Harness::ClaudeCode && self.source.as_deref() == Some("subagent") {
+            if let Some(parent_session_id) = self.parent_thread_id.as_deref() {
+                return storage_id_for_claude_subagent(parent_session_id, &self.id);
+            }
+        }
+
+        storage_id_for_session(self.harness, &self.id)
+    }
+
     /// All-time (model, tier) usage buckets. Derived from history when
     /// present (which preserves per-event service tiers for fast-mode
     /// pricing); falls back to the per-model buckets for sessions without
@@ -653,6 +721,7 @@ mod tests {
             timestamp: ts.parse().unwrap(),
             model: model.map(str::to_owned),
             service_tier: tier.map(str::to_owned),
+            request_input_tokens: Some(n),
             total_tokens: 0,
             delta: delta(n),
         }
@@ -661,6 +730,7 @@ mod tests {
     fn session_with_history(history: Vec<TokenHistoryPoint>) -> Session {
         Session {
             id: "s".into(),
+            storage_id: storage_id_for_session(Harness::Codex, "s"),
             harness: Harness::Codex,
             thread_name: None,
             forked_from_id: None,
@@ -668,12 +738,14 @@ mod tests {
             agent_path: None,
             agent_nickname: None,
             file_path: String::new(),
+            source_availability: SourceAvailability::Present,
             archived: false,
             started_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             last_event_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             working_directory: None,
             originator: None,
             source: None,
+            subagent_id_is_path_fallback: false,
             history_mode: None,
             memory_mode: None,
             cli_version: None,
@@ -850,6 +922,7 @@ mod tests {
                 timestamp: base + chrono::Duration::seconds(second),
                 model: Some("m".into()),
                 service_tier: None,
+                request_input_tokens: Some(1),
                 total_tokens: second as u64,
                 delta: delta(1),
             })
@@ -877,8 +950,33 @@ mod tests {
         s.thread_name = Some("t".into());
         let summary = SessionSummary::of(&s);
         assert_eq!(summary.id, "s");
+        assert_eq!(summary.storage_id, "codex:thread:s");
+        assert_eq!(summary.source_availability, SourceAvailability::Present);
         assert_eq!(summary.thread_name.as_deref(), Some("t"));
         assert_eq!(summary.buckets.len(), 1);
         assert_eq!(summary.buckets[0].tokens.input_tokens, 100);
+    }
+
+    #[test]
+    fn storage_fields_default_when_deserializing_legacy_sessions() {
+        let session = session_with_history(vec![]);
+        let mut serialized = serde_json::to_value(&session).unwrap();
+        let fields = serialized.as_object_mut().unwrap();
+        fields.remove("storage_id");
+        fields.remove("source_availability");
+
+        let restored: Session = serde_json::from_value(serialized).unwrap();
+        assert!(restored.storage_id.is_empty());
+        assert_eq!(restored.source_availability, SourceAvailability::Present);
+        assert_eq!(restored.effective_storage_id(), "codex:thread:s");
+
+        let summary = SessionSummary::of(&session);
+        let mut serialized = serde_json::to_value(&summary).unwrap();
+        let fields = serialized.as_object_mut().unwrap();
+        fields.remove("storage_id");
+        fields.remove("source_availability");
+        let restored: SessionSummary = serde_json::from_value(serialized).unwrap();
+        assert!(restored.storage_id.is_empty());
+        assert_eq!(restored.source_availability, SourceAvailability::Present);
     }
 }

@@ -135,6 +135,7 @@ function buckets(f: Fixture): TierBucket[] {
 function summary(f: Fixture): SessionSummary {
   return {
     id: f.id,
+    storage_id: f.harness === 'codex' ? `codex:thread:${f.id}` : `claude_code:session:${f.id}`,
     harness: f.harness,
     thread_name: f.name,
     forked_from_id: null,
@@ -142,6 +143,7 @@ function summary(f: Fixture): SessionSummary {
     agent_path: null,
     agent_nickname: null,
     file_path: `/home/dev/.sessions/${f.id}.jsonl`,
+    source_availability: 'present',
     archived: f.archived ?? false,
     started_at: f.started,
     last_event_at: new Date(new Date(f.started).getTime() + f.hoursActive * 3_600_000).toISOString(),
@@ -211,12 +213,14 @@ function details(f: Fixture): Session {
       timestamp: t.started_at!,
       model: f.model,
       service_tier: null,
+      request_input_tokens: t.tokens.input_tokens,
       total_tokens: cumulative,
       delta: t.tokens,
     };
   });
   return {
     ...s,
+    subagent_id_is_path_fallback: false,
     history_mode: null,
     memory_mode: null,
     model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
@@ -256,21 +260,28 @@ const RATES: RateCard = {
     'gpt-5.5': { input: 1, cached_input: 0.1, output: 8, reasoning: 8 },
   },
   unpriced_models: ['gpt-5.3-codex-spark'],
+  pricing_catalog: { rate_periods: [], conditional_modifiers: [], notes: [] },
 };
 
-function rangeTotals(from: string | null, to: string | null): Record<string, RangeTotals> {
+function rangeTotals(
+  from: string | null,
+  to: string | null,
+  sessionIds?: string[],
+): Record<string, RangeTotals> {
   const fromMs = from ? new Date(from).getTime() : 0;
   const toMs = to ? new Date(to).getTime() : now;
   const out: Record<string, RangeTotals> = {};
+  const requestedIds = sessionIds ? new Set(sessionIds) : null;
   for (const f of FIXTURES) {
     const s = summary(f);
+    if (requestedIds && !requestedIds.has(s.storage_id)) continue;
     const sStart = new Date(s.started_at).getTime();
     const sEnd = new Date(s.last_event_at).getTime();
     if (sEnd < fromMs || sStart > toMs) continue;
     // Fraction of the session window inside the queried range.
     const overlap = Math.min(sEnd, toMs) - Math.max(sStart, fromMs);
     const fraction = Math.max(0, Math.min(1, overlap / Math.max(1, sEnd - sStart)));
-    out[f.id] = {
+    out[s.storage_id] = {
       tokens: scaleTok(tok(f.total), fraction),
       buckets: buckets(f).map((b) => ({ ...b, tokens: scaleTok(b.tokens, fraction) })),
       tool_metrics: toolMetrics(Math.round(f.turns * 3 * fraction)),
@@ -288,12 +299,15 @@ mockIPC((cmd, payload) => {
       return FIXTURES.map(summary);
     case 'get_session_details': {
       const { sessionId } = payload as { sessionId: string };
-      const f = FIXTURES.find((x) => x.id === sessionId);
+      const f = FIXTURES.find((x) => summary(x).storage_id === sessionId);
       return f ? details(f) : null;
     }
     case 'sessions_in_ranges': {
-      const { ranges } = payload as { ranges: { from: string | null; to: string | null }[] };
-      return ranges.map((r) => rangeTotals(r.from, r.to));
+      const { ranges, sessionIds } = payload as {
+        ranges: { from: string | null; to: string | null }[];
+        sessionIds?: string[];
+      };
+      return ranges.map((r) => rangeTotals(r.from, r.to, sessionIds));
     }
     case 'list_tool_impact_targets':
       return [

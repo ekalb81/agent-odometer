@@ -35,6 +35,12 @@ export interface SessionProjection<T extends SessionSummary = SessionSummary> {
   currency: string;
   missingModels: string[];
   unpricedModels: string[];
+  /** Aggregate buckets omit event timestamps and request input, so a dated
+   * conditional API scenario cannot be computed honestly here. */
+  timeAwareApiStatus: 'unavailable_requires_request_history' | null;
+  pricingCatalogAvailable: boolean;
+  rateCardVersion: number | null;
+  rateCardFetchedAt: string | null;
 }
 
 const projectionCache = new WeakMap<SessionSummary, {
@@ -198,6 +204,10 @@ export function projectSession<T extends SessionSummary>(
       currency: session.harness === 'claude_code' ? 'USD' : 'credits',
       missingModels: [],
       unpricedModels: [],
+      timeAwareApiStatus: null,
+      pricingCatalogAvailable: false,
+      rateCardVersion: null,
+      rateCardFetchedAt: null,
     };
     projectionCache.set(session, { rates, range, dateScoped, value });
     return value;
@@ -224,6 +234,13 @@ export function projectSession<T extends SessionSummary>(
     currency: useApi ? 'USD' : harnessCurrency(rates, session.harness),
     missingModels: useApi ? (api?.missingModels ?? []) : plan.missingModels,
     unpricedModels: useApi ? (api?.unpricedModels ?? []) : plan.unpricedModels,
+    timeAwareApiStatus: rates.pricing_catalog.rate_periods.some((period) =>
+      period.surface === (session.harness === 'codex' ? 'openai_api_usd' : 'anthropic_api_usd'))
+      ? 'unavailable_requires_request_history'
+      : null,
+    pricingCatalogAvailable: rates.pricing_catalog.rate_periods.length > 0,
+    rateCardVersion: rates.version,
+    rateCardFetchedAt: rates.fetched_at,
   };
   projectionCache.set(session, { rates, range, dateScoped, value });
   return value;
@@ -237,7 +254,7 @@ export function projectSessions<T extends SessionSummary>(
 ): Map<string, SessionProjection<T>> {
   const result = new Map<string, SessionProjection<T>>();
   for (const session of sessions) {
-    result.set(session.id, projectSession(session, rates, ranges[session.id], dateScoped));
+    result.set(session.storage_id, projectSession(session, rates, ranges[session.storage_id], dateScoped));
   }
   return result;
 }
@@ -269,7 +286,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
   const grouped = new Map<string, ModelMetric>();
 
   for (const session of sessions) {
-    const range = ranges[session.id];
+    const range = ranges[session.storage_id];
     if (!range) continue;
     for (const bucket of range.buckets) {
       const key = `${session.harness}\0${bucket.model}`;
@@ -326,14 +343,20 @@ export function exportRows<T extends SessionSummary>(
     currency,
     missingModels,
     unpricedModels,
+    timeAwareApiStatus,
+    pricingCatalogAvailable,
+    rateCardVersion,
+    rateCardFetchedAt,
   }) => {
     const row: Record<string, string | number | boolean | null> = {
       id: session.id,
+      storage_id: session.storage_id,
       harness: session.harness,
       name: session.thread_name ?? session.id.slice(0, 8),
       started_at: session.started_at,
       last_event_at: session.last_event_at,
       archived: session.archived,
+      source_availability: session.source_availability,
       subagent: isSubagent(session),
       parent_thread_id: session.parent_thread_id,
       model: session.model,
@@ -345,6 +368,15 @@ export function exportRows<T extends SessionSummary>(
       total_tokens: tokens.total_tokens,
       codex_credits: session.harness === 'codex' ? planCost : null,
       codex_estimated_api_usd: session.harness === 'codex' ? apiCost : null,
+      codex_time_aware_api_usd: null,
+      codex_time_aware_api_status: session.harness === 'codex' ? timeAwareApiStatus : null,
+      time_aware_api_status: timeAwareApiStatus,
+      pricing_catalog_available: pricingCatalogAvailable,
+      rate_card_version: rateCardVersion,
+      rate_card_fetched_at: rateCardFetchedAt,
+      cache_write_pricing: session.harness === 'codex' && pricingCatalogAvailable
+        ? 'unmodeled_not_observed'
+        : null,
       claude_estimated_usd: session.harness === 'claude_code' ? planCost : null,
       display_currency: currency,
       fallback_models: missingModels.join(';'),

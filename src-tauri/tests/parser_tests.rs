@@ -10,6 +10,10 @@ fn fixture() -> PathBuf {
 fn parses_session_identity() {
     let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
     assert_eq!(s.id, "019e2ba6-95be-7bd2-a255-238cdf02936c");
+    assert_eq!(
+        s.storage_id,
+        "codex:thread:019e2ba6-95be-7bd2-a255-238cdf02936c"
+    );
     assert_eq!(s.originator.as_deref(), Some("Codex Desktop"));
     assert_eq!(s.source.as_deref(), Some("vscode"));
     assert_eq!(s.cli_version.as_deref(), Some("0.130.0-alpha.5"));
@@ -21,6 +25,30 @@ fn parses_session_identity() {
         .contains("summarize-my-codex-usage-for-may"));
     assert_eq!(s.started_at.to_rfc3339(), "2026-05-15T12:39:58.142+00:00");
     assert_eq!(s.thread_name, None); // not present in this fixture
+}
+
+#[test]
+fn moved_codex_transcript_keeps_storage_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = dir.path().join("original.jsonl");
+    let moved = dir.path().join("moved.jsonl");
+    let session_meta = concat!(
+        r#"{"timestamp":"2026-07-27T12:00:00Z","type":"session_meta","payload":{"id":"thread-1","timestamp":"2026-07-27T12:00:00Z"}}"#,
+        "\n"
+    );
+    std::fs::write(&original, session_meta).unwrap();
+    std::fs::write(&moved, session_meta).unwrap();
+
+    let original_session = parser::parse_file(&original, false).unwrap().unwrap();
+    let moved_session = parser::parse_file(&moved, false).unwrap().unwrap();
+
+    assert_ne!(original_session.file_path, moved_session.file_path);
+    assert_eq!(original_session.storage_id, moved_session.storage_id);
+    assert_eq!(original_session.storage_id, "codex:thread:thread-1");
+    assert_eq!(
+        original_session.source_availability,
+        odometer_lib::model::SourceAvailability::Present
+    );
 }
 
 #[test]
@@ -314,6 +342,11 @@ fn resumed_session_attributes_carryover_total_to_active_model() {
     assert_eq!(per.output_tokens, 90_479);
     assert_eq!(per.reasoning_output_tokens, 46_811);
     assert_eq!(per.total_tokens, 23_278_211);
+    // Conditional request pricing must use the direct last-call evidence,
+    // not the 23M-token reconciliation contribution stored in `delta`.
+    assert_eq!(s.tokens_history[0].request_input_tokens, Some(100_000));
+    assert!(s.tokens_history[0].delta.input_tokens > 22_000_000);
+    assert_eq!(s.tokens_history[1].request_input_tokens, Some(187_732));
 }
 
 #[test]
@@ -441,6 +474,7 @@ fn tokens_history_captures_model_and_delta_per_event() {
 
     // First event: total == last == 29196 in this fixture.
     assert_eq!(s.tokens_history[0].delta.total_tokens, 29_196);
+    assert_eq!(s.tokens_history[0].request_input_tokens, Some(28_470));
 }
 
 #[test]

@@ -42,20 +42,21 @@ pub fn read(path: &Path) -> HashMap<String, String> {
     out
 }
 
-/// Patches `thread_name` on every Session whose id appears in `names`.
-/// Returns the list of session ids that were actually updated (so callers can
+/// Patches `thread_name` on every Session whose provider ID appears in `names`.
+/// Returns the durable storage keys that were actually updated (so callers can
 /// emit fine-grained `session-updated` events).
 pub fn apply(
     sessions: &dashmap::DashMap<String, std::sync::Arc<crate::model::Session>>,
     names: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut updated = Vec::new();
-    for (id, name) in names {
-        if let Some(mut entry) = sessions.get_mut(id) {
-            if entry.value().thread_name.as_ref() != Some(name) {
-                std::sync::Arc::make_mut(entry.value_mut()).thread_name = Some(name.clone());
-                updated.push(id.clone());
-            }
+    for mut entry in sessions.iter_mut() {
+        let Some(name) = names.get(&entry.value().id) else {
+            continue;
+        };
+        if entry.value().thread_name.as_ref() != Some(name) {
+            std::sync::Arc::make_mut(entry.value_mut()).thread_name = Some(name.clone());
+            updated.push(entry.key().clone());
         }
     }
     updated

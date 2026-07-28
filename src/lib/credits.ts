@@ -1,6 +1,8 @@
 import type {
   Harness,
   ModelRate,
+  PricingCatalog,
+  PricingSurface,
   RateCard,
   Session,
   SessionSummary,
@@ -20,6 +22,30 @@ export interface SessionCredits {
   byModel: ModelCredit[];
   missingModels: string[];
   unpricedModels: string[];
+}
+
+/** An exact, event-timestamped API scenario.  It is only available for full
+ * sessions because summary buckets deliberately omit request timestamps and
+ * input context. */
+export interface TimeAwareApiScenario extends SessionCredits {
+  surface: PricingSurface;
+  appliedRatePeriods: string[];
+  appliedModifiers: string[];
+  /** Conditional rules whose scope matched but whose per-request input
+   * evidence was absent. They are not applied speculatively. */
+  conditionalEvidenceMissing: string[];
+  cacheWritePricingUnmodeled: boolean;
+  /** Documented multipliers selected by the dated rate period. No dollars are
+   * added for these because telemetry does not identify cache-write tokens. */
+  unobservedCacheWriteInputMultipliers: number[];
+}
+
+/** The legacy flat reference and the separately-scoped dated scenario.
+ * `timeAware` is null rather than extrapolated when any observed request has
+ * no matching catalog period. */
+export interface SessionApiCostScenarios {
+  flat: SessionCredits | null;
+  timeAware: TimeAwareApiScenario | null;
 }
 
 /** Currency label for a harness, falling back to the card-wide currency. */
@@ -168,6 +194,150 @@ export function computeSummaryCredits(summary: SessionSummary, rates: RateCard):
 export function computeSessionApiCost(session: Session, rates: RateCard): SessionCredits | null {
   if (Object.keys(rates.api_models ?? {}).length === 0) return null;
   return historyCost(session, rates.api_models, fallbackModelFor(rates, session.harness), rates.unpriced_models);
+}
+
+function apiSurfaceForHarness(harness: Harness): PricingSurface {
+  return harness === 'codex' ? 'openai_api_usd' : 'anthropic_api_usd';
+}
+
+function inPeriod(timestamp: string, from: string, to: string | null): boolean {
+  const at = Date.parse(timestamp);
+  const start = Date.parse(from);
+  const end = to === null ? Number.POSITIVE_INFINITY : Date.parse(to);
+  return Number.isFinite(at) && Number.isFinite(start) && (to === null || Number.isFinite(end))
+    && at >= start && at < end;
+}
+
+function applicablePeriod(
+  catalog: PricingCatalog,
+  surface: PricingSurface,
+  model: string,
+  timestamp: string,
+) {
+  return catalog.rate_periods.find((period) =>
+    period.surface === surface && period.model === model && inPeriod(timestamp, period.from, period.to));
+}
+
+function applicableModifiers(
+  catalog: PricingCatalog,
+  surface: PricingSurface,
+  model: string,
+  timestamp: string,
+  requestInputTokens: number | null,
+) {
+  if (requestInputTokens === null) return [];
+  return catalog.conditional_modifiers.filter((modifier) =>
+    modifier.surface === surface
+      && modifier.model === model
+      && inPeriod(timestamp, modifier.from, modifier.to)
+      && modifier.condition.kind === 'request_input_token_threshold'
+      && requestInputTokens > modifier.condition.greater_than);
+}
+
+/**
+ * Returns two intentionally separate API figures for a detailed session:
+ *
+ * - `flat` retains the existing legacy rate-table calculation.
+ * - `timeAware` selects a dated catalog period and conditional modifiers for
+ *   each token event. It never uses the current rule retroactively, and is
+ *   unavailable when the event history or applicable catalog coverage is
+ *   incomplete.
+ *
+ * The modifier input multiplier applies to both ordinary and cached input;
+ * the output multiplier applies to ordinary and reasoning output. Cache-write
+ * premiums are not inferred because parsers do not observe that category.
+ */
+export function computeSessionApiCostScenarios(
+  session: Session,
+  rates: RateCard,
+): SessionApiCostScenarios {
+  const flat = session.harness === 'codex'
+    ? computeSessionApiCost(session, rates)
+    : historyCost(session, rates.models, fallbackModelFor(rates, session.harness), rates.unpriced_models);
+  if (session.tokens_history.length === 0 || rates.pricing_catalog.rate_periods.length === 0) {
+    return { flat, timeAware: null };
+  }
+
+  const surface = apiSurfaceForHarness(session.harness);
+  const byModelMap = new Map<string, number>();
+  const periodIds = new Set<string>();
+  const modifierIds = new Set<string>();
+  const missingConditionalEvidence = new Set<string>();
+  const unpriced = new Set(rates.unpriced_models ?? []);
+  const cacheWriteMultipliers = new Set<number>();
+  let total = 0;
+
+  for (const event of session.tokens_history) {
+    if (!event.model) {
+      // A full event history is only useful for dated pricing when every
+      // priced request is attributable to a model.
+      if (event.delta.total_tokens > 0) return { flat, timeAware: null };
+      continue;
+    }
+    if (unpriced.has(event.model)) {
+      return { flat, timeAware: null };
+    }
+    const period = applicablePeriod(rates.pricing_catalog, surface, event.model, event.timestamp);
+    // A dated scenario must have direct evidence for every observed model and
+    // request. Do not substitute a fallback or a latest/current rate here.
+    if (!period) {
+      return { flat, timeAware: null };
+    }
+    const modifiers = applicableModifiers(
+      rates.pricing_catalog,
+      surface,
+      event.model,
+      event.timestamp,
+      event.request_input_tokens,
+    );
+    if (event.request_input_tokens === null) {
+      for (const modifier of rates.pricing_catalog.conditional_modifiers) {
+        if (modifier.surface === surface
+          && modifier.model === event.model
+          && inPeriod(event.timestamp, modifier.from, modifier.to)) {
+          missingConditionalEvidence.add(modifier.id);
+        }
+      }
+    }
+    const inputMultiplier = modifiers.reduce((value, modifier) => value * modifier.multipliers.input, 1);
+    const outputMultiplier = modifiers.reduce((value, modifier) => value * modifier.multipliers.output, 1);
+    const nonCachedInput = Math.max(0, event.delta.input_tokens - event.delta.cached_input_tokens);
+    const nonReasoningOutput = Math.max(0, event.delta.output_tokens - event.delta.reasoning_output_tokens);
+    const cost = (
+      (nonCachedInput * period.rate.input * inputMultiplier)
+      + (event.delta.cached_input_tokens * period.rate.cached_input * inputMultiplier)
+      + (nonReasoningOutput * period.rate.output * outputMultiplier)
+      + (event.delta.reasoning_output_tokens * period.rate.reasoning * outputMultiplier)
+    ) / 1_000_000 * serviceTierMultiplier(event.model, event.service_tier);
+    total += cost;
+    byModelMap.set(event.model, (byModelMap.get(event.model) ?? 0) + cost);
+    periodIds.add(period.id);
+    if (period.cache_write_input_multiplier !== null && period.cache_write_input_multiplier !== undefined) {
+      cacheWriteMultipliers.add(period.cache_write_input_multiplier);
+    }
+    for (const modifier of modifiers) modifierIds.add(modifier.id);
+  }
+
+  return {
+    flat,
+    timeAware: {
+      total,
+      byModel: Array.from(byModelMap, ([model, cost]) => ({
+        model,
+        cost,
+        fallbackUsed: false,
+        unpriced: unpriced.has(model),
+      })),
+      missingModels: [],
+      unpricedModels: [],
+      surface,
+      appliedRatePeriods: Array.from(periodIds),
+      appliedModifiers: Array.from(modifierIds),
+      conditionalEvidenceMissing: Array.from(missingConditionalEvidence),
+      cacheWritePricingUnmodeled: cacheWriteMultipliers.size > 0,
+      unobservedCacheWriteInputMultipliers: Array.from(cacheWriteMultipliers),
+    },
+  };
 }
 
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {

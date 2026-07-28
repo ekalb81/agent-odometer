@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { rewriteUpdaterManifestUrls, validateUpdaterManifest } from './validate-updater-manifest.mjs';
 
-const VERSION = '0.6.2';
+const VERSION = '0.6.4';
 const SHA = '0123456789abcdef0123456789abcdef01234567';
 
 function fixture() {

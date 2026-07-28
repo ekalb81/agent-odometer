@@ -23,7 +23,10 @@
 //! file stem, linked via `parent_thread_id` — otherwise they'd collide with
 //! (and clobber) the parent in the session map.
 
-use crate::model::{Harness, Session, TokenHistoryPoint, TokenTotals, TurnStatus};
+use crate::model::{
+    storage_id_for_claude_subagent, storage_id_for_session, Harness, Session, SourceAvailability,
+    TokenHistoryPoint, TokenTotals, TurnStatus,
+};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -226,19 +229,42 @@ impl ClaudeSessionParser {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        // Subagent transcripts reuse the parent's sessionId; identify them by
-        // file stem instead and keep the parent linkage.
-        let (id, parent_thread_id, source) = if self.is_subagent {
-            (file_stem, record_session_id, Some("subagent".to_owned()))
-        } else {
-            (record_session_id.unwrap_or(file_stem), None, None)
-        };
+        // Subagent transcripts reuse the parent's sessionId; their agentId
+        // is stable across source moves. Filename stems remain a fallback for
+        // older transcripts that do not provide agentId.
+        let (id, storage_id, parent_thread_id, source, subagent_id_is_path_fallback) =
+            if self.is_subagent {
+                let parent_thread_id = record_session_id;
+                let provider_agent_id = root
+                    .get("agentId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned);
+                let subagent_id_is_path_fallback = provider_agent_id.is_none();
+                let agent_id = provider_agent_id.unwrap_or_else(|| file_stem.clone());
+                let storage_id = parent_thread_id
+                    .as_deref()
+                    .map(|parent| storage_id_for_claude_subagent(parent, &agent_id))
+                    .unwrap_or_else(|| storage_id_for_session(Harness::ClaudeCode, &agent_id));
+                (
+                    agent_id,
+                    storage_id,
+                    parent_thread_id,
+                    Some("subagent".to_owned()),
+                    subagent_id_is_path_fallback,
+                )
+            } else {
+                let id = record_session_id.unwrap_or(file_stem);
+                let storage_id = storage_id_for_session(Harness::ClaudeCode, &id);
+                (id, storage_id, None, None, false)
+            };
         if id.is_empty() {
             return;
         }
 
         self.session = Some(Session {
             id,
+            storage_id,
             harness: Harness::ClaudeCode,
             thread_name: self.pending_thread_name.take(),
             forked_from_id: None,
@@ -246,12 +272,14 @@ impl ClaudeSessionParser {
             agent_path: None,
             agent_nickname: None,
             file_path: self.file_path.to_string_lossy().into_owned(),
+            source_availability: SourceAvailability::Present,
             archived: false,
             started_at,
             last_event_at: started_at,
             working_directory: None,
             originator: None,
             source,
+            subagent_id_is_path_fallback,
             history_mode: None,
             memory_mode: None,
             cli_version: None,
@@ -507,6 +535,7 @@ impl ClaudeSessionParser {
                             timestamp: ts,
                             model: model.clone(),
                             service_tier: service_tier.clone(),
+                            request_input_tokens: Some(delta.input_tokens),
                             total_tokens: s.tokens_total.total_tokens,
                             delta: delta.clone(),
                         });

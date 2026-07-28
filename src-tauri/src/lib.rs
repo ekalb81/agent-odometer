@@ -5,6 +5,7 @@ pub mod config_events;
 pub mod correlation;
 pub mod git_outcomes;
 pub mod harness_integration;
+pub mod history_store;
 pub mod instructions;
 pub mod model;
 pub mod parser;
