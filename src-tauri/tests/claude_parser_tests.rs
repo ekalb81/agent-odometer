@@ -11,6 +11,10 @@ fn fixture() -> PathBuf {
 fn parses_session_identity() {
     let s = claude_parser::parse_file(&fixture()).unwrap().unwrap();
     assert_eq!(s.id, "11111111-2222-3333-4444-555555555555");
+    assert_eq!(
+        s.storage_id,
+        "claude_code:session:11111111-2222-3333-4444-555555555555"
+    );
     assert_eq!(s.harness, Harness::ClaudeCode);
     assert_eq!(
         s.working_directory.as_deref(),
@@ -45,6 +49,10 @@ fn dedupes_streamed_usage_by_message_id() {
     assert_eq!(s.tokens_history.len(), 4);
     // Last counted message (msg_ccc): input 40+50+2000 = 2090, output 60.
     assert_eq!(s.latest_context_tokens, Some(2_150));
+    assert_eq!(
+        s.tokens_history.last().unwrap().request_input_tokens,
+        Some(2_090)
+    );
 }
 
 #[test]
@@ -186,7 +194,13 @@ fn subagent_transcript_gets_own_identity_and_parent_link() {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-fixture123.jsonl");
     let s = claude_parser::parse_file(&path).unwrap().unwrap();
-    assert_eq!(s.id, "agent-fixture123");
+    // Prefer the transcript's stable provider agentId; the filename stem is
+    // only a compatibility fallback for older subagent records.
+    assert_eq!(s.id, "fixture123");
+    assert_eq!(
+        s.storage_id,
+        "claude_code:subagent:11111111-2222-3333-4444-555555555555:fixture123"
+    );
     assert_eq!(
         s.parent_thread_id.as_deref(),
         Some("11111111-2222-3333-4444-555555555555")
@@ -206,6 +220,50 @@ fn subagent_transcript_gets_own_identity_and_parent_link() {
     );
     assert_eq!(s.tokens_total.input_tokens, 540);
     assert_eq!(s.tokens_total.output_tokens, 20);
+}
+
+#[test]
+fn renamed_claude_subagent_with_agent_id_keeps_storage_identity() {
+    let original =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-fixture123.jsonl");
+    let dir = tempfile::tempdir().unwrap();
+    let subagents = dir.path().join("subagents");
+    std::fs::create_dir(&subagents).unwrap();
+    let renamed = subagents.join("agent-renamed.jsonl");
+    std::fs::copy(&original, &renamed).unwrap();
+
+    let original_session = claude_parser::parse_file(&original).unwrap().unwrap();
+    let renamed_session = claude_parser::parse_file(&renamed).unwrap().unwrap();
+    let parent_session = claude_parser::parse_file(&fixture()).unwrap().unwrap();
+
+    assert_eq!(original_session.id, "fixture123");
+    assert_eq!(renamed_session.id, "fixture123");
+    assert!(!original_session.subagent_id_is_path_fallback);
+    assert!(!renamed_session.subagent_id_is_path_fallback);
+    assert_eq!(original_session.storage_id, renamed_session.storage_id);
+    assert_ne!(parent_session.storage_id, renamed_session.storage_id);
+}
+
+#[test]
+fn legacy_claude_subagent_without_agent_id_uses_file_stem() {
+    let original =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/agent-fixture123.jsonl");
+    let raw = std::fs::read_to_string(original)
+        .unwrap()
+        .replace(r#""agentId":"fixture123","#, "");
+    let dir = tempfile::tempdir().unwrap();
+    let subagents = dir.path().join("subagents");
+    std::fs::create_dir(&subagents).unwrap();
+    let legacy = subagents.join("agent-legacy.jsonl");
+    std::fs::write(&legacy, raw).unwrap();
+
+    let session = claude_parser::parse_file(&legacy).unwrap().unwrap();
+    assert_eq!(session.id, "agent-legacy");
+    assert!(session.subagent_id_is_path_fallback);
+    assert_eq!(
+        session.storage_id,
+        "claude_code:subagent:11111111-2222-3333-4444-555555555555:agent-legacy"
+    );
 }
 
 #[test]

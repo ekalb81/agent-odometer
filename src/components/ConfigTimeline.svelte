@@ -70,7 +70,7 @@
       };
     };
     const before = price(item.before); const after = price(item.after);
-    return `credits ${after.credits - before.credits >= 0 ? '+' : ''}${(after.credits - before.credits).toFixed(2)} · Codex ${formatCredits(after.codexUsd - before.codexUsd, 'USD')} · Claude ${formatCredits(after.claudeUsd - before.claudeUsd, 'USD')}`;
+    return `credits ${after.credits - before.credits >= 0 ? '+' : ''}${(after.credits - before.credits).toFixed(2)} · Codex flat API ${formatCredits(after.codexUsd - before.codexUsd, 'USD')} · Claude ${formatCredits(after.claudeUsd - before.claudeUsd, 'USD')}`;
   }
 
   function countContext(item: EventCorrelation): string {

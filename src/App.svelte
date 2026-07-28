@@ -86,7 +86,7 @@
         let unlimited = 0; let missingCredits = false; let missingApi = false; let missingClaude = false;
         let unpricedCredits = false; let unpricedApi = false; let unpricedClaude = false;
         for (const session of sessionsStore.map.values()) {
-          const range = ranges[session.id]; if (!range) continue;
+          const range = ranges[session.storage_id]; if (!range) continue;
           tokens += range.tokens.total_tokens;
           const plan = creditsFromBuckets(range.buckets, rateCard, session.harness);
           if (session.harness === 'codex') {
@@ -197,7 +197,7 @@
   }
 
   function queueUpsert(s: SessionSummary) {
-    pendingMutations.set(s.id, { kind: 'upsert', session: s });
+    pendingMutations.set(s.storage_id, { kind: 'upsert', session: s });
     scheduleMutationFlush();
   }
 

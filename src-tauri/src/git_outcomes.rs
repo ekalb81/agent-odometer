@@ -18,6 +18,8 @@ pub enum GitOutcomeKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitOutcome {
+    /// Durable, harness-namespaced session storage identity. The field name is
+    /// retained for wire compatibility; it is not the provider-facing ID.
     pub session_id: String,
     pub repository_scope: Option<String>,
     pub kind: GitOutcomeKind,
@@ -77,9 +79,10 @@ pub fn evaluate<S: Borrow<Session>>(
     let mut outcomes = Vec::new();
     for session in sessions {
         let session = session.borrow();
+        let session_id = session.effective_storage_id();
         let Some(cwd) = session.working_directory.as_deref() else {
             outcomes.push(GitOutcome {
-                session_id: session.id.clone(),
+                session_id,
                 repository_scope: None,
                 kind: GitOutcomeKind::NotEvaluated,
                 commit_ids: Vec::new(),
@@ -91,7 +94,7 @@ pub fn evaluate<S: Borrow<Session>>(
             Ok(repo) => repo,
             Err(_) => {
                 outcomes.push(GitOutcome {
-                    session_id: session.id.clone(),
+                    session_id,
                     repository_scope: None,
                     kind: GitOutcomeKind::NotEvaluated,
                     commit_ids: Vec::new(),
@@ -107,7 +110,7 @@ pub fn evaluate<S: Borrow<Session>>(
             .or_insert_with(|| load_commits(&repo).map_err(|error| error.to_string()));
         let Ok(commits) = commits else {
             outcomes.push(GitOutcome {
-                session_id: session.id.clone(),
+                session_id,
                 repository_scope: Some(scope),
                 kind: GitOutcomeKind::NotEvaluated,
                 commit_ids: Vec::new(),
@@ -136,7 +139,7 @@ pub fn evaluate<S: Borrow<Session>>(
             GitOutcomeKind::Kept
         };
         outcomes.push(GitOutcome {
-            session_id: session.id.clone(),
+            session_id,
             repository_scope: Some(scope),
             kind,
             commit_ids: matched.iter().map(|commit| commit.id.clone()).collect(),
@@ -190,7 +193,7 @@ pub fn evaluate<S: Borrow<Session>>(
                 sessions
                     .iter()
                     .map(Borrow::borrow)
-                    .find(|session| session.id == outcome.session_id)
+                    .find(|session| session.effective_storage_id() == outcome.session_id)
                     .map(|session| session.last_event_at)
             })
             .unwrap_or_else(Utc::now);
@@ -226,6 +229,7 @@ mod tests {
     fn session(id: &str, cwd: Option<&Path>, started_at: &str, last_event_at: &str) -> Session {
         Session {
             id: id.into(),
+            storage_id: format!("codex:thread:{id}"),
             harness: Harness::Codex,
             thread_name: None,
             forked_from_id: None,
@@ -233,12 +237,14 @@ mod tests {
             agent_path: None,
             agent_nickname: None,
             file_path: String::new(),
+            source_availability: Default::default(),
             archived: false,
             started_at: started_at.parse().unwrap(),
             last_event_at: last_event_at.parse().unwrap(),
             working_directory: cwd.map(|path| path.to_string_lossy().into_owned()),
             originator: None,
             source: None,
+            subagent_id_is_path_fallback: false,
             history_mode: None,
             memory_mode: None,
             cli_version: None,
@@ -453,6 +459,52 @@ mod tests {
         assert_eq!(
             Path::new(outcomes[0].repository_scope.as_deref().unwrap()),
             directory.path()
+        );
+    }
+
+    #[test]
+    fn colliding_provider_ids_keep_distinct_outcomes_and_events() {
+        let directory = repository();
+        commit(
+            directory.path(),
+            "base",
+            &["-m", "Base"],
+            "2026-04-01T00:00:00Z",
+        );
+        let codex = session(
+            "shared",
+            Some(directory.path()),
+            "2026-04-02T00:00:00Z",
+            "2026-04-02T01:00:00Z",
+        );
+        let mut claude = session(
+            "shared",
+            Some(directory.path()),
+            "2026-04-03T00:00:00Z",
+            "2026-04-03T02:00:00Z",
+        );
+        claude.harness = Harness::ClaudeCode;
+        claude.storage_id = "claude_code:session:shared".into();
+
+        let (outcomes, events) = evaluate(&[codex, claude], 0);
+
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].session_id, "codex:thread:shared");
+        assert_eq!(outcomes[1].session_id, "claude_code:session:shared");
+        assert!(outcomes
+            .iter()
+            .all(|outcome| outcome.kind == GitOutcomeKind::Abandoned));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].metadata["session_id"], outcomes[0].session_id);
+        assert_eq!(events[1].metadata["session_id"], outcomes[1].session_id);
+        assert_ne!(events[0].id, events[1].id);
+        assert_eq!(
+            events[0].timestamp.to_rfc3339(),
+            "2026-04-02T01:00:00+00:00"
+        );
+        assert_eq!(
+            events[1].timestamp.to_rfc3339(),
+            "2026-04-03T02:00:00+00:00"
         );
     }
 

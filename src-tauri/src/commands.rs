@@ -764,6 +764,10 @@ pub fn set_config(
 /// done. Shared by startup (lib.rs) and set_config.
 pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
     let generation = state.current_scan_generation();
+    // Allocate the archive generation before workers start. Live watcher
+    // writes during discovery use the same generation, preventing a newly
+    // created file from being falsely marked missing at completion.
+    let history_generation = state.begin_history_scan();
     state.scanned.store(false, Ordering::Release);
     state.scan_done.store(0, Ordering::Release);
     state.scan_total.store(0, Ordering::Release);
@@ -782,10 +786,23 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
                 if state.current_scan_generation() != generation {
                     return;
                 }
-                let summary = SessionSummary::of(&session);
-                if state.publish_scanned_session(generation, path, session) {
+                let Some(reconciled) = state.reconcile_scanned_session_if_current(
+                    generation,
+                    path,
+                    session,
+                    history_generation,
+                ) else {
+                    return;
+                };
+                let summary = SessionSummary::of(&reconciled.session);
+                if state.publish_scanned_session(generation, path, reconciled.session) {
                     if let Err(e) = app.emit("session-updated", &summary) {
                         tracing::warn!("emit session-updated failed: {}", e);
+                    }
+                }
+                if let Some(displaced) = reconciled.displaced {
+                    if let Err(e) = app.emit("session-updated", &SessionSummary::of(&displaced)) {
+                        tracing::warn!("emit displaced session-updated failed: {}", e);
                     }
                 }
             },
@@ -818,15 +835,39 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
             return;
         }
 
+        // A parser/read failure makes a complete source observation
+        // untrustworthy. Retain stale-present history rather than incorrectly
+        // marking a transcript missing.
+        if report.parse_failures == 0 {
+            if let Some(history_generation) = history_generation {
+                for session in state.finish_history_scan(history_generation) {
+                    if let Err(e) = app.emit("session-updated", &SessionSummary::of(&session)) {
+                        tracing::warn!("emit session-updated failed: {}", e);
+                    }
+                }
+            }
+        } else {
+            tracing::warn!(
+                "durable source availability was not finalized: {} scan parse failure(s)",
+                report.parse_failures
+            );
+        }
+
+        if state.current_scan_generation() != generation {
+            return;
+        }
+
         // Overlay thread names from the session index, if present.
         let names = crate::session_index::read(&config.session_index_path);
         let changed = crate::session_index::apply(&state.sessions, &names);
         for id in changed {
-            if let Some(session) = state.sessions.get(&id) {
-                if let Err(e) = app.emit(
-                    "session-updated",
-                    &SessionSummary::of(session.value().as_ref()),
-                ) {
+            if let Some(session) = state
+                .sessions
+                .get(&id)
+                .map(|session| session.value().as_ref().clone())
+            {
+                state.persist_session_metadata(&session);
+                if let Err(e) = app.emit("session-updated", &SessionSummary::of(&session)) {
                     tracing::warn!("emit session-updated failed: {}", e);
                 }
             }
@@ -949,6 +990,7 @@ pub fn get_rates() -> RateCard {
         fallback_models: std::collections::HashMap::new(),
         api_models: std::collections::HashMap::new(),
         unpriced_models: Vec::new(),
+        pricing_catalog: Default::default(),
     })
 }
 
@@ -968,6 +1010,7 @@ pub fn get_bundled_rates() -> RateCard {
         fallback_models: std::collections::HashMap::new(),
         api_models: std::collections::HashMap::new(),
         unpriced_models: Vec::new(),
+        pricing_catalog: Default::default(),
     })
 }
 

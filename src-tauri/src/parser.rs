@@ -1,5 +1,6 @@
 use crate::model::{
-    RateLimitSnapshotPoint, RateLimitWindow, Session, TokenHistoryPoint, TokenTotals, TurnStatus,
+    storage_id_for_session, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
+    TokenHistoryPoint, TokenTotals, TurnStatus,
 };
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -339,6 +340,7 @@ impl SessionParser {
             .map(str::to_owned);
 
         self.session = Some(Session {
+            storage_id: storage_id_for_session(crate::model::Harness::Codex, &id),
             id,
             harness: crate::model::Harness::Codex,
             thread_name,
@@ -347,12 +349,14 @@ impl SessionParser {
             agent_path,
             agent_nickname,
             file_path: self.file_path.to_string_lossy().into_owned(),
+            source_availability: SourceAvailability::Present,
             archived: self.archived,
             started_at,
             last_event_at,
             working_directory: cwd,
             originator,
             source,
+            subagent_id_is_path_fallback: false,
             history_mode,
             memory_mode,
             cli_version,
@@ -690,6 +694,7 @@ impl SessionParser {
         let last_usage = info
             .and_then(|value| value.get("last_token_usage"))
             .map(parse_token_totals);
+        let request_input_tokens = last_usage.as_ref().map(|usage| usage.input_tokens);
         let context_window = info
             .and_then(|value| value.get("model_context_window"))
             .and_then(Value::as_u64)
@@ -740,6 +745,7 @@ impl SessionParser {
                     timestamp: event_ts,
                     model: model.clone(),
                     service_tier: service_tier.clone(),
+                    request_input_tokens,
                     total_tokens: total.total_tokens,
                     delta: contribution.clone(),
                 });

@@ -322,6 +322,7 @@ mod tests {
     fn session(id: &str) -> Session {
         Session {
             id: id.into(),
+            storage_id: format!("codex:thread:{id}"),
             harness: Harness::Codex,
             thread_name: None,
             forked_from_id: None,
@@ -329,12 +330,14 @@ mod tests {
             agent_path: None,
             agent_nickname: None,
             file_path: String::new(),
+            source_availability: Default::default(),
             archived: false,
             started_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             last_event_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             working_directory: None,
             originator: None,
             source: None,
+            subagent_id_is_path_fallback: false,
             history_mode: None,
             memory_mode: None,
             cli_version: None,

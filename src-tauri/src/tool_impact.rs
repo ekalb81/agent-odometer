@@ -177,6 +177,7 @@ fn samples_for_session(
     from: Option<DateTime<Utc>>,
     to: Option<DateTime<Utc>>,
 ) -> Vec<TurnSample> {
+    let storage_id = session.effective_storage_id();
     let observed_turns: BTreeSet<&str> = session
         .tool_observations
         .iter()
@@ -190,7 +191,7 @@ fn samples_for_session(
         .filter(|turn| turn_overlaps(session, turn, from, to))
         .filter(|turn| turn_has_comparison_data(turn))
         .map(|turn| TurnSample {
-            session_id: session.id.clone(),
+            session_id: storage_id.clone(),
             timestamp: turn.started_at.unwrap_or(session.started_at),
             key: MatchKey {
                 harness: session.harness,
@@ -255,6 +256,7 @@ pub fn list_targets<S: Borrow<Session>>(
     let mut counts: BTreeMap<(ToolImpactTargetKind, String), TargetCount> = BTreeMap::new();
     for item in sessions {
         let session = item.borrow();
+        let storage_id = session.effective_storage_id();
         let eligible_turns: BTreeSet<&str> = session
             .turns
             .iter()
@@ -270,7 +272,7 @@ pub fn list_targets<S: Borrow<Session>>(
             if !eligible_turns.contains(turn_id) {
                 continue;
             }
-            let turn_identity = (session.id.clone(), turn_id.to_owned());
+            let turn_identity = (storage_id.clone(), turn_id.to_owned());
             let mut observation_targets = BTreeSet::new();
             for provider in &observation.providers {
                 observation_targets.insert((
@@ -438,6 +440,7 @@ mod tests {
         };
         Session {
             id: id.into(),
+            storage_id: format!("codex:thread:{id}"),
             harness: Harness::Codex,
             thread_name: None,
             forked_from_id: None,
@@ -445,12 +448,14 @@ mod tests {
             agent_path: None,
             agent_nickname: None,
             file_path: format!("{id}.jsonl"),
+            source_availability: Default::default(),
             archived: false,
             started_at: timestamp,
             last_event_at: timestamp + chrono::Duration::seconds(30),
             working_directory: None,
             originator: None,
             source: None,
+            subagent_id_is_path_fallback: false,
             history_mode: None,
             memory_mode: None,
             cli_version: None,
@@ -570,5 +575,31 @@ mod tests {
         );
         assert_eq!(result.observed.turn_count, 1);
         assert_eq!(result.baseline.turn_count, 1);
+    }
+
+    #[test]
+    fn colliding_provider_ids_remain_distinct_sessions_and_turns() {
+        let codex = session("shared", true, 800, 10);
+        let mut claude = session("shared", true, 900, 12);
+        claude.harness = Harness::ClaudeCode;
+        claude.storage_id = "claude_code:session:shared".into();
+
+        let sessions = vec![codex, claude];
+        let targets = list_targets(&sessions, None, None);
+        let alpha = targets
+            .iter()
+            .find(|target| target.kind == ToolImpactTargetKind::Provider && target.key == "alpha")
+            .unwrap();
+        assert_eq!(alpha.turn_count, 2);
+
+        let result = compare(
+            &sessions,
+            ToolImpactTargetKind::Provider,
+            "alpha",
+            None,
+            None,
+        );
+        assert_eq!(result.observed.turn_count, 2);
+        assert_eq!(result.observed.session_count, 2);
     }
 }

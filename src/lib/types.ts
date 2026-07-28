@@ -120,6 +120,8 @@ export interface RateLimitSnapshotPoint {
 
 export interface Session {
   id: string;
+  /** Durable, harness-namespaced storage identity; provider id remains in `id`. */
+  storage_id: string;
   harness: Harness;
   thread_name: string | null;
   forked_from_id: string | null;
@@ -127,12 +129,16 @@ export interface Session {
   agent_path: string | null;
   agent_nickname: string | null;
   file_path: string;
+  /** Whether the recorded transcript is still available at `file_path`. */
+  source_availability: 'present' | 'missing';
   archived: boolean;
   started_at: string; // ISO8601
   last_event_at: string; // ISO8601
   working_directory: string | null;
   originator: string | null;
   source: string | null;
+  /** True when a legacy Claude subagent used its filename stem as identity because agentId was absent. */
+  subagent_id_is_path_fallback: boolean;
   history_mode: string | null;
   memory_mode: string | null;
   cli_version: string | null;
@@ -153,6 +159,8 @@ export interface Session {
     timestamp: string;
     model: string | null;
     service_tier: string | null;
+    /** Complete per-request input count; null for historical records without direct request evidence. */
+    request_input_tokens: number | null;
     total_tokens: number;
     delta: TokenTotals;
   }[];
@@ -219,6 +227,8 @@ export interface ToolImpactResult {
 /** Lightweight wire form of a Session for the list view and live updates. */
 export interface SessionSummary {
   id: string;
+  /** Durable, harness-namespaced storage identity; provider id remains in `id`. */
+  storage_id: string;
   harness: Harness;
   thread_name: string | null;
   forked_from_id: string | null;
@@ -226,6 +236,8 @@ export interface SessionSummary {
   agent_path: string | null;
   agent_nickname: string | null;
   file_path: string;
+  /** Whether the recorded transcript is still available at `file_path`. */
+  source_availability: 'present' | 'missing';
   archived: boolean;
   started_at: string; // ISO8601
   last_event_at: string; // ISO8601
@@ -376,6 +388,65 @@ export interface ModelRate {
   reasoning: number;
 }
 
+/** Billing surface for a catalog rule.  Rules never cross billing surfaces. */
+export type PricingSurface = 'codex_plan_credits' | 'openai_api_usd' | 'anthropic_api_usd';
+
+/** Source evidence retained with a dated or conditional pricing rule. */
+export interface PricingProvenance {
+  evidence: string;
+  source_url: string;
+  verified_at: string;
+  note: string | null;
+}
+
+/** A base rate that applies over the half-open interval [from, to). */
+export interface EffectiveRatePeriod {
+  id: string;
+  surface: PricingSurface;
+  model: string;
+  from: string;
+  to: string | null;
+  rate: ModelRate;
+  /** Documented cache-write premium, when the provider publishes one. Parsed
+   * telemetry has no cache-write token category, so this is provenance only. */
+  cache_write_input_multiplier?: number | null;
+  provenance: PricingProvenance;
+  label: string;
+}
+
+export interface RequestInputTokenThresholdCondition {
+  kind: 'request_input_token_threshold';
+  greater_than: number;
+}
+
+export type PricingCondition = RequestInputTokenThresholdCondition;
+
+export interface RateMultipliers {
+  input: number;
+  output: number;
+}
+
+/** A request-level modifier. Cache-write pricing is intentionally absent: it
+ * is not observed separately by the parsers and must not be guessed. */
+export interface ConditionalRateModifier {
+  id: string;
+  surface: PricingSurface;
+  model: string;
+  from: string;
+  to: string | null;
+  condition: PricingCondition;
+  multipliers: RateMultipliers;
+  provenance: PricingProvenance;
+  label: string;
+}
+
+/** Versioned, source-backed, time-aware scenario pricing data. */
+export interface PricingCatalog {
+  rate_periods: EffectiveRatePeriod[];
+  conditional_modifiers: ConditionalRateModifier[];
+  notes: string[];
+}
+
 export interface RateCard {
   version: number;
   currency: string;
@@ -392,6 +463,8 @@ export interface RateCard {
   api_models: Record<string, ModelRate>;
   /** Known models without a published price; excluded rather than fallback-priced. */
   unpriced_models: string[];
+  /** Dated and conditional scenario rules. Kept intact by the settings editor. */
+  pricing_catalog: PricingCatalog;
 }
 
 export interface ExternalEvent {

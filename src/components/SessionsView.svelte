@@ -30,7 +30,7 @@
   import GitOutcomes from './GitOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
-  import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository, modelProviderVisual } from '../lib/sessionGrid';
+  import { formatStartedLocal, formatTokenCategory, modelProviderVisual } from '../lib/sessionGrid';
   import {
     collectSessionExportTree,
     sessionExportContent,
@@ -144,6 +144,23 @@
   const allSessions = $derived(
     active ? filterSessions(sessionsStore.map.values(), harness, defaultFilters(), false) : [],
   );
+  // Provider ids are relationship identifiers, while storage ids are durable
+  // UI and IPC keys. Keep this bridge local to the currently visible scope.
+  const providerToStorageIds = $derived((() => {
+    const groups = new Map<string, string[]>();
+    for (const session of allSessions) {
+      const key = `${session.harness}\0${session.id}`;
+      const ids = groups.get(key);
+      if (ids) ids.push(session.storage_id);
+      else groups.set(key, [session.storage_id]);
+    }
+    return groups;
+  })());
+  function parentStorageId(session: TrackedSession): string | null {
+    if (!session.parent_thread_id) return null;
+    const ids = providerToStorageIds.get(`${session.harness}\0${session.parent_thread_id}`);
+    return ids?.length === 1 ? ids[0] : null;
+  }
 
   // Convert datetime-local strings (local time) to UTC ISO once, so the rest
   // of the pipeline can do lexical comparison against the UTC ISO timestamps
@@ -160,8 +177,8 @@
   // [started_at, last_event_at] window intersects the filter range.
   // Comparison is lexical on UTC ISO strings, which sorts chronologically.
   const filtered = $derived(filterSessions(filteredNoDate, harness, filters, true));
-  const filteredIds = $derived(filtered.map((session) => session.id));
-  const analyticsSessionIds = $derived(filteredNoDate.map((session) => session.id));
+  const filteredIds = $derived(filtered.map((session) => session.storage_id));
+  const analyticsSessionIds = $derived(filteredNoDate.map((session) => session.storage_id));
 
   // True when the user has narrowed by date — drives whether per-session
   // tokens and costs are "all-time" or scoped to the visible window.
@@ -259,31 +276,31 @@
         cmp = (a.model ?? '').localeCompare(b.model ?? '');
         break;
       case 'input': {
-        const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
         cmp = at.input_tokens - bt.input_tokens;
         break;
       }
       case 'cached': {
-        const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
         cmp = at.cached_input_tokens - bt.cached_input_tokens;
         break;
       }
       case 'output': {
-        const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
         cmp = at.output_tokens - bt.output_tokens;
         break;
       }
       case 'total': {
-        const at = sessionDisplayMap.get(a.id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
         cmp = at.total_tokens - bt.total_tokens;
         break;
       }
       case 'cost':
-        cmp = costOf(a.id) - costOf(b.id);
+        cmp = costOf(a.storage_id) - costOf(b.storage_id);
         break;
     }
     return sortDir === 'asc' ? cmp : -cmp;
@@ -297,14 +314,15 @@
   const displayedWithAnchors = $derived((() => {
     const sorted = [...filtered].sort(compareSession);
     const anchorMs = new Map<string, number>();
-    const ids = new Set(sorted.map((s) => s.id));
+    const ids = new Set(sorted.map((s) => s.storage_id));
     const children = new Map<string, TrackedSession[]>();
     const roots: TrackedSession[] = [];
     for (const s of sorted) {
-      if (s.parent_thread_id && ids.has(s.parent_thread_id)) {
-        const arr = children.get(s.parent_thread_id);
+      const parentId = parentStorageId(s);
+      if (parentId && ids.has(parentId)) {
+        const arr = children.get(parentId);
         if (arr) arr.push(s);
-        else children.set(s.parent_thread_id, [s]);
+        else children.set(parentId, [s]);
       } else {
         roots.push(s);
       }
@@ -312,9 +330,9 @@
     const list: TrackedSession[] = [];
     const append = (s: TrackedSession, anchor: number) => {
       list.push(s);
-      anchorMs.set(s.id, anchor);
-      if (collapsedParents.has(s.id)) return;
-      for (const c of children.get(s.id) ?? []) append(c, anchor);
+      anchorMs.set(s.storage_id, anchor);
+      if (collapsedParents.has(s.storage_id)) return;
+      for (const c of children.get(s.storage_id) ?? []) append(c, anchor);
     };
     for (const r of roots) append(r, r.startedMs);
     return { list, anchorMs };
@@ -335,37 +353,38 @@
   // has in-view children. Primary cells stay per-thread; these feed the Σ lines.
   const combinedUsage = $derived((() => {
     const childrenOf = new Map<string, TrackedSession[]>();
-    const ids = new Set(filtered.map((s) => s.id));
+    const ids = new Set(filtered.map((s) => s.storage_id));
     for (const s of filtered) {
-      if (s.parent_thread_id && ids.has(s.parent_thread_id)) {
-        const arr = childrenOf.get(s.parent_thread_id);
+      const parentId = parentStorageId(s);
+      if (parentId && ids.has(parentId)) {
+        const arr = childrenOf.get(parentId);
         if (arr) arr.push(s);
-        else childrenOf.set(s.parent_thread_id, [s]);
+        else childrenOf.set(parentId, [s]);
       }
     }
     const memo = new Map<string, { tokens: number; cost: number }>();
     const total = (session: TrackedSession): { tokens: number; cost: number } => {
-      const cached = memo.get(session.id);
+      const cached = memo.get(session.storage_id);
       if (cached !== undefined) return cached;
       const own = {
-        tokens: sessionDisplayMap.get(session.id)?.tokens.total_tokens ?? session.tokens_total.total_tokens,
-        cost: costOf(session.id),
+        tokens: sessionDisplayMap.get(session.storage_id)?.tokens.total_tokens ?? session.tokens_total.total_tokens,
+        cost: costOf(session.storage_id),
       };
-      memo.set(session.id, own); // pre-set guards against parent-id cycles
+      memo.set(session.storage_id, own); // pre-set guards against parent-id cycles
       let tokens = own.tokens;
       let cost = own.cost;
-      for (const childSession of childrenOf.get(session.id) ?? []) {
+      for (const childSession of childrenOf.get(session.storage_id) ?? []) {
         const child = total(childSession);
         tokens += child.tokens;
         cost += child.cost;
       }
       const sum = { tokens, cost };
-      memo.set(session.id, sum);
+      memo.set(session.storage_id, sum);
       return sum;
     };
     const out = new Map<string, { tokens: number; cost: number }>();
     for (const s of filtered) {
-      if ((childrenOf.get(s.id)?.length ?? 0) > 0) out.set(s.id, total(s));
+      if ((childrenOf.get(s.storage_id)?.length ?? 0) > 0) out.set(s.storage_id, total(s));
     }
     return out;
   })());
@@ -400,14 +419,40 @@
     return `${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
   }
 
+  function groupByRepository(sessions: TrackedSession[]): { label: string; sessions: TrackedSession[] }[] {
+    const groups = new Map<string, { label: string; sessions: TrackedSession[] }>();
+    const byStorageId = new Map(sessions.map((session) => [session.storage_id, session]));
+    for (const session of sessions) {
+      let anchor = session;
+      const seen = new Set<string>();
+      while (!seen.has(anchor.storage_id)) {
+        seen.add(anchor.storage_id);
+        const parentId = parentStorageId(anchor);
+        const parent = parentId ? byStorageId.get(parentId) : undefined;
+        if (!parent) break;
+        anchor = parent;
+      }
+      const workingDirectory = anchor.working_directory;
+      const normalized = workingDirectory?.replace(/\\/g, '/').replace(/\/+$/, '') ?? '';
+      const windowsStyle = Boolean(workingDirectory && (/\\/.test(workingDirectory) || /^[A-Za-z]:[\\/]/.test(workingDirectory)));
+      const key = workingDirectory
+        ? `path:${windowsStyle ? normalized.toLowerCase() : normalized}`
+        : 'missing:';
+      const group = groups.get(key);
+      if (group) group.sessions.push(session);
+      else groups.set(key, { label: repositoryLabel(anchor) ?? 'No repository recorded', sessions: [session] });
+    }
+    return [...groups.values()];
+  }
+
   const groups = $derived((() => {
     if (sessionGridStore.groupByRepository) {
-      return groupSessionsByRepository(displayed);
+      return groupByRepository(displayed);
     }
     if (sortKey !== null) return [{ label: null as string | null, sessions: displayed }];
     const out: { label: string | null; sessions: TrackedSession[] }[] = [];
     for (const s of displayed) {
-      const label = groupLabelFor(displayedWithAnchors.anchorMs.get(s.id) ?? s.startedMs);
+      const label = groupLabelFor(displayedWithAnchors.anchorMs.get(s.storage_id) ?? s.startedMs);
       const last = out[out.length - 1];
       if (last && last.label === label) last.sessions.push(s);
       else out.push({ label, sessions: [s] });
@@ -438,7 +483,7 @@
         });
       }
       for (const session of group.sessions) {
-        rows.push({ kind: 'session', key: `session:${session.id}`, session, height: SESSION_ROW_HEIGHT });
+        rows.push({ kind: 'session', key: `session:${session.storage_id}`, session, height: SESSION_ROW_HEIGHT });
       }
     }
     return rows;
@@ -497,20 +542,21 @@
   const childCounts = $derived((() => {
     const m = new Map<string, number>();
     for (const s of allSessions) {
-      if (s.parent_thread_id) m.set(s.parent_thread_id, (m.get(s.parent_thread_id) ?? 0) + 1);
+      const parentId = parentStorageId(s);
+      if (parentId) m.set(parentId, (m.get(parentId) ?? 0) + 1);
     }
     return m;
   })());
 
   const filteredTokenTotals = $derived(filtered.reduce((sum, s) => {
-    const tokens = sessionDisplayMap.get(s.id)?.tokens ?? s.tokens_total;
+    const tokens = sessionDisplayMap.get(s.storage_id)?.tokens ?? s.tokens_total;
     addTotals(sum, tokens);
     return sum;
   }, zeroTotals()));
   const filteredTotal = $derived(filteredTokenTotals.total_tokens);
 
   // Money total for the pinned totals row (matches the column semantics).
-  const costTotal = $derived(filtered.reduce((sum, s) => sum + costOf(s.id), 0));
+  const costTotal = $derived(filtered.reduce((sum, s) => sum + costOf(s.storage_id), 0));
 
   // ---------------------------------------------------------------------------
   // Analytics band: spend-by-day series + window totals for the delta pills.
@@ -699,14 +745,14 @@
     session: TrackedSession,
     rateCard: RateCard,
   ): RangeSessionPrice | null {
-    const totals = data[session.id];
+    const totals = data[session.storage_id];
     if (!totals || totals.tokens.total_tokens === 0) return null;
     let cached = rangePriceCache.get(data);
     if (!cached || cached.rates !== rateCard) {
       cached = { rates: rateCard, perSession: new Map() };
       rangePriceCache.set(data, cached);
     }
-    const existing = cached.perSession.get(session.id);
+    const existing = cached.perSession.get(session.storage_id);
     if (existing) return existing;
     const plan = creditsFromBuckets(totals.buckets, rateCard, session.harness);
     const api = session.harness === 'codex'
@@ -721,7 +767,7 @@
       apiFallbackModels: api?.missingModels ?? [],
       apiUnpricedModels: api?.unpricedModels ?? [],
     };
-    cached.perSession.set(session.id, value);
+    cached.perSession.set(session.storage_id, value);
     return value;
   }
 
@@ -788,7 +834,7 @@
     };
     if (!data || !r) return out;
     for (const s of filteredNoDate) {
-      const rt = data[s.id];
+      const rt = data[s.storage_id];
       if (!rt || rt.tokens.total_tokens === 0) continue;
       const priced = priceRangeSession(data, s, r);
       if (!priced) continue;
@@ -807,7 +853,7 @@
       }
     }
     out.byModel = allUsdAvailable ? aggregateModelMetrics(filteredNoDate, data, r) : [];
-    const codexCount = filteredNoDate.filter((session) => data[session.id]?.tokens.total_tokens && session.harness === 'codex').length;
+    const codexCount = filteredNoDate.filter((session) => data[session.storage_id]?.tokens.total_tokens && session.harness === 'codex').length;
     out.allUnlimited = codexCount > 0 && out.credits.unlimitedCount === codexCount;
     return out;
   })());
@@ -818,8 +864,8 @@
         session,
         summary: dateScoped
           ? optimizationSummaryOrCount(
-              analyticsCurrent?.[session.id]?.optimization_summary,
-              analyticsCurrent?.[session.id]?.optimization_findings_count ?? 0,
+              analyticsCurrent?.[session.storage_id]?.optimization_summary,
+              analyticsCurrent?.[session.storage_id]?.optimization_findings_count ?? 0,
             )
           : optimizationSummaryOrCount(
               session.optimization_summary,
@@ -945,7 +991,8 @@
           ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
           : windowTotals.fallbackModels.length > 0
             ? `estimate · ${windowTotals.fallbackModels.length} fallback rate${windowTotals.fallbackModels.length === 1 ? '' : 's'} used`
-            : windowStats.allUnlimited ? 'à la carte · all sessions unlimited' : 'OpenAI API rates')
+            : windowStats.allUnlimited ? 'à la carte · all sessions unlimited'
+            : ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0 ? 'flat OpenAI API reference' : 'OpenAI API rates')
       : windowTotals.unpricedModels.length > 0
         ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
         : windowTotals.fallbackModels.length > 0
@@ -958,6 +1005,9 @@
       : '',
     windowTotals.unpricedModels.length > 0
       ? `Excluded because no published rate is available: ${windowTotals.unpricedModels.join(', ')}`
+      : '',
+    harness === 'codex' && ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0
+      ? 'Aggregate buckets omit per-request timestamps and input context, so this view intentionally stays on the flat API reference. Open a session for its exact dated scenario when supported.'
       : '',
   ].filter(Boolean).join('\n'));
 
@@ -1021,7 +1071,7 @@
       const exportRanges = dateScoped
         ? (await measureAsync(
             'frontend.session_export_range_fetch',
-            () => sessionsInRanges([{ from: fromUtc, to: toUtc }], exportSessions.map((session) => session.id)),
+            () => sessionsInRanges([{ from: fromUtc, to: toUtc }], exportSessions.map((session) => session.storage_id)),
             { sessions: exportSessions.length, ranges: 1 },
           ))[0]
         : rangeTotals;
@@ -1060,11 +1110,11 @@
   function openSessionContextMenu(session: TrackedSession, x: number, y: number) {
     const descendantCount = Math.max(
       0,
-      collectSessionExportTree(allSessions, session.id, true).length - 1,
+      collectSessionExportTree(allSessions, session.storage_id, true).length - 1,
     );
     sessionExportError = null;
     sessionContextMenu = {
-      sessionId: session.id,
+      sessionId: session.storage_id,
       sessionName: sessionName(session),
       x: Math.max(8, Math.min(x, window.innerWidth - 248)),
       y: Math.max(8, Math.min(y, window.innerHeight - 220)),
@@ -1087,7 +1137,7 @@
       openSessionContextMenu(session, rect.left + 16, rect.top + 16);
     } else if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      selectSession(session.id);
+      selectSession(session.storage_id);
     }
   }
 
@@ -1116,7 +1166,7 @@
             'frontend.single_session_export_range_fetch',
             () => sessionsInRanges(
               [{ from: fromUtc, to: toUtc }],
-              exportSessions.map((session) => session.id),
+              exportSessions.map((session) => session.storage_id),
             ),
             { sessions: exportSessions.length, ranges: 1 },
           ))[0]
@@ -1174,7 +1224,7 @@
         })
         .catch((e) => console.error('get_session_details failed:', e));
     };
-    if (selectedSession?.id === id) {
+    if (selectedSession?.storage_id === id) {
       // Refresh of an already-selected session: debounce.
       detailsFetchTimer = setTimeout(fetchDetails, 400);
     } else {
@@ -1453,11 +1503,11 @@
             {/each}
           </div>
           <div class="flex max-h-48 flex-col gap-1 overflow-y-auto pr-1">
-            {#each findingSessions as item (item.session.id)}
+            {#each findingSessions as item (item.session.storage_id)}
               <button
                 type="button"
                 class="flex items-center justify-between gap-3 rounded px-2 py-2 text-left text-xs hover:bg-[var(--row-hover)] transition-colors"
-                onclick={() => reviewFindingSession(item.session.id)}
+                onclick={() => reviewFindingSession(item.session.storage_id)}
                 aria-label={`Review optimization evidence for ${sessionName(item.session)}`}
               >
                 <span class="min-w-0">
@@ -1546,13 +1596,13 @@
             {:else}
               {@const session = row.session}
               {@const name = sessionName(session)}
-              {@const display = sessionDisplayMap.get(session.id)}
+              {@const display = sessionDisplayMap.get(session.storage_id)}
               {@const rowTokens = display?.tokens ?? session.tokens_total}
               {@const sub = isSubagent(session)}
-              {@const kids = childCounts.get(session.id) ?? 0}
-              {@const combined = combinedUsage.get(session.id)}
-              {@const collapsed = collapsedParents.has(session.id)}
-              {@const selected = selectedSessionId === session.id}
+              {@const kids = childCounts.get(session.storage_id) ?? 0}
+              {@const combined = combinedUsage.get(session.storage_id)}
+              {@const collapsed = collapsedParents.has(session.storage_id)}
+              {@const selected = selectedSessionId === session.storage_id}
               {@const providerVisual = modelProviderVisual(session)}
               <div
                 role="button"
@@ -1566,7 +1616,7 @@
                            : 'hover:bg-[var(--row-hover)]'}"
                 style={`${gridCols}${sessionGridStore.colorByModelProvider ? `; background-image: linear-gradient(90deg, ${providerVisual.tint}, transparent 24%)` : ''}`}
                 data-model-provider={providerVisual.key}
-                onclick={() => selectSession(session.id)}
+                onclick={() => selectSession(session.storage_id)}
                 oncontextmenu={(event) => openSessionContextMenuFromPointer(event, session)}
                 onkeydown={(event) => handleSessionRowKeydown(event, session)}
                 aria-haspopup="menu"
@@ -1575,9 +1625,9 @@
                 {#each visibleColumns as column (column.id)}
                   {#if column.id === 'name'}
                     <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-[var(--row-name)]'}" title={name}>
-                      {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
+                      {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.storage_id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
                       {#if sub}<span class="text-[var(--subagent-chip-fg)] font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
-                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}
+                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap" title="The saved transcript source is currently unavailable">source missing</span>{/if}
                       {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)] ml-1 whitespace-nowrap">archived</span>{/if}
                       {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{session.harness === 'codex' ? 'Codex' : 'Claude'}</span>{/if}
                     </span>
@@ -1599,7 +1649,7 @@
                   {:else if column.id === 'total'}
                     <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmt.format(combined.tokens)}</span>{/if}</span>
                   {:else if column.id === 'cost'}
-                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{allUsdAvailable ? fmtAmount(costOf(session.id)) : 'unavailable'}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmtAmount(combined.cost)}</div>{/if}</span>
+                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{allUsdAvailable ? fmtAmount(costOf(session.storage_id)) : 'unavailable'}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmtAmount(combined.cost)}</div>{/if}</span>
                   {/if}
                 {/each}
               </div>
