@@ -54,6 +54,7 @@ test('assembles a complete public updater manifest after all platform bundles ex
     });
 
     assert.doesNotThrow(() => validateUpdaterManifest(manifest, release(), VERSION, SHA));
+    assert.equal(manifest.platforms['darwin-aarch64'].url, `https://github.com/${REPOSITORY}/releases/download/${TAG}/Odometer.app.tar.gz`);
     assert.equal(manifest.platforms['windows-x86_64-nsis'].signature, `signature:Odometer_${VERSION}_x64-setup.exe.sig`);
     assert.equal(manifest.platforms['linux-x86_64'].url, `https://github.com/${REPOSITORY}/releases/download/${TAG}/Odometer_${VERSION}_amd64.AppImage`);
   });

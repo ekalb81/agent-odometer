@@ -38,7 +38,7 @@ export function assembleUpdaterManifest({ artifactRoot, release, version, reposi
   }
 
   const assets = releaseAssetMap(artifactRoot, version);
-  const macApp = `Odometer_${version}_aarch64.app.tar.gz`;
+  const macApp = 'Odometer.app.tar.gz';
   const appImage = `Odometer_${version}_amd64.AppImage`;
   const deb = `Odometer_${version}_amd64.deb`;
   const rpm = `Odometer-${version}-1.x86_64.rpm`;

@@ -289,7 +289,8 @@ jobs:
           set -euo pipefail
 
           package_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).version')"
-          mapfile -t release_assets < <(node scripts/release-artifacts.mjs release-artifacts "$package_version")
+          node scripts/release-artifacts.mjs release-artifacts "$package_version" > release-assets.txt
+          mapfile -t release_assets < release-assets.txt
           gh release upload "$GITHUB_REF_NAME" "${release_assets[@]}" --clobber
 
           gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json

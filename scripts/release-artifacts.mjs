@@ -5,8 +5,10 @@ import { pathToFileURL } from 'node:url';
 export function releaseAssetNames(version) {
   return [
     'latest.json',
-    `Odometer_${version}_aarch64.app.tar.gz`,
-    `Odometer_${version}_aarch64.app.tar.gz.sig`,
+    // Tauri's macOS updater archive deliberately has a stable app name rather
+    // than a versioned bundle name.
+    'Odometer.app.tar.gz',
+    'Odometer.app.tar.gz.sig',
     `Odometer_${version}_aarch64.dmg`,
     `Odometer_${version}_amd64.AppImage`,
     `Odometer_${version}_amd64.AppImage.sig`,

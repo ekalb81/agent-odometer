@@ -9,8 +9,8 @@ const SHA = '0123456789abcdef0123456789abcdef01234567';
 function fixture() {
   const names = [
     'latest.json',
-    `Odometer_${VERSION}_aarch64.app.tar.gz`,
-    `Odometer_${VERSION}_aarch64.app.tar.gz.sig`,
+    'Odometer.app.tar.gz',
+    'Odometer.app.tar.gz.sig',
     `Odometer_${VERSION}_aarch64.dmg`,
     `Odometer_${VERSION}_amd64.AppImage`,
     `Odometer_${VERSION}_amd64.AppImage.sig`,

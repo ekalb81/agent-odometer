@@ -19,6 +19,11 @@ function withArtifactDirectory(callback) {
 
 test('collects the exact signed release asset set in deterministic order', () => {
   withArtifactDirectory((directory) => {
+    assert.deepEqual(releaseBundleAssetNames(VERSION).slice(0, 2), [
+      'Odometer.app.tar.gz',
+      'Odometer.app.tar.gz.sig',
+    ]);
+
     for (const [index, name] of releaseBundleAssetNames(VERSION).entries()) {
       const target = path.join(directory, index % 2 === 0 ? 'first' : 'second', name);
       fs.mkdirSync(path.dirname(target), { recursive: true });
