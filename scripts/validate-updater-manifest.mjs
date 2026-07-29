@@ -1,7 +1,9 @@
 import fs from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
-const REQUIRED_PLATFORMS = [
+import { releaseAssetNames } from './release-artifacts.mjs';
+
+export const REQUIRED_PLATFORMS = [
   'darwin-aarch64',
   'darwin-aarch64-app',
   'linux-x86_64',
@@ -17,25 +19,6 @@ function requireObject(value, label) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error(`${label} must be a JSON object`);
   }
-}
-
-function expectedAssetNames(version) {
-  return [
-    'latest.json',
-    `Odometer_${version}_aarch64.app.tar.gz`,
-    `Odometer_${version}_aarch64.app.tar.gz.sig`,
-    `Odometer_${version}_aarch64.dmg`,
-    `Odometer_${version}_amd64.AppImage`,
-    `Odometer_${version}_amd64.AppImage.sig`,
-    `Odometer_${version}_amd64.deb`,
-    `Odometer_${version}_amd64.deb.sig`,
-    `Odometer-${version}-1.x86_64.rpm`,
-    `Odometer-${version}-1.x86_64.rpm.sig`,
-    `Odometer_${version}_x64-setup.exe`,
-    `Odometer_${version}_x64-setup.exe.sig`,
-    `Odometer_${version}_x64_en-US.msi`,
-    `Odometer_${version}_x64_en-US.msi.sig`,
-  ];
 }
 
 function assetIdFromUpdaterUrl(url) {
@@ -100,7 +83,7 @@ export function validateUpdaterManifest(manifest, release, expectedVersion, expe
     throw new Error('release.assets must be an array');
   }
 
-  const expectedNames = expectedAssetNames(expectedVersion);
+  const expectedNames = releaseAssetNames(expectedVersion);
   const actualNames = release.assets.map((asset) => asset.name);
   const missing = expectedNames.filter((name) => !actualNames.includes(name));
   const unexpected = actualNames.filter((name) => !expectedNames.includes(name));
@@ -129,7 +112,7 @@ export function validateUpdaterManifest(manifest, release, expectedVersion, expe
     throw new Error(`updater platform set mismatch; missing=[${missingPlatforms.join(', ')}] unexpected=[${unexpectedPlatforms.join(', ')}]`);
   }
 
-  const browserUrls = new Set(release.assets.map((asset) => asset.browser_download_url));
+  const assetNames = new Set(release.assets.map((asset) => asset.name));
   for (const [platform, entry] of Object.entries(manifest.platforms)) {
     requireObject(entry, `manifest.platforms.${platform}`);
     if (typeof entry.signature !== 'string' || entry.signature.trim() === '') {
@@ -150,7 +133,8 @@ export function validateUpdaterManifest(manifest, release, expectedVersion, expe
     if (parsed.hostname !== 'github.com' || !parsed.pathname.includes(`/releases/download/${release.tag_name}/`)) {
       throw new Error(`${platform}.url must use a public GitHub release download URL`);
     }
-    if (!browserUrls.has(entry.url)) {
+    const assetName = decodeURIComponent(parsed.pathname.split('/').at(-1) ?? '');
+    if (!assetNames.has(assetName)) {
       throw new Error(`${platform}.url does not reference an asset in this release`);
     }
   }

@@ -111,8 +111,8 @@ jobs:
           set -euo pipefail
 
           # GitHub's releases/tags endpoint does not return draft releases.
-          # Enumerate releases instead, then pin every matrix job to the exact
-          # release ID so parallel builders cannot create split drafts.
+          # Enumerate releases and make one mutable draft for the serialized
+          # publisher that runs after all platform builds finish.
           mapfile -t matches < <(
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
               --jq ".[] | select(.tag_name == \"${GITHUB_REF_NAME}\") | [.id, .draft, .immutable, .target_commitish] | @tsv"
@@ -150,7 +150,7 @@ jobs:
               '' \
               '- Repair in-app update checks after the malformed v0.6.1 updater manifest.' \
               '- Validate updater field types, signed platform mappings, asset digests, and exact release ownership before publication.' \
-              '- Pin every platform build to one draft release and serialize uploads so updater manifests cannot split or race.'
+              '- Build all platforms in parallel, then publish one complete and validated updater manifest from a single draft-release writer.'
           )"
           release_id="$(
             gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
@@ -170,21 +170,26 @@ jobs:
     needs: preflight
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # Bundling is isolated per OS. Only the downstream publisher mutates the
+      # draft release, so these expensive platform builds can safely overlap.
+      max-parallel: 3
       matrix:
         include:
           - platform: macos-latest
             label: macOS (Apple Silicon)
             args: --target aarch64-apple-darwin
             rust_target: aarch64-apple-darwin
+            artifact_name: release-bundles-macos
           - platform: ubuntu-22.04
             label: Linux (x86_64)
             args: ''
             rust_target: ''
+            artifact_name: release-bundles-linux
           - platform: windows-latest
             label: Windows (x86_64)
             args: ''
             rust_target: ''
+            artifact_name: release-bundles-windows
 
     runs-on: ${{ matrix.platform }}
     timeout-minutes: 30
@@ -230,54 +235,77 @@ jobs:
       - name: Install frontend deps
         run: npm ci
 
-      - name: Build and bundle (manual dry run; no release upload)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Build and sign bundles
         uses: tauri-apps/tauri-action@v1
         env:
-          # createUpdaterArtifacts is enabled, so dry runs still exercise the
-          # updater-signing path while keeping every artifact local to the job.
+          # createUpdaterArtifacts exercises updater signing for both release
+          # tags and manual dry runs. Publishing happens in one later job.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
+          # Do not provide releaseId or tagName. Tauri Action would otherwise
+          # generate and overwrite latest.json once per matrix entry.
+          uploadUpdaterJson: false
           args: ${{ matrix.args }}
 
-      - name: Build, bundle, and upload to draft release
+      - name: Preserve signed release bundles for the publisher
         if: github.event_name == 'push'
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Updater artifact signing (minisign). tauri-action also assembles
-          # and uploads latest.json for the in-app updater when these are set.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        uses: actions/upload-artifact@v4
         with:
-          releaseId: ${{ needs.preflight.outputs.release_id }}
-          tagName: ${{ github.ref_name }}
-          releaseName: 'Odometer ${{ github.ref_name }}'
-          releaseBody: |
-            ## Installation
+          name: ${{ matrix.artifact_name }}
+          path: src-tauri/target/**/release/bundle/**
+          if-no-files-found: error
+          retention-days: 1
 
-            Download the installer for your platform:
+  publish:
+    name: Publish signed release assets
+    if: github.event_name == 'push'
+    needs: [preflight, build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
 
-            - **Windows**: the `.msi` (recommended) or `.exe`.
-            - **macOS (Apple Silicon)**: the `.dmg`. Right-click → Open on first launch (the app isn't notarized yet).
-            - **Linux**: the `.AppImage` (single file, no install) or `.deb` (Debian/Ubuntu).
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
 
-            Installed copies check for new releases on launch and offer a one-click update.
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
 
-            ## Changes
+      - name: Download signed platform bundles
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-bundles-*
+          path: release-artifacts
+          merge-multiple: true
 
-            - Repair in-app update checks after the malformed v0.6.1 updater manifest.
-            - Validate updater field types, signed platform mappings, asset digests, and exact release ownership before publication.
-            - Pin every platform build to one draft release and serialize uploads so updater manifests cannot split or race.
-          releaseDraft: true
-          prerelease: false
-          args: ${{ matrix.args }}
+      - name: Upload release assets and assemble updater manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.preflight.outputs.release_id }}
+        run: |
+          set -euo pipefail
+
+          package_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).version')"
+          mapfile -t release_assets < <(node scripts/release-artifacts.mjs release-artifacts "$package_version")
+          gh release upload "$GITHUB_REF_NAME" "${release_assets[@]}" --clobber
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json
+          node scripts/assemble-updater-manifest.mjs \
+            release-artifacts \
+            release.json \
+            "$package_version" \
+            "$GITHUB_REPOSITORY" \
+            "$GITHUB_REF_NAME" \
+            latest.json
+          gh release upload "$GITHUB_REF_NAME" latest.json --clobber
 
   validate:
     name: Validate updater release
     if: github.event_name == 'push'
-    needs: [preflight, build]
+    needs: [preflight, publish]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
 
@@ -322,26 +350,6 @@ jobs:
           package_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).version')"
           node scripts/validate-updater-manifest.mjs \
             latest.json \
-            release.json \
-            "$package_version" \
-            "$GITHUB_SHA" \
-            --rewrite
-
-          # tauri-action v1 emits authenticated API asset URLs for draft
-          # releases. Replace latest.json with the validated public-download
-          # form before publication so installed clients receive binaries,
-          # not GitHub API metadata.
-          gh release upload "$GITHUB_REF_NAME" latest.json --clobber
-
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json
-          latest_asset_id="$(
-            jq -r '[.assets[] | select(.name == "latest.json")] | if length == 1 then .[0].id else empty end' release.json
-          )"
-          gh api \
-            -H 'Accept: application/octet-stream' \
-            "repos/${GITHUB_REPOSITORY}/releases/assets/${latest_asset_id}" > published-latest.json
-          node scripts/validate-updater-manifest.mjs \
-            published-latest.json \
             release.json \
             "$package_version" \
             "$GITHUB_SHA"
