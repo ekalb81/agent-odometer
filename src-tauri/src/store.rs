@@ -596,6 +596,7 @@ mod tests {
             working_directory: None,
             originator: None,
             source: None,
+            subagent_id_is_path_fallback: false,
             history_mode: None,
             memory_mode: None,
             cli_version: None,
