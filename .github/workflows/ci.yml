@@ -19,6 +19,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      run_cargo_cache_probe:
+        description: 'Also compare warm registry-only and target-directory Cargo caches.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -132,7 +138,6 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
 
       - name: Determine visual impact
         id: impact
@@ -149,12 +154,10 @@ jobs:
             bash -lc '
               set -e
               npm ci
-              set +e
-              npm run visual:test
-              visual_status=$?
-              set -e
-              npm run visual:gallery
-              exit "$visual_status"
+              if ! npm run visual:test; then
+                npm run visual:gallery || true
+                exit 1
+              fi
             '
 
       - name: Report visual check
@@ -168,12 +171,13 @@ jobs:
           fi
 
       - name: Upload visual artifacts
-        if: always() && steps.impact.outputs.impacted == 'true'
+        if: failure() && steps.impact.outputs.impacted == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: visual-regression-${{ github.run_id }}
           if-no-files-found: warn
           path: output/playwright/**
+          retention-days: 7
 
   msrv:
     name: Minimum supported Rust
@@ -297,3 +301,57 @@ jobs:
           files: src-tauri/lcov.info
           use_oidc: true
           fail_ci_if_error: false
+
+  cargo-cache-probe:
+    name: Cargo cache probe (${{ matrix.cache_targets && 'target' || 'registry-only' }})
+    # The normal lane retains its proven target cache. This opt-in experiment
+    # produces directly comparable timings before changing that policy.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_cargo_cache_probe
+    strategy:
+      fail-fast: false
+      matrix:
+        cache_targets: [true, false]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+          key: cargo-cache-probe-${{ matrix.cache_targets }}
+          cache-targets: ${{ matrix.cache_targets }}
+
+      - name: Install Linux system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            build-essential \
+            pkg-config
+
+      - name: Measure Cargo tests
+        working-directory: ./src-tauri
+        shell: bash
+        run: |
+          set -euo pipefail
+          started_at="$SECONDS"
+          cargo test --locked
+          elapsed_seconds=$((SECONDS - started_at))
+          {
+            echo "## Cargo cache probe"
+            echo
+            echo "- Target directory cached: \`${{ matrix.cache_targets }}\`"
+            echo "- \`cargo test --locked\`: ${elapsed_seconds}s"
+          } >> "$GITHUB_STEP_SUMMARY"

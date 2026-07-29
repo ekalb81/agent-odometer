@@ -70,6 +70,15 @@ test('rewrites API asset URLs to public release downloads for every platform', (
   }
 });
 
+test('accepts deterministic public URLs while a draft release reports API asset URLs', () => {
+  const { manifest, release } = fixture();
+  for (const asset of release.assets) {
+    asset.browser_download_url = `https://api.github.com/repos/example/app/releases/assets/${asset.id}`;
+  }
+
+  assert.doesNotThrow(() => validateUpdaterManifest(manifest, release, VERSION, SHA));
+});
+
 test('rejects API asset URLs in a published manifest', () => {
   const { manifest, release } = fixture();
   manifest.platforms['windows-x86_64'].url = `https://api.github.com/repos/example/app/releases/assets/${release.assets[1].id}`;

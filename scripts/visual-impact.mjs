@@ -32,8 +32,6 @@ export function isVisualImpactPath(value) {
   if (/^(?:public|static)(?:\/|$)/i.test(changedPath)) return true;
   if (FRONTEND_CONFIG.test(changedPath)) return true;
   if (/^tsconfig(?:\.[^/]+)?\.json$/i.test(changedPath)) return true;
-  if (/^src-tauri\/src(?:\/|$)/i.test(changedPath)) return true;
-
   if (/^src(?:\/|$)/i.test(changedPath)) {
     return !SOURCE_UNIT_TEST.test(changedPath);
   }

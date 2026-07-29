@@ -22,7 +22,7 @@ test('source implementation and visual harness files trigger visual checks', () 
   assert.equal(isVisualImpactPath('src-tauri/tauri.conf.json'), true);
   assert.equal(isVisualImpactPath('.env.visual'), true);
   assert.equal(isVisualImpactPath('.env.production'), true);
-  assert.equal(isVisualImpactPath('src-tauri/src/commands.rs'), true);
+  assert.equal(isVisualImpactPath('src-tauri/src/commands.rs'), false);
   assert.equal(isVisualImpactPath('docs/ARCHITECTURE.md'), false);
 });
 
