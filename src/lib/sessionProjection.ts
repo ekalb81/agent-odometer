@@ -335,6 +335,7 @@ export function exportRows<T extends SessionSummary>(
       last_event_at: session.last_event_at,
       archived: session.archived,
       subagent: isSubagent(session),
+      parent_thread_id: session.parent_thread_id,
       model: session.model,
       turns: session.total_turns,
       input_tokens: tokens.input_tokens,

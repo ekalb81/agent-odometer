@@ -31,7 +31,14 @@
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
   import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository, modelProviderVisual } from '../lib/sessionGrid';
+  import {
+    collectSessionExportTree,
+    sessionExportContent,
+    sessionExportFileName,
+    type SessionExportFormat,
+  } from '../lib/sessionExport';
   import SessionGridControls from './SessionGridControls.svelte';
+  import SessionContextMenu from './SessionContextMenu.svelte';
 
   interface Props {
     harness?: ViewScope;
@@ -1037,6 +1044,103 @@
     }
   }
 
+  interface SessionContextMenuState {
+    sessionId: string;
+    sessionName: string;
+    x: number;
+    y: number;
+    descendantCount: number;
+    includeDescendants: boolean;
+  }
+
+  let sessionContextMenu = $state<SessionContextMenuState | null>(null);
+  let sessionExportBusy = $state(false);
+  let sessionExportError = $state<string | null>(null);
+
+  function openSessionContextMenu(session: TrackedSession, x: number, y: number) {
+    const descendantCount = Math.max(
+      0,
+      collectSessionExportTree(allSessions, session.id, true).length - 1,
+    );
+    sessionExportError = null;
+    sessionContextMenu = {
+      sessionId: session.id,
+      sessionName: sessionName(session),
+      x: Math.max(8, Math.min(x, window.innerWidth - 248)),
+      y: Math.max(8, Math.min(y, window.innerHeight - 220)),
+      descendantCount,
+      includeDescendants: false,
+    };
+  }
+
+  function openSessionContextMenuFromPointer(event: MouseEvent, session: TrackedSession) {
+    event.preventDefault();
+    openSessionContextMenu(session, event.clientX, event.clientY);
+  }
+
+  function handleSessionRowKeydown(event: KeyboardEvent, session: TrackedSession) {
+    if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) {
+      event.preventDefault();
+      const rect = event.currentTarget instanceof HTMLElement
+        ? event.currentTarget.getBoundingClientRect()
+        : { left: 8, top: 8 };
+      openSessionContextMenu(session, rect.left + 16, rect.top + 16);
+    } else if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      selectSession(session.id);
+    }
+  }
+
+  function setSessionExportDescendants(includeDescendants: boolean) {
+    if (sessionContextMenu) sessionContextMenu = { ...sessionContextMenu, includeDescendants };
+  }
+
+  async function exportSession(format: SessionExportFormat) {
+    const menu = sessionContextMenu;
+    if (!menu || sessionExportBusy) return;
+    const exportSessions = collectSessionExportTree(
+      allSessions,
+      menu.sessionId,
+      menu.includeDescendants,
+    );
+    if (exportSessions.length === 0) {
+      sessionExportError = 'This session is no longer available.';
+      return;
+    }
+
+    sessionExportBusy = true;
+    sessionExportError = null;
+    try {
+      const exportRanges = dateScoped
+        ? (await measureAsync(
+            'frontend.single_session_export_range_fetch',
+            () => sessionsInRanges(
+              [{ from: fromUtc, to: toUtc }],
+              exportSessions.map((session) => session.id),
+            ),
+            { sessions: exportSessions.length, ranges: 1 },
+          ))[0]
+        : {};
+      const projections = projectSessions(exportSessions, $rates, exportRanges, dateScoped);
+      const rows = measureSync(
+        'frontend.single_session_export_build',
+        () => exportRows(projections.values(), false),
+        { sessions: projections.size, format },
+      );
+      const descendantCount = exportSessions.length - 1;
+      await writeExport(
+        sessionExportFileName(exportSessions[0].harness, menu.sessionId, descendantCount, format),
+        format,
+        sessionExportContent(rows, format, rowsToCsv),
+      );
+      sessionContextMenu = null;
+    } catch (error) {
+      sessionExportError = String(error);
+    } finally {
+      sessionExportBusy = false;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Selection + detail pane. The table only holds summaries, so the full
   // session (turns, token history) is fetched on select and refreshed when
@@ -1102,7 +1206,9 @@
 
   // Escape deselects (kept from the drawer flow).
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape' && selectedSessionId !== null) deselect();
+    if (e.key !== 'Escape') return;
+    if (sessionContextMenu !== null) sessionContextMenu = null;
+    else if (selectedSessionId !== null) deselect();
   }
   $effect(() => {
     if (active) {
@@ -1461,7 +1567,9 @@
                 style={`${gridCols}${sessionGridStore.colorByModelProvider ? `; background-image: linear-gradient(90deg, ${providerVisual.tint}, transparent 24%)` : ''}`}
                 data-model-provider={providerVisual.key}
                 onclick={() => selectSession(session.id)}
-                onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(session.id); } }}
+                oncontextmenu={(event) => openSessionContextMenuFromPointer(event, session)}
+                onkeydown={(event) => handleSessionRowKeydown(event, session)}
+                aria-haspopup="menu"
                 aria-label="Select session {name}"
               >
                 {#each visibleColumns as column (column.id)}
@@ -1530,6 +1638,21 @@
     {/if}
   </div>
 </div>
+
+{#if sessionContextMenu}
+  <SessionContextMenu
+    sessionName={sessionContextMenu.sessionName}
+    x={sessionContextMenu.x}
+    y={sessionContextMenu.y}
+    descendantCount={sessionContextMenu.descendantCount}
+    includeDescendants={sessionContextMenu.includeDescendants}
+    busy={sessionExportBusy}
+    error={sessionExportError}
+    onincludechange={setSessionExportDescendants}
+    onexport={(format) => void exportSession(format)}
+    onclose={() => { if (!sessionExportBusy) sessionContextMenu = null; }}
+  />
+{/if}
 
 <!-- Narrow layouts: the pane collapses back to an overlay drawer -->
 {#if !isWide && selectedSessionId !== null}

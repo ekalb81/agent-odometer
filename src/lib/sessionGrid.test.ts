@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository, modelProviderVisual } from './sessionGrid';
-import { projectSession, repositoryLabel, zeroToolMetrics, zeroTotals } from './sessionProjection';
+import { exportRows, projectSession, repositoryLabel, zeroToolMetrics, zeroTotals } from './sessionProjection';
 import type { RangeTotals, SessionSummary, TokenTotals } from './types';
 
 describe('session grid formatting', () => {
@@ -76,5 +76,9 @@ describe('session grid formatting', () => {
     expect(projectSession(session, null, range, true).tokens).toEqual(scoped);
     expect(projectSession(session, null, undefined, true).tokens).toEqual(zeroTotals());
     expect(projectSession(session, null, range, false).tokens).toEqual(allTime);
+    expect(exportRows([projectSession(session, null, undefined, false)])[0]).toMatchObject({
+      id: 'session',
+      parent_thread_id: null,
+    });
   });
 });
