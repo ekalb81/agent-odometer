@@ -1,0 +1,8 @@
+/* Applied before the app mounts so snapshots never capture in-flight motion. */
+*, *::before, *::after {
+  animation-duration: 0.001ms !important;
+  animation-delay: 0ms !important;
+  transition-duration: 0.001ms !important;
+  transition-delay: 0ms !important;
+  caret-color: transparent !important;
+}

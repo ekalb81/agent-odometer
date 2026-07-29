@@ -2,6 +2,7 @@ node_modules/
 dist/
 coverage/
 .svelte-kit/
+output/playwright/
 .DS_Store
 
 # Rust / Tauri

@@ -7,11 +7,15 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "vitest run && node --test scripts/validate-frontend-coverage.test.mjs",
+    "test": "vitest run && node --test scripts/validate-frontend-coverage.test.mjs scripts/visual-impact.test.mjs scripts/visual-artifacts.test.mjs",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage && node --test scripts/validate-frontend-coverage.test.mjs && node scripts/validate-frontend-coverage.mjs",
+    "test:coverage": "vitest run --coverage && node --test scripts/validate-frontend-coverage.test.mjs scripts/visual-impact.test.mjs scripts/visual-artifacts.test.mjs && node scripts/validate-frontend-coverage.mjs",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "check:updater-manifest": "node --test scripts/validate-updater-manifest.test.mjs",
+    "visual:test": "node scripts/validate-visual-baselines.mjs && playwright test",
+    "visual:update": "node scripts/assert-visual-baseline-platform.mjs && playwright test --update-snapshots && node scripts/validate-visual-baselines.mjs",
+    "visual:gallery": "node scripts/generate-visual-gallery.mjs",
+    "visual:docs:update": "node scripts/generate-doc-screenshots.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -23,6 +27,7 @@
     "marked": "^18.0.7"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.0",
     "@sveltejs/vite-plugin-svelte": "^5",
     "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^7.0.0",
