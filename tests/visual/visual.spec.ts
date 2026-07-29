@@ -21,6 +21,8 @@ interface ScreenshotOptions {
   fullPage?: boolean;
 }
 
+type VisualTestBody = (page: Page) => Promise<void>;
+
 function visualUrl(scenario: string): string {
   return `/?visualScenario=${encodeURIComponent(scenario)}`;
 }
@@ -104,6 +106,43 @@ async function capture(
   });
 }
 
+const declaredSnapshotIds = new Set<string>(visualManifest.snapshots);
+const registeredSnapshotIds = new Set<string>();
+const duplicateManifestIds = visualManifest.snapshots.filter(
+  (id, index, ids) => ids.indexOf(id) !== index,
+);
+
+if (duplicateManifestIds.length > 0) {
+  throw new Error(`Duplicate visual manifest IDs: ${[...new Set(duplicateManifestIds)].join(', ')}`);
+}
+
+function visualTest(
+  id: string,
+  title: string,
+  body: VisualTestBody,
+  options: ScreenshotOptions = {},
+): void {
+  if (!declaredSnapshotIds.has(id)) {
+    throw new Error(`Visual test "${title}" registered undeclared snapshot ID: ${id}`);
+  }
+  if (registeredSnapshotIds.has(id)) {
+    throw new Error(`Visual snapshot ID registered more than once: ${id}`);
+  }
+  registeredSnapshotIds.add(id);
+
+  test(title, async ({ page }, testInfo) => {
+    await body(page);
+    await capture(page, testInfo, id, options);
+  });
+}
+
+function assertManifestCasesAreRegistered(): void {
+  const unregistered = visualManifest.snapshots.filter((id) => !registeredSnapshotIds.has(id));
+  if (unregistered.length > 0) {
+    throw new Error(`Manifest snapshots without a visual test: ${unregistered.join(', ')}`);
+  }
+}
+
 test.beforeEach(async ({ page }) => {
   await page.clock.install({ time: FIXED_TIME });
   page.on('pageerror', (error) => {
@@ -124,11 +163,9 @@ const primaryViews: ReadonlyArray<{ id: ViewId; label: string }> = [
   { id: 'settings', label: 'Settings' },
 ];
 
-const VISUAL_SNAPSHOT_IDS = visualManifest.snapshots;
-
 for (const { id: view, label } of primaryViews) {
   for (const theme of ['light', 'dark'] as const) {
-    test(`primary ${label} ${theme} desktop`, async ({ page }, testInfo) => {
+    visualTest(`primary-${view}-${theme}-desktop`, `primary ${label} ${theme} desktop`, async (page) => {
       await visit(page, { theme, view });
       if (view === 'instructions') {
         await expect(page.getByRole('heading', { name: 'Instructions', exact: true })).toBeVisible();
@@ -141,58 +178,51 @@ for (const { id: view, label } of primaryViews) {
         await expect(grid).toContainText(view === 'claude' ? 'Dark mode palette sweep' : 'Add dark mode toggle');
         await expectSessionRollup(page, view === 'all' ? 15 : view === 'codex' ? 8 : 7);
       }
-      await capture(page, testInfo, `primary-${view}-${theme}-desktop`);
     });
   }
 }
 
-test('session selected detail', async ({ page }, testInfo) => {
+visualTest('session-selected-detail', 'session selected detail', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
   await page.clock.runFor(500);
   await expect(page.locator('[aria-label="Session details"]:visible')).toContainText('Add dark mode toggle');
   await expectSessionRollup(page, 8);
-  await capture(page, testInfo, 'session-selected-detail');
 });
 
-test('session context menu', async ({ page }, testInfo) => {
+visualTest('session-context-menu', 'session context menu', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click({ button: 'right' });
   await expect(page.getByRole('menu', { name: /Export Add dark mode toggle/ })).toBeVisible();
   await expectSessionRollup(page, 8);
-  await capture(page, testInfo, 'session-context-menu');
 });
 
-test('session filtered empty', async ({ page }, testInfo) => {
+visualTest('sessions-filtered-empty', 'session filtered empty', async (page) => {
   await visit(page, { view: 'all' });
   await page.getByRole('searchbox', { name: 'Search sessions' }).fill('no matching visual fixture');
   await expect(page.getByText('No sessions match the current filters.')).toBeVisible();
-  await capture(page, testInfo, 'sessions-filtered-empty');
 });
 
-test('session true empty', async ({ page }, testInfo) => {
+visualTest('sessions-true-empty', 'session true empty', async (page) => {
   await visit(page, { scenario: 'sessions-empty', view: 'all' });
   await expect(page.getByText('No sessions found').filter({ visible: true })).toBeVisible();
-  await capture(page, testInfo, 'sessions-true-empty');
 });
 
-test('session scanning', async ({ page }, testInfo) => {
+visualTest('sessions-scanning', 'session scanning', async (page) => {
   await visit(page, { scenario: 'sessions-scanning', view: 'all' });
   await expect(page.getByText(/Scanning your sessions|Scanning sessions/).first()).toBeVisible();
-  await capture(page, testInfo, 'sessions-scanning');
 });
 
-test('session subagents collapsed', async ({ page }, testInfo) => {
+visualTest('sessions-subagents-collapsed', 'session subagents collapsed', async (page) => {
   await visit(page, { view: 'codex' });
   const collapse = page.getByRole('button', { name: /Collapse subagent rows for Add dark mode toggle/ });
   await expect(collapse).toBeVisible();
   await collapse.click();
   await expect(page.getByRole('button', { name: /Expand subagent rows for Add dark mode toggle/ })).toBeVisible();
   await expectSessionRollup(page, 8);
-  await capture(page, testInfo, 'sessions-subagents-collapsed');
 });
 
-test('session availability, fallback, and unpriced indicators', async ({ page }, testInfo) => {
+visualTest('sessions-availability-fallback', 'session availability, fallback, and unpriced indicators', async (page) => {
   await visit(page, { scenario: 'sessions-availability-fallback', view: 'codex' });
   await expect(page.getByText(/unpriced model excluded/i)).toBeVisible();
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
@@ -200,144 +230,129 @@ test('session availability, fallback, and unpriced indicators', async ({ page },
   await expect(page.locator('[aria-label="Session details"]:visible')).toContainText('source missing');
   await expect(page.locator('[title^="Fallback rate used"]:visible').first()).toBeVisible();
   await expectSessionRollup(page, 8);
-  await capture(page, testInfo, 'sessions-availability-fallback');
 });
 
 test.describe('narrow session drawer', () => {
   test.use({ viewport: { width: 800, height: 600 } });
 
   for (const view of ['all', 'codex', 'claude'] as const) {
-    test(`primary ${view} narrow`, async ({ page }, testInfo) => {
+    visualTest(`primary-${view}-narrow`, `primary ${view} narrow`, async (page) => {
       await visit(page, { view });
       await expect(page.locator('[data-testid="session-grid-region"]:visible')).toBeVisible();
       await expectSessionRollup(page, view === 'all' ? 15 : view === 'codex' ? 8 : 7);
-      await capture(page, testInfo, `primary-${view}-narrow`);
     });
   }
 
-  test('selected session is rendered in an overlay', async ({ page }, testInfo) => {
+  visualTest('session-narrow-detail-overlay', 'selected session is rendered in an overlay', async (page) => {
     await visit(page, { view: 'codex' });
     await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
     await page.clock.runFor(500);
     await expect(page.getByRole('dialog', { name: 'Session details' })).toBeVisible();
     await expectSessionRollup(page, 8);
-    await capture(page, testInfo, 'session-narrow-detail-overlay');
   });
 });
 
-test('instructions preview', async ({ page }, testInfo) => {
+visualTest('instructions-preview', 'instructions preview', async (page) => {
   await visit(page, { view: 'instructions' });
   await expect(page.getByText('Project instructions')).toBeVisible();
-  await capture(page, testInfo, 'instructions-preview');
 });
 
-test('instructions raw content', async ({ page }, testInfo) => {
+visualTest('instructions-raw', 'instructions raw content', async (page) => {
   await visit(page, { view: 'instructions' });
   await page.getByRole('button', { name: 'Raw', exact: true }).click();
   await expect(page.locator('pre')).toContainText('Project instructions');
-  await capture(page, testInfo, 'instructions-raw');
 });
 
-test('instructions empty inventory', async ({ page }, testInfo) => {
+visualTest('instructions-empty', 'instructions empty inventory', async (page) => {
   await visit(page, { scenario: 'instructions-empty', view: 'instructions' });
   await expect(page.getByText(/No matching instruction files/)).toBeVisible();
-  await capture(page, testInfo, 'instructions-empty');
 });
 
-test('instructions loading inventory', async ({ page }, testInfo) => {
+visualTest('instructions-loading', 'instructions loading inventory', async (page) => {
   await visit(page, { scenario: 'instructions-loading', view: 'instructions' });
   await expect(page.getByRole('button', { name: /Cancel|Cancelling/ })).toBeVisible();
-  await capture(page, testInfo, 'instructions-loading');
 });
 
-test('instructions inventory error', async ({ page }, testInfo) => {
+visualTest('instructions-inventory-error', 'instructions inventory error', async (page) => {
   await visit(page, { scenario: 'instructions-error', view: 'instructions' });
   await expect(page.getByRole('alert')).toBeVisible();
-  await capture(page, testInfo, 'instructions-inventory-error');
 });
 
-test('instructions content error', async ({ page }, testInfo) => {
+visualTest('instructions-content-error', 'instructions content error', async (page) => {
   await visit(page, { scenario: 'instructions-content-error', view: 'instructions' });
   await expect(page.getByText(/could not|failed|error/i).last()).toBeVisible();
-  await capture(page, testInfo, 'instructions-content-error');
 });
 
-test('settings roots and instruction sections', async ({ page }, testInfo) => {
+visualTest('settings-roots', 'settings roots', async (page) => {
   await visit(page, { view: 'settings' });
   await scrollHeadingToTop(page, 'Watched roots');
-  await capture(page, testInfo, 'settings-roots');
-  await scrollHeadingToTop(page, 'Instruction inventory');
-  await capture(page, testInfo, 'settings-instructions');
 });
 
-test('settings rates frame', async ({ page }, testInfo) => {
+visualTest('settings-instructions', 'settings instruction inventory', async (page) => {
+  await visit(page, { view: 'settings' });
+  await scrollHeadingToTop(page, 'Instruction inventory');
+});
+
+visualTest('settings-rates', 'settings rates frame', async (page) => {
   await visit(page, { view: 'settings' });
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();
-  await capture(page, testInfo, 'settings-rates');
 });
 
-test('settings rate validation error', async ({ page }, testInfo) => {
+visualTest('settings-rate-validation-error', 'settings rate validation error', async (page) => {
   await visit(page, { view: 'settings' });
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();
   const fallback = page.locator('#fallback-model');
   await fallback.selectOption('');
   await page.getByRole('button', { name: 'Save', exact: true }).last().click();
   await expect(page.getByText(/fallback model/i).last()).toBeVisible();
-  await capture(page, testInfo, 'settings-rate-validation-error');
 });
 
-test('settings save error', async ({ page }, testInfo) => {
+visualTest('settings-save-error', 'settings save error', async (page) => {
   await visit(page, { scenario: 'settings-save-error', view: 'settings' });
   await page.getByRole('heading', { name: 'Watched roots', exact: true }).scrollIntoViewIfNeeded();
   await page.getByPlaceholder('/absolute/path/to/sessions').fill('/visual/failing-root');
   await page.getByRole('button', { name: 'Add', exact: true }).first().click();
   await page.getByRole('button', { name: 'Save changes', exact: true }).click();
   await expect(page.getByText(/could not|failed|error/i).last()).toBeVisible();
-  await capture(page, testInfo, 'settings-save-error');
 });
 
-test('defender slow scan banner', async ({ page }, testInfo) => {
+visualTest('defender-slow-banner', 'defender slow scan banner', async (page) => {
   await visit(page, { scenario: 'defender-slow', view: 'all' });
   await expect(page.getByText(/Windows Defender/)).toBeVisible();
   await expectSessionRollup(page, 15);
-  await capture(page, testInfo, 'defender-slow-banner');
 });
 
-test('defender error', async ({ page }, testInfo) => {
+visualTest('defender-error', 'defender error', async (page) => {
   await visit(page, { scenario: 'defender-error', view: 'all' });
   await page.getByRole('button', { name: 'Add exclusions…', exact: true }).click();
   await expect(page.getByText(/could not|failed|error/i).first()).toBeVisible();
   await expectSessionRollup(page, 15);
-  await capture(page, testInfo, 'defender-error');
 });
 
-test('updater available banner', async ({ page }, testInfo) => {
+visualTest('updater-available', 'updater available banner', async (page) => {
   await visit(page, { scenario: 'updater-available', view: 'all' });
   await expect(page.getByText('Version 9.9.9 is available.')).toBeVisible();
   await expectSessionRollup(page, 15);
-  await capture(page, testInfo, 'updater-available');
 });
 
-test('updater installing banner', async ({ page }, testInfo) => {
+visualTest('updater-installing', 'updater installing banner', async (page) => {
   await visit(page, { scenario: 'updater-installing', view: 'all' });
   await page.getByRole('button', { name: 'Update & restart', exact: true }).click();
   await expect(page.getByText('Downloading v9.9.9… 40%')).toBeVisible();
   await expectSessionRollup(page, 15);
-  await capture(page, testInfo, 'updater-installing');
 });
 
-test('updater installation error', async ({ page }, testInfo) => {
+visualTest('updater-error', 'updater installation error', async (page) => {
   await visit(page, { scenario: 'updater-error', view: 'all' });
   await page.getByRole('button', { name: 'Update & restart', exact: true }).click();
   await expect(page.getByText('Install failed — see console; you can retry.')).toBeVisible();
   await expectSessionRollup(page, 15);
-  await capture(page, testInfo, 'updater-error');
 });
 
-test('visual manifest covers every registered top-level view in light and dark without duplicate IDs', () => {
+assertManifestCasesAreRegistered();
+
+test('visual manifest covers every registered top-level view in light and dark', () => {
   const registeredIds = APP_VIEWS.map((view) => view.id).sort();
   const expectedIds = primaryViews.map((view) => view.id).sort();
   expect(registeredIds).toEqual(expectedIds);
-
-  expect(new Set(VISUAL_SNAPSHOT_IDS).size).toBe(VISUAL_SNAPSHOT_IDS.length);
 });

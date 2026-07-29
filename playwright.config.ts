@@ -6,6 +6,7 @@ import { defineConfig, devices } from '@playwright/test';
  */
 export default defineConfig({
   testDir: './tests/visual',
+  globalSetup: './scripts/prepare-visual-captures.mjs',
   outputDir: 'output/playwright/test-results',
   snapshotPathTemplate: '{testDir}/{testFilePath}-snapshots/{arg}{ext}',
   fullyParallel: false,

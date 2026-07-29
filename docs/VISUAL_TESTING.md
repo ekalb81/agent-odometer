@@ -28,7 +28,7 @@ primary-instructions-{light,dark}-desktop
 primary-settings-{light,dark}-desktop
 ```
 
-The manifest also covers relevant empty, filtered-empty, loading/progress, selected-detail, error, archived/source-missing, pricing fallback/unpriced, narrow-window, disabled/busy, and validation-error states. Keep state data synthetic and stable; freeze time, locale, timezone, theme, and network/IPC responses. Add a scenario when a new screen or state becomes user-visible, and remove its baseline when the scenario is intentionally deleted. `scripts/validate-visual-baselines.mjs` fails for duplicate IDs, missing references, or orphaned PNGs.
+The manifest also covers relevant empty, filtered-empty, loading/progress, selected-detail, error, archived/source-missing, pricing fallback/unpriced, narrow-window, disabled/busy, and validation-error states. Keep state data synthetic and stable; freeze time, locale, timezone, theme, and network/IPC responses. Add a scenario when a new screen or state becomes user-visible, and remove its baseline when the scenario is intentionally deleted. `scripts/validate-visual-baselines.mjs` fails for duplicate IDs, missing references, or orphaned PNGs, while Playwright test discovery fails when a declared ID has no registered screenshot case.
 
 ## Local workflow
 
@@ -46,6 +46,8 @@ To inspect the current captures, generate a local gallery:
 npm run visual:gallery
 # open output/playwright/gallery/index.html
 ```
+
+Each Playwright invocation clears `output/playwright/current` once during global setup. A filtered or interrupted run therefore leaves only captures produced by that invocation; generate galleries or promote documentation images only from a complete passing run when you need the full set.
 
 When a visual change is deliberate, review the diff and update references explicitly. Use the same pinned Playwright container as CI; its tag must match the `@playwright/test` version in `package-lock.json`:
 

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { generateDocScreenshots } from './generate-doc-screenshots.mjs';
 import { generateVisualGallery } from './generate-visual-gallery.mjs';
+import { prepareVisualCaptures } from './prepare-visual-captures.mjs';
 import { validateVisualBaselines } from './validate-visual-baselines.mjs';
 
 function withTempDirectory(run) {
@@ -57,4 +58,15 @@ test('baseline validator reports missing, orphaned, and duplicate IDs', () => wi
   assert.deepEqual(result.duplicateIds, ['two']);
   assert.deepEqual(result.missing, ['two', 'two']);
   assert.deepEqual(result.orphaned, ['orphan']);
+}));
+
+test('visual run setup removes the entire previous capture set', () => withTempDirectory((root) => {
+  const current = path.join(root, 'current');
+  fs.mkdirSync(path.join(current, 'nested'), { recursive: true });
+  fs.writeFileSync(path.join(current, 'stale.png'), 'stale');
+  fs.writeFileSync(path.join(current, 'nested', 'stale.txt'), 'stale');
+
+  prepareVisualCaptures({ current });
+
+  assert.equal(fs.existsSync(current), false);
 }));
