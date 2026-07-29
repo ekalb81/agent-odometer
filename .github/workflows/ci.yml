@@ -114,6 +114,67 @@ jobs:
               src-tauri/test-output.txt
           } >> "$GITHUB_STEP_SUMMARY"
 
+  visual-regression:
+    name: Visual regression
+    # Keep this job present on every PR/push so the check has a stable status.
+    # The Chromium install and browser work are skipped when the changed paths
+    # cannot affect the rendered frontend.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Determine visual impact
+        id: impact
+        run: node scripts/visual-impact.mjs --github-output "$GITHUB_OUTPUT"
+
+      - name: Run visual regression in pinned container
+        if: steps.impact.outputs.impacted == 'true'
+        run: |
+          docker run --rm --ipc=host \
+            --volume "$GITHUB_WORKSPACE:/work" \
+            --mount type=volume,target=/work/node_modules \
+            --workdir /work \
+            mcr.microsoft.com/playwright:v1.62.0-jammy@sha256:b012874f829d298730411256666afcaeaeebaf505a0cf4c2f668d6dedb3d1e80 \
+            bash -lc '
+              set -e
+              npm ci
+              set +e
+              npm run visual:test
+              visual_status=$?
+              set -e
+              npm run visual:gallery
+              exit "$visual_status"
+            '
+
+      - name: Report visual check
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.impact.outputs.impacted }}" == "true" ]]; then
+            echo "Visual regression ran (or produced artifacts after a failure)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Visual regression skipped: no UI-impacting paths changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload visual artifacts
+        if: always() && steps.impact.outputs.impacted == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-regression-${{ github.run_id }}
+          if-no-files-found: warn
+          path: output/playwright/**
+
   msrv:
     name: Minimum supported Rust
     # PRs already exercise the same source with stable Rust. Keep the slower

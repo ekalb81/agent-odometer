@@ -98,6 +98,8 @@ Edit any rate under **Settings → Rate card**; your overrides persist and autom
 
 Built with Tauri 2 + Rust (filesystem, parsing, IPC) and Svelte 5 + TypeScript + Tailwind (UI). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for data flow, wire contracts, invariants, and known limitations.
 
+Visual regression coverage and baseline-update guidance lives in [docs/VISUAL_TESTING.md](docs/VISUAL_TESTING.md).
+
 Prerequisites: Node.js 22, Rust 1.95 or later, and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```powershell
@@ -114,6 +116,12 @@ npm run tauri dev
 | `npm run test:coverage` | Run frontend tests and enforce the source-backed initial coverage slice |
 | `npm run build` | Build the frontend into `dist/` |
 | `npm run tauri build` | Build and bundle the desktop app |
+| `npm run visual:test` | Run deterministic Playwright screenshot comparisons |
+| `npm run visual:update` | Review and intentionally update Playwright baselines (Linux only; use the pinned container elsewhere) |
+| `npm run visual:gallery` | Build an HTML gallery from current Playwright screenshots |
+| `npm run visual:docs:update` | Copy selected current images into `docs/screenshots/` (add `-- --force` to replace reviewed files) |
+
+The docs screenshot command is an explicit local action: it copies reviewed images from `output/playwright/current`, refuses to overwrite without `--force`, and is never run automatically in CI.
 
 Match CI before handing off:
 

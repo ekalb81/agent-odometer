@@ -19,9 +19,9 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from './lib/credits';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
+  import { APP_VIEWS, type AppView } from './lib/appViews';
 
-  type View = 'all' | 'codex' | 'claude' | 'instructions' | 'settings';
-  let activeView: View = $state('all');
+  let activeView: AppView = $state('all');
   let appVersion = $state('');
   const appStarted = performance.now();
 
@@ -132,7 +132,12 @@
   // ---------------------------------------------------------------------------
   const SLOW_SCAN_MS = 20_000;
   const DEFENDER_DISMISSED_KEY = 'defenderPromptDismissed';
-  const isWindows = navigator.userAgent.includes('Windows');
+  // main.ts adds this marker only in the browser fixture branch. It lets the
+  // visual matrix exercise the Windows-specific banner without allowing a
+  // URL parameter to alter a real native launch.
+  const visualScenario = document.documentElement.dataset.visualScenario ?? null;
+  const isWindows = navigator.userAgent.includes('Windows') ||
+    visualScenario === 'defender-slow' || visualScenario === 'defender-error';
   let defenderDismissed = $state(localStorage.getItem(DEFENDER_DISMISSED_KEY) === '1');
   let defenderRequested = $state(false);
   let defenderError = $state<string | null>(null);
@@ -418,9 +423,18 @@
     `px-4 py-[5px] rounded-md text-xs transition-colors ${
       isActive ? `${fill} text-white font-semibold` : 'text-ink-muted hover:text-ink font-normal'
     }`;
+
+  function tabFill(view: AppView): string {
+    if (view === 'codex') return 'bg-[#2b58c9]';
+    if (view === 'claude') return 'bg-[#e8935a]';
+    return 'bg-ink !text-app';
+  }
 </script>
 
-<div class="flex flex-col h-screen bg-app text-ink text-[13px] {activeView === 'claude' ? 'accent-claude' : 'accent-codex'}">
+<div
+  class="flex flex-col h-screen bg-app text-ink text-[13px] {activeView === 'claude' ? 'accent-claude' : 'accent-codex'}"
+  data-visual-scenario={visualScenario ?? undefined}
+>
   <!-- Update banner -->
   {#if updaterStore.available}
     <div class="flex items-center justify-center gap-3 px-4 py-1.5 bg-chrome border-b border-edge text-xs text-ink-2 flex-shrink-0">
@@ -488,23 +502,13 @@
     </span>
 
     <nav class="flex bg-app rounded-lg p-[2px] gap-[2px] border border-edge" aria-label="Views">
-      <button class={tabClass(activeView === 'all', 'bg-ink !text-app')} onclick={() => (activeView = 'all')}>
-        All
-      </button>
-      <button class={tabClass(activeView === 'codex', 'bg-[#2b58c9]')} onclick={() => (activeView = 'codex')}>
-        Codex
-      </button>
-      <button class={tabClass(activeView === 'claude', 'bg-[#e8935a]')} onclick={() => (activeView = 'claude')}>
-        Claude Code
-      </button>
-      {#if $config.instructions_enabled && $config.instructions_tab_visible}
-        <button class={tabClass(activeView === 'instructions', 'bg-ink !text-app')} onclick={() => (activeView = 'instructions')}>
-          Instructions
-        </button>
-      {/if}
-      <button class={tabClass(activeView === 'settings', 'bg-ink !text-app')} onclick={() => (activeView = 'settings')}>
-        Settings
-      </button>
+      {#each APP_VIEWS as view (view.id)}
+        {#if view.id !== 'instructions' || ($config.instructions_enabled && $config.instructions_tab_visible)}
+          <button class={tabClass(activeView === view.id, tabFill(view.id))} onclick={() => (activeView = view.id)}>
+            {view.label}
+          </button>
+        {/if}
+      {/each}
     </nav>
 
     {#if activeScope}

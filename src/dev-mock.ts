@@ -3,6 +3,7 @@
 // main.ts. Production builds tree-shake this module away entirely.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
+import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } from './dev-mock/visualScenario';
 import type {
   RangeTotals,
   RateCard,
@@ -15,7 +16,17 @@ import type {
 } from './lib/types';
 
 const DAY = 86_400_000;
-const now = Date.now();
+const now = import.meta.env.VITE_VISUAL_TEST === '1'
+  ? Date.parse('2026-07-29T15:30:00.000Z')
+  : Date.now();
+const visualScenarioSelection = selectVisualScenario(location.search);
+const visualScenario: VisualScenario = visualScenarioSelection.scenario;
+
+if (visualScenarioSelection.warning) console.warn(visualScenarioSelection.warning);
+// This attribute is intentionally installed only by main.ts's browser fixture
+// branch. It gives screenshot tests a stable readiness/state marker without
+// allowing query parameters to change native application behaviour.
+document.documentElement.dataset.visualScenario = visualScenario;
 
 function tok(total: number): TokenTotals {
   const input = Math.round(total * 0.62);
@@ -128,11 +139,19 @@ if (stressN > 0) {
   console.info(`[dev-mock] stress mode: +${stressN * 2} synthetic sessions`);
 }
 
+function fixtureModel(f: Fixture): string {
+  if (visualScenario !== 'sessions-availability-fallback') return f.model;
+  if (f.id.endsWith('c0de0001')) return 'gpt-5.7-visual-preview';
+  if (f.id.endsWith('c0de0004')) return 'gpt-5.3-codex-spark';
+  return f.model;
+}
+
 function buckets(f: Fixture): TierBucket[] {
-  return [{ model: f.model, service_tier: null, tokens: tok(f.total) }];
+  return [{ model: fixtureModel(f), service_tier: null, tokens: tok(f.total) }];
 }
 
 function summary(f: Fixture): SessionSummary {
+  const model = fixtureModel(f);
   return {
     id: f.id,
     storage_id: f.harness === 'codex' ? `codex:thread:${f.id}` : `claude_code:session:${f.id}`,
@@ -143,7 +162,7 @@ function summary(f: Fixture): SessionSummary {
     agent_path: null,
     agent_nickname: null,
     file_path: `/home/dev/.sessions/${f.id}.jsonl`,
-    source_availability: 'present',
+    source_availability: visualScenario === 'sessions-availability-fallback' && f.id.endsWith('c0de0001') ? 'missing' : 'present',
     archived: f.archived ?? false,
     started_at: f.started,
     last_event_at: new Date(new Date(f.started).getTime() + f.hoursActive * 3_600_000).toISOString(),
@@ -152,7 +171,7 @@ function summary(f: Fixture): SessionSummary {
     source: f.parent ? 'subagent' : null,
     cli_version: '1.4.2',
     model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
-    model: f.model,
+    model,
     service_tier: null,
     plan_type: f.unlimited ? 'pro' : null,
     credits_unlimited: f.unlimited ?? null,
@@ -163,7 +182,7 @@ function summary(f: Fixture): SessionSummary {
     tokens_total: tok(f.total),
     buckets: buckets(f),
     tool_metrics: toolMetrics(f.turns * 3),
-    tool_metrics_by_model: { [f.model]: toolMetrics(f.turns * 3) },
+    tool_metrics_by_model: { [model]: toolMetrics(f.turns * 3) },
     category_totals: { coding: { turns: f.turns, tokens: tok(f.total), tool_calls: f.turns * 3, buckets: buckets(f) } },
     optimization_findings_count: 0,
     optimization_summary: { findings: 0, warnings: 0, likely_avoidable_calls: 0, by_rule: {} },
@@ -181,6 +200,7 @@ const TURN_PROMPTS = [
 
 function details(f: Fixture): Session {
   const s = summary(f);
+  const model = s.model ?? f.model;
   const startMs = new Date(f.started).getTime();
   const perTurn = Math.floor(f.total / f.turns);
   const turns: TurnInfo[] = Array.from({ length: f.turns }, (_, i) => {
@@ -189,7 +209,7 @@ function details(f: Fixture): Session {
     return {
       turn_id: `${f.id}-t${i + 1}`,
       index: i + 1,
-      model: f.model,
+      model,
       reasoning_effort: null,
       collaboration_mode: null,
       service_tier: null,
@@ -211,7 +231,7 @@ function details(f: Fixture): Session {
     cumulative += t.tokens.total_tokens;
     return {
       timestamp: t.started_at!,
-      model: f.model,
+      model,
       service_tier: null,
       request_input_tokens: t.tokens.input_tokens,
       total_tokens: cumulative,
@@ -225,7 +245,7 @@ function details(f: Fixture): Session {
     memory_mode: null,
     model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
     latest_context_tokens: Math.round((s.context_window ?? 200_000) * 0.54),
-    tokens_by_model: { [f.model]: tok(f.total) },
+    tokens_by_model: { [model]: tok(f.total) },
     tokens_history: history,
     rate_limits_history: [],
     turns,
@@ -272,7 +292,7 @@ function rangeTotals(
   const toMs = to ? new Date(to).getTime() : now;
   const out: Record<string, RangeTotals> = {};
   const requestedIds = sessionIds ? new Set(sessionIds) : null;
-  for (const f of FIXTURES) {
+  for (const f of visibleFixtures()) {
     const s = summary(f);
     if (requestedIds && !requestedIds.has(s.storage_id)) continue;
     const sStart = new Date(s.started_at).getTime();
@@ -285,7 +305,7 @@ function rangeTotals(
       tokens: scaleTok(tok(f.total), fraction),
       buckets: buckets(f).map((b) => ({ ...b, tokens: scaleTok(b.tokens, fraction) })),
       tool_metrics: toolMetrics(Math.round(f.turns * 3 * fraction)),
-      tool_metrics_by_model: { [f.model]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
+      tool_metrics_by_model: { [fixtureModel(f)]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
       optimization_findings_count: 0,
       optimization_summary: { findings: 0, warnings: 0, likely_avoidable_calls: 0, by_rule: {} },
     };
@@ -293,13 +313,67 @@ function rangeTotals(
   return out;
 }
 
+function visibleFixtures(): Fixture[] {
+  return visualScenario === 'sessions-empty' || visualScenario === 'sessions-scanning'
+    ? []
+    : FIXTURES;
+}
+
+function scanStatus() {
+  if (visualScenario === 'sessions-scanning') {
+    return { done: 3, total: 12, complete: false, elapsed_ms: null };
+  }
+  if (visualScenario === 'defender-slow' || visualScenario === 'defender-error') {
+    return { done: FIXTURES.length, total: FIXTURES.length, complete: true, elapsed_ms: 31_000 };
+  }
+  const sessions = visibleFixtures();
+  return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240 };
+}
+
+function emptyInstructionInventory() {
+  return {
+    files: [],
+    roots: [{ path: '/home/dev/projects', source: 'configured', recursive: true, exists: true }],
+    truncated: false,
+    truncation_reason: null,
+    entries_visited: 0,
+    elapsed_ms: 0,
+    scanned_at: new Date(now).toISOString(),
+  };
+}
+
+function fixtureUpdateMetadata() {
+  return {
+    rid: 1,
+    currentVersion: '0.6.4',
+    version: '9.9.9',
+    date: '2026-07-01',
+    body: 'Synthetic visual fixture',
+    rawJson: {},
+  };
+}
+
+function emitUpdateProgress(channelId: number) {
+  const internals = (window as unknown as {
+    __TAURI_INTERNALS__: { runCallback(id: number, data: unknown): void };
+  }).__TAURI_INTERNALS__;
+  internals.runCallback(channelId, {
+    index: 0,
+    message: { event: 'Started', data: { contentLength: 100 } },
+  });
+  internals.runCallback(channelId, {
+    index: 1,
+    message: { event: 'Progress', data: { chunkLength: 40 } },
+  });
+}
+
 mockIPC((cmd, payload) => {
   switch (cmd) {
     case 'list_sessions':
-      return FIXTURES.map(summary);
+      return visibleFixtures().map(summary);
     case 'get_session_details': {
       const { sessionId } = payload as { sessionId: string };
-      const f = FIXTURES.find((x) => summary(x).storage_id === sessionId);
+      const f = visibleFixtures().find((x) => summary(x).storage_id === sessionId);
       return f ? details(f) : null;
     }
     case 'sessions_in_ranges': {
@@ -345,7 +419,7 @@ mockIPC((cmd, payload) => {
       };
     }
     case 'get_scan_status':
-      return { done: FIXTURES.length, total: FIXTURES.length, complete: true, elapsed_ms: 1240 };
+      return scanStatus();
     case 'get_performance_status':
       return { enabled: false, max_log_mb: 64, stored_bytes: 0, recorded_this_run: 0, dropped_this_run: 0 };
     case 'get_config':
@@ -364,6 +438,11 @@ mockIPC((cmd, payload) => {
         turn_receipts_claude: true,
       };
     case 'list_instruction_files': {
+      if (visualScenario === 'instructions-empty') return emptyInstructionInventory();
+      if (visualScenario === 'instructions-loading') return new Promise<never>(() => {});
+      if (visualScenario === 'instructions-error') {
+        return Promise.reject(new Error('Fixture instruction inventory failed.'));
+      }
       const root = '/home/dev/projects/demo';
       return {
         files: [
@@ -396,10 +475,16 @@ mockIPC((cmd, payload) => {
         ],
         roots: [{ path: '/home/dev/projects', source: 'configured', recursive: true, exists: true }],
         truncated: false,
-        scanned_at: new Date().toISOString(),
+        truncation_reason: null,
+        entries_visited: 24,
+        elapsed_ms: 120,
+        scanned_at: new Date(now).toISOString(),
       };
     }
     case 'read_instruction_file': {
+      if (visualScenario === 'instructions-content-error') {
+        return Promise.reject(new Error('Fixture instruction content could not be loaded.'));
+      }
       const { path } = payload as { path: string };
       const nested = path.includes('/packages/app/');
       const claude = path.endsWith('CLAUDE.md');
@@ -415,6 +500,15 @@ mockIPC((cmd, payload) => {
       return RATES;
     case 'set_rates':
     case 'set_config':
+      if (visualScenario === 'settings-save-error') {
+        return Promise.reject(new Error('Fixture settings save failed.'));
+      }
+      return true;
+    case 'add_defender_exclusions':
+      if (visualScenario === 'defender-error') {
+        return Promise.reject(new Error('Fixture Defender exclusion request failed.'));
+      }
+      return undefined;
     case 'reveal_in_file_manager':
     case 'open_instruction_file':
     case 'open_task_in_chatgpt':
@@ -433,6 +527,19 @@ mockIPC((cmd, payload) => {
       return undefined;
     case 'plugin:app|version':
       return '0.0.0-dev';
+    case 'plugin:updater|check':
+      return isUpdaterVisualScenario(visualScenario) ? fixtureUpdateMetadata() : null;
+    case 'plugin:updater|download_and_install': {
+      const { onEvent } = payload as { onEvent: { id: number } };
+      emitUpdateProgress(onEvent.id);
+      if (visualScenario === 'updater-error') {
+        return Promise.reject(new Error('Fixture updater install failed.'));
+      }
+      if (visualScenario === 'updater-installing') return new Promise<never>(() => {});
+      return undefined;
+    }
+    case 'plugin:process|restart':
+      return undefined;
     case 'plugin:event|listen':
     case 'plugin:event|unlisten':
       return 0;
@@ -442,4 +549,4 @@ mockIPC((cmd, payload) => {
   }
 });
 
-console.info('[dev-mock] Tauri IPC mocked with fixture data (browser dev mode)');
+console.info(`[dev-mock] Tauri IPC mocked with ${visualScenario} fixture data (browser mode)`);
