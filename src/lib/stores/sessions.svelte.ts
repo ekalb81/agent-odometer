@@ -25,7 +25,7 @@ function createSessionsStore() {
   function replaceAll(list: SessionSummary[]): void {
     const next = new Map<string, TrackedSession>();
     for (const s of list) {
-      next.set(s.id, track(s, 0));
+      next.set(s.storage_id, track(s, 0));
     }
     map = next;
   }
@@ -42,7 +42,7 @@ function createSessionsStore() {
     const now = Date.now();
     const next = new Map(map);
     for (const s of list) {
-      next.set(s.id, track(s, now));
+      next.set(s.storage_id, track(s, now));
     }
     map = next;
   }
@@ -54,7 +54,7 @@ function createSessionsStore() {
     if (list.length === 0 && removals.length === 0) return;
     const now = Date.now();
     const next = new Map(map);
-    for (const s of list) next.set(s.id, track(s, now));
+    for (const s of list) next.set(s.storage_id, track(s, now));
     for (const id of removals) next.delete(id);
     map = next;
   }

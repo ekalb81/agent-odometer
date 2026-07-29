@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionApiCost, computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
+  import { computeSessionApiCostScenarios, computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
   import {
     findingAvoidableCalls,
@@ -47,6 +47,13 @@
     return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   }
 
+  /** Catalog windows are UTC half-open intervals: [from, to). Keep that
+   * explicit so a limited-time price is not mistaken for a current default. */
+  function fmtPricingWindow(from: string, to: string | null): string {
+    const date = (iso: string) => `${iso.slice(0, 10)} UTC`;
+    return `[${date(from)}, ${to ? date(to) : 'open-ended'})`;
+  }
+
   function fmtDurationMs(ms: number | null): string {
     if (ms == null) return '—';
     if (ms < 1000) return `${ms} ms`;
@@ -67,6 +74,7 @@
   const isSubagent = $derived(
     Boolean(session && (session.parent_thread_id || session.agent_path || session.source === 'subagent')),
   );
+  const sourceMissing = $derived(session?.source_availability === 'missing');
 
   // Newest turn first.
   const turnsDesc = $derived(session ? [...session.turns].sort((a, b) => b.index - a.index) : []);
@@ -94,7 +102,7 @@
   // refreshes of the same session, which replace the object while it's busy.
   let lastSessionId: string | null = null;
   $effect(() => {
-    const id = session?.id ?? null;
+    const id = session?.storage_id ?? null;
     if (id !== lastSessionId) {
       lastSessionId = id;
       expandedTurn = null;
@@ -116,7 +124,7 @@
   }
 
   function handleRevealTranscript() {
-    if (!session) return;
+    if (!session || sourceMissing) return;
     revealInFileManager(session.file_path).catch(() => {});
   }
 
@@ -140,11 +148,25 @@
 
   // What the same usage would cost à la carte at OpenAI API rates —
   // informational for subscription users; codex sessions only.
-  const sessionApiCost = $derived(
-    session && session.harness === 'codex' && $rates
-      ? computeSessionApiCost(session, $rates)
+  const apiCostScenarios = $derived(
+    session && $rates
+      ? computeSessionApiCostScenarios(session, $rates)
       : null,
   );
+  const flatApiReference = $derived(apiCostScenarios?.flat ?? null);
+  const sessionApiCost = $derived(session?.harness === 'codex' ? flatApiReference : null);
+  const timeAwareApiScenario = $derived(apiCostScenarios?.timeAware ?? null);
+  const timeAwarePricingRules = $derived((() => {
+    if (!$rates || !timeAwareApiScenario) return [];
+    const ids = new Set([
+      ...timeAwareApiScenario.appliedRatePeriods,
+      ...timeAwareApiScenario.appliedModifiers,
+    ]);
+    return [
+      ...$rates.pricing_catalog.rate_periods,
+      ...$rates.pricing_catalog.conditional_modifiers,
+    ].filter((rule) => ids.has(rule.id));
+  })());
 
   // The headline money figure: Codex shows the API-rate estimate, Claude the
   // Anthropic-rate cost.
@@ -235,6 +257,9 @@
         {/if}
         {#if session.archived}
           <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)]">archived</span>
+        {/if}
+        {#if sourceMissing}
+          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-amber-500/10 text-amber-500 border border-amber-500/20">source missing</span>
         {/if}
         {#if session.harness !== 'claude_code'}
           <button
@@ -534,16 +559,52 @@
                 Reference: {fmtCredit(sessionCredits.total)} à-la-carte equivalent
               </p>
             {/if}
-            {#if sessionApiCost}
+            {#if flatApiReference}
               <p class="mt-1.5 text-[11px] text-ink-faint">
-                Est. API cost: <span class="text-accent-cost">{formatCredits(sessionApiCost.total, 'USD')}</span>
-                at OpenAI API rates{#if session.plan_type}&nbsp;— informational on the {session.plan_type} plan{/if}
+                Flat {session.harness === 'codex' ? 'OpenAI' : 'Anthropic'} API reference: <span class="text-accent-cost">{formatCredits(flatApiReference.total, 'USD')}</span>
+                at the legacy rate table{#if session.harness === 'codex' && session.plan_type}&nbsp;— informational on the {session.plan_type} plan{/if}
               </p>
-              {#if sessionApiCost.unpricedModels.length > 0}
+              {#if flatApiReference.unpricedModels.length > 0}
                 <p class="mt-1 text-[11px] text-amber-500">
-                  Excludes models without a published rate: {sessionApiCost.unpricedModels.join(', ')}
+                  Excludes models without a published rate: {flatApiReference.unpricedModels.join(', ')}
                 </p>
               {/if}
+            {/if}
+            {#if timeAwareApiScenario}
+              <p class="mt-1.5 text-[11px] text-ink-faint">
+                Time-aware API scenario: <span class="text-accent-cost">{formatCredits(timeAwareApiScenario.total, 'USD')}</span>
+                — not a claim about Codex or ChatGPT subscription billing.
+              </p>
+              {#if timeAwarePricingRules.length > 0}
+                <p class="mt-1 text-[11px] text-ink-faint">
+                  {#each timeAwarePricingRules as rule (rule.id)}
+                    <span>
+                      {rule.label} · {fmtPricingWindow(rule.from, rule.to)} · verified {rule.provenance.verified_at.slice(0, 10)} UTC
+                      <a class="ml-1 text-accent hover:underline" href={rule.provenance.source_url} target="_blank" rel="noreferrer" title={rule.provenance.note ?? rule.provenance.evidence}>source</a>{#if rule !== timeAwarePricingRules[timeAwarePricingRules.length - 1]}; {/if}
+                    </span>
+                  {/each}
+                </p>
+              {/if}
+              {#if timeAwareApiScenario.conditionalEvidenceMissing.length > 0}
+                <p class="mt-1 text-[11px] text-amber-500">
+                  Conditional rule not applied without direct per-request input evidence:
+                  {timeAwareApiScenario.conditionalEvidenceMissing.join(', ')}. The dated base rate remains included.
+                </p>
+              {/if}
+              {#if timeAwareApiScenario.cacheWritePricingUnmodeled}
+                <p class="mt-1 text-[11px] text-ink-faint">
+                  {#if timeAwareApiScenario.unobservedCacheWriteInputMultipliers.length > 0}
+                    Documented {timeAwareApiScenario.unobservedCacheWriteInputMultipliers.map((multiplier) => `${multiplier}×`).join(', ')} cache-write input premium remains unmodeled:
+                  {:else}
+                    Cache-write premiums remain unmodeled:
+                  {/if}
+                  parsed usage does not distinguish cache writes from uncached input.
+                </p>
+              {/if}
+            {:else if session.tokens_history.length > 0 && ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0}
+              <p class="mt-1 text-[11px] text-ink-faint">
+                Time-aware API scenario unavailable: this session has a model or time outside the catalog’s dated coverage. The flat reference above is retained.
+              </p>
             {/if}
           </div>
 
@@ -573,7 +634,11 @@
             <div class="flex items-start gap-2">
               <dt class="text-ink-faint w-20 flex-shrink-0">Transcript</dt>
               <dd class="font-mono text-ink-2 break-all min-w-0">{session.file_path}</dd>
-              <button onclick={handleRevealTranscript} class="flex-shrink-0 text-ink-faint hover:text-ink transition-colors" title="Reveal in file manager">Reveal</button>
+              {#if sourceMissing}
+                <span class="flex-shrink-0 text-amber-500" title="The saved transcript source is currently unavailable">Missing</span>
+              {:else}
+                <button onclick={handleRevealTranscript} class="flex-shrink-0 text-ink-faint hover:text-ink transition-colors" title="Reveal in file manager">Reveal</button>
+              {/if}
             </div>
             {#if session.agent_path || session.agent_nickname}
               <div class="flex items-start gap-2">

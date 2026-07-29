@@ -8,7 +8,7 @@
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
-  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, TurnReceiptIntegrationStatus } from '../lib/types';
+  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, TurnReceiptIntegrationStatus, PricingCatalog } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
 
   const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
@@ -440,6 +440,9 @@
   // API USD rates for Codex models; not editable here yet, carried through.
   let ratesApiModels = $state<Record<string, ModelRate>>({});
   let ratesUnpricedModels = $state<string[]>([]);
+  // Catalog rules have their own provenance and validation contract. The
+  // editor does not modify them yet, so preserve the complete object verbatim.
+  let pricingCatalog = $state<PricingCatalog>({ rate_periods: [], conditional_modifiers: [], notes: [] });
 
   // New-model form.
   let newName = $state('');
@@ -476,6 +479,7 @@
     ratesFallbackModels = { ...(r.fallback_models ?? {}) };
     ratesApiModels = { ...(r.api_models ?? {}) };
     ratesUnpricedModels = [...(r.unpriced_models ?? [])];
+    pricingCatalog = r.pricing_catalog;
     dirty = false;
   });
 
@@ -490,6 +494,19 @@
     const n = parseFloat(s);
     if (isNaN(n) || n < 0) return null;
     return n;
+  }
+
+  /** Catalog intervals are intentionally shown as UTC half-open windows so a
+   * temporary price does not look like a current default. */
+  function fmtPricingWindow(from: string, to: string | null): string {
+    const date = (iso: string) => `${iso.slice(0, 10)} UTC`;
+    return `[${date(from)}, ${to ? date(to) : 'open-ended'})`;
+  }
+
+  function fmtPricingSurface(surface: PricingCatalog['rate_periods'][number]['surface']): string {
+    if (surface === 'codex_plan_credits') return 'Codex plan credits';
+    if (surface === 'openai_api_usd') return 'OpenAI API USD';
+    return 'Anthropic API USD';
   }
 
   function buildRateCard(): RateCard | null {
@@ -532,6 +549,7 @@
       fallback_models: ratesFallbackModels,
       api_models: ratesApiModels,
       unpriced_models: ratesUnpricedModels,
+      pricing_catalog: pricingCatalog,
     };
   }
 
@@ -1360,6 +1378,50 @@
             </tr>
           </tbody>
         </table>
+      </div>
+
+      <!-- Managed, read-only catalog. Rule provenance and stable IDs are
+           deliberately not editable in the base rate editor. -->
+      <div class="mt-5 rounded-lg border border-edge bg-card px-4 py-3">
+        <h3 class="text-xs font-semibold uppercase tracking-wider text-ink-muted">Effective-dated pricing catalog</h3>
+        <p class="mt-1 text-[11px] text-ink-faint max-w-3xl">
+          Read-only managed rules refresh by stable ID when a newer Odometer bundled card ships. “Reset to shipped defaults” reloads the currently shipped card; saving the base-rate editor preserves this catalog unchanged.
+        </p>
+        {#if pricingCatalog.rate_periods.length === 0 && pricingCatalog.conditional_modifiers.length === 0}
+          <p class="mt-2 text-xs text-ink-faint">No effective-dated rules are available in this rate card.</p>
+        {:else}
+          <div class="mt-3 space-y-2">
+            {#each pricingCatalog.rate_periods as period (period.id)}
+              <div class="border-t border-edgerow pt-2 text-[11px] text-ink-2">
+                <div class="font-medium text-ink">Base rate · {period.model} · {fmtPricingSurface(period.surface)}</div>
+                <div class="mt-0.5 font-mono text-ink-faint break-all">{period.id}</div>
+                <div class="mt-0.5 text-ink-faint">Applies {fmtPricingWindow(period.from, period.to)} · verified {period.provenance.verified_at.slice(0, 10)} UTC</div>
+                <div class="mt-0.5">
+                  <a class="text-accent hover:underline" href={period.provenance.source_url} target="_blank" rel="noreferrer">{period.label} · source</a>
+                  {#if period.cache_write_input_multiplier !== null && period.cache_write_input_multiplier !== undefined}
+                    <span class="text-ink-faint"> · {period.cache_write_input_multiplier}× cache-write input (unobserved)</span>
+                  {/if}
+                </div>
+              </div>
+            {/each}
+            {#each pricingCatalog.conditional_modifiers as modifier (modifier.id)}
+              <div class="border-t border-edgerow pt-2 text-[11px] text-ink-2">
+                <div class="font-medium text-ink">Conditional rule · {modifier.model} · {fmtPricingSurface(modifier.surface)}</div>
+                <div class="mt-0.5 font-mono text-ink-faint break-all">{modifier.id}</div>
+                <div class="mt-0.5 text-ink-faint">Applies {fmtPricingWindow(modifier.from, modifier.to)} · verified {modifier.provenance.verified_at.slice(0, 10)} UTC</div>
+                <div class="mt-0.5 text-ink-faint">When request input exceeds {modifier.condition.greater_than.toLocaleString()} tokens · input {modifier.multipliers.input}× · output {modifier.multipliers.output}×</div>
+                <div class="mt-0.5"><a class="text-accent hover:underline" href={modifier.provenance.source_url} target="_blank" rel="noreferrer">{modifier.label} · source</a></div>
+              </div>
+            {/each}
+          </div>
+          {#if pricingCatalog.notes.length > 0}
+            <div class="mt-3 space-y-1 text-[11px] text-ink-faint">
+              {#each pricingCatalog.notes as note}
+                <p>{note}</p>
+              {/each}
+            </div>
+          {/if}
+        {/if}
       </div>
     </section>
   {:else}

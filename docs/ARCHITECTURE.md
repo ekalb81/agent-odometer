@@ -16,12 +16,33 @@ The frontend starts at `src/main.ts` and `src/App.svelte`. The native process st
 1. `Config::load` reads the platform config file or creates defaults.
 2. `watcher::start` begins watching all configured roots immediately, so changes during the initial scan are not missed.
 3. `scanner::scan_all` bulk-loads existing sessions on a background thread, parsing files in parallel (rayon) and emitting a `session-updated` summary per file — the window is interactive immediately and the list populates progressively. A persistent SQLite scan cache (`scan_cache.rs`, stored under the OS cache directory and keyed by file size+mtime, versioned by app release) serves unchanged files without re-reading them. Each scan touches or replaces individual rows and prunes unseen generations, avoiding whole-corpus cache deserialization and rewrites. The previous JSON cache is imported on first use. Progress flows to the UI via throttled `scan-progress` events and the `get_scan_status` command.
-4. `parser::parse_file` (Codex) or `claude_parser::parse_file` (Claude Code) builds a `Session` for each file, stored in `AppState.sessions` keyed by session ID. When duplicate IDs exist under multiple roots, the parallel scan's winner is nondeterministic.
-5. `session_index::read` overlays current thread names from Codex's session index after the scan.
-6. `App.svelte` invokes `list_sessions`, `get_config`, and `get_rates`, then subscribes to update/removal events.
-7. The watcher debounces filesystem activity, incrementally parses complete appended records, updates the `DashMap`, and emits Tauri events.
+4. `parser::parse_file` (Codex) or `claude_parser::parse_file` (Claude Code) builds a `Session` for each file. Before publication, `history_store.rs` reconciles the parsed source with the durable archive, assigns a path-independent `storage_id`, and records the source observation and normalized token-event suffix transactionally.
+5. `AppState.sessions` stores the resulting projection by durable `storage_id`. Multiple paths on one event lineage converge on one session; reused provider IDs with divergent lineages remain separate collision records.
+6. `session_index::read` overlays current thread names from Codex's session index after the scan and advances the current materialized snapshot without changing source ownership.
+7. `App.svelte` invokes `list_sessions`, `get_config`, and `get_rates`, then subscribes to update/removal events.
+8. The watcher debounces filesystem activity, incrementally parses complete appended records, reconciles each result through the same durable-history boundary, updates the `DashMap`, and emits Tauri events.
 
 Saving watched-root settings persists the new config, stops the old watcher, clears state, restarts the watcher, kicks off the same background rescan, and emits `config-updated`. Performance and turn-receipt settings apply without restarting watchers or rescanning the corpus; receipt setup additionally performs its bounded harness-config transaction.
+
+## Durable-history contract
+
+The durable history in `history_store.rs` is a source of retained session truth, not a parsing optimization. It is deliberately separate from the disposable, app-versioned scan cache:
+
+- The archive lives under the platform local-data directory as `agent-odometer/history-v1.sqlite3`. It uses WAL mode, foreign keys, a five-second busy timeout, and forward-only `PRAGMA user_version` migrations. A schema newer than the running application is rejected instead of opened unsafely.
+- A scan, watcher removal, moved transcript, missing configured root, or cache eviction never deletes a durable session, its current snapshot, an artifact, or a normalized token event. Source disappearance changes `source_availability` to `missing`; `archived` remains the provider's separate archive classification. Replacing a full materialized snapshot prunes its superseded copy; normalized events retain the append history without repeatedly storing the growing `Session` blob.
+- The database contains materialized `Session` snapshots and normalized token events, so it is sensitive local application data. It inherits the same no-upload/no-log handling as the source transcripts and is not safe to treat as an anonymous metrics database.
+
+Identity and reconciliation follow these invariants:
+
+- Provider IDs are harness-namespaced: `codex:thread:<id>` and `claude_code:session:<id>`. Claude subagents use `claude_code:subagent:<parent-session-id>:<agent-id>`; only legacy subagents without a provider `agentId` may use a filename-stem fallback.
+- A filesystem path is an availability observation, never logical identity. Stored path keys normalize separators, remove Windows verbatim prefixes, and fold case on Windows so scanner and watcher events address the same location.
+- Provider identity, the first-event fingerprint, and an append-compatible token-event lineage reconcile copies and moves. Equal histories and prefix histories are one lineage. Divergence after a shared prefix creates a deterministic `:collision:<lineage-hash>` storage ID and marks every final session claiming that provider identity as a collision; neither transcript overwrites the other.
+- A source observation can advance the materialized snapshot only when it has more token-history events, or the same event count with an equal-or-newer `last_event_at`. Metadata overlays such as session-index names advance the snapshot version and may update display metadata without creating or reassigning a source location; only the current full snapshot is retained.
+- Token events are keyed deterministically within a durable session. Repeated scans and watcher passes are idempotent, while appends insert only the unseen suffix. Direct request-input evidence added by a later schema is backfilled without replaying or duplicating earlier events.
+
+Availability publication is generation-safe. A completed scan marks unseen paths missing only when it is still the newest durable generation and the scan had zero parse failures; an incomplete scan retains the previous availability rather than inventing deletions. Per-path tombstones and the settings-transition lock prevent an older bulk-scan callback from resurrecting a watcher-removed or reconfigured source. If the history database cannot be opened or written, Odometer logs a warning and keeps live parsing available, but it makes no durability, move-reconciliation, or collision-preservation claim for that failed operation.
+
+This is the first durable-history slice, not the complete normalized ledger tracked by issue #38. Existing desktop, tray, export, and range consumers still query the in-memory session projection; the archive currently retains the latest materialized session snapshot plus normalized token events rather than aggregate-only facts and exposes no user-controlled purge/rebuild or read-only recovery workflow. Those boundaries must be resolved before #38 can be considered complete.
 
 ## Opt-in turn-receipt flow
 
@@ -61,6 +82,7 @@ pricing.
 | `src-tauri/src/claude_parser.rs` | Full and incremental Claude Code session JSONL parsing |
 | `src-tauri/src/scanner.rs` | Recursive JSONL discovery, cached parallel initial parse |
 | `src-tauri/src/scan_cache.rs` | Incremental SQLite parsed-session cache keyed by file size+mtime |
+| `src-tauri/src/history_store.rs` | Durable SQLite session archive, source availability, identity reconciliation, and schema migration |
 | `src-tauri/src/performance.rs` | Default-off, bounded local performance event writer and JSONL/CSV export |
 | `src-tauri/src/watcher.rs` | Debounced file watching, per-harness parser dispatch, frontend events |
 | `src-tauri/src/session_index.rs` | Thread-name overlay from `session_index.jsonl` |
@@ -112,7 +134,26 @@ Subagent transcripts (`.../<session>/subagents/agent-<id>.jsonl`) carry the pare
 
 Anthropic usage reports `input_tokens` excluding cache traffic, while the viewer's `TokenTotals` treats cached input as a subset of input. The mapping is `input = input + cache_read + cache_creation`, `cached = cache_read`, `reasoning = 0` (thinking is billed as ordinary output). Cache writes are priced at the plain input rate, a slight underestimate of the 1.25x write premium. There is no cumulative counter in the file; totals accumulate from per-message deltas, and sidechain usage counts toward the enclosing turn.
 
-The rate card prices Codex models in credits and Claude models in USD; `currencies` and `fallback_models` on the card map each harness to its display currency and fallback rate so the two never mix. A third table, `api_models`, holds the same Codex models at OpenAI API USD prices — it powers the Codex tab's informational "Est. $" column and the detail pane's est.-API-cost figures, priced from the same (model, tier) buckets as the credit math. `unpriced_models` identifies known models without a published rate; their usage is excluded and labeled rather than priced with the fallback. Other unknown model IDs still use the configured harness fallback and surface the exact IDs in the UI.
+## Pricing-catalog contract
+
+The rate card has two intentionally separate pricing layers:
+
+- The legacy `models` map prices Codex plan credits and Claude API USD, with `currencies` and `fallback_models` keeping harness units and unknown-model fallbacks separate. `api_models` supplies the Codex tab's flat informational API-USD comparison. These maps remain authoritative for list summaries, range buckets, existing views, and editable user overrides.
+- `pricing_catalog` supplies opt-in, event-level scenarios. Every base period and conditional modifier has a stable ID, billing `surface`, exact model, half-open UTC interval `[from, to)`, label, and provenance (`evidence`, source URL, verification timestamp, and optional note). A rule never crosses from OpenAI API USD, Anthropic API USD, or Codex plan credits to another surface.
+
+Catalog validation is fail-closed. Rule IDs, models, labels, evidence, and source URLs must be non-empty; IDs must be globally unique; interval ends must follow starts; cache-write and conditional multipliers must be positive; base periods for one `(surface, model)` cannot overlap; and modifiers with the same `(surface, model, condition)` cannot overlap. Adjacent periods are valid. A malformed or invalid on-disk override logs a warning and falls back to the bundled card.
+
+Time-aware pricing follows these rules:
+
+- A full session is evaluated event by event at the event timestamp. Every priced event must identify a model and have a direct catalog period for its model and billing surface. Missing coverage, a known-unpriced model, or an unattributed nonzero event makes the time-aware scenario unavailable (`null`); it never substitutes a fallback model, the latest rate, or the flat reference retroactively.
+- Conditional rules operate on one provider request. The current threshold condition applies only when observed `request_input_tokens` is strictly greater than the configured threshold. Missing request-level evidence never triggers a modifier speculatively; the result names the applicable rule under `conditionalEvidenceMissing`.
+- Applicable input multipliers compose multiplicatively and cover both ordinary and cached input. Output multipliers likewise cover ordinary and reasoning output. The existing service-tier multiplier is then applied to the event.
+- Published cache-write premiums remain provenance metadata only. The parsers observe cached reads but cannot distinguish cache-write tokens from ordinary input, so the UI reports `cacheWritePricingUnmodeled` and the documented multiplier without adding an invented charge.
+- The scenario result carries the IDs of every applied period and modifier. The flat reference remains visible beside it so a dated or conditional scenario cannot silently redefine existing totals.
+
+`unpriced_models` identifies known models without a published rate; flat calculations exclude and label their usage rather than applying a fallback. Other unknown model IDs use the configured per-harness fallback only in the legacy flat calculation and remain named in the UI. When an older user rate card is upgraded, user-edited legacy rates, currencies, units, and fallback choices are preserved; new bundled legacy entries are added, bundled catalog rules replace or append by stable ID, separately identified custom rules remain, and bundled notes are unioned. Saving validates the catalog before writing an adjacent temporary file and renaming it into place.
+
+This catalog is likewise a bounded advance on issue #42, not the complete pricing authority. It does not yet add model aliases, cache-write token observation, provider-specific metered extras, subscription-plan configuration, signed network refresh, exchange-rate conversion, or original-plus-converted currency totals.
 
 ## IPC and frontend state
 
@@ -184,15 +225,14 @@ Claude Code sessions are resolved below `$CLAUDE_CONFIG_DIR`, falling back to `~
 
 - `$CLAUDE_CONFIG_DIR/projects`
 
-User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`. Enabled turn receipts also keep independent bounded `turn-receipt-status-codex.json` and `turn-receipt-status-claude-code.json` health records under the OS local-data directory; they contain no session IDs or paths. Reads retain compatibility with the earlier shared development-format file.
+User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`. Durable parsed session history lives separately under the platform local-data directory in `agent-odometer/history-v1.sqlite3`; it is retained independently of transcript availability and scan-cache eviction. Enabled turn receipts also keep independent bounded `turn-receipt-status-codex.json` and `turn-receipt-status-claude-code.json` health records under the OS local-data directory; they contain no session IDs or paths. Reads retain compatibility with the earlier shared development-format file.
 
 Session files can contain full prompts, responses, system/developer instructions, local paths, and tool output. Keep processing local, avoid logging message bodies, and use synthetic/redacted test data. Tauri capabilities in `src-tauri/capabilities/default.json` should remain narrowly scoped.
 
 ## Known limitations
 
-- Watcher parser state is not seeded from the initial scan. Removing a startup-existing file before the watcher has observed a create/modify event may leave its session in memory until a rescan.
 - A configured root that does not exist when the watcher starts is skipped; creating it later requires saving settings or restarting the app to establish the watch.
-- Sessions are keyed only by ID. Duplicate IDs found under multiple roots overwrite according to scan traversal order.
+- If the durable history database is unavailable, live sessions still work for readable sources, but disappeared-source retention and collision-safe reconciliation are unavailable until persistence succeeds again.
 - An invalid envelope timestamp falls back to the current time and can affect ordering.
 - `forked_from_id` is represented in the model/UI but may be absent when the source rollout does not provide or the parser does not extract it.
 - Claude Code's `Stop` payload does not include subscription rate-limit windows, so its first receipt version shows tokens and API-rate estimates but no per-turn subscription delta. Codex quota values come from its transcript snapshots.

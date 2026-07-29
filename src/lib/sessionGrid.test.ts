@@ -30,9 +30,9 @@ describe('session grid formatting', () => {
   });
 
   it('groups sessions by repository while keeping subagents with their parent', () => {
-    const parent = { id: 'parent', parent_thread_id: null, working_directory: 'C:\\workspace\\alpha' };
-    const child = { id: 'child', parent_thread_id: 'parent', working_directory: 'C:\\workspace\\beta' };
-    const unscoped = { id: 'unscoped', parent_thread_id: null, working_directory: null };
+    const parent = { id: 'parent', storage_id: 'codex:thread:parent', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\workspace\\alpha' };
+    const child = { id: 'child', storage_id: 'codex:thread:child', harness: 'codex' as const, parent_thread_id: 'parent', working_directory: 'C:\\workspace\\beta' };
+    const unscoped = { id: 'unscoped', storage_id: 'codex:thread:unscoped', harness: 'codex' as const, parent_thread_id: null, working_directory: null };
 
     expect(groupSessionsByRepository([parent, child, unscoped])).toEqual([
       { label: 'alpha', sessions: [parent, child] },
@@ -41,9 +41,9 @@ describe('session grid formatting', () => {
   });
 
   it('keeps distinct repositories separate when their folder labels match', () => {
-    const client = { id: 'client', parent_thread_id: null, working_directory: 'C:\\clients\\shared-name' };
-    const personal = { id: 'personal', parent_thread_id: null, working_directory: 'D:\\personal\\shared-name' };
-    const clientVariant = { id: 'client-variant', parent_thread_id: null, working_directory: 'c:/CLIENTS/shared-name/' };
+    const client = { id: 'client', storage_id: 'codex:thread:client', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\clients\\shared-name' };
+    const personal = { id: 'personal', storage_id: 'codex:thread:personal', harness: 'codex' as const, parent_thread_id: null, working_directory: 'D:\\personal\\shared-name' };
+    const clientVariant = { id: 'client-variant', storage_id: 'codex:thread:client-variant', harness: 'codex' as const, parent_thread_id: null, working_directory: 'c:/CLIENTS/shared-name/' };
 
     expect(groupSessionsByRepository([client, personal, clientVariant])).toEqual([
       { label: 'shared-name', sessions: [client, clientVariant] },
@@ -51,12 +51,24 @@ describe('session grid formatting', () => {
     ]);
   });
 
+  it('leaves a child separate when its provider parent id resolves to multiple durable sessions', () => {
+    const first = { id: 'duplicate', storage_id: 'codex:thread:duplicate:first', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\workspace\\first' };
+    const second = { id: 'duplicate', storage_id: 'codex:thread:duplicate:second', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\workspace\\second' };
+    const child = { id: 'child', storage_id: 'codex:thread:child', harness: 'codex' as const, parent_thread_id: 'duplicate', working_directory: 'C:\\workspace\\child' };
+
+    expect(groupSessionsByRepository([first, second, child])).toEqual([
+      { label: 'first', sessions: [first] },
+      { label: 'second', sessions: [second] },
+      { label: 'child', sessions: [child] },
+    ]);
+  });
+
   it('uses range token categories when the grid is date scoped', () => {
     const allTime: TokenTotals = { input_tokens: 100, cached_input_tokens: 40, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 120 };
     const scoped: TokenTotals = { input_tokens: 12, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1, total_tokens: 15 };
     const session: SessionSummary = {
-      id: 'session', harness: 'codex', thread_name: null, forked_from_id: null,
-      parent_thread_id: null, agent_path: null, agent_nickname: null, file_path: 'fixture.jsonl',
+      id: 'session', storage_id: 'codex:thread:session', harness: 'codex', thread_name: null, forked_from_id: null,
+      parent_thread_id: null, agent_path: null, agent_nickname: null, file_path: 'fixture.jsonl', source_availability: 'present',
       archived: false, started_at: '2026-01-01T00:00:00Z', last_event_at: '2026-01-01T00:01:00Z',
       working_directory: null, originator: null, source: null, cli_version: null, model: null,
       model_provider: null,
@@ -78,7 +90,15 @@ describe('session grid formatting', () => {
     expect(projectSession(session, null, range, false).tokens).toEqual(allTime);
     expect(exportRows([projectSession(session, null, undefined, false)])[0]).toMatchObject({
       id: 'session',
+      storage_id: 'codex:thread:session',
+      source_availability: 'present',
       parent_thread_id: null,
+      codex_time_aware_api_usd: null,
+      codex_time_aware_api_status: null,
+      time_aware_api_status: null,
+      pricing_catalog_available: false,
+      rate_card_version: null,
+      rate_card_fetched_at: null,
     });
   });
 });

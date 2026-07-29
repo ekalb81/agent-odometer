@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -9,6 +10,266 @@ pub struct ModelRate {
     pub output: f64,
     /// Typically the same as output for reasoning models.
     pub reasoning: f64,
+}
+
+/// The billing surface a catalog rule applies to.  A model can carry different
+/// rules for a subscription plan and for a provider's API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingSurface {
+    CodexPlanCredits,
+    OpenaiApiUsd,
+    AnthropicApiUsd,
+}
+
+/// Source information retained with each catalog rule so scenario estimates do
+/// not imply a billing policy that has not been published for that surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PricingProvenance {
+    pub evidence: String,
+    pub source_url: String,
+    pub verified_at: DateTime<Utc>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// An effective-dated base rate. `to: None` denotes an open-ended interval;
+/// otherwise periods use the half-open interval `[from, to)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectiveRatePeriod {
+    /// Stable catalog identity used to reconcile rate rules across updates.
+    /// Missing IDs deserialize for old user overrides but do not validate.
+    #[serde(default)]
+    pub id: String,
+    pub surface: PricingSurface,
+    pub model: String,
+    pub from: DateTime<Utc>,
+    #[serde(default)]
+    pub to: Option<DateTime<Utc>>,
+    pub rate: ModelRate,
+    /// Cache-write multiplier over uncached input. Parsers do not currently
+    /// expose cache-write tokens, so this is catalog metadata only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_multiplier: Option<f64>,
+    pub provenance: PricingProvenance,
+    pub label: String,
+}
+
+/// A condition evaluated against a single provider request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PricingCondition {
+    /// Applies only when the request's complete input exceeds this count.
+    RequestInputTokenThreshold { greater_than: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RateMultipliers {
+    pub input: f64,
+    pub output: f64,
+}
+
+/// An effective-dated conditional pricing rule.  Cache-write token categories
+/// are deliberately not represented by `RateMultipliers`: parsers currently
+/// retain cache reads but do not distinguish cache writes from uncached input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionalRateModifier {
+    /// Stable catalog identity used to reconcile conditional rules across updates.
+    /// Missing IDs deserialize for old user overrides but do not validate.
+    #[serde(default)]
+    pub id: String,
+    pub surface: PricingSurface,
+    pub model: String,
+    pub from: DateTime<Utc>,
+    #[serde(default)]
+    pub to: Option<DateTime<Utc>>,
+    pub condition: PricingCondition,
+    pub multipliers: RateMultipliers,
+    pub provenance: PricingProvenance,
+    pub label: String,
+}
+
+/// Versioned, auditable scenario pricing data.  The legacy `models` maps stay
+/// authoritative for existing views and user overrides; this catalog adds
+/// time/surface-aware alternatives without changing those calculations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PricingCatalog {
+    #[serde(default)]
+    pub rate_periods: Vec<EffectiveRatePeriod>,
+    #[serde(default)]
+    pub conditional_modifiers: Vec<ConditionalRateModifier>,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl PricingCatalog {
+    pub fn is_empty(&self) -> bool {
+        self.rate_periods.is_empty()
+            && self.conditional_modifiers.is_empty()
+            && self.notes.is_empty()
+    }
+
+    /// Selects the base rate whose half-open effective interval contains `at`.
+    pub fn rate_at(
+        &self,
+        surface: PricingSurface,
+        model: &str,
+        at: DateTime<Utc>,
+    ) -> Option<&EffectiveRatePeriod> {
+        self.rate_periods.iter().find(|period| {
+            period.surface == surface
+                && period.model == model
+                && interval_contains(period.from, period.to, at)
+        })
+    }
+
+    /// Returns every modifier whose interval and request condition apply.
+    pub fn modifiers_for_request(
+        &self,
+        surface: PricingSurface,
+        model: &str,
+        at: DateTime<Utc>,
+        request_input_tokens: u64,
+    ) -> Vec<&ConditionalRateModifier> {
+        self.conditional_modifiers
+            .iter()
+            .filter(|modifier| {
+                modifier.surface == surface
+                    && modifier.model == model
+                    && interval_contains(modifier.from, modifier.to, at)
+                    && matches!(
+                        modifier.condition,
+                        PricingCondition::RequestInputTokenThreshold { greater_than }
+                            if request_input_tokens > greater_than
+                    )
+            })
+            .collect()
+    }
+
+    /// Ensures catalog intervals are well-formed and that base-rate periods do
+    /// not overlap for one `(surface, model)` pair.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut ids = std::collections::HashSet::new();
+        for period in &self.rate_periods {
+            validate_rule_id(&period.id, &mut ids)?;
+            validate_rule_scope(
+                &period.model,
+                period.from,
+                period.to,
+                &period.label,
+                &period.provenance,
+            )?;
+            if period
+                .cache_write_input_multiplier
+                .is_some_and(|multiplier| multiplier <= 0.0)
+            {
+                anyhow::bail!("cache-write input multiplier must be greater than zero");
+            }
+        }
+        for modifier in &self.conditional_modifiers {
+            validate_rule_id(&modifier.id, &mut ids)?;
+            validate_rule_scope(
+                &modifier.model,
+                modifier.from,
+                modifier.to,
+                &modifier.label,
+                &modifier.provenance,
+            )?;
+            match modifier.condition {
+                PricingCondition::RequestInputTokenThreshold { greater_than }
+                    if greater_than > 0 => {}
+                PricingCondition::RequestInputTokenThreshold { .. } => {
+                    anyhow::bail!("request input token threshold must be greater than zero")
+                }
+            }
+            if modifier.multipliers.input <= 0.0 || modifier.multipliers.output <= 0.0 {
+                anyhow::bail!("pricing modifier multipliers must be greater than zero");
+            }
+        }
+
+        let mut grouped: HashMap<(PricingSurface, &str), Vec<&EffectiveRatePeriod>> =
+            HashMap::new();
+        for period in &self.rate_periods {
+            grouped
+                .entry((period.surface, period.model.as_str()))
+                .or_default()
+                .push(period);
+        }
+        for ((surface, model), periods) in &mut grouped {
+            periods.sort_by_key(|period| period.from);
+            for pair in periods.windows(2) {
+                let current = pair[0];
+                let next = pair[1];
+                if intervals_overlap(current.from, current.to, next.from, next.to) {
+                    anyhow::bail!(
+                        "overlapping pricing periods for {surface:?}/{model}: {} and {}",
+                        current.label,
+                        next.label
+                    );
+                }
+            }
+        }
+        for (index, modifier) in self.conditional_modifiers.iter().enumerate() {
+            for other in self.conditional_modifiers.iter().skip(index + 1) {
+                if modifier.surface == other.surface
+                    && modifier.model == other.model
+                    && modifier.condition == other.condition
+                    && intervals_overlap(modifier.from, modifier.to, other.from, other.to)
+                {
+                    anyhow::bail!(
+                        "overlapping conditional pricing modifiers for {:?}/{}: {} and {}",
+                        modifier.surface,
+                        modifier.model,
+                        modifier.label,
+                        other.label
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_rule_id(id: &str, ids: &mut std::collections::HashSet<String>) -> anyhow::Result<()> {
+    if id.trim().is_empty() {
+        anyhow::bail!("pricing catalog rules require a non-empty ID");
+    }
+    if !ids.insert(id.to_owned()) {
+        anyhow::bail!("duplicate pricing catalog rule ID: {id}");
+    }
+    Ok(())
+}
+
+fn interval_contains(from: DateTime<Utc>, to: Option<DateTime<Utc>>, at: DateTime<Utc>) -> bool {
+    at >= from && to.is_none_or(|end| at < end)
+}
+
+fn intervals_overlap(
+    first_from: DateTime<Utc>,
+    first_to: Option<DateTime<Utc>>,
+    second_from: DateTime<Utc>,
+    second_to: Option<DateTime<Utc>>,
+) -> bool {
+    first_to.is_none_or(|end| second_from < end) && second_to.is_none_or(|end| first_from < end)
+}
+
+fn validate_rule_scope(
+    model: &str,
+    from: DateTime<Utc>,
+    to: Option<DateTime<Utc>>,
+    label: &str,
+    provenance: &PricingProvenance,
+) -> anyhow::Result<()> {
+    if model.trim().is_empty() || label.trim().is_empty() {
+        anyhow::bail!("pricing catalog rules require a model and label");
+    }
+    if provenance.evidence.trim().is_empty() || provenance.source_url.trim().is_empty() {
+        anyhow::bail!("pricing catalog rules require evidence and a source URL");
+    }
+    if to.is_some_and(|end| end <= from) {
+        anyhow::bail!("pricing catalog interval end must be after its start");
+    }
+    Ok(())
 }
 
 /// Rate card shipped with the binary or customized by the user.
@@ -42,6 +303,10 @@ pub struct RateCard {
     /// estimates instead of being priced with an unrelated fallback model.
     #[serde(default)]
     pub unpriced_models: Vec<String>,
+    /// Time-aware rates and modifiers for explicitly labeled billing scenarios.
+    /// Optional so rate-card overrides written by earlier releases still load.
+    #[serde(default)]
+    pub pricing_catalog: PricingCatalog,
 }
 
 fn rates_path() -> Option<PathBuf> {
@@ -53,6 +318,7 @@ impl RateCard {
     pub fn load_bundled() -> anyhow::Result<Self> {
         let raw = include_str!("../rates.json");
         let card: Self = serde_json::from_str(raw)?;
+        card.pricing_catalog.validate()?;
         Ok(card)
     }
 
@@ -71,7 +337,17 @@ impl RateCard {
             Ok(raw) => match serde_json::from_str::<Self>(&raw) {
                 Ok(card) => {
                     let bundled = Self::load_bundled()?;
-                    Ok(merge_older_override(card, bundled))
+                    let merged = merge_older_override(card, bundled.clone());
+                    if let Err(e) = merged.pricing_catalog.validate() {
+                        tracing::warn!(
+                            "rates.json at {:?} has an invalid pricing catalog ({}); falling back to bundled",
+                            path,
+                            e
+                        );
+                        Ok(bundled)
+                    } else {
+                        Ok(merged)
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -95,6 +371,7 @@ impl RateCard {
 
     /// Atomic-ish write to <config_dir>/agent-odometer/rates.json.
     pub fn save(&self) -> anyhow::Result<()> {
+        self.pricing_catalog.validate()?;
         let path = rates_path().ok_or_else(|| anyhow::anyhow!("could not determine config dir"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -133,15 +410,54 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
             disk.unpriced_models.push(model);
         }
     }
+    // Reconcile managed catalog rules by durable ID. This refreshes corrected
+    // bundled periods/modifiers and adds newly published rules while retaining
+    // a user's separately identified custom rules and notes.
+    disk.pricing_catalog = merge_older_catalog(disk.pricing_catalog, bundled.pricing_catalog);
     disk.version = bundled.version;
     disk.source_url = bundled.source_url;
     disk.fetched_at = bundled.fetched_at;
     disk
 }
 
+fn merge_older_catalog(mut disk: PricingCatalog, bundled: PricingCatalog) -> PricingCatalog {
+    for bundled_period in bundled.rate_periods {
+        match disk
+            .rate_periods
+            .iter_mut()
+            .find(|period| period.id == bundled_period.id)
+        {
+            Some(existing) => *existing = bundled_period,
+            None => disk.rate_periods.push(bundled_period),
+        }
+    }
+    for bundled_modifier in bundled.conditional_modifiers {
+        match disk
+            .conditional_modifiers
+            .iter_mut()
+            .find(|modifier| modifier.id == bundled_modifier.id)
+        {
+            Some(existing) => *existing = bundled_modifier,
+            None => disk.conditional_modifiers.push(bundled_modifier),
+        }
+    }
+    for bundled_note in bundled.notes {
+        if !disk.notes.contains(&bundled_note) {
+            disk.notes.push(bundled_note);
+        }
+    }
+    disk
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn instant(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .expect("valid RFC3339 instant")
+            .with_timezone(&Utc)
+    }
 
     fn rate(value: f64) -> ModelRate {
         ModelRate {
@@ -166,6 +482,7 @@ mod tests {
             fallback_models: HashMap::new(),
             api_models: HashMap::from([("preview-covered".into(), rate(7.0))]),
             unpriced_models: vec!["preview-old".into()],
+            pricing_catalog: PricingCatalog::default(),
         };
         let bundled = RateCard {
             version: 3,
@@ -179,6 +496,10 @@ mod tests {
             fallback_models: HashMap::from([("claude_code".into(), "claude-new".into())]),
             api_models: HashMap::from([("gpt-old".into(), rate(0.04))]),
             unpriced_models: vec!["preview-new".into(), "preview-covered".into()],
+            pricing_catalog: PricingCatalog {
+                notes: vec!["new scenario metadata".into()],
+                ..PricingCatalog::default()
+            },
         };
 
         let merged = merge_older_override(disk, bundled);
@@ -194,6 +515,91 @@ mod tests {
         assert_eq!(merged.api_models["gpt-old"].input, 0.04);
         assert_eq!(merged.unpriced_models, ["preview-old", "preview-new"]);
         assert_eq!(merged.api_models["preview-covered"].input, 7.0);
+        assert_eq!(merged.pricing_catalog.notes, ["new scenario metadata"]);
+    }
+
+    #[test]
+    fn older_catalog_refreshes_bundled_ids_but_preserves_custom_ids() {
+        let provenance = PricingProvenance {
+            evidence: "published".into(),
+            source_url: "https://example.test/rates".into(),
+            verified_at: instant("2026-01-01T00:00:00Z"),
+            note: None,
+        };
+        let managed_disk_period = EffectiveRatePeriod {
+            id: "provider/model/api/base".into(),
+            surface: PricingSurface::OpenaiApiUsd,
+            model: "managed-model".into(),
+            from: instant("2026-01-01T00:00:00Z"),
+            to: None,
+            rate: rate(99.0),
+            cache_write_input_multiplier: None,
+            provenance: provenance.clone(),
+            label: "stale bundled rate".into(),
+        };
+        let custom_period = EffectiveRatePeriod {
+            id: "user/custom-model/api/base".into(),
+            model: "custom-model".into(),
+            rate: rate(77.0),
+            label: "custom rate".into(),
+            ..managed_disk_period.clone()
+        };
+        let bundled_period = EffectiveRatePeriod {
+            rate: rate(2.0),
+            label: "refreshed bundled rate".into(),
+            ..managed_disk_period.clone()
+        };
+        let bundled_modifier = ConditionalRateModifier {
+            id: "provider/model/api/high-context".into(),
+            surface: PricingSurface::OpenaiApiUsd,
+            model: "managed-model".into(),
+            from: instant("2026-01-01T00:00:00Z"),
+            to: None,
+            condition: PricingCondition::RequestInputTokenThreshold { greater_than: 1 },
+            multipliers: RateMultipliers {
+                input: 2.0,
+                output: 1.5,
+            },
+            provenance,
+            label: "new bundled modifier".into(),
+        };
+
+        let merged = merge_older_catalog(
+            PricingCatalog {
+                rate_periods: vec![managed_disk_period, custom_period],
+                conditional_modifiers: Vec::new(),
+                notes: vec!["custom note".into()],
+            },
+            PricingCatalog {
+                rate_periods: vec![bundled_period],
+                conditional_modifiers: vec![bundled_modifier],
+                notes: vec!["bundled note".into()],
+            },
+        );
+
+        assert_eq!(merged.rate_periods.len(), 2);
+        assert_eq!(
+            merged
+                .rate_periods
+                .iter()
+                .find(|period| period.id == "provider/model/api/base")
+                .expect("managed period")
+                .rate
+                .input,
+            2.0
+        );
+        assert_eq!(
+            merged
+                .rate_periods
+                .iter()
+                .find(|period| period.id == "user/custom-model/api/base")
+                .expect("custom period")
+                .rate
+                .input,
+            77.0
+        );
+        assert_eq!(merged.conditional_modifiers.len(), 1);
+        assert_eq!(merged.notes, ["custom note", "bundled note"]);
     }
 
     #[test]
@@ -220,5 +626,255 @@ mod tests {
             .contains(&"gpt-5.3-codex-spark".to_string()));
         assert!(!card.models.contains_key("gpt-5.3-codex-spark"));
         assert!(!card.api_models.contains_key("gpt-5.3-codex-spark"));
+    }
+
+    #[test]
+    fn catalog_uses_half_open_period_boundaries_for_sonnet_five() {
+        let card = RateCard::load_bundled().expect("bundled rate card should parse");
+        let introductory = card
+            .pricing_catalog
+            .rate_at(
+                PricingSurface::AnthropicApiUsd,
+                "claude-sonnet-5",
+                instant("2026-08-31T23:59:59Z"),
+            )
+            .expect("introductory period");
+        assert_eq!(introductory.rate.input, 2.0);
+        assert_eq!(introductory.cache_write_input_multiplier, Some(1.25));
+
+        let standard = card
+            .pricing_catalog
+            .rate_at(
+                PricingSurface::AnthropicApiUsd,
+                "claude-sonnet-5",
+                instant("2026-09-01T00:00:00Z"),
+            )
+            .expect("standard period at its inclusive start");
+        assert_eq!(standard.rate.input, 3.0);
+        assert_eq!(standard.rate.cached_input, 0.3);
+        assert_eq!(standard.rate.output, 15.0);
+        assert_eq!(standard.rate.reasoning, 15.0);
+        assert_eq!(standard.cache_write_input_multiplier, Some(1.25));
+    }
+
+    #[test]
+    fn gpt_sol_high_context_rule_is_api_only_and_strictly_above_threshold() {
+        let card = RateCard::load_bundled().expect("bundled rate card should parse");
+        let at = instant("2026-07-27T00:00:00Z");
+
+        assert!(card
+            .pricing_catalog
+            .modifiers_for_request(PricingSurface::CodexPlanCredits, "gpt-5.6-sol", at, 272_001,)
+            .is_empty());
+        assert!(card
+            .pricing_catalog
+            .modifiers_for_request(PricingSurface::OpenaiApiUsd, "gpt-5.6-sol", at, 272_000,)
+            .is_empty());
+
+        let modifiers = card.pricing_catalog.modifiers_for_request(
+            PricingSurface::OpenaiApiUsd,
+            "gpt-5.6-sol",
+            at,
+            272_001,
+        );
+        assert_eq!(modifiers.len(), 1);
+        assert_eq!(modifiers[0].multipliers.input, 2.0);
+        assert_eq!(modifiers[0].multipliers.output, 1.5);
+
+        let base_period = card
+            .pricing_catalog
+            .rate_at(PricingSurface::OpenaiApiUsd, "gpt-5.6-sol", at)
+            .expect("Sol API base period");
+        assert_eq!(base_period.cache_write_input_multiplier, Some(1.25));
+        let serialized = serde_json::to_value(base_period).expect("period serializes");
+        assert_eq!(serialized["cache_write_input_multiplier"], 1.25);
+    }
+
+    #[test]
+    fn old_rate_cards_without_catalog_fields_remain_deserializable() {
+        let card: RateCard = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "currency": "credits",
+            "unit": "per_1m_tokens",
+            "source_url": "https://example.test/rates",
+            "fetched_at": null,
+            "models": {},
+            "fallback_model": "fallback"
+        }))
+        .expect("pre-catalog rate card should load");
+        assert!(card.pricing_catalog.is_empty());
+    }
+
+    #[test]
+    fn pricing_catalog_rejects_invalid_and_overlapping_periods() {
+        let provenance = PricingProvenance {
+            evidence: "published".into(),
+            source_url: "https://example.test/rates".into(),
+            verified_at: instant("2026-01-01T00:00:00Z"),
+            note: None,
+        };
+        let first = EffectiveRatePeriod {
+            id: "test/model/api/first".into(),
+            surface: PricingSurface::OpenaiApiUsd,
+            model: "model".into(),
+            from: instant("2026-01-01T00:00:00Z"),
+            to: Some(instant("2026-02-01T00:00:00Z")),
+            rate: rate(1.0),
+            cache_write_input_multiplier: None,
+            provenance: provenance.clone(),
+            label: "first".into(),
+        };
+        let overlapping = EffectiveRatePeriod {
+            from: instant("2026-01-15T00:00:00Z"),
+            to: None,
+            label: "overlapping".into(),
+            ..first.clone()
+        };
+        assert!(PricingCatalog {
+            rate_periods: vec![first.clone(), overlapping],
+            ..PricingCatalog::default()
+        }
+        .validate()
+        .is_err());
+
+        let duplicate_id = EffectiveRatePeriod {
+            from: instant("2026-02-01T00:00:00Z"),
+            to: None,
+            label: "duplicate ID".into(),
+            ..first.clone()
+        };
+        assert!(PricingCatalog {
+            rate_periods: vec![first.clone(), duplicate_id],
+            ..PricingCatalog::default()
+        }
+        .validate()
+        .is_err());
+
+        let missing_id = EffectiveRatePeriod {
+            id: String::new(),
+            label: "missing ID".into(),
+            ..first.clone()
+        };
+        assert!(PricingCatalog {
+            rate_periods: vec![missing_id],
+            ..PricingCatalog::default()
+        }
+        .validate()
+        .is_err());
+
+        let encoded_without_cache_write = serde_json::to_value(&first).expect("period serializes");
+        assert!(encoded_without_cache_write
+            .get("cache_write_input_multiplier")
+            .is_none());
+        let decoded_without_cache_write: EffectiveRatePeriod =
+            serde_json::from_value(encoded_without_cache_write).expect("old period deserializes");
+        assert_eq!(
+            decoded_without_cache_write.cache_write_input_multiplier,
+            None
+        );
+
+        let invalid_cache_write = EffectiveRatePeriod {
+            cache_write_input_multiplier: Some(0.0),
+            label: "invalid cache-write multiplier".into(),
+            ..first.clone()
+        };
+        assert!(PricingCatalog {
+            rate_periods: vec![invalid_cache_write],
+            ..PricingCatalog::default()
+        }
+        .validate()
+        .is_err());
+
+        let invalid = EffectiveRatePeriod {
+            to: Some(first.from),
+            label: "invalid".into(),
+            ..first
+        };
+        assert!(PricingCatalog {
+            rate_periods: vec![invalid],
+            ..PricingCatalog::default()
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn pricing_catalog_allows_adjacent_same_condition_modifiers() {
+        let provenance = PricingProvenance {
+            evidence: "published".into(),
+            source_url: "https://example.test/rates".into(),
+            verified_at: instant("2026-01-01T00:00:00Z"),
+            note: None,
+        };
+        let first = ConditionalRateModifier {
+            id: "test/model/api/high-context-first".into(),
+            surface: PricingSurface::OpenaiApiUsd,
+            model: "model".into(),
+            from: instant("2026-01-01T00:00:00Z"),
+            to: Some(instant("2026-02-01T00:00:00Z")),
+            condition: PricingCondition::RequestInputTokenThreshold {
+                greater_than: 272_000,
+            },
+            multipliers: RateMultipliers {
+                input: 2.0,
+                output: 1.5,
+            },
+            provenance,
+            label: "first high-context rule".into(),
+        };
+        let adjacent = ConditionalRateModifier {
+            id: "test/model/api/high-context-second".into(),
+            from: instant("2026-02-01T00:00:00Z"),
+            to: None,
+            label: "second high-context rule".into(),
+            ..first.clone()
+        };
+
+        PricingCatalog {
+            conditional_modifiers: vec![first, adjacent],
+            ..PricingCatalog::default()
+        }
+        .validate()
+        .expect("adjacent half-open modifier periods must not overlap");
+    }
+
+    #[test]
+    fn pricing_catalog_rejects_overlapping_same_condition_modifiers() {
+        let provenance = PricingProvenance {
+            evidence: "published".into(),
+            source_url: "https://example.test/rates".into(),
+            verified_at: instant("2026-01-01T00:00:00Z"),
+            note: None,
+        };
+        let first = ConditionalRateModifier {
+            id: "test/model/api/high-context-first".into(),
+            surface: PricingSurface::OpenaiApiUsd,
+            model: "model".into(),
+            from: instant("2026-01-01T00:00:00Z"),
+            to: Some(instant("2026-02-01T00:00:00Z")),
+            condition: PricingCondition::RequestInputTokenThreshold {
+                greater_than: 272_000,
+            },
+            multipliers: RateMultipliers {
+                input: 2.0,
+                output: 1.5,
+            },
+            provenance,
+            label: "first high-context rule".into(),
+        };
+        let overlapping = ConditionalRateModifier {
+            id: "test/model/api/high-context-overlapping".into(),
+            from: instant("2026-01-15T00:00:00Z"),
+            to: None,
+            label: "overlapping high-context rule".into(),
+            ..first.clone()
+        };
+
+        assert!(PricingCatalog {
+            conditional_modifiers: vec![first, overlapping],
+            ..PricingCatalog::default()
+        }
+        .validate()
+        .is_err());
     }
 }

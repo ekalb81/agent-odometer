@@ -369,6 +369,7 @@ mod tests {
                 timestamp: timestamp.parse().unwrap(),
                 model: Some("m".into()),
                 service_tier: None,
+                request_input_tokens: Some(*count),
                 total_tokens: *count,
                 delta: TokenTotals {
                     input_tokens: *count,
@@ -379,6 +380,7 @@ mod tests {
             .collect();
         Session {
             id: id.into(),
+            storage_id: format!("codex:thread:{id}"),
             harness: Harness::Codex,
             thread_name: None,
             forked_from_id: None,
@@ -386,12 +388,14 @@ mod tests {
             agent_path: None,
             agent_nickname: None,
             file_path: String::new(),
+            source_availability: Default::default(),
             archived: false,
             started_at: points.first().unwrap().0.parse().unwrap(),
             last_event_at: points.last().unwrap().0.parse().unwrap(),
             working_directory: cwd.map(str::to_owned),
             originator: None,
             source: None,
+            subagent_id_is_path_fallback: false,
             history_mode: None,
             memory_mode: None,
             cli_version: None,

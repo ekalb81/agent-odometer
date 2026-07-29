@@ -1,10 +1,10 @@
 {
-  "version": 6,
+  "version": 7,
   "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
-  "fetched_at": "2026-07-25",
-  "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. api_models holds the same Codex models at OpenAI API USD prices (developers.openai.com/api/docs/pricing, fetched 2026-07-25) for the est.-cost column; gpt-5.5-cyber, gpt-5.2, and codex-auto-review are not on the public API page and are derived via the exact 25-credits-per-USD ratio the rest of the card follows. Claude models are priced in USD per the Anthropic API price list (fetched 2026-07-25; cached_input is the 0.1x cache-read rate; thinking is billed as ordinary output). Cache writes (1.25x) are not modeled, so USD estimates are slight underestimates. gpt-5.3-codex-spark is explicitly unpriced because OpenAI lists its research-preview rates as not final; its usage is excluded instead of fallback-priced. api_models and unpriced_models are not editable in the Settings UI yet; edit this file or the on-disk rates.json override.",
+  "fetched_at": "2026-07-27",
+  "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. api_models holds the same Codex models at OpenAI API USD prices (developers.openai.com/api/docs/pricing, verified 2026-07-27) for the est.-cost column; gpt-5.5-cyber, gpt-5.2, and codex-auto-review are not on the public API page and are derived via the exact 25-credits-per-USD ratio the rest of the card follows. Claude models are priced in USD per the Anthropic API price list (verified 2026-07-27; cached_input is the 0.1x cache-read rate; thinking is billed as ordinary output). Cache-write premiums are retained as catalog metadata when published but are not dollarized without observed cache-write tokens. The pricing_catalog contains explicitly scoped, effective-dated scenario rules; it does not change the existing flat legacy rate maps until a caller opts into that calculation. gpt-5.3-codex-spark is explicitly unpriced because OpenAI lists its research-preview rates as not final; its usage is excluded instead of fallback-priced. api_models and unpriced_models are not editable in the Settings UI yet; edit this file or the on-disk rates.json override.",
   "currencies": {
     "codex": "credits",
     "claude_code": "USD"
@@ -16,6 +16,80 @@
   "unpriced_models": [
     "gpt-5.3-codex-spark"
   ],
+  "pricing_catalog": {
+    "notes": [
+      "Conditional modifiers are scenario estimates, not a claim about Codex subscription billing.",
+      "ModelRate tracks cache reads as cached_input but has no separate cache-write category; cache-write charges, including the documented 1.25x uncached-input category, are intentionally unmodeled."
+    ],
+    "rate_periods": [
+      {
+        "id": "openai/gpt-5.6-sol/api/base",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.6-sol",
+        "from": "2026-01-01T00:00:00Z",
+        "to": null,
+        "rate": { "input": 5.0, "cached_input": 0.5, "output": 30.0, "reasoning": 30.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published API model pricing",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          "verified_at": "2026-07-27T00:00:00Z",
+          "note": "Effective-start instant is a catalog lower bound; the published page does not state a historical start instant."
+        },
+        "label": "GPT-5.6 Sol API base pricing"
+      },
+      {
+        "id": "anthropic/claude-sonnet-5/api/introductory-2026",
+        "surface": "anthropic_api_usd",
+        "model": "claude-sonnet-5",
+        "from": "2026-01-01T00:00:00Z",
+        "to": "2026-09-01T00:00:00Z",
+        "rate": { "input": 2.0, "cached_input": 0.2, "output": 10.0, "reasoning": 10.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published introductory API pricing through 2026-08-31",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "verified_at": "2026-07-28T00:00:00Z",
+          "note": "The provider publishes an end date but not a precise first-effective instant; this lower bound keeps historical scenario selection deterministic. The catalog records the 1.25x five-minute cache-write premium, but cache writes are not represented by ModelRate."
+        },
+        "label": "Claude Sonnet 5 introductory API pricing"
+      },
+      {
+        "id": "anthropic/claude-sonnet-5/api/standard-2026-09-01",
+        "surface": "anthropic_api_usd",
+        "model": "claude-sonnet-5",
+        "from": "2026-09-01T00:00:00Z",
+        "to": null,
+        "rate": { "input": 3.0, "cached_input": 0.3, "output": 15.0, "reasoning": 15.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published standard API pricing beginning 2026-09-01",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "verified_at": "2026-07-28T00:00:00Z",
+          "note": "The catalog records the 1.25x five-minute cache-write premium, but cache writes are not represented by ModelRate."
+        },
+        "label": "Claude Sonnet 5 standard API pricing"
+      }
+    ],
+    "conditional_modifiers": [
+      {
+        "id": "openai/gpt-5.6-sol/api/high-context-over-272k",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.6-sol",
+        "from": "2026-01-01T00:00:00Z",
+        "to": null,
+        "condition": { "kind": "request_input_token_threshold", "greater_than": 272000 },
+        "multipliers": { "input": 2.0, "output": 1.5 },
+        "provenance": {
+          "evidence": "Published API high-context pricing",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          "verified_at": "2026-07-27T00:00:00Z",
+          "note": "This rule is explicitly limited to the OpenAI API USD surface; Codex plan billing evidence is conflicting and is not inferred from this API rule. Cache-write pricing is unmodeled."
+        },
+        "label": "GPT-5.6 Sol API requests exceeding 272K input tokens"
+      }
+    ]
+  },
   "models": {
     "gpt-5.6-sol":    { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
     "gpt-5.6-terra":  { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },

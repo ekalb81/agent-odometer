@@ -56,7 +56,8 @@ impl AnyParser {
 /// harness, call parse_to_end(), and if the session is Some upsert it into
 /// state and emit "session-updated".
 ///
-/// On Remove: drop the parser, remove from state, and emit "session-removed".
+/// On Remove: drop the parser, retain its durable history, mark its source
+/// missing, and emit a refreshed "session-updated" summary.
 pub fn start(
     app: AppHandle,
     state: Arc<AppState>,
@@ -118,9 +119,14 @@ pub fn start(
                             ]),
                         );
                         for id in changed {
-                            if let Some(session) = state_cb.sessions.get(&id) {
-                                if let Err(e) = app_cb
-                                    .emit("session-updated", &SessionSummary::of(session.as_ref()))
+                            if let Some(session) = state_cb
+                                .sessions
+                                .get(&id)
+                                .map(|session| session.value().as_ref().clone())
+                            {
+                                state_cb.persist_session_metadata(&session);
+                                if let Err(e) =
+                                    app_cb.emit("session-updated", &SessionSummary::of(&session))
                                 {
                                     tracing::warn!("emit session-updated failed: {}", e);
                                 }
@@ -138,20 +144,12 @@ pub fn start(
                         // Bulk-scanned and idle-evicted files may not have a
                         // parser slot, so path ownership in AppState is the
                         // source of truth for removal.
-                        let parser_id = parsers_cb
-                            .remove(path)
-                            .and_then(|(_, slot)| slot.parser.session().map(|s| s.id.clone()));
-                        if let Some((id, removed)) = state_cb.remove_session_path(path) {
-                            if removed {
-                                if let Err(e) = app_cb.emit("session-removed", &id) {
-                                    tracing::warn!("emit session-removed failed: {}", e);
-                                }
-                            }
-                        } else if let Some(id) = parser_id {
-                            if state_cb.sessions.remove(&id).is_some() {
-                                if let Err(e) = app_cb.emit("session-removed", &id) {
-                                    tracing::warn!("emit session-removed failed: {}", e);
-                                }
+                        let _ = parsers_cb.remove(path);
+                        if let Some(session) = state_cb.mark_source_missing(path) {
+                            if let Err(e) =
+                                app_cb.emit("session-updated", &SessionSummary::of(&session))
+                            {
+                                tracing::warn!("emit session-updated failed: {}", e);
                             }
                         }
                     } else {
@@ -193,10 +191,19 @@ pub fn start(
                         }
 
                         if let Some(session) = entry.parser.session() {
-                            let summary = SessionSummary::of(session);
-                            state_cb.publish_watched_session(path, session.clone());
+                            let reconciled =
+                                state_cb.reconcile_observed_session(path, session.clone());
+                            let summary = SessionSummary::of(&reconciled.session);
+                            state_cb.publish_watched_session(path, reconciled.session);
                             if let Err(e) = app_cb.emit("session-updated", &summary) {
                                 tracing::warn!("emit session-updated failed: {}", e);
+                            }
+                            if let Some(displaced) = reconciled.displaced {
+                                if let Err(e) =
+                                    app_cb.emit("session-updated", &SessionSummary::of(&displaced))
+                                {
+                                    tracing::warn!("emit displaced session-updated failed: {}", e);
+                                }
                             }
                         }
                     }
