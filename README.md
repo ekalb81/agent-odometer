@@ -98,7 +98,7 @@ Edit any rate under **Settings → Rate card**; your overrides persist and autom
 
 Built with Tauri 2 + Rust (filesystem, parsing, IPC) and Svelte 5 + TypeScript + Tailwind (UI). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for data flow, wire contracts, invariants, and known limitations.
 
-Prerequisites: Node.js 22, Rust 1.88 or later, and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
+Prerequisites: Node.js 22, Rust 1.95 or later, and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```powershell
 npm ci

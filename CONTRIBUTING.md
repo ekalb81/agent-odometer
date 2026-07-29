@@ -8,7 +8,7 @@ Use the issue templates. For bugs, include your OS, Odometer version (title bar 
 
 ## Development setup
 
-Prerequisites: Node.js 22, stable Rust (MSRV 1.77), and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
+Prerequisites: Node.js 22, stable Rust (MSRV 1.95), and the [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ```sh
 npm ci
