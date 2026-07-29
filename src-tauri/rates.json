@@ -45,11 +45,12 @@
         "from": "2026-01-01T00:00:00Z",
         "to": "2026-09-01T00:00:00Z",
         "rate": { "input": 2.0, "cached_input": 0.2, "output": 10.0, "reasoning": 10.0 },
+        "cache_write_input_multiplier": 1.25,
         "provenance": {
           "evidence": "Published introductory API pricing through 2026-08-31",
           "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
-          "verified_at": "2026-07-27T00:00:00Z",
-          "note": "The provider publishes an end date but not a precise first-effective instant; this lower bound keeps historical scenario selection deterministic. Cache writes are not represented by ModelRate."
+          "verified_at": "2026-07-28T00:00:00Z",
+          "note": "The provider publishes an end date but not a precise first-effective instant; this lower bound keeps historical scenario selection deterministic. The catalog records the 1.25x five-minute cache-write premium, but cache writes are not represented by ModelRate."
         },
         "label": "Claude Sonnet 5 introductory API pricing"
       },
@@ -60,11 +61,12 @@
         "from": "2026-09-01T00:00:00Z",
         "to": null,
         "rate": { "input": 3.0, "cached_input": 0.3, "output": 15.0, "reasoning": 15.0 },
+        "cache_write_input_multiplier": 1.25,
         "provenance": {
           "evidence": "Published standard API pricing beginning 2026-09-01",
           "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
-          "verified_at": "2026-07-27T00:00:00Z",
-          "note": "Cache writes are not represented by ModelRate."
+          "verified_at": "2026-07-28T00:00:00Z",
+          "note": "The catalog records the 1.25x five-minute cache-write premium, but cache writes are not represented by ModelRate."
         },
         "label": "Claude Sonnet 5 standard API pricing"
       }

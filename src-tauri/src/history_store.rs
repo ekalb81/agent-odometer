@@ -1,9 +1,11 @@
 //! Durable, local session history.
 //!
-//! This is deliberately distinct from `scan_cache`: it keeps an append-only
-//! record of parsed sessions even when their transcript files move or vanish.
-//! In particular, it has no application-version invalidation path and never
-//! removes a session or token event during a scan.
+//! This is deliberately distinct from `scan_cache`: it keeps durable sessions
+//! and append-only normalized token events even when transcript files move or
+//! vanish. Full `Session` blobs are replaceable current materializations so a
+//! growing transcript is not copied into an unbounded snapshot history. The
+//! store has no application-version invalidation path and never removes a
+//! session or token event during a scan.
 
 use crate::model::{Harness, Session, SourceAvailability, TokenHistoryPoint};
 use anyhow::{anyhow, bail, Context, Result};
@@ -521,14 +523,28 @@ fn reconcile_session(
             .optional()?;
         let provisional = match provisional_from_path {
             Some(key) => Some(key),
-            None => transaction
-                .query_row(
-                    "SELECT session_key FROM durable_sessions WHERE identity_key = ?1 AND fingerprint_is_final = 0
-                     GROUP BY identity_key HAVING COUNT(*) = 1",
-                    [identity],
-                    |row| row.get(0),
-                )
-                .optional()?,
+            None => {
+                let mut statement = transaction.prepare(
+                    "SELECT d.session_key, s.session_json
+                     FROM durable_sessions d JOIN session_snapshots s
+                       ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+                     WHERE d.identity_key = ?1 AND d.fingerprint_is_final = 0",
+                )?;
+                let candidates = statement
+                    .query_map([identity], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(statement);
+                if let [(key, raw)] = candidates.as_slice() {
+                    let stored: Session = serde_json::from_slice(raw).with_context(|| {
+                        format!("corrupt provisional durable session snapshot for {key}")
+                    })?;
+                    provisional_metadata_matches(incoming, &stored).then_some(key.clone())
+                } else {
+                    None
+                }
+            }
         };
         if let Some(key) = provisional {
             transaction.execute(
@@ -616,6 +632,10 @@ fn store_snapshot(
         "UPDATE durable_sessions SET current_snapshot_version = ?2, current_snapshot_hash = ?3 WHERE session_key = ?1",
         params![key, next_version, snapshot_hash],
     )?;
+    transaction.execute(
+        "DELETE FROM session_snapshots WHERE session_key = ?1 AND version <> ?2",
+        params![key, next_version],
+    )?;
     Ok(true)
 }
 
@@ -643,7 +663,7 @@ fn store_token_events(
         |row| row.get(0),
     )?;
     if missing_request_evidence > 0 {
-        let mut update = transaction.prepare_cached(
+        let mut update = transaction.prepare(
             "UPDATE durable_token_events SET request_input_tokens = ?3
              WHERE session_key = ?1 AND event_key = ?2 AND request_input_tokens IS NULL",
         )?;
@@ -662,7 +682,7 @@ fn store_token_events(
     // Histories are append-only within one reconciled lineage, so only the
     // new suffix needs insertion. Preparing once also avoids reparsing the
     // statement for each new event.
-    let mut statement = transaction.prepare_cached(
+    let mut statement = transaction.prepare(
         "INSERT INTO durable_token_events(
            session_key, event_key, event_index, timestamp_ms, model, service_tier, request_input_tokens,
            cumulative_total_tokens, input_tokens, cached_input_tokens, output_tokens,
@@ -813,6 +833,34 @@ fn histories_share_lineage(left: &[TokenHistoryPoint], right: &[TokenHistoryPoin
     left.iter()
         .zip(right)
         .all(|(left, right)| token_event_signature(left) == token_event_signature(right))
+}
+
+fn provisional_metadata_matches(incoming: &Session, stored: &Session) -> bool {
+    if incoming.harness != stored.harness || incoming.started_at != stored.started_at {
+        return false;
+    }
+    if !optional_metadata_matches(&incoming.parent_thread_id, &stored.parent_thread_id)
+        || !optional_metadata_matches(&incoming.forked_from_id, &stored.forked_from_id)
+        || !optional_metadata_matches(&incoming.agent_path, &stored.agent_path)
+        || !optional_metadata_matches(&incoming.first_user_message, &stored.first_user_message)
+    {
+        return false;
+    }
+    match (incoming.turns.first(), stored.turns.first()) {
+        (Some(incoming), Some(stored)) => {
+            incoming.turn_id == stored.turn_id
+                && optional_metadata_matches(&incoming.started_at, &stored.started_at)
+                && optional_metadata_matches(&incoming.user_message, &stored.user_message)
+        }
+        _ => true,
+    }
+}
+
+fn optional_metadata_matches<T: PartialEq>(left: &Option<T>, right: &Option<T>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 fn history_lineage(session: &Session) -> String {
@@ -1261,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn appended_snapshot_adds_only_the_new_normalized_event() {
+    fn appended_snapshot_replaces_the_previous_materialization() {
         let (_directory, store) = store();
         let generation = store.begin_scan().unwrap();
         store
@@ -1295,7 +1343,70 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(snapshot_count, 2);
+        assert_eq!(snapshot_count, 1);
+        let current_version: i64 = connection
+            .query_row(
+                "SELECT current_snapshot_version FROM durable_sessions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(current_version, 2);
+        drop(connection);
+        assert_eq!(
+            store.load_sessions().unwrap()[0]
+                .session
+                .tokens_history
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn moved_provisional_session_requires_matching_start_metadata() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let mut provisional = session("reused-provider-id", 10);
+        provisional.tokens_history.clear();
+        provisional.tokens_total = TokenTotals::default();
+        provisional.last_event_at = provisional.started_at;
+
+        let original = store
+            .observe(Path::new("old-location.jsonl"), &provisional, generation)
+            .unwrap();
+        let mut reused = session("reused-provider-id", 20);
+        reused.started_at = timestamp("2026-02-01T00:00:00Z");
+        let replacement = store
+            .observe(Path::new("new-location.jsonl"), &reused, generation)
+            .unwrap();
+
+        assert_ne!(original.key, replacement.key);
+        assert_eq!(store.load_sessions().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn moved_provisional_session_finalizes_when_start_metadata_matches() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let mut provisional = session("moved-provider-id", 10);
+        provisional.tokens_history.clear();
+        provisional.tokens_total = TokenTotals::default();
+        provisional.last_event_at = provisional.started_at;
+
+        let original = store
+            .observe(Path::new("old-location.jsonl"), &provisional, generation)
+            .unwrap();
+        let finalized = store
+            .observe(
+                Path::new("new-location.jsonl"),
+                &session("moved-provider-id", 10),
+                generation,
+            )
+            .unwrap();
+
+        assert_eq!(original.key, finalized.key);
+        assert_eq!(store.load_sessions().unwrap().len(), 1);
+        assert_eq!(finalized.locations.len(), 2);
     }
 
     #[test]

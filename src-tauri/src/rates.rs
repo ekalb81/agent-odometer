@@ -640,6 +640,7 @@ mod tests {
             )
             .expect("introductory period");
         assert_eq!(introductory.rate.input, 2.0);
+        assert_eq!(introductory.cache_write_input_multiplier, Some(1.25));
 
         let standard = card
             .pricing_catalog
@@ -653,6 +654,7 @@ mod tests {
         assert_eq!(standard.rate.cached_input, 0.3);
         assert_eq!(standard.rate.output, 15.0);
         assert_eq!(standard.rate.reasoning, 15.0);
+        assert_eq!(standard.cache_write_input_multiplier, Some(1.25));
     }
 
     #[test]

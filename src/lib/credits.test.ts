@@ -139,6 +139,7 @@ describe('time-aware API pricing scenarios', () => {
             id: 'anthropic/claude-sonnet-5/intro', surface: 'anthropic_api_usd', model: 'claude-sonnet-5',
             from: '2026-01-01T00:00:00Z', to: '2026-09-01T00:00:00Z',
             rate: { input: 2, cached_input: 0.2, output: 10, reasoning: 10 },
+            cache_write_input_multiplier: 1.25,
             provenance: { evidence: 'test', source_url: 'https://example.test/sonnet', verified_at: '2026-07-27T00:00:00Z', note: null },
             label: 'introductory',
           },
@@ -146,6 +147,7 @@ describe('time-aware API pricing scenarios', () => {
             id: 'anthropic/claude-sonnet-5/standard', surface: 'anthropic_api_usd', model: 'claude-sonnet-5',
             from: '2026-09-01T00:00:00Z', to: null,
             rate: { input: 3, cached_input: 0.3, output: 15, reasoning: 15 },
+            cache_write_input_multiplier: 1.25,
             provenance: { evidence: 'test', source_url: 'https://example.test/sonnet', verified_at: '2026-07-27T00:00:00Z', note: null },
             label: 'standard',
           },
@@ -163,5 +165,7 @@ describe('time-aware API pricing scenarios', () => {
       'anthropic/claude-sonnet-5/intro',
       'anthropic/claude-sonnet-5/standard',
     ]);
+    expect(result.timeAware?.cacheWritePricingUnmodeled).toBe(true);
+    expect(result.timeAware?.unobservedCacheWriteInputMultipliers).toEqual([1.25]);
   });
 });
