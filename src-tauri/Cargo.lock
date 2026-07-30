@@ -18,6 +18,7 @@ dependencies = [
  "dashmap",
  "dirs",
  "gix",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "rayon",
@@ -31,10 +32,12 @@ dependencies = [
  "tauri-plugin-process",
  "tauri-plugin-updater",
  "tempfile",
+ "toml_edit 0.25.11+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "walkdir",
  "windows-sys 0.61.2",
+ "xattr",
 ]
 
 [[package]]
@@ -5328,6 +5331,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 

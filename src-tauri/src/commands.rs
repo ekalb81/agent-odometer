@@ -622,7 +622,9 @@ pub fn get_config(state: State<'_, Arc<AppState>>) -> Result<Config, String> {
 /// exposing transcript contents or arbitrary configuration data.
 #[tauri::command]
 pub fn get_turn_receipt_status(
+    state: State<'_, Arc<AppState>>,
 ) -> Result<crate::harness_integration::TurnReceiptIntegrationStatus, String> {
+    let _transition = state.config_transition.lock().unwrap();
     let config = Config::load().map_err(|error| error.to_string())?;
     Ok(crate::harness_integration::status(&config))
 }
@@ -632,11 +634,13 @@ pub fn get_turn_receipt_status(
 /// writes harness configuration merely because the app was opened.
 #[tauri::command]
 pub fn repair_turn_receipt_integrations(
+    state: State<'_, Arc<AppState>>,
 ) -> Result<crate::harness_integration::TurnReceiptIntegrationStatus, String> {
+    let _transition = state.config_transition.lock().unwrap();
     let config = Config::load().map_err(|error| error.to_string())?;
     let transaction =
         crate::harness_integration::sync(&config).map_err(|error| error.to_string())?;
-    transaction.commit();
+    transaction.commit().map_err(|error| error.to_string())?;
     Ok(crate::harness_integration::status(&config))
 }
 
@@ -679,7 +683,16 @@ pub fn set_config(
             .then(|| crate::harness_integration::sync(&config))
             .transpose()
             .map_err(|error| error.to_string())?;
-        config.save().map_err(|e| e.to_string())?;
+        if let Err(error) = config.save() {
+            let error = error.to_string();
+            if let Some(transaction) = integration {
+                return match transaction.abort() {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(format!("{error}; {rollback}")),
+                };
+            }
+            return Err(error);
+        }
         if instruction_sources_changed {
             state.cancel_instruction_scan_and_clear_paths();
             let previous_watcher = state
@@ -690,7 +703,7 @@ pub fn set_config(
             drop(previous_watcher);
         }
         if let Some(transaction) = integration {
-            transaction.commit();
+            transaction.commit().map_err(|error| error.to_string())?;
         }
         state.performance.configure(
             config.performance_tracking_enabled,
@@ -729,10 +742,19 @@ pub fn set_config(
         .then(|| crate::harness_integration::sync(&config))
         .transpose()
         .map_err(|error| error.to_string())?;
-    config.save().map_err(|e| e.to_string())?;
+    if let Err(error) = config.save() {
+        let error = error.to_string();
+        if let Some(transaction) = integration {
+            return match transaction.abort() {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(format!("{error}; {rollback}")),
+            };
+        }
+        return Err(error);
+    }
     state.cancel_instruction_scan_and_clear_paths();
     if let Some(transaction) = integration {
-        transaction.commit();
+        transaction.commit().map_err(|error| error.to_string())?;
     }
     state.performance.configure(
         config.performance_tracking_enabled,

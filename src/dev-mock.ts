@@ -11,6 +11,7 @@ import type {
   SessionSummary,
   TierBucket,
   TokenTotals,
+  TurnReceiptIntegrationStatus,
   TurnInfo,
   ToolMetrics,
 } from './lib/types';
@@ -330,6 +331,43 @@ function scanStatus() {
   return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240 };
 }
 
+function turnReceiptStatus(): TurnReceiptIntegrationStatus {
+  return {
+    enabled: false,
+    executable_path: '/opt/odometer/odometer',
+    codex: {
+      requested: false,
+      configured: false,
+      receipt_observed: false,
+      config_source: 'codex_hooks_json',
+      config_path: '/home/dev/.codex/hooks.json',
+      diagnostic_code: 'hook_not_requested',
+      detail: 'Off. Harness configuration is unchanged.',
+      restart_recommended: false,
+      trust_review_recommended: false,
+      last_run_at: null,
+      last_run_success: null,
+      last_receipt: null,
+      last_run_detail: null,
+    },
+    claude_code: {
+      requested: false,
+      configured: false,
+      receipt_observed: false,
+      config_source: 'claude_settings_json',
+      config_path: '/home/dev/.claude/settings.json',
+      diagnostic_code: 'hook_not_requested',
+      detail: 'Off. Harness configuration is unchanged.',
+      restart_recommended: false,
+      trust_review_recommended: false,
+      last_run_at: null,
+      last_run_success: null,
+      last_receipt: null,
+      last_run_detail: null,
+    },
+  };
+}
+
 function emptyInstructionInventory() {
   return {
     files: [],
@@ -422,6 +460,9 @@ mockIPC((cmd, payload) => {
       return scanStatus();
     case 'get_performance_status':
       return { enabled: false, max_log_mb: 64, stored_bytes: 0, recorded_this_run: 0, dropped_this_run: 0 };
+    case 'get_turn_receipt_status':
+    case 'repair_turn_receipt_integrations':
+      return turnReceiptStatus();
     case 'get_config':
       return {
         session_roots: ['/home/dev/.codex/sessions'],
