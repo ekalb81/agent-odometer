@@ -39,7 +39,7 @@
   <div class="mt-2 flex items-center gap-2">
     <button class="px-3 py-1.5 rounded-md border border-edge bg-panel hover:bg-app text-xs disabled:opacity-50" disabled={busy} onclick={scan}>{busy ? 'Scanning…' : 'Evaluate local repositories'}</button>
     <label class="text-[11px] text-ink-muted">Post-session window
-      <input class="ml-1 w-16 rounded border border-edge bg-app px-1.5 py-1 font-mono" type="number" min="0" max="8760" step="1" bind:value={postWindowHours} disabled={busy} /> h
+      <input class="ml-1 w-16 rounded-sm border border-edge bg-app px-1.5 py-1 font-mono" type="number" min="0" max="8760" step="1" bind:value={postWindowHours} disabled={busy} /> h
     </label>
     <span class="text-[11px] text-ink-faint">HEAD-reachable commits · no remotes or worktree changes</span>
   </div>
@@ -47,7 +47,7 @@
   {#if outcomes.length > 0}
     <div class="grid grid-cols-5 gap-2 mt-2">
       {#each kinds as kind}
-        <div class="border border-edgerow rounded px-2 py-1 text-[11px]"><span class="text-ink-muted">{kind.replace('_', ' ')}</span><div class="font-mono font-semibold">{outcomes.filter((outcome) => outcome.kind === kind).length}</div></div>
+        <div class="border border-edgerow rounded-sm px-2 py-1 text-[11px]"><span class="text-ink-muted">{kind.replace('_', ' ')}</span><div class="font-mono font-semibold">{outcomes.filter((outcome) => outcome.kind === kind).length}</div></div>
       {/each}
     </div>
     <details class="mt-2"><summary class="text-[11px] cursor-pointer text-ink-muted">Session evidence</summary>

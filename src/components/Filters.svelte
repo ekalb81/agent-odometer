@@ -137,7 +137,7 @@
       placeholder="Search sessions"
       value={localSearch}
       oninput={handleSearchInput}
-      class="w-[220px] pl-8 pr-3 py-1.5 text-xs bg-app border border-edge rounded-lg text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-accent focus:border-accent"
+      class="w-[220px] pl-8 pr-3 py-1.5 text-xs bg-app border border-edge rounded-lg text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-accent focus:border-accent"
       aria-label="Search sessions"
     />
   </div>
@@ -178,7 +178,7 @@
               type="datetime-local"
               value={filters.dateFrom}
               onchange={(e) => emit({ dateFrom: (e.target as HTMLInputElement).value })}
-              class="py-1 px-2 text-xs bg-app border border-edge rounded-lg text-ink focus:outline-none focus:ring-1 focus:ring-accent"
+              class="py-1 px-2 text-xs bg-app border border-edge rounded-lg text-ink focus:outline-hidden focus:ring-1 focus:ring-accent"
               aria-label="Start datetime from"
             />
           </label>
@@ -188,7 +188,7 @@
               type="datetime-local"
               value={filters.dateTo}
               onchange={(e) => emit({ dateTo: (e.target as HTMLInputElement).value })}
-              class="py-1 px-2 text-xs bg-app border border-edge rounded-lg text-ink focus:outline-none focus:ring-1 focus:ring-accent"
+              class="py-1 px-2 text-xs bg-app border border-edge rounded-lg text-ink focus:outline-hidden focus:ring-1 focus:ring-accent"
               aria-label="Start datetime to"
             />
           </label>
@@ -219,7 +219,7 @@
           <select
             value={filters.model}
             onchange={(e) => emit({ model: (e.target as HTMLSelectElement).value })}
-            class="py-1.5 px-2 text-xs bg-app border border-edge rounded-lg text-ink font-mono focus:outline-none focus:ring-1 focus:ring-accent"
+            class="py-1.5 px-2 text-xs bg-app border border-edge rounded-lg text-ink font-mono focus:outline-hidden focus:ring-1 focus:ring-accent"
             aria-label="Filter by model"
           >
             <option value="">All models</option>
@@ -242,7 +242,7 @@
                 emit({ showActive: next });
               }}
               disabled={filters.showActive && !filters.showArchived}
-              class="accent-[var(--accent)]"
+              class="accent-(--accent)"
               aria-label="Show active sessions"
             />
             Active
@@ -257,7 +257,7 @@
                 emit({ showArchived: next });
               }}
               disabled={filters.showArchived && !filters.showActive}
-              class="accent-[var(--accent)]"
+              class="accent-(--accent)"
               aria-label="Show archived sessions"
             />
             Archived
@@ -267,7 +267,7 @@
               type="checkbox"
               checked={filters.showSubagents}
               onchange={(e) => emit({ showSubagents: (e.target as HTMLInputElement).checked })}
-              class="accent-[var(--accent)]"
+              class="accent-(--accent)"
               aria-label="Show subagent tasks"
             />
             Subagents

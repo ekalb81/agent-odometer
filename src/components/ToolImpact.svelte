@@ -160,7 +160,7 @@
       <label class="flex flex-wrap items-center gap-2 text-[11px] text-ink-muted">
         <span class="font-semibold text-ink">Compare</span>
         <select
-          class="min-w-0 max-w-full rounded border border-edge bg-surface px-2 py-1 text-xs text-ink"
+          class="min-w-0 max-w-full rounded-sm border border-edge bg-surface px-2 py-1 text-xs text-ink"
           bind:value={selectedTargetId}
           aria-label="Tool impact target"
         >

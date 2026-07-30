@@ -275,13 +275,13 @@
             type="button"
             onclick={() => void cancelScan()}
             disabled={cancelRequested}
-            class="ml-auto px-2.5 py-1 text-xs rounded border border-edge bg-card hover:bg-[var(--row-hover)] disabled:opacity-40"
+            class="ml-auto px-2.5 py-1 text-xs rounded-sm border border-edge bg-card hover:bg-(--row-hover) disabled:opacity-40"
           >{cancelRequested ? 'Cancelling…' : 'Cancel'}</button>
         {:else}
           <button
             type="button"
             onclick={() => void refresh()}
-            class="ml-auto px-2.5 py-1 text-xs rounded border border-edge bg-card hover:bg-[var(--row-hover)]"
+            class="ml-auto px-2.5 py-1 text-xs rounded-sm border border-edge bg-card hover:bg-(--row-hover)"
           >Refresh</button>
         {/if}
         <button
@@ -302,12 +302,12 @@
         type="search"
         bind:value={query}
         placeholder="Filter paths…"
-        class="w-full bg-app border border-edge rounded px-2.5 py-1.5 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+        class="w-full bg-app border border-edge rounded-sm px-2.5 py-1.5 text-xs text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent)"
       />
       <div class="flex items-center gap-2">
         <select
           bind:value={harnessFilter}
-          class="bg-app border border-edge rounded px-2 py-1 text-xs text-ink"
+          class="bg-app border border-edge rounded-sm px-2 py-1 text-xs text-ink"
           aria-label="Filter by harness"
         >
           <option value="all">All harnesses</option>
@@ -343,16 +343,16 @@
             <button
               type="button"
               onclick={() => (selectedId = file.id)}
-              class="w-full flex items-start gap-2 pr-3 py-2 text-left border-b border-edgerow hover:bg-[var(--row-hover)] {selectedId === file.id ? 'bg-[var(--row-selected)]' : ''}"
+              class="w-full flex items-start gap-2 pr-3 py-2 text-left border-b border-edgerow hover:bg-(--row-hover) {selectedId === file.id ? 'bg-(--row-selected)' : ''}"
               style={`padding-left: ${10 + Math.min(6, hierarchyDepth(file)) * 14}px`}
               title={file.path}
             >
-              <span class="mt-[5px] w-1.5 h-1.5 rounded-full flex-shrink-0 {file.file_name === 'AGENTS.md' ? 'bg-[#2b58c9]' : 'bg-[#e8935a]'}"></span>
+              <span class="mt-[5px] w-1.5 h-1.5 rounded-full shrink-0 {file.file_name === 'AGENTS.md' ? 'bg-[#2b58c9]' : 'bg-[#e8935a]'}"></span>
               <span class="min-w-0 flex-1">
                 <span class="flex items-center gap-1.5">
                   <span class="font-mono text-xs text-ink">{file.file_name}</span>
                   {#if file.warnings.length > 0}
-                    <span class="px-1 rounded bg-amber-500/15 text-amber-500 text-[10px]">{file.warnings.length}</span>
+                    <span class="px-1 rounded-sm bg-amber-500/15 text-amber-500 text-[10px]">{file.warnings.length}</span>
                   {/if}
                 </span>
                 <span class="block text-[10px] font-mono text-ink-faint truncate">{file.relative_path}</span>
@@ -372,15 +372,15 @@
             <div class="flex items-center gap-2 flex-wrap">
               <h2 class="font-mono text-sm font-semibold text-ink">{selected.file_name}</h2>
               {#each selected.harnesses as harness}
-                <span class="px-1.5 py-0.5 rounded bg-chip text-[10px] text-ink-muted">{harnessLabel(harness)}</span>
+                <span class="px-1.5 py-0.5 rounded-sm bg-chip text-[10px] text-ink-muted">{harnessLabel(harness)}</span>
               {/each}
-              <span class="px-1.5 py-0.5 rounded bg-chip text-[10px] text-ink-muted">{selected.root_source}</span>
+              <span class="px-1.5 py-0.5 rounded-sm bg-chip text-[10px] text-ink-muted">{selected.root_source}</span>
             </div>
             <p class="mt-1 font-mono text-[11px] text-ink-faint break-all">{selected.path}</p>
           </div>
-          <div class="ml-auto flex items-center gap-2 flex-shrink-0">
-            <button onclick={() => void revealSelected()} class="px-2.5 py-1 text-xs rounded border border-edge bg-card hover:bg-[var(--row-hover)]">Reveal</button>
-            <button onclick={() => void openSelected()} class="px-2.5 py-1 text-xs rounded bg-accent-tab text-white hover:opacity-90">Open</button>
+          <div class="ml-auto flex items-center gap-2 shrink-0">
+            <button onclick={() => void revealSelected()} class="px-2.5 py-1 text-xs rounded-sm border border-edge bg-card hover:bg-(--row-hover)">Reveal</button>
+            <button onclick={() => void openSelected()} class="px-2.5 py-1 text-xs rounded-sm bg-accent-tab text-white hover:opacity-90">Open</button>
           </div>
         </div>
         <div class="mt-2 flex items-center gap-3 text-[10px] text-ink-faint flex-wrap">
@@ -441,14 +441,14 @@
         <section class="border border-edge rounded-lg bg-card overflow-hidden">
           <div class="flex items-center gap-2 px-3 py-2 border-b border-edge">
             <h3 class="text-xs font-semibold text-ink">Content</h3>
-            <div class="ml-auto flex bg-app rounded p-[2px] border border-edge">
+            <div class="ml-auto flex bg-app rounded-sm p-[2px] border border-edge">
               <button
                 onclick={() => (previewMode = 'preview')}
-                class="px-2.5 py-0.5 rounded text-[11px] {previewMode === 'preview' ? 'bg-ink text-app font-semibold' : 'text-ink-muted'}"
+                class="px-2.5 py-0.5 rounded-sm text-[11px] {previewMode === 'preview' ? 'bg-ink text-app font-semibold' : 'text-ink-muted'}"
               >Preview</button>
               <button
                 onclick={() => (previewMode = 'raw')}
-                class="px-2.5 py-0.5 rounded text-[11px] {previewMode === 'raw' ? 'bg-ink text-app font-semibold' : 'text-ink-muted'}"
+                class="px-2.5 py-0.5 rounded-sm text-[11px] {previewMode === 'raw' ? 'bg-ink text-app font-semibold' : 'text-ink-muted'}"
               >Raw</button>
             </div>
           </div>
@@ -459,7 +459,7 @@
           {:else if content !== null && previewMode === 'preview'}
             <article class="markdown-preview p-5 text-sm text-ink">{@html renderedMarkdown}</article>
           {:else if content !== null}
-            <pre class="p-4 overflow-x-auto whitespace-pre-wrap break-words text-xs leading-5 font-mono text-ink-2">{content}</pre>
+            <pre class="p-4 overflow-x-auto whitespace-pre-wrap wrap-break-word text-xs leading-5 font-mono text-ink-2">{content}</pre>
           {/if}
         </section>
       </div>

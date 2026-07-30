@@ -59,7 +59,7 @@
     <div class="truncate px-2 py-1.5 font-semibold" title={sessionName}>{sessionName}</div>
     {#if descendantCount > 0}
       <button
-        class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left hover:bg-[var(--row-hover)] disabled:opacity-50"
+        class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left hover:bg-(--row-hover) disabled:opacity-50"
         role="menuitemcheckbox"
         aria-checked={includeDescendants}
         disabled={busy}
@@ -71,13 +71,13 @@
       <div class="my-1 border-t border-edge"></div>
     {/if}
     <button
-      class="w-full rounded px-2 py-1.5 text-left hover:bg-[var(--row-hover)] disabled:opacity-50"
+      class="w-full rounded-sm px-2 py-1.5 text-left hover:bg-(--row-hover) disabled:opacity-50"
       role="menuitem"
       disabled={busy}
       onclick={() => onexport('json')}
     >Export as JSON</button>
     <button
-      class="w-full rounded px-2 py-1.5 text-left hover:bg-[var(--row-hover)] disabled:opacity-50"
+      class="w-full rounded-sm px-2 py-1.5 text-left hover:bg-(--row-hover) disabled:opacity-50"
       role="menuitem"
       disabled={busy}
       onclick={() => onexport('csv')}

@@ -1,6 +1,63 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss';
+
+@theme inline {
+  --color-app: var(--bg);
+  --color-chrome: var(--chrome);
+  --color-panel: var(--panel);
+  --color-card: var(--card);
+  --color-edge: var(--border);
+  --color-edgerow: var(--row-border);
+  --color-track: var(--track);
+  --color-tablebg: var(--table);
+
+  --color-ink-2: var(--text-2);
+  --color-ink: var(--text);
+  --color-ink-muted: var(--muted);
+  --color-ink-faint: var(--faint);
+
+  --color-accent: var(--accent);
+  --color-accent-dim: var(--accent-dim);
+  --color-accent-tab: var(--accent-tab);
+  --color-accent-cost: var(--accent-cost);
+  --color-accent-chipbg: var(--accent-chip-bg);
+  --color-accent-chipfg: var(--accent-chip-fg);
+  --color-accent-rowbg: var(--accent-row-bg);
+
+  --color-pos: var(--positive);
+
+  --font-sans: Spline Sans, system-ui, -apple-system, Segoe UI, sans-serif;
+  --font-mono: Spline Sans Mono, ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Keep v3's absolute leading so nested arbitrary text sizes inherit the
+     same line boxes instead of v4's proportional leading. */
+  --text-xs--line-height: 1rem;
+  --text-sm--line-height: 1.25rem;
+  --text-base--line-height: 1.5rem;
+  --text-xl--line-height: 1.75rem;
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: #e5e7eb;
+  }
+
+  button:not(:disabled),
+  [role='button']:not(:disabled) {
+    cursor: pointer;
+  }
+}
 
 /* Spline Sans / Spline Sans Mono — bundled variable fonts (latin, OFL). */
 @font-face {
@@ -20,7 +77,8 @@
 
 /* ---------------------------------------------------------------------------
    "Instrument Ledger" design tokens. Semantic names are mapped to Tailwind
-   colors in tailwind.config.js; [data-theme] on <html> flips the theme.
+   colors in the inline Tailwind theme above; [data-theme] on <html> flips the
+   runtime theme without rebuilding utilities.
    --------------------------------------------------------------------------- */
 :root,
 :root[data-theme='dark'] {

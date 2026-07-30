@@ -1280,7 +1280,7 @@
 
 <div class="flex flex-col h-full overflow-hidden">
   <!-- Analytics band -->
-  <div class="grid gap-3.5 p-4 flex-shrink-0" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
+  <div class="grid gap-3.5 p-4 shrink-0" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
     <!-- Spend card -->
     <div class="bg-card border border-edge rounded-xl px-5 pt-4 pb-3 min-w-0">
       <div class="flex items-baseline gap-3">
@@ -1506,7 +1506,7 @@
             {#each findingSessions as item (item.session.storage_id)}
               <button
                 type="button"
-                class="flex items-center justify-between gap-3 rounded px-2 py-2 text-left text-xs hover:bg-[var(--row-hover)] transition-colors"
+                class="flex items-center justify-between gap-3 rounded-sm px-2 py-2 text-left text-xs hover:bg-(--row-hover) transition-colors"
                 onclick={() => reviewFindingSession(item.session.storage_id)}
                 aria-label={`Review optimization evidence for ${sessionName(item.session)}`}
               >
@@ -1516,7 +1516,7 @@
                     {Object.entries(item.summary.by_rule).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([rule, count]) => `${findingRuleTitle(rule)} ${count}`).join(' · ') || 'Detailed evidence available'}
                   </span>
                 </span>
-                <span class="flex flex-shrink-0 items-center gap-2 text-[10px]">
+                <span class="flex shrink-0 items-center gap-2 text-[10px]">
                   {#if item.summary.warnings > 0}<span class="text-amber-500">{item.summary.warnings} warning{item.summary.warnings === 1 ? '' : 's'}</span>{/if}
                   {#if item.summary.likely_avoidable_calls > 0}<span class="text-accent">~{fmt.format(item.summary.likely_avoidable_calls)} calls</span>{/if}
                   <span class="text-ink-muted">{item.summary.findings} signal{item.summary.findings === 1 ? '' : 's'} ›</span>
@@ -1613,7 +1613,7 @@
                          ? 'bg-accent-rowbg shadow-[inset_2px_0_0_var(--accent)]'
                          : isPulsing(session.lastUpdatedAt)
                            ? 'bg-accent-rowbg animate-pulse'
-                           : 'hover:bg-[var(--row-hover)]'}"
+                           : 'hover:bg-(--row-hover)'}"
                 style={`${gridCols}${sessionGridStore.colorByModelProvider ? `; background-image: linear-gradient(90deg, ${providerVisual.tint}, transparent 24%)` : ''}`}
                 data-model-provider={providerVisual.key}
                 onclick={() => selectSession(session.storage_id)}
@@ -1624,11 +1624,11 @@
               >
                 {#each visibleColumns as column (column.id)}
                   {#if column.id === 'name'}
-                    <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-[var(--row-name)]'}" title={name}>
+                    <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-(--row-name)'}" title={name}>
                       {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.storage_id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
-                      {#if sub}<span class="text-[var(--subagent-chip-fg)] font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
-                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)] ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap" title="The saved transcript source is currently unavailable">source missing</span>{/if}
-                      {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)] ml-1 whitespace-nowrap">archived</span>{/if}
+                      {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
+                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap" title="The saved transcript source is currently unavailable">source missing</span>{/if}
+                      {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg) ml-1 whitespace-nowrap">archived</span>{/if}
                       {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{session.harness === 'codex' ? 'Codex' : 'Claude'}</span>{/if}
                     </span>
                   {:else if column.id === 'started'}
@@ -1637,7 +1637,7 @@
                     <span class="text-ink-muted text-xs truncate" title={session.working_directory ? 'Recorded project folder' : 'No repository recorded for this session'}>{repositoryLabel(session) ?? 'No repository recorded'}</span>
                   {:else if column.id === 'model'}
                     <span class="text-ink-muted font-mono text-xs truncate flex items-center gap-1.5" title={`${session.model ?? 'Unknown model'} · ${providerVisual.label}`}>
-                      {#if sessionGridStore.colorByModelProvider}<span class="inline-block size-2 rounded-full flex-shrink-0" style:background-color={providerVisual.tint} aria-hidden="true"></span>{/if}
+                      {#if sessionGridStore.colorByModelProvider}<span class="inline-block size-2 rounded-full shrink-0" style:background-color={providerVisual.tint} aria-hidden="true"></span>{/if}
                       <span class="truncate">{session.model ?? '—'}</span>
                     </span>
                   {:else if column.id === 'input'}
@@ -1678,7 +1678,7 @@
 
     <!-- Persistent detail pane (wide layouts) -->
     {#if isWide}
-      <div class="w-[410px] flex-shrink-0 min-h-0">
+      <div class="w-[410px] shrink-0 min-h-0">
         <DetailPane
           session={selectedSession}
           childCount={selectedSessionId ? (childCounts.get(selectedSessionId) ?? 0) : 0}
