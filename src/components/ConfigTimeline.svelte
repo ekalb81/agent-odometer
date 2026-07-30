@@ -105,7 +105,7 @@
             {@const usage = readyUsageContext(correlation)}
             <div class="text-ink-2">Observed samples · {countContext(correlation)}</div>
             {#if !correlation.after_window_complete}
-              <div class="mt-1 rounded border border-edge bg-panel px-2 py-1 text-ink-muted">{collectingContext(correlation)} Comparisons use seven full days on each side.</div>
+              <div class="mt-1 rounded-sm border border-edge bg-panel px-2 py-1 text-ink-muted">{collectingContext(correlation)} Comparisons use seven full days on each side.</div>
             {/if}
             {#if comparisonReady(correlation)}
               <div class="text-ink-2">Tokens {correlation.token_delta >= 0 ? '+' : ''}{correlation.token_delta.toLocaleString()} · sessions {correlation.session_delta >= 0 ? '+' : ''}{correlation.session_delta} · {costs(correlation)}</div>

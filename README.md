@@ -45,6 +45,8 @@ Download the installer for your platform from the [latest release](https://githu
 
 Odometer checks for new releases on launch (and periodically while running) and offers a one-click in-place update.
 
+The UI follows Tailwind 4's browser floor: Chrome, Edge, and WebView2 111+, Safari and WKWebView 16.4+, or Firefox 128+. Linux packages likewise require a current WebKitGTK system webview with equivalent CSS support. Older embedded webviews are unsupported, so keep the operating system webview current.
+
 ### First run
 
 If Codex or Claude Code is installed with default paths, there is nothing to configure — Odometer finds your sessions automatically:

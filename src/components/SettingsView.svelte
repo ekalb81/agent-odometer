@@ -646,7 +646,7 @@
         <button
           onclick={() => void updaterStore.install()}
           disabled={updaterStore.phase === 'installing'}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
         >
           {updaterStore.phase === 'installing'
             ? `Downloading v${updaterStore.available.version}…`
@@ -656,7 +656,7 @@
         <button
           onclick={() => void updaterStore.checkNow(true)}
           disabled={updaterStore.phase === 'checking'}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-app hover:bg-[var(--row-hover)] disabled:opacity-40 text-ink transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-app hover:bg-(--row-hover) disabled:opacity-40 text-ink transition-colors"
         >
           {updaterStore.phase === 'checking'
             ? 'Checking…'
@@ -711,14 +711,14 @@
       <button
         onclick={saveRoots}
         disabled={!rootsDirty || rootsSaving}
-        class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
+        class="px-3 py-1.5 text-xs font-medium rounded-sm bg-accent-tab hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
       >
         {rootsSaving ? 'Saving…' : 'Save changes'}
       </button>
       <button
         onclick={resetRoots}
         disabled={!rootsDirty || rootsSaving}
-        class="px-3 py-1.5 text-xs font-medium rounded bg-app hover:bg-[var(--row-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-ink transition-colors"
+        class="px-3 py-1.5 text-xs font-medium rounded-sm bg-app hover:bg-(--row-hover) disabled:opacity-40 disabled:cursor-not-allowed text-ink transition-colors"
       >
         Reset
       </button>
@@ -741,7 +741,7 @@
             <span class="font-mono text-xs text-ink-2 break-all">{root}</span>
             <button
               onclick={() => removeSessionRoot(i)}
-              class="flex-shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-[var(--row-hover)]"
+              class="shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded-sm hover:bg-(--row-hover)"
               aria-label="Remove {root}"
               title="Remove"
             >Remove</button>
@@ -754,11 +754,11 @@
           placeholder="/absolute/path/to/sessions"
           bind:value={newSessionRoot}
           onkeydown={(e) => { if (e.key === 'Enter') addSessionRoot(); }}
-          class="flex-1 bg-app border border-edge rounded px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
+          class="flex-1 bg-app border border-edge rounded-sm px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) font-mono"
         />
         <button
           onclick={addSessionRoot}
-          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
+          class="shrink-0 text-xs px-2 py-0.5 rounded-sm bg-accent-tab hover:opacity-90 text-white transition-colors"
         >Add</button>
       </li>
     </ul>
@@ -774,7 +774,7 @@
             <span class="font-mono text-xs text-ink-2 break-all">{root}</span>
             <button
               onclick={() => removeArchiveRoot(i)}
-              class="flex-shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-[var(--row-hover)]"
+              class="shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded-sm hover:bg-(--row-hover)"
               aria-label="Remove {root}"
               title="Remove"
             >Remove</button>
@@ -787,11 +787,11 @@
           placeholder="/absolute/path/to/archives"
           bind:value={newArchiveRoot}
           onkeydown={(e) => { if (e.key === 'Enter') addArchiveRoot(); }}
-          class="flex-1 bg-app border border-edge rounded px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
+          class="flex-1 bg-app border border-edge rounded-sm px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) font-mono"
         />
         <button
           onclick={addArchiveRoot}
-          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
+          class="shrink-0 text-xs px-2 py-0.5 rounded-sm bg-accent-tab hover:opacity-90 text-white transition-colors"
         >Add</button>
       </li>
     </ul>
@@ -811,7 +811,7 @@
             <span class="font-mono text-xs text-ink-2 break-all">{root}</span>
             <button
               onclick={() => removeClaudeRoot(i)}
-              class="flex-shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded hover:bg-[var(--row-hover)]"
+              class="shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded-sm hover:bg-(--row-hover)"
               aria-label="Remove {root}"
               title="Remove"
             >Remove</button>
@@ -824,11 +824,11 @@
           placeholder="/absolute/path/to/.claude/projects"
           bind:value={newClaudeRoot}
           onkeydown={(e) => { if (e.key === 'Enter') addClaudeRoot(); }}
-          class="flex-1 bg-app border border-edge rounded px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
+          class="flex-1 bg-app border border-edge rounded-sm px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) font-mono"
         />
         <button
           onclick={addClaudeRoot}
-          class="flex-shrink-0 text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
+          class="shrink-0 text-xs px-2 py-0.5 rounded-sm bg-accent-tab hover:opacity-90 text-white transition-colors"
         >Add</button>
       </li>
     </ul>
@@ -844,7 +844,7 @@
       placeholder="/absolute/path/to/session_index.jsonl"
       bind:value={editedIndexPath}
       oninput={markRootsDirty}
-      class="w-full bg-card border border-edge rounded px-3 py-2 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono mb-2"
+      class="w-full bg-card border border-edge rounded-sm px-3 py-2 text-xs text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) font-mono mb-2"
     />
 
     {#if hasDuplicateRoots}
@@ -882,12 +882,12 @@
         <button
           onclick={saveInstructionSettings}
           disabled={!instructionsDirty || instructionsSaving}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
         >{instructionsSaving ? 'Saving…' : 'Save'}</button>
         <button
           onclick={onopeninstructions}
           disabled={!$config.instructions_enabled || !$config.instructions_tab_visible || instructionsDirty}
-          class="px-3 py-1.5 text-xs rounded border border-edge bg-app hover:bg-[var(--row-hover)] disabled:opacity-40"
+          class="px-3 py-1.5 text-xs rounded-sm border border-edge bg-app hover:bg-(--row-hover) disabled:opacity-40"
         >Open Instructions</button>
         {#if instructionsSavedAt && !instructionsDirty}
           <span class="text-xs text-pos">Saved at {instructionsSavedAt}</span>
@@ -913,7 +913,7 @@
             {#each editedInstructionRoots as root, index}
               <li class="flex items-center gap-3 px-3 py-2">
                 <span class="flex-1 min-w-0 font-mono text-xs text-ink-2 break-all">{root.path}</span>
-                <label class="flex items-center gap-1.5 text-[11px] text-ink-muted flex-shrink-0">
+                <label class="flex items-center gap-1.5 text-[11px] text-ink-muted shrink-0">
                   <input
                     type="checkbox"
                     checked={root.recursive}
@@ -935,14 +935,14 @@
               bind:value={newInstructionRoot}
               onkeydown={(event) => { if (event.key === 'Enter') addInstructionRoot(); }}
               placeholder="D:\projects"
-              class="flex-1 min-w-[260px] bg-app border border-edge rounded px-2 py-1 text-xs text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono"
+              class="flex-1 min-w-[260px] bg-app border border-edge rounded-sm px-2 py-1 text-xs text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) font-mono"
             />
             <label class="flex items-center gap-1.5 text-[11px] text-ink-muted">
               <input type="checkbox" bind:checked={newInstructionRootRecursive} /> Include subfolders
             </label>
             <button
               onclick={addInstructionRoot}
-              class="px-2.5 py-1 text-xs rounded bg-accent-tab text-white hover:opacity-90"
+              class="px-2.5 py-1 text-xs rounded-sm bg-accent-tab text-white hover:opacity-90"
             >Add</button>
           </li>
         </ul>
@@ -1006,12 +1006,12 @@
         <button
           onclick={saveTurnReceipts}
           disabled={!turnReceiptsDirty || turnReceiptsSaving}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
         >{turnReceiptsSaving ? 'Saving…' : 'Save setup'}</button>
         <button
           onclick={repairTurnReceipts}
           disabled={turnReceiptsSaving || turnReceiptsDirty}
-          class="px-3 py-1.5 text-xs rounded bg-app border border-edge hover:bg-[var(--row-hover)] disabled:opacity-40"
+          class="px-3 py-1.5 text-xs rounded-sm bg-app border border-edge hover:bg-(--row-hover) disabled:opacity-40"
         >Repair setup</button>
         <button
           onclick={refreshTurnReceiptStatus}
@@ -1099,14 +1099,14 @@
             step="1"
             bind:value={performanceMaxMb}
             oninput={markPerformanceDirty}
-            class="w-20 text-right bg-app border border-edge rounded px-2 py-1 text-ink font-mono"
+            class="w-20 text-right bg-app border border-edge rounded-sm px-2 py-1 text-ink font-mono"
           />
           MiB
         </label>
         <button
           onclick={savePerformanceSettings}
           disabled={!performanceDirty || performanceSaving}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-accent-tab hover:opacity-90 disabled:opacity-40 text-white transition-colors"
         >{performanceSaving ? 'Saving…' : 'Save'}</button>
         {#if performanceSavedAt && !performanceDirty}
           <span class="text-xs text-pos">Saved at {performanceSavedAt}</span>
@@ -1120,12 +1120,12 @@
         <button
           onclick={() => exportPerformance('jsonl')}
           disabled={performanceExporting || (performanceStatus?.stored_bytes ?? 0) === 0}
-          class="px-3 py-1.5 text-xs rounded bg-app border border-edge hover:bg-[var(--row-hover)] disabled:opacity-40"
+          class="px-3 py-1.5 text-xs rounded-sm bg-app border border-edge hover:bg-(--row-hover) disabled:opacity-40"
         >Export JSONL…</button>
         <button
           onclick={() => exportPerformance('csv')}
           disabled={performanceExporting || (performanceStatus?.stored_bytes ?? 0) === 0}
-          class="px-3 py-1.5 text-xs rounded bg-app border border-edge hover:bg-[var(--row-hover)] disabled:opacity-40"
+          class="px-3 py-1.5 text-xs rounded-sm bg-app border border-edge hover:bg-(--row-hover) disabled:opacity-40"
         >Export CSV…</button>
         <button
           onclick={refreshPerformanceStatus}
@@ -1163,7 +1163,7 @@
         <button
           onclick={handleDefenderExclusions}
           disabled={defenderState === 'pending'}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-card border border-edge hover:bg-[var(--row-hover)] text-ink transition-colors disabled:opacity-50"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-card border border-edge hover:bg-(--row-hover) text-ink transition-colors disabled:opacity-50"
         >
           Exclude session folders from Defender…
         </button>
@@ -1205,14 +1205,14 @@
         <button
           onclick={handleSave}
           disabled={!dirty || saving}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-accent-tab hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-accent-tab hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
         >
           {saving ? 'Saving…' : 'Save'}
         </button>
         <button
           onclick={handleReset}
           disabled={saving}
-          class="px-3 py-1.5 text-xs font-medium rounded bg-app hover:bg-[var(--row-hover)] disabled:opacity-40 disabled:cursor-not-allowed text-ink transition-colors"
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-app hover:bg-(--row-hover) disabled:opacity-40 disabled:cursor-not-allowed text-ink transition-colors"
         >
           Reset to shipped defaults
         </button>
@@ -1234,7 +1234,7 @@
           id="fallback-model"
           bind:value={fallbackModel}
           onchange={markDirty}
-          class="bg-card border border-edge rounded px-2 py-1 text-xs text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)]"
+          class="bg-card border border-edge rounded-sm px-2 py-1 text-xs text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent)"
         >
           <option value="">— select —</option>
           {#each rows as row}
@@ -1267,7 +1267,7 @@
                     step="0.001"
                     bind:value={row.input}
                     oninput={markDirty}
-                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -1277,7 +1277,7 @@
                     step="0.001"
                     bind:value={row.cached_input}
                     oninput={markDirty}
-                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -1287,7 +1287,7 @@
                     step="0.001"
                     bind:value={row.output}
                     oninput={markDirty}
-                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -1297,7 +1297,7 @@
                     step="0.001"
                     bind:value={row.reasoning}
                     oninput={markDirty}
-                    class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5 text-center">
@@ -1324,7 +1324,7 @@
                   type="text"
                   placeholder="model-name"
                   bind:value={newName}
-                  class="w-full bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] font-mono text-xs"
+                  class="w-full bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) font-mono text-xs"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -1334,7 +1334,7 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newInput}
-                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -1344,7 +1344,7 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newCachedInput}
-                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -1354,7 +1354,7 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newOutput}
-                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5">
@@ -1364,13 +1364,13 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newReasoning}
-                  class="w-24 text-right bg-app border border-edge rounded px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-none focus:ring-1 focus:ring-[var(--accent)] tabular-nums"
+                  class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                 />
               </td>
               <td class="px-3 py-1.5 text-center">
                 <button
                   onclick={addModel}
-                  class="text-xs px-2 py-0.5 rounded bg-accent-tab hover:opacity-90 text-white transition-colors"
+                  class="text-xs px-2 py-0.5 rounded-sm bg-accent-tab hover:opacity-90 text-white transition-colors"
                 >
                   Add
                 </button>

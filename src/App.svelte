@@ -427,7 +427,7 @@
   function tabFill(view: AppView): string {
     if (view === 'codex') return 'bg-[#2b58c9]';
     if (view === 'claude') return 'bg-[#e8935a]';
-    return 'bg-ink !text-app';
+    return 'bg-ink text-app!';
   }
 </script>
 
@@ -437,7 +437,7 @@
 >
   <!-- Update banner -->
   {#if updaterStore.available}
-    <div class="flex items-center justify-center gap-3 px-4 py-1.5 bg-chrome border-b border-edge text-xs text-ink-2 flex-shrink-0">
+    <div class="flex items-center justify-center gap-3 px-4 py-1.5 bg-chrome border-b border-edge text-xs text-ink-2 shrink-0">
       {#if updaterStore.phase === 'installing'}
         <span>
           Downloading v{updaterStore.available.version}…
@@ -462,10 +462,10 @@
 
   <!-- Defender-exclusion suggestion (Windows, slow scan only) -->
   {#if showDefenderBanner}
-    <div class="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1.5 bg-chrome border-b border-edge text-xs text-ink-2 flex-shrink-0">
+    <div class="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1.5 bg-chrome border-b border-edge text-xs text-ink-2 shrink-0">
       {#if defenderRequested}
         <span>Approve the Windows security prompt to finish adding the exclusions. Takes effect next launch.</span>
-        <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded text-xs text-ink-muted hover:text-ink transition-colors">Done</button>
+        <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded-sm text-xs text-ink-muted hover:text-ink transition-colors">Done</button>
       {:else}
         <span>
           That scan took {Math.round((scanStore.status.elapsed_ms ?? 0) / 1000)}s — antivirus scanning of session files is usually the biggest cost.
@@ -478,7 +478,7 @@
         >
           Add exclusions…
         </button>
-        <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded text-xs text-ink-muted hover:text-ink transition-colors">No thanks</button>
+        <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded-sm text-xs text-ink-muted hover:text-ink transition-colors">No thanks</button>
         {#if defenderError}
           <span class="text-xs text-red-400">{defenderError}</span>
         {/if}
@@ -487,7 +487,7 @@
   {/if}
 
   <!-- Toolbar -->
-  <header class="flex items-center gap-5 px-4 h-12 bg-chrome border-b border-edge flex-shrink-0">
+  <header class="flex items-center gap-5 px-4 h-12 bg-chrome border-b border-edge shrink-0">
     <!-- Gauge-O wordmark. The ring/hub follow the text color; the needle is
          always brand orange (#e8935a). -->
     <span class="font-bold text-[15px] tracking-[-0.015em] leading-none text-ink whitespace-nowrap">
@@ -559,7 +559,7 @@
   </main>
 
   <!-- Status bar -->
-  <footer class="flex items-center gap-4 px-4 h-7 bg-chrome border-t border-edge text-[11px] text-ink-faint flex-shrink-0">
+  <footer class="flex items-center gap-4 px-4 h-7 bg-chrome border-t border-edge text-[11px] text-ink-faint shrink-0">
     {#if !scanStore.status.complete}
       <span class="flex items-center gap-1.5" role="status">
         <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -580,7 +580,7 @@
     {/if}
     {#if instructionScanActive && instructionScanStatus}
       <span class="flex items-center gap-1.5 min-w-0" role="status">
-        <svg class="w-3 h-3 animate-spin flex-shrink-0" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <svg class="w-3 h-3 animate-spin shrink-0" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />
           <path d="M22 12a10 10 0 0 0-10-10" stroke="currentColor" stroke-width="4" stroke-linecap="round" />
         </svg>

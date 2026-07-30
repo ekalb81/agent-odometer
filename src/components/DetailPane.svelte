@@ -219,14 +219,14 @@
     </div>
   {:else}
     <!-- Header -->
-    <div class="px-5 py-4 border-b border-edge flex-shrink-0">
+    <div class="px-5 py-4 border-b border-edge shrink-0">
       <div class="flex items-start justify-between gap-2">
         <div class="font-semibold text-[15px] text-ink min-w-0 truncate" title={session.thread_name ?? session.first_user_message ?? session.id}>
           {session.thread_name ?? session.first_user_message?.slice(0, 60) ?? session.id.slice(0, 8)}
         </div>
         <button
           onclick={onclose}
-          class="flex-shrink-0 p-0.5 rounded text-ink-faint hover:text-ink transition-colors"
+          class="shrink-0 p-0.5 rounded-sm text-ink-faint hover:text-ink transition-colors"
           aria-label="Deselect session"
           title="Deselect (Esc)"
         >
@@ -243,20 +243,20 @@
           aria-label="Copy session ID"
         >{copied ? 'copied ✓' : session.id.slice(0, 18)}</button>
         {#if session.credits_unlimited}
-          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-[var(--positive-chip-bg)] text-pos border border-[var(--positive-chip-border)]">
+          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-(--positive-chip-bg) text-pos border border-(--positive-chip-border)">
             unlimited{#if session.plan_type}&nbsp;· {session.plan_type}{/if}
           </span>
         {/if}
         {#if childCount > 0}
-          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)]">
+          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg)">
             {childCount} {childCount === 1 ? 'subagent' : 'subagents'}
           </span>
         {/if}
         {#if isSubagent}
-          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-[var(--subagent-chip-bg)] text-[var(--subagent-chip-fg)]">subagent</span>
+          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg)">subagent</span>
         {/if}
         {#if session.archived}
-          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)]">archived</span>
+          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg)">archived</span>
         {/if}
         {#if sourceMissing}
           <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-amber-500/10 text-amber-500 border border-amber-500/20">source missing</span>
@@ -274,7 +274,7 @@
     </div>
 
     <!-- 2×2 stat grid -->
-    <div class="grid grid-cols-2 gap-px bg-edge border-b border-edge flex-shrink-0">
+    <div class="grid grid-cols-2 gap-px bg-edge border-b border-edge shrink-0">
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label">Tokens</div>
         <div class="font-mono font-semibold mt-0.5 text-ink">{fmt(session.tokens_total.total_tokens)}</div>
@@ -367,7 +367,7 @@
                   <span class="rounded-full bg-panel px-2 py-0.5 text-ink-muted">{findingGroups.length} pattern{findingGroups.length === 1 ? '' : 's'}</span>
                 </div>
                 {#each findingGroups as group (group.ruleId)}
-                  <details class="rounded border border-edgerow bg-panel px-2 py-1.5">
+                  <details class="rounded-sm border border-edgerow bg-panel px-2 py-1.5">
                     <summary class="cursor-pointer text-[11px]">
                       <span class="font-semibold text-ink">{group.title}</span>
                       <span class="text-ink-muted"> · {group.findings.length}</span>
@@ -379,7 +379,7 @@
                       {#each group.findings as finding (`${finding.rule_id}:${finding.turn_id ?? 'session'}:${finding.evidence}`)}
                         {@const turnIndex = finding.turn_id ? turnIndexById.get(finding.turn_id) : undefined}
                         {@const avoidableCalls = findingAvoidableCalls(finding)}
-                        <div class="rounded border border-edgerow bg-card px-2 py-2 text-[11px]">
+                        <div class="rounded-sm border border-edgerow bg-card px-2 py-2 text-[11px]">
                           <div class="mb-1 flex flex-wrap items-center gap-1.5 text-[10px]">
                             <span class="rounded-full px-1.5 py-px {finding.severity === 'warning' ? 'bg-amber-500/10 text-amber-500' : 'bg-accent-chipbg text-accent-chipfg'}">
                               {finding.severity === 'warning' ? 'Needs attention' : 'Opportunity'}
@@ -414,7 +414,7 @@
               <div id={`turn-${turn.turn_id}`} class="bg-card border border-edge rounded-lg overflow-hidden scroll-mt-3">
                 <button
                   type="button"
-                  class="w-full text-left px-3 py-2 hover:bg-[var(--row-hover)] transition-colors"
+                  class="w-full text-left px-3 py-2 hover:bg-(--row-hover) transition-colors"
                   onclick={() => toggleTurn(turn.turn_id)}
                   aria-expanded={isOpen}
                 >
@@ -430,13 +430,13 @@
                           {turn.status === 'aborted'
                             ? 'bg-amber-500/15 text-amber-500'
                             : turn.status === 'rolled_back'
-                              ? 'bg-[var(--archived-chip-bg)] text-[var(--archived-chip-fg)]'
+                              ? 'bg-(--archived-chip-bg) text-(--archived-chip-fg)'
                               : 'bg-accent-chipbg text-accent-chipfg'}">
                           {turn.status.replace('_', ' ')}
                         </span>
                       {/if}
                     </span>
-                    <span class="flex items-center gap-1.5 flex-shrink-0">
+                    <span class="flex items-center gap-1.5 shrink-0">
                       {#if credit}
                         <span class="font-mono text-pos">{fmtMoney(credit.cost)}</span>
                         {#if credit.unpriced && turn.tokens.total_tokens > 0}
@@ -496,13 +496,13 @@
                     {#if turn.user_message}
                       <div>
                         <div class="text-ink-faint mb-0.5">Prompt</div>
-                        <p class="whitespace-pre-wrap text-ink-2 bg-app rounded px-2 py-1.5">{turn.user_message}</p>
+                        <p class="whitespace-pre-wrap text-ink-2 bg-app rounded-sm px-2 py-1.5">{turn.user_message}</p>
                       </div>
                     {/if}
                     {#if turn.last_agent_message}
                       <div>
                         <div class="text-ink-faint mb-0.5">Final reply</div>
-                        <p class="whitespace-pre-wrap text-ink-2 bg-app rounded px-2 py-1.5">{turn.last_agent_message}</p>
+                        <p class="whitespace-pre-wrap text-ink-2 bg-app rounded-sm px-2 py-1.5">{turn.last_agent_message}</p>
                       </div>
                     {/if}
                   </div>
@@ -626,29 +626,29 @@
           <dl class="space-y-1.5 text-[11px]">
             {#if session.working_directory}
               <div class="flex items-start gap-2">
-                <dt class="text-ink-faint w-20 flex-shrink-0">Workspace</dt>
+                <dt class="text-ink-faint w-20 shrink-0">Workspace</dt>
                 <dd class="font-mono text-ink-2 break-all min-w-0">{session.working_directory}</dd>
-                <button onclick={handleRevealWorkspace} class="flex-shrink-0 text-ink-faint hover:text-ink transition-colors" title="Open in file manager">Reveal</button>
+                <button onclick={handleRevealWorkspace} class="shrink-0 text-ink-faint hover:text-ink transition-colors" title="Open in file manager">Reveal</button>
               </div>
             {/if}
             <div class="flex items-start gap-2">
-              <dt class="text-ink-faint w-20 flex-shrink-0">Transcript</dt>
+              <dt class="text-ink-faint w-20 shrink-0">Transcript</dt>
               <dd class="font-mono text-ink-2 break-all min-w-0">{session.file_path}</dd>
               {#if sourceMissing}
-                <span class="flex-shrink-0 text-amber-500" title="The saved transcript source is currently unavailable">Missing</span>
+                <span class="shrink-0 text-amber-500" title="The saved transcript source is currently unavailable">Missing</span>
               {:else}
-                <button onclick={handleRevealTranscript} class="flex-shrink-0 text-ink-faint hover:text-ink transition-colors" title="Reveal in file manager">Reveal</button>
+                <button onclick={handleRevealTranscript} class="shrink-0 text-ink-faint hover:text-ink transition-colors" title="Reveal in file manager">Reveal</button>
               {/if}
             </div>
             {#if session.agent_path || session.agent_nickname}
               <div class="flex items-start gap-2">
-                <dt class="text-ink-faint w-20 flex-shrink-0">Agent</dt>
+                <dt class="text-ink-faint w-20 shrink-0">Agent</dt>
                 <dd class="text-ink-2">{session.agent_nickname ?? session.agent_path}</dd>
               </div>
             {/if}
             {#if session.model}
               <div class="flex items-start gap-2">
-                <dt class="text-ink-faint w-20 flex-shrink-0">Model</dt>
+                <dt class="text-ink-faint w-20 shrink-0">Model</dt>
                 <dd class="font-mono text-ink-2">
                   {session.model}{#if session.service_tier}&nbsp;· {session.service_tier}{/if}
                   {#if session.model_provider}&nbsp;({session.model_provider}){/if}
@@ -657,13 +657,13 @@
             {/if}
             {#if session.plan_type}
               <div class="flex items-start gap-2">
-                <dt class="text-ink-faint w-20 flex-shrink-0">Plan</dt>
+                <dt class="text-ink-faint w-20 shrink-0">Plan</dt>
                 <dd class="text-ink-2">{session.plan_type}{#if session.credits_balance !== null}&nbsp;· balance {session.credits_balance}{/if}</dd>
               </div>
             {/if}
             {#if session.originator || session.source || session.cli_version}
               <div class="flex items-start gap-2">
-                <dt class="text-ink-faint w-20 flex-shrink-0">Source</dt>
+                <dt class="text-ink-faint w-20 shrink-0">Source</dt>
                 <dd class="text-ink-2">
                   {[session.originator, session.source].filter(Boolean).join(' · ')}
                   {#if session.cli_version}<span class="font-mono">&nbsp;· {session.cli_version}</span>{/if}
@@ -671,16 +671,16 @@
               </div>
             {/if}
             <div class="flex items-start gap-2">
-              <dt class="text-ink-faint w-20 flex-shrink-0">Started</dt>
+              <dt class="text-ink-faint w-20 shrink-0">Started</dt>
               <dd class="text-ink-2">{fmtDatetime(session.started_at)}</dd>
             </div>
             <div class="flex items-start gap-2">
-              <dt class="text-ink-faint w-20 flex-shrink-0">Last event</dt>
+              <dt class="text-ink-faint w-20 shrink-0">Last event</dt>
               <dd class="text-ink-2">{fmtDatetime(session.last_event_at)}</dd>
             </div>
             {#if session.forked_from_id}
               <div class="flex items-start gap-2">
-                <dt class="text-ink-faint w-20 flex-shrink-0">Forked from</dt>
+                <dt class="text-ink-faint w-20 shrink-0">Forked from</dt>
                 <dd class="font-mono text-ink-muted break-all">{session.forked_from_id}</dd>
               </div>
             {/if}
