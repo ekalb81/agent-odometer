@@ -930,7 +930,7 @@ fn latest_project_activity(projects: &[ProjectContext]) -> HashMap<String, DateT
 fn discover_project_root(path: &Path) -> Option<PathBuf> {
     gix::discover(path).ok().map(|repository| {
         repository
-            .work_dir()
+            .workdir()
             .unwrap_or_else(|| repository.git_dir())
             .to_path_buf()
     })

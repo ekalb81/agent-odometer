@@ -35,7 +35,7 @@ struct CommitInfo {
 }
 
 fn repository_scope(repo: &gix::Repository) -> PathBuf {
-    repo.work_dir()
+    repo.workdir()
         .unwrap_or_else(|| repo.git_dir())
         .to_path_buf()
 }
