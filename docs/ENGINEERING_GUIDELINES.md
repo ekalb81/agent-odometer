@@ -215,15 +215,15 @@ For normal code changes, match CI with:
 
 ```text
 npm run check
-npm test
+npm run test:coverage
+npm run check:updater-manifest
 npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-Add `npm run test:coverage`, `npm run check:updater-manifest`, and
-`npm run visual:test` when the affected contracts require them. Run a native
+Add `npm run visual:test` when the affected contracts require it. Run a native
 `npm run tauri dev` smoke test for runtime, IPC, dialog, tray, updater,
 filesystem, or capability changes. Inspect exit codes and test results rather
 than treating a Windows incremental-cleanup warning as an application failure.
