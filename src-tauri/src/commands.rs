@@ -1,4 +1,6 @@
-use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
+#[cfg(windows)]
+use crate::config::DEFENDER_EXCLUSION_RECEIPT_VERSION;
+use crate::config::{Config, DefenderExclusionReceipt};
 use crate::model::{RangeTotals, Session, SessionSummary};
 use crate::rates::RateCard;
 use crate::store::AppState;
