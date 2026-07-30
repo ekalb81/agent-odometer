@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, TurnReceiptIntegrationStatus } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, TurnReceiptIntegrationStatus, DefenderExclusionReceipt } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -65,8 +65,8 @@ export function getScanStatus(): Promise<ScanStatus> {
 }
 
 /** Windows only: opens the UAC flow to exclude session folders from Defender scanning. */
-export function addDefenderExclusions(): Promise<void> {
-  return invoke<void>('add_defender_exclusions');
+export function addDefenderExclusions(): Promise<DefenderExclusionReceipt> {
+  return invoke<DefenderExclusionReceipt>('add_defender_exclusions');
 }
 
 export function getConfig(): Promise<Config> {

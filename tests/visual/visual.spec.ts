@@ -329,6 +329,21 @@ visualTest('defender-error', 'defender error', async (page) => {
   await expectSessionRollup(page, 15);
 });
 
+test('Defender verification survives Settings remount and suppresses the slow-scan prompt', async ({ page }) => {
+  await visit(page, { scenario: 'defender-slow', view: 'settings' });
+  await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
+  await page.getByRole('button', { name: 'Exclude session folders from Defender…', exact: true }).click();
+  const verifiedStatus = page.getByRole('status').filter({ hasText: 'Last verified' });
+  await expect(verifiedStatus).toContainText('for 3 session folders.');
+
+  await page.getByRole('button', { name: 'All', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Add exclusions…', exact: true })).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
+  await expect(page.getByRole('status').filter({ hasText: 'Last verified' })).toContainText('for 3 session folders.');
+});
+
 visualTest('updater-available', 'updater available banner', async (page) => {
   await visit(page, { scenario: 'updater-available', view: 'all' });
   await expect(page.getByText('Version 9.9.9 is available.')).toBeVisible();

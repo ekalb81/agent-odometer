@@ -428,6 +428,7 @@ mockIPC((cmd, payload) => {
         archive_roots: ['/home/dev/.codex/archived_sessions'],
         session_index_path: '/home/dev/.codex/session_index.jsonl',
         claude_session_roots: ['/home/dev/.claude/projects'],
+        defender_exclusion_receipt: null,
         performance_tracking_enabled: false,
         performance_log_max_mb: 64,
         instructions_enabled: true,
@@ -508,7 +509,20 @@ mockIPC((cmd, payload) => {
       if (visualScenario === 'defender-error') {
         return Promise.reject(new Error('Fixture Defender exclusion request failed.'));
       }
-      return undefined;
+      return {
+        version: 1,
+        configured_roots: [
+          '/home/dev/.codex/sessions',
+          '/home/dev/.codex/archived_sessions',
+          '/home/dev/.claude/projects',
+        ],
+        verified_roots: [
+          '/home/dev/.codex/sessions',
+          '/home/dev/.codex/archived_sessions',
+          '/home/dev/.claude/projects',
+        ],
+        verified_at: new Date(now).toISOString(),
+      };
     case 'reveal_in_file_manager':
     case 'open_instruction_file':
     case 'open_task_in_chatgpt':

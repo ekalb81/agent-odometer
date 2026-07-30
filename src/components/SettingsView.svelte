@@ -1,15 +1,17 @@
 <script lang="ts">
   import { config } from '../lib/stores/config';
+  import { defenderActionStore } from '../lib/stores/defender.svelte';
   import { rates } from '../lib/stores/rates';
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
-  import { setConfig, setRates, getBundledRates, addDefenderExclusions, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations } from '../lib/ipc';
+  import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations } from '../lib/ipc';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
   import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, TurnReceiptIntegrationStatus, PricingCatalog } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
+  import { defenderReceiptStatus, isWindowsDefenderSurface } from '../lib/defenderStatus';
 
   const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
 
@@ -133,22 +135,22 @@
   // ---------------------------------------------------------------------------
   // Performance: Windows Defender exclusions (Windows only).
   // ---------------------------------------------------------------------------
-  const isWindows = navigator.userAgent.includes('Windows');
-  let defenderState = $state<'idle' | 'pending' | 'done'>('idle');
-  let defenderError = $state<string | null>(null);
+  const isWindows = isWindowsDefenderSurface();
+  const defenderStatus = $derived(defenderReceiptStatus($config));
+  const defenderReceipt = $derived($config.defender_exclusion_receipt);
+  const defenderVerifiedAt = $derived.by(() => {
+    if (!defenderReceipt) return null;
+    const parsed = new Date(defenderReceipt.verified_at);
+    return Number.isNaN(parsed.getTime()) ? 'an unknown time' : parsed.toLocaleString();
+  });
+  const defenderConfiguredCount = $derived(defenderReceipt?.configured_roots.length ?? 0);
+  const defenderVerifiedCount = $derived(defenderReceipt?.verified_roots.length ?? 0);
+  const defenderUnverifiedCount = $derived(
+    Math.max(0, defenderConfiguredCount - defenderVerifiedCount),
+  );
 
-  async function handleDefenderExclusions() {
-    defenderError = null;
-    defenderState = 'pending';
-    try {
-      // Resolves only after the elevated process finishes, so success here
-      // means the exclusions really were added.
-      await addDefenderExclusions();
-      defenderState = 'done';
-    } catch (e) {
-      defenderState = 'idle';
-      defenderError = String(e);
-    }
+  function handleDefenderExclusions() {
+    void defenderActionStore.request('settings').catch(() => {});
   }
 
   async function saveRoots() {
@@ -1157,23 +1159,44 @@
         load of a large history. You can exclude the watched session folders above from Defender's
         real-time scanning. Trade-off: files in those folders are no longer scanned for threats —
         they normally contain only text session logs written by Codex and Claude Code. Windows will
-        ask for administrator approval.
+        ask for administrator approval. Odometer verifies the effective exclusion immediately after
+        the change; Windows or device policy can change it later.
       </p>
       <div class="flex items-center gap-3 flex-wrap">
         <button
           onclick={handleDefenderExclusions}
-          disabled={defenderState === 'pending'}
+          disabled={defenderActionStore.phase === 'pending'}
           class="px-3 py-1.5 text-xs font-medium rounded-sm bg-card border border-edge hover:bg-(--row-hover) text-ink transition-colors disabled:opacity-50"
         >
-          Exclude session folders from Defender…
+          {defenderStatus === 'never_requested'
+            ? 'Exclude session folders from Defender…'
+            : defenderStatus === 'stale'
+              ? 'Update Defender exclusions…'
+              : 'Reapply Defender exclusions…'}
         </button>
-        {#if defenderState === 'pending'}
-          <span class="text-xs text-ink-muted">Waiting for approval in the Windows security prompt…</span>
-        {:else if defenderState === 'done'}
-          <span class="text-xs text-pos">Done — the session folders are excluded from real-time scanning.</span>
+        {#if defenderActionStore.phase === 'pending'}
+          <span class="text-xs text-ink-muted" role="status" aria-live="polite">
+            Waiting for approval and Windows Defender verification…
+          </span>
+        {:else if defenderStatus === 'current' && defenderVerifiedAt}
+          <span class="text-xs text-pos" role="status">
+            Last verified {defenderVerifiedAt} for {defenderVerifiedCount}
+            {defenderVerifiedCount === 1 ? 'session folder' : 'session folders'}.
+          </span>
+        {:else if defenderStatus === 'partial' && defenderVerifiedAt}
+          <span class="text-xs text-amber-500" role="status">
+            Verified {defenderVerifiedCount} existing
+            {defenderVerifiedCount === 1 ? 'folder' : 'folders'} {defenderVerifiedAt};
+            {defenderUnverifiedCount} configured
+            {defenderUnverifiedCount === 1 ? 'folder was' : 'folders were'} not present and could not be verified.
+          </span>
+        {:else if defenderStatus === 'stale' && defenderVerifiedAt}
+          <span class="text-xs text-amber-500" role="status">
+            Session folders changed since the last verification at {defenderVerifiedAt}. Reapply to verify the current folders.
+          </span>
         {/if}
-        {#if defenderError}
-          <span class="text-xs text-red-500">{defenderError}</span>
+        {#if defenderActionStore.phase === 'error'}
+          <span class="text-xs text-red-500" role="alert">{defenderActionStore.error}</span>
         {/if}
       </div>
     </section>

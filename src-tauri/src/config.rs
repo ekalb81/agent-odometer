@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -5,6 +6,20 @@ use crate::provider::{
     claude_code_provider_id, codex_provider_id, ProviderSource, ProviderSourceKind,
     ProviderSourceSet,
 };
+
+pub const DEFENDER_EXCLUSION_RECEIPT_VERSION: u32 = 1;
+
+/// Local evidence that Odometer verified the configured session roots as
+/// effective Defender exclusions at a point in time. Windows or device policy
+/// may change the effective exclusions later, so this is intentionally a
+/// receipt rather than a continuously authoritative status flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenderExclusionReceipt {
+    pub version: u32,
+    pub configured_roots: Vec<PathBuf>,
+    pub verified_roots: Vec<PathBuf>,
+    pub verified_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstructionRoot {
@@ -22,6 +37,10 @@ pub struct Config {
     /// Roots containing Claude Code session JSONL files (~/.claude/projects).
     #[serde(default = "default_claude_session_roots")]
     pub claude_session_roots: Vec<PathBuf>,
+    /// Backend-owned last-verification receipt for the opt-in Defender action.
+    /// Ordinary config payloads preserve this field rather than overwriting it.
+    #[serde(default)]
+    pub defender_exclusion_receipt: Option<DefenderExclusionReceipt>,
     /// Local app performance measurements. Disabled unless explicitly enabled.
     #[serde(default)]
     pub performance_tracking_enabled: bool,
@@ -95,6 +114,7 @@ impl Default for Config {
             archive_roots: vec![codex_home.join("archived_sessions")],
             session_index_path: codex_home.join("session_index.jsonl"),
             claude_session_roots: default_claude_session_roots(),
+            defender_exclusion_receipt: None,
             performance_tracking_enabled: false,
             performance_log_max_mb: default_performance_log_max_mb(),
             instructions_enabled: false,
@@ -204,6 +224,14 @@ mod tests {
             archive_roots: vec![dir.path().join("archived")],
             session_index_path: dir.path().join("session_index.jsonl"),
             claude_session_roots: vec![dir.path().join("claude-projects")],
+            defender_exclusion_receipt: Some(DefenderExclusionReceipt {
+                version: DEFENDER_EXCLUSION_RECEIPT_VERSION,
+                configured_roots: vec![dir.path().join("sessions")],
+                verified_roots: vec![dir.path().join("sessions")],
+                verified_at: DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            }),
             performance_tracking_enabled: true,
             performance_log_max_mb: 32,
             instructions_enabled: true,
@@ -226,6 +254,10 @@ mod tests {
         assert_eq!(loaded.session_roots, cfg.session_roots);
         assert_eq!(loaded.archive_roots, cfg.archive_roots);
         assert_eq!(loaded.claude_session_roots, cfg.claude_session_roots);
+        assert_eq!(
+            loaded.defender_exclusion_receipt,
+            cfg.defender_exclusion_receipt
+        );
         assert!(loaded.performance_tracking_enabled);
         assert_eq!(loaded.performance_log_max_mb, 32);
         assert!(loaded.instructions_enabled);
@@ -248,6 +280,7 @@ mod tests {
         // claude_session_roots should fall back to <claude config dir>/projects.
         assert_eq!(cfg.claude_session_roots.len(), 1);
         assert!(cfg.claude_session_roots[0].ends_with("projects"));
+        assert!(cfg.defender_exclusion_receipt.is_none());
         assert!(!cfg.performance_tracking_enabled);
         assert_eq!(cfg.performance_log_max_mb, 64);
         assert!(!cfg.instructions_enabled);
@@ -351,6 +384,21 @@ mod tests {
 
         let error = config.provider_sources().unwrap_err().to_string();
         assert!(error.contains("ambiguous ownership"));
+    }
+
+    #[test]
+    fn defender_receipt_changes_do_not_change_session_sources() {
+        let first = Config::default();
+        let mut second = first.clone();
+        second.defender_exclusion_receipt = Some(DefenderExclusionReceipt {
+            version: DEFENDER_EXCLUSION_RECEIPT_VERSION,
+            configured_roots: first.session_roots.clone(),
+            verified_roots: first.session_roots.clone(),
+            verified_at: DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        });
+        assert!(first.session_sources_equal(&second));
     }
 
     #[test]
