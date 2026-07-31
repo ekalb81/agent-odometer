@@ -66,7 +66,7 @@ fn project_scope(path: &Path) -> PathBuf {
     gix::discover(path)
         .ok()
         .map(|repo| {
-            repo.work_dir()
+            repo.workdir()
                 .unwrap_or_else(|| repo.git_dir())
                 .to_path_buf()
         })
