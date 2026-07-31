@@ -702,15 +702,23 @@ pub fn set_config(
                 .replace(config_watcher_replacement.expect("replacement was staged"));
             drop(previous_watcher);
         }
-        if let Some(transaction) = integration {
-            transaction.commit().map_err(|error| error.to_string())?;
-        }
+        // A commit-time cleanup warning does not undo the durable config or
+        // installed hooks. Keep applying live state and emit the new config
+        // before surfacing that warning to the caller.
+        let integration_error = integration
+            .and_then(|transaction| transaction.commit().err())
+            .map(|error| error.to_string());
         state.performance.configure(
             config.performance_tracking_enabled,
             config.performance_log_max_mb,
         );
-        app.emit("config-updated", &config)
-            .map_err(|e| e.to_string())?;
+        if let Err(error) = app.emit("config-updated", &config) {
+            let error = error.to_string();
+            return Err(match integration_error.as_deref() {
+                Some(integration_error) => format!("{integration_error}; {error}"),
+                None => error,
+            });
+        }
         state.performance.record_backend(
             if instruction_settings_changed {
                 "settings.save_instructions"
@@ -720,9 +728,12 @@ pub fn set_config(
                 "settings.save_performance"
             },
             started,
-            true,
+            integration_error.is_none(),
             BTreeMap::new(),
         );
+        if let Some(error) = integration_error {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -753,9 +764,12 @@ pub fn set_config(
         return Err(error);
     }
     state.cancel_instruction_scan_and_clear_paths();
-    if let Some(transaction) = integration {
-        transaction.commit().map_err(|error| error.to_string())?;
-    }
+    // A commit-time cleanup warning does not undo the durable config or
+    // installed hooks. Keep applying live state and emit the new config
+    // before surfacing that warning to the caller.
+    let integration_error = integration
+        .and_then(|transaction| transaction.commit().err())
+        .map(|error| error.to_string());
     state.performance.configure(
         config.performance_tracking_enabled,
         config.performance_log_max_mb,
@@ -781,15 +795,24 @@ pub fn set_config(
         true,
     );
 
-    app.emit("config-updated", &config)
-        .map_err(|e| e.to_string())?;
+    if let Err(error) = app.emit("config-updated", &config) {
+        let error = error.to_string();
+        return Err(match integration_error.as_deref() {
+            Some(integration_error) => format!("{integration_error}; {error}"),
+            None => error,
+        });
+    }
 
     state.performance.record_backend(
         "settings.save_session_sources",
         started,
-        true,
+        integration_error.is_none(),
         BTreeMap::new(),
     );
+
+    if let Some(error) = integration_error {
+        return Err(error);
+    }
 
     Ok(())
 }
