@@ -1,5 +1,5 @@
 use crate::model::{Harness, Session};
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -217,8 +217,13 @@ impl ProviderSourceSet {
         let path = strip_verbatim_prefix(path);
         self.sources
             .iter()
-            .filter(|source| path.starts_with(strip_verbatim_prefix(source.root())))
-            .max_by_key(|source| strip_verbatim_prefix(source.root()).components().count())
+            .filter_map(|source| {
+                let root = strip_verbatim_prefix(source.root());
+                path.starts_with(root.as_ref())
+                    .then(|| (source, root.components().count()))
+            })
+            .max_by_key(|(_, depth)| *depth)
+            .map(|(source, _)| source)
     }
 }
 
@@ -396,22 +401,45 @@ fn same_owner(left: &ProviderSource, right: &ProviderSource) -> bool {
 fn roots_overlap(left: &Path, right: &Path) -> bool {
     let left = strip_verbatim_prefix(left);
     let right = strip_verbatim_prefix(right);
-    left.starts_with(right) || right.starts_with(left)
+    left.starts_with(right.as_ref()) || right.starts_with(left.as_ref())
 }
 
 fn root_contains(parent: &Path, child: &Path) -> bool {
-    strip_verbatim_prefix(child).starts_with(strip_verbatim_prefix(parent))
+    let parent = strip_verbatim_prefix(parent);
+    strip_verbatim_prefix(child).starts_with(parent.as_ref())
 }
 
 fn is_jsonl(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
 }
 
-fn strip_verbatim_prefix(path: &Path) -> &Path {
+fn strip_verbatim_prefix(path: &Path) -> Cow<'_, Path> {
     if let Some(path) = path.to_str() {
+        if let Some(stripped) = path.strip_prefix(r"\\?\UNC\") {
+            return Cow::Owned(PathBuf::from(format!(r"\\{stripped}")));
+        }
         if let Some(stripped) = path.strip_prefix(r"\\?\") {
-            return Path::new(stripped);
+            return Cow::Borrowed(Path::new(stripped));
         }
     }
-    path
+    Cow::Borrowed(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_verbatim_prefix;
+    use std::path::Path;
+
+    #[test]
+    fn verbatim_prefix_normalization_preserves_disk_and_unc_roots() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\sessions\thread.jsonl")).as_ref(),
+            Path::new(r"C:\sessions\thread.jsonl")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\sessions\thread.jsonl"))
+                .as_ref(),
+            Path::new(r"\\server\share\sessions\thread.jsonl")
+        );
+    }
 }

@@ -146,6 +146,23 @@ fn source_ownership_collapses_redundancy_and_rejects_ambiguity() {
         .contains("does not support archived sources"));
 }
 
+#[cfg(windows)]
+#[test]
+fn source_resolution_matches_verbatim_unc_watcher_paths() {
+    let root = PathBuf::from(r"\\server\share\sessions");
+    let sources = ProviderSourceSet::try_new([ProviderSource::new(
+        codex_provider_id(),
+        root.clone(),
+        ProviderSourceKind::Live,
+    )])
+    .unwrap();
+
+    let resolved = sources
+        .resolve(Path::new(r"\\?\UNC\server\share\sessions\thread.jsonl"))
+        .expect("verbatim UNC watcher path should match the configured UNC root");
+    assert_eq!(resolved.root(), root);
+}
+
 #[test]
 fn every_builtin_provider_passes_full_incremental_and_truncation_contracts() {
     for case in cases() {
