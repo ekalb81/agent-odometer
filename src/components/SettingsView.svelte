@@ -9,7 +9,7 @@
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
-  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, TurnReceiptIntegrationStatus, PricingCatalog } from '../lib/types';
+  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, HarnessIntegrationStatus, TurnReceiptIntegrationStatus, PricingCatalog } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
   import { defenderReceiptStatus, isWindowsDefenderSurface } from '../lib/defenderStatus';
 
@@ -334,6 +334,47 @@
     if (!value) return 'No receipt observed yet';
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? value : `Last observed ${date.toLocaleString()}`;
+  }
+
+  const receiptAttentionCodes = new Set([
+    'hook_cleanup_needed',
+    'hooks_disabled',
+    'hook_stale',
+    'hook_missing',
+    'hook_duplicate',
+    'receipt_failed',
+    'configuration_invalid',
+  ]);
+
+  function receiptNeedsAttention(value: HarnessIntegrationStatus): boolean {
+    return receiptAttentionCodes.has(value.diagnostic_code);
+  }
+
+  function receiptStatusLabel(value: HarnessIntegrationStatus): string {
+    if (value.receipt_observed) return 'Receipt observed';
+    if (receiptNeedsAttention(value)) return 'Needs attention';
+    if (value.configured) return 'Configured';
+    return value.requested ? 'Not configured' : 'Off';
+  }
+
+  function receiptSourceLabel(source: string): string {
+    switch (source) {
+      case 'codex_inline_toml': return 'Inline Codex config.toml';
+      case 'codex_hooks_json': return 'Codex hooks.json';
+      case 'claude_settings_json': return 'Claude Code user settings.json';
+      default: return 'Harness configuration';
+    }
+  }
+
+  function receiptNextStep(value: HarnessIntegrationStatus, harness: string): string | null {
+    const steps: string[] = [];
+    if (value.trust_review_recommended) steps.push('Review and trust the command in /hooks.');
+    if (value.restart_recommended) {
+      steps.push(harness === 'claude'
+        ? 'Start a fresh CLI or local Desktop Code task to load and verify it.'
+        : 'Start a fresh Codex task to load and verify it.');
+    }
+    return steps.length > 0 ? steps.join(' ') : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -1000,9 +1041,13 @@
             onchange={markTurnReceiptsDirty}
             disabled={!turnReceiptsEnabled}
           />
-          Claude Code
+          Claude Code (CLI + local Desktop Code)
         </label>
       </div>
+      <p class="text-[11px] text-ink-faint pl-5">
+        Local Desktop Code sessions share Claude Code user settings. Direct setup requires Claude
+        Code 2.1.139 or later. Remote and SSH sessions use the settings on that host.
+      </p>
 
       <div class="flex items-center gap-3 flex-wrap">
         <button
@@ -1032,42 +1077,48 @@
       {#if turnReceiptStatus}
         <div class="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1">
           {#each [
-            { label: 'Codex', value: turnReceiptStatus.codex },
-            { label: 'Claude Code', value: turnReceiptStatus.claude_code },
+            { label: 'Codex', harness: 'codex', value: turnReceiptStatus.codex },
+            { label: 'Claude Code', harness: 'claude', value: turnReceiptStatus.claude_code },
           ] as item}
             <div class="bg-app border border-edgerow rounded-md px-3 py-2 min-w-0">
               <div class="flex items-center justify-between gap-2">
                 <span class="text-xs font-medium text-ink">{item.label}</span>
-                <span class:text-pos={item.value.installed && item.value.requested}
-                  class:text-ink-faint={!item.value.installed || !item.value.requested}
+                <span class:text-pos={item.value.receipt_observed}
+                  class:text-red-500={receiptNeedsAttention(item.value)}
+                  class:text-amber-500={item.value.requested && item.value.configured && !item.value.receipt_observed && !receiptNeedsAttention(item.value)}
+                  class:text-ink-faint={!item.value.receipt_observed && !receiptNeedsAttention(item.value) && (!item.value.requested || !item.value.configured)}
                   class="text-[11px]">
-                  {item.value.installed ? 'Hook installed' : 'No hook installed'}
+                  {receiptStatusLabel(item.value)}
                 </span>
               </div>
               <p class="text-[11px] text-ink-faint mt-1">{item.value.detail}</p>
-              <p class="text-[11px] text-ink-faint mt-1 font-mono break-all">{item.value.config_path}</p>
+              <p class="text-[11px] text-ink-muted mt-1">{receiptSourceLabel(item.value.config_source)}</p>
+              <p class="text-[11px] text-ink-faint font-mono break-all">{item.value.config_path}</p>
+              {#if receiptNextStep(item.value, item.harness)}
+                <p class="text-[11px] text-amber-500 mt-1">{receiptNextStep(item.value, item.harness)}</p>
+              {/if}
               <p class="text-[11px] mt-2"
-                class:text-pos={item.value.last_run_success === true}
-                class:text-red-500={item.value.last_run_success === false}
-                class:text-ink-faint={item.value.last_run_success === null}>
+                class:text-pos={item.value.receipt_observed}
+                class:text-red-500={item.value.diagnostic_code === 'receipt_failed'}
+                class:text-ink-faint={!item.value.receipt_observed && item.value.diagnostic_code !== 'receipt_failed'}>
                 {formatHookRun(item.value.last_run_at)}
               </p>
               {#if item.value.last_run_detail}
-                <p class="text-[11px] text-red-500 mt-1">{item.value.last_run_detail}</p>
+                <p class="text-[11px] mt-1"
+                  class:text-red-500={item.value.diagnostic_code === 'receipt_failed'}
+                  class:text-ink-faint={item.value.diagnostic_code !== 'receipt_failed'}>
+                  {item.value.last_run_detail}
+                </p>
               {/if}
               {#if item.value.last_receipt}
+                <p class="text-[10px] uppercase tracking-wide text-ink-faint mt-1">
+                  {item.value.receipt_observed ? 'Latest observed receipt' : 'Previous stored receipt'}
+                </p>
                 <pre class="text-[11px] text-ink-2 whitespace-pre-wrap mt-1 font-mono">{item.value.last_receipt}</pre>
               {/if}
             </div>
           {/each}
         </div>
-        {#if turnReceiptStatus.enabled && turnReceiptStatus.codex.requested}
-          <p class="text-[11px] text-ink-faint">
-            Codex requires explicit trust for new or changed command hooks. Open
-            <span class="font-mono">/hooks</span> in Codex after setup. Start a new task if the
-            current harness session does not reload configuration automatically.
-          </p>
-        {/if}
       {:else}
          <p class="text-[11px] text-ink-faint">Status is available in the installed desktop app.</p>
        {/if}

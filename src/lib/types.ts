@@ -366,9 +366,14 @@ export interface InstructionContent {
 
 export interface HarnessIntegrationStatus {
   requested: boolean;
-  installed: boolean;
+  configured: boolean;
+  receipt_observed: boolean;
+  config_source: string;
   config_path: string;
+  diagnostic_code: string;
   detail: string;
+  restart_recommended: boolean;
+  trust_review_recommended: boolean;
   last_run_at: string | null;
   last_run_success: boolean | null;
   last_receipt: string | null;

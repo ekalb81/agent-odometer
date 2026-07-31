@@ -48,9 +48,45 @@ This is the first durable-history slice, not the complete normalized ledger trac
 
 Turn receipts are a separate, default-off freshness path; they do not replace the watcher:
 
-1. Settings transactionally adds one identifiable `Stop` command to the selected user-level Codex
-   `hooks.json` and/or Claude Code `settings.json`. Existing JSON and unrelated hook handlers are
-   retained. Disable removes only handlers containing Odometer's integration ID.
+1. Settings transactionally reconciles one identifiable `Stop` command per selected harness while
+   retaining unrelated settings and handlers. Codex preserves an existing Odometer source; for a
+   new integration it edits the `[[hooks.Stop]]` representation in inline `config.toml` when those
+   hooks already exist, otherwise `hooks.json`. Other valid inline-array TOML shapes and symlinked
+   config files fail closed rather than being rewritten or duplicated. Repair removes Odometer-owned
+   duplicates across both sources. Claude Code uses a direct executable `command` plus explicit
+   `args` in the user-level `settings.json`, shared by Claude Code 2.1.139+ CLI and local Desktop Code
+   sessions; remote and SSH sessions use configuration on their host. For AppImage launches, the installed hook
+   uses the absolute `APPIMAGE` path only when the running executable resolves inside the matching
+   absolute `APPDIR`; otherwise status and setup both use the current executable. Disable owns only
+   handlers whose parsed command or argument list contains the exact
+   `--integration-id odometer-turn-receipts-v1` value (the `--integration-id=...` form is also
+   recognized), never an arbitrary substring.
+
+   Every planned source is checked against its original bytes immediately before replacement. New
+   files use an atomic no-replace rename. Existing files use `ReplaceFileW` with no ignore flags on
+   Windows, which makes ACL/attribute/stream merge failures fatal and leaves a random same-volume
+   recovery file until commit. The documented `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` partial state is
+   repaired back to a canonical path before failure is returned. Linux uses `renameat2` exchange and
+   macOS uses `renamex_np` swap; Linux fails closed for multiple hard links, extended attributes or
+   ACLs, and owner/group/mode metadata it cannot reproduce, while macOS copies file metadata before
+   swapping. Other Unix platforms fail closed rather than using a non-atomic fallback. Temporary and
+   recovery names are random; Unix temporary files start mode `0600`. For an existing Windows file,
+   the temporary copy is seeded with the original file's security resource properties before its
+   contents are rewritten, and replacement merges the original security metadata again before the
+   replacement becomes active. File contents are
+   flushed before and after replacement, and containing directories are flushed where the platform
+   supports it.
+
+   A path-based byte or supported metadata edit observed before the swap aborts rather than being
+   overwritten. Rollback swaps first and verifies the displaced file before deletion, so an edit
+   ordered before that swap is restored instead of clobbered. Commit atomically detaches the recovery
+   name before checking it; an already-open-handle edit visible in that check is preserved with an
+   actionable error. This is not a claim that writes racing the final verification, or writes through
+   a superseded handle afterward, can be detected forever; ordinary OS open-handle semantics apply.
+   An incomplete multi-file write restores only files that still match Odometer's applied bytes, and
+   cleanup or rollback failures are surfaced or logged with the retained recovery path rather than
+   silently ignored. Config-save failure paths call the fallible rollback explicitly so incomplete
+   restoration is included in the settings IPC error rather than only appearing in logs.
 2. Codex/Claude passes bounded JSON on stdin, including the session and transcript path. The helper
    exits before Tauri startup, checks that the feature and harness remain enabled, and validates the
    canonical transcript path against the configured roots.
@@ -60,6 +96,13 @@ Turn receipts are a separate, default-off freshness path; they do not replace th
 4. The ordinary 250 ms filesystem watcher still updates the dashboard and remains the universal
    path for users who never enable receipts. A later watcher pass is harmless because parser cursors
    and cumulative reconciliation remain idempotent.
+
+Integration status separates request state, configuration presence, and receipt observation. The
+wire field `receipt_observed` becomes true only after a successful receipt newer than the selected
+user-level configuration is observed; merely finding the command never produces a green state. This
+is historical evidence, not proof that higher-precedence managed or project policy still permits the
+hook. The payload also names the active configuration source and carries explicit restart and Codex
+trust-review recommendations.
 
 Codex `rate_limits.primary` and `secondary` snapshots are retained only on full sessions. A receipt
 compares the final snapshot for the turn with the prior turn's snapshot when the limit/reset identity
