@@ -6,7 +6,7 @@
   import Filters from './components/Filters.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, onInstructionScanProgress, addDefenderExclusions, sessionsInRanges, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, onInstructionScanProgress, sessionsInRanges, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
   import { instructionScanStore } from './lib/stores/instructionScan.svelte';
@@ -14,6 +14,8 @@
   import './lib/stores/theme.svelte'; // applies data-theme on import
   import { rates } from './lib/stores/rates';
   import { config } from './lib/stores/config';
+  import { defenderActionStore } from './lib/stores/defender.svelte';
+  import { defenderReceiptStatus, isWindowsDefenderSurface } from './lib/defenderStatus';
   import { getVersion } from '@tauri-apps/api/app';
   import type { InstructionScanProgress, SessionSummary } from './lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
@@ -132,36 +134,30 @@
   // ---------------------------------------------------------------------------
   const SLOW_SCAN_MS = 20_000;
   const DEFENDER_DISMISSED_KEY = 'defenderPromptDismissed';
-  // main.ts adds this marker only in the browser fixture branch. It lets the
-  // visual matrix exercise the Windows-specific banner without allowing a
-  // URL parameter to alter a real native launch.
   const visualScenario = document.documentElement.dataset.visualScenario ?? null;
-  const isWindows = navigator.userAgent.includes('Windows') ||
-    visualScenario === 'defender-slow' || visualScenario === 'defender-error';
+  const isWindows = isWindowsDefenderSurface(navigator.userAgent, visualScenario);
   let defenderDismissed = $state(localStorage.getItem(DEFENDER_DISMISSED_KEY) === '1');
-  let defenderRequested = $state(false);
-  let defenderError = $state<string | null>(null);
+  const defenderStatus = $derived(defenderReceiptStatus($config));
+  const showDefenderConfirmation = $derived(
+    defenderActionStore.phase === 'success' && defenderActionStore.origin === 'banner',
+  );
 
   const showDefenderBanner = $derived(
     isWindows &&
       !defenderDismissed &&
       scanStore.status.complete &&
-      (scanStore.status.elapsed_ms ?? 0) > SLOW_SCAN_MS,
+      (scanStore.status.elapsed_ms ?? 0) > SLOW_SCAN_MS &&
+      (defenderStatus !== 'current' || showDefenderConfirmation),
   );
 
-  async function requestDefenderExclusion() {
-    defenderError = null;
-    try {
-      await addDefenderExclusions();
-      defenderRequested = true;
-    } catch (e) {
-      defenderError = String(e);
-    }
+  function requestDefenderExclusion() {
+    void defenderActionStore.request('banner').catch(() => {});
   }
 
   function dismissDefenderBanner() {
     defenderDismissed = true;
     localStorage.setItem(DEFENDER_DISMISSED_KEY, '1');
+    defenderActionStore.clearFeedback();
   }
 
   // During the initial scan, session-updated events arrive by the hundred.
@@ -463,8 +459,10 @@
   <!-- Defender-exclusion suggestion (Windows, slow scan only) -->
   {#if showDefenderBanner}
     <div class="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1.5 bg-chrome border-b border-edge text-xs text-ink-2 shrink-0">
-      {#if defenderRequested}
-        <span>Approve the Windows security prompt to finish adding the exclusions. Takes effect next launch.</span>
+      {#if defenderActionStore.phase === 'pending'}
+        <span role="status" aria-live="polite">Waiting for approval and Windows Defender verification…</span>
+      {:else if showDefenderConfirmation}
+        <span role="status" aria-live="polite">Verified — the existing session folders are excluded. Future scans can use the change.</span>
         <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded-sm text-xs text-ink-muted hover:text-ink transition-colors">Done</button>
       {:else}
         <span>
@@ -479,8 +477,8 @@
           Add exclusions…
         </button>
         <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded-sm text-xs text-ink-muted hover:text-ink transition-colors">No thanks</button>
-        {#if defenderError}
-          <span class="text-xs text-red-400">{defenderError}</span>
+        {#if defenderActionStore.phase === 'error' && defenderActionStore.origin === 'banner'}
+          <span class="text-xs text-red-400" role="alert">{defenderActionStore.error}</span>
         {/if}
       {/if}
     </div>

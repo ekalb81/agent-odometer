@@ -1,8 +1,14 @@
-use crate::config::Config;
+#[cfg(windows)]
+use crate::config::DEFENDER_EXCLUSION_RECEIPT_VERSION;
+use crate::config::{Config, DefenderExclusionReceipt};
 use crate::model::{RangeTotals, Session, SessionSummary};
 use crate::rates::RateCard;
 use crate::store::AppState;
+#[cfg(any(windows, test))]
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Utc};
+#[cfg(any(windows, test))]
+use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -642,7 +648,7 @@ pub fn repair_turn_receipt_integrations(
 pub fn set_config(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
-    config: Config,
+    mut config: Config,
 ) -> Result<(), String> {
     let _transition = state.config_transition.lock().unwrap();
     let started = Instant::now();
@@ -652,6 +658,7 @@ pub fn set_config(
     crate::instructions::validate_instruction_roots(&config.instruction_roots)
         .map_err(|error| error.to_string())?;
     let previous = Config::load().map_err(|e| e.to_string())?;
+    preserve_backend_owned_config(&previous, &mut config);
     let session_sources_changed = !previous.session_sources_equal(&config);
     let instruction_sources_changed = previous.instructions_enabled != config.instructions_enabled
         || previous.instruction_roots != config.instruction_roots;
@@ -763,6 +770,10 @@ pub fn set_config(
     );
 
     Ok(())
+}
+
+fn preserve_backend_owned_config(previous: &Config, next: &mut Config) {
+    next.defender_exclusion_receipt = previous.defender_exclusion_receipt.clone();
 }
 
 /// Scans all configured roots on a background thread, inserting sessions
@@ -1116,69 +1127,346 @@ fn valid_session_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// Escapes a path for a single-quoted PowerShell string literal.
+#[cfg(any(windows, test))]
+fn powershell_encoded_path(path: &std::path::Path) -> String {
+    #[cfg(windows)]
+    let units = {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().collect::<Vec<_>>()
+    };
+    #[cfg(not(windows))]
+    let units = path.to_string_lossy().encode_utf16().collect::<Vec<_>>();
+
+    let bytes = units
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    BASE64.encode(bytes)
+}
+
+/// PowerShell's `-EncodedCommand` expects a UTF-16LE Base64 payload.
+#[cfg(any(windows, test))]
+fn powershell_encoded_command(script: &str) -> String {
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    BASE64.encode(bytes)
+}
+
+#[cfg(any(windows, test))]
+fn normalize_defender_root_key(path: &std::path::Path) -> String {
+    let mut normalized = path.to_string_lossy().replace('/', "\\");
+    while normalized.len() > 3 && normalized.ends_with('\\') {
+        normalized.pop();
+    }
+    normalized.to_lowercase()
+}
+
+#[cfg(any(windows, test))]
+fn configured_defender_roots(config: &Config) -> Vec<std::path::PathBuf> {
+    let mut seen = HashSet::new();
+    config
+        .session_roots
+        .iter()
+        .chain(config.archive_roots.iter())
+        .chain(config.claude_session_roots.iter())
+        .filter(|path| !path.as_os_str().is_empty())
+        .filter(|path| seen.insert(normalize_defender_root_key(path)))
+        .cloned()
+        .collect()
+}
+
+/// Accept only a descendant of a Windows drive or UNC share. This rejects
+/// relative paths, drive roots, share roots, device paths, and lexical `..`
+/// traversal back to those broad roots before an exclusion reaches elevation.
+#[cfg(any(windows, test))]
+fn defender_root_is_scoped(path: &std::path::Path) -> bool {
+    let Some(value) = path.to_str() else {
+        return false;
+    };
+    let normalized = value.replace('/', "\\");
+    let lower = normalized.to_ascii_lowercase();
+
+    let tail = if lower.starts_with(r"\\?\unc\") {
+        let mut parts = normalized[8..].split('\\');
+        let (Some(server), Some(share)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        if server.is_empty() || share.is_empty() {
+            return false;
+        }
+        parts.collect::<Vec<_>>().join("\\")
+    } else if lower.starts_with(r"\\?\") {
+        let drive_path = &normalized[4..];
+        let bytes = drive_path.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return false;
+        }
+        drive_path[3..].to_owned()
+    } else if lower.starts_with(r"\\.\") {
+        return false;
+    } else if let Some(unc_tail) = normalized.strip_prefix(r"\\") {
+        let mut parts = unc_tail.split('\\');
+        let (Some(server), Some(share)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        if server.is_empty() || share.is_empty() {
+            return false;
+        }
+        parts.collect::<Vec<_>>().join("\\")
+    } else {
+        let bytes = normalized.as_bytes();
+        if bytes.len() < 3
+            || !bytes[0].is_ascii_alphabetic()
+            || bytes[1] != b':'
+            || bytes[2] != b'\\'
+        {
+            return false;
+        }
+        normalized[3..].to_owned()
+    };
+
+    let mut depth = 0_usize;
+    for segment in tail.split('\\') {
+        match segment {
+            "" | "." => {}
+            ".." if depth == 0 => return false,
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+    }
+    depth > 0
+}
+
 #[cfg(windows)]
-fn ps_quote(path: &str) -> String {
-    format!("'{}'", path.replace('\'', "''"))
+fn validate_defender_root_scope(path: &std::path::Path) -> Result<(), String> {
+    if !defender_root_is_scoped(path) {
+        return Err(format!(
+            "Odometer only excludes absolute session subfolders, never a drive or network-share root: {}",
+            path.display()
+        ));
+    }
+    let resolved = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "could not safely resolve the session folder {}: {error}",
+            path.display()
+        )
+    })?;
+    if !defender_root_is_scoped(&resolved) {
+        return Err(format!(
+            "Odometer will not exclude {} because it resolves to a drive or network-share root",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Builds the elevated script that adds the requested exclusions and then
+/// verifies their effective behavior with Microsoft's documented
+/// `MpCmdRun.exe -CheckExclusion` contract. The script never lists or exports
+/// unrelated exclusions, which may be hidden by device policy.
+#[cfg(any(windows, test))]
+fn defender_verification_script(paths: &[std::path::PathBuf]) -> String {
+    // Never interpolate filesystem paths as PowerShell literals. Windows
+    // PowerShell treats several Unicode quote characters as delimiters, so
+    // ordinary ASCII apostrophe escaping is insufficient across elevation.
+    let path_values = paths
+        .iter()
+        .map(|path| {
+            format!(
+                "[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('{}'))",
+                powershell_encoded_path(path)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $paths = @({path_values}); \
+         try {{ Add-MpPreference -ExclusionPath $paths -ErrorAction Stop }} catch {{ exit 1 }}; \
+         try {{ \
+           $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData); \
+           $programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles); \
+           $platformRoot = Join-Path $programData 'Microsoft\\Windows Defender\\Platform'; \
+           $platform = Get-ChildItem -LiteralPath $platformRoot -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending | Where-Object {{ Test-Path -LiteralPath (Join-Path $_.FullName 'MpCmdRun.exe') -PathType Leaf }} | Select-Object -First 1; \
+           $mp = if ($platform) {{ Join-Path $platform.FullName 'MpCmdRun.exe' }} else {{ $null }}; \
+           if (-not $mp -or -not (Test-Path -LiteralPath $mp -PathType Leaf)) {{ $mp = Join-Path $programFiles 'Windows Defender\\MpCmdRun.exe' }}; \
+           if (-not (Test-Path -LiteralPath $mp -PathType Leaf)) {{ exit 4 }} \
+         }} catch {{ exit 4 }}; \
+         foreach ($path in $paths) {{ \
+           try {{ \
+             $global:LASTEXITCODE = $null; \
+             & $mp -CheckExclusion -Path $path *> $null; \
+             $checkExitCode = $LASTEXITCODE \
+           }} catch {{ exit 5 }}; \
+           if ($checkExitCode -eq 1) {{ exit 3 }}; \
+           if ($checkExitCode -ne 0) {{ exit 5 }} \
+         }}; \
+         exit 0"
+    )
+}
+
+#[cfg(any(windows, test))]
+fn defender_elevation_script(inner: &str) -> String {
+    let encoded = powershell_encoded_command(inner);
+    format!(
+        "try {{ $powershell = Join-Path $PSHOME 'powershell.exe'; \
+         $process = Start-Process -FilePath $powershell -Verb RunAs -WindowStyle Hidden \
+         -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','{encoded}') \
+         -Wait -PassThru -ErrorAction Stop; \
+         exit $process.ExitCode }} catch {{ \
+           $nativeError = $_.Exception.NativeErrorCode; \
+           $hresult = $_.Exception.HResult; \
+           if (-not $nativeError -and $_.Exception.InnerException) {{ $nativeError = $_.Exception.InnerException.NativeErrorCode }}; \
+           if ($_.Exception.InnerException) {{ $hresult = $_.Exception.InnerException.HResult }}; \
+           if ($nativeError -eq 1223 -or $hresult -eq -2147023673) {{ exit 2 }}; \
+           exit 6 \
+         }}"
+    )
+}
+
+#[cfg(windows)]
+fn windows_powershell_path() -> Result<std::path::PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 32_768];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    if length as usize >= buffer.len() {
+        return Err("Windows system directory path is unexpectedly long".into());
+    }
+    let mut path = std::path::PathBuf::from(OsString::from_wide(&buffer[..length as usize]));
+    path.push("WindowsPowerShell");
+    path.push("v1.0");
+    path.push("powershell.exe");
+    Ok(path)
 }
 
 /// Opens Windows' UAC consent flow to add the configured session roots as
 /// Windows Defender real-time-scanning path exclusions. Strictly opt-in from
 /// the UI: the user clicks the button AND approves the elevation prompt, and
 /// only the session-data directories are excluded — never the app itself.
-/// Waits for the elevated process and reports the real outcome — non-admin
-/// processes cannot read the exclusion list back, so the exit code relayed
-/// through the launcher is the only verification available.
+/// Waits for the elevated process, verifies every existing root as effectively
+/// excluded, and persists a point-in-time receipt. Opening Settings or starting
+/// Odometer never triggers elevation or a Defender status query.
 #[tauri::command]
-pub async fn add_defender_exclusions() -> Result<(), String> {
+pub async fn add_defender_exclusions(
+    _app: AppHandle,
+    _state: State<'_, Arc<AppState>>,
+) -> Result<DefenderExclusionReceipt, String> {
     #[cfg(windows)]
     {
-        let config = Config::load().map_err(|e| e.to_string())?;
-        let paths: Vec<String> = config
-            .session_roots
-            .iter()
-            .chain(config.archive_roots.iter())
-            .chain(config.claude_session_roots.iter())
-            .filter(|p| p.exists())
-            .map(|p| ps_quote(&p.to_string_lossy()))
-            .collect();
-        if paths.is_empty() {
+        let app_state = _state.inner().clone();
+        let (configured_roots, existing_roots) = {
+            let _transition = app_state.config_transition.lock().unwrap();
+            let config = Config::load().map_err(|error| error.to_string())?;
+            let configured_roots = configured_defender_roots(&config);
+            let existing_roots = configured_roots
+                .iter()
+                .filter(|path| path.exists())
+                .cloned()
+                .collect::<Vec<_>>();
+            (configured_roots, existing_roots)
+        };
+        if existing_roots.is_empty() {
             return Err("no existing session folders to exclude".into());
+        }
+        for root in &existing_roots {
+            validate_defender_root_scope(root)?;
         }
 
         // Elevation happens through Start-Process -Verb RunAs, so Windows
-        // itself asks the user for consent; nothing runs silently. The
-        // elevated shell exits 0/1 by Add-MpPreference outcome; a declined
-        // UAC prompt makes Start-Process throw, mapped to exit 2.
-        let inner = format!(
-            "try {{ Add-MpPreference -ExclusionPath {} -ErrorAction Stop; exit 0 }} catch {{ exit 1 }}",
-            paths.join(",")
-        );
-        let arg_list = ps_quote(&format!("-NoProfile -Command {inner}"));
-        let outer = format!(
-            "try {{ $p = Start-Process powershell -Verb RunAs -ArgumentList {arg_list} -Wait -PassThru -ErrorAction Stop; exit $p.ExitCode }} catch {{ exit 2 }}"
-        );
+        // itself asks the user for consent; nothing runs silently. The child
+        // returns distinct codes for add, verification, and tool failures.
+        let inner = defender_verification_script(&existing_roots);
+        let outer = defender_elevation_script(&inner);
+        let powershell = windows_powershell_path()?;
 
         let output = tauri::async_runtime::spawn_blocking(move || {
-            std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", &outer])
-                .output()
+            use std::os::windows::process::CommandExt;
+
+            let mut command = std::process::Command::new(powershell);
+            command
+                .args(["-NoProfile", "-NonInteractive", "-Command", &outer])
+                .creation_flags(0x0800_0000);
+            command.output()
         })
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
 
         match output.status.code() {
-            Some(0) => Ok(()),
-            Some(2) => {
-                Err("The Windows security prompt was declined — nothing was changed.".into())
+            Some(0) => {}
+            Some(1) => {
+                return Err(
+                    "Windows Defender did not accept the exclusions. Another security product or \
+                     a device policy may be managing them."
+                        .into(),
+                );
             }
-            _ => Err(
-                "Windows Defender did not accept the exclusions. Another security product or a \
-                 policy may be managing it."
-                    .into(),
-            ),
+            Some(2) => {
+                return Err(
+                    "The Windows security prompt was declined — nothing was changed.".into(),
+                );
+            }
+            Some(3) => {
+                return Err(
+                    "Windows accepted the request, but one or more session folders are not \
+                     effectively excluded. Tamper protection or device policy may be managing \
+                     Defender."
+                        .into(),
+                );
+            }
+            Some(4) => {
+                return Err(
+                    "Windows accepted the request, but Odometer could not find Microsoft's \
+                     exclusion verification tool. No verification status was saved."
+                        .into(),
+                );
+            }
+            Some(5) => {
+                return Err(
+                    "Windows accepted the request, but Microsoft's exclusion verification tool \
+                     did not complete successfully. No verification status was saved."
+                        .into(),
+                );
+            }
+            Some(6) => {
+                return Err(
+                    "Odometer could not start or wait for the elevated Windows Defender action. \
+                     Its outcome could not be confirmed, so no verification status was saved."
+                        .into(),
+                );
+            }
+            _ => return Err("The Windows Defender exclusion request did not complete.".into()),
         }
+
+        let receipt = DefenderExclusionReceipt {
+            version: DEFENDER_EXCLUSION_RECEIPT_VERSION,
+            configured_roots,
+            verified_roots: existing_roots,
+            verified_at: Utc::now(),
+        };
+        let updated_config = {
+            let _transition = app_state.config_transition.lock().unwrap();
+            let mut config = Config::load().map_err(|error| error.to_string())?;
+            config.defender_exclusion_receipt = Some(receipt.clone());
+            config.save().map_err(|error| error.to_string())?;
+            config
+        };
+        if let Err(error) = _app.emit("config-updated", &updated_config) {
+            tracing::warn!("could not emit Defender config update: {}", error);
+        }
+        Ok(receipt)
     }
     #[cfg(not(windows))]
     {
@@ -1188,8 +1476,16 @@ pub async fn add_defender_exclusions() -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{range_has_data, valid_session_id, write_export_file};
+    use super::{
+        configured_defender_roots, defender_elevation_script, defender_root_is_scoped,
+        defender_verification_script, powershell_encoded_command, powershell_encoded_path,
+        preserve_backend_owned_config, range_has_data, valid_session_id, write_export_file,
+    };
+    use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
     use crate::model::{RangeTotals, TokenTotals, ToolMetrics};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+    use chrono::{DateTime, Utc};
+    use std::path::PathBuf;
 
     #[test]
     fn validates_deep_link_session_ids() {
@@ -1229,5 +1525,135 @@ mod tests {
             optimization_summary: Default::default(),
         };
         assert!(range_has_data(&range));
+    }
+
+    #[test]
+    fn defender_roots_are_stable_and_case_insensitively_deduplicated() {
+        let config = Config {
+            session_roots: vec![PathBuf::from(r"C:\Users\dev\.codex\sessions")],
+            archive_roots: vec![
+                PathBuf::from(r"c:/users/dev/.codex/sessions/"),
+                PathBuf::from(r"C:\Users\dev\.codex\archived_sessions"),
+            ],
+            claude_session_roots: vec![PathBuf::from(r"C:\Users\dev\.claude\projects")],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            configured_defender_roots(&config),
+            vec![
+                PathBuf::from(r"C:\Users\dev\.codex\sessions"),
+                PathBuf::from(r"C:\Users\dev\.codex\archived_sessions"),
+                PathBuf::from(r"C:\Users\dev\.claude\projects"),
+            ]
+        );
+    }
+
+    #[test]
+    fn defender_scope_rejects_relative_drive_and_share_roots() {
+        assert!(defender_root_is_scoped(std::path::Path::new(
+            r"C:\sessions"
+        )));
+        assert!(defender_root_is_scoped(std::path::Path::new(
+            r"\\server\share\sessions"
+        )));
+        assert!(defender_root_is_scoped(std::path::Path::new(
+            r"\\?\C:\sessions"
+        )));
+        assert!(!defender_root_is_scoped(std::path::Path::new("sessions")));
+        assert!(!defender_root_is_scoped(std::path::Path::new(
+            r"C:sessions"
+        )));
+        assert!(!defender_root_is_scoped(std::path::Path::new(r"C:\")));
+        assert!(!defender_root_is_scoped(std::path::Path::new(
+            r"C:\logs\.."
+        )));
+        assert!(!defender_root_is_scoped(std::path::Path::new(
+            r"\\server\share"
+        )));
+        assert!(!defender_root_is_scoped(std::path::Path::new(
+            r"\\?\UNC\server\share"
+        )));
+        assert!(!defender_root_is_scoped(std::path::Path::new(
+            r"\\.\C:\sessions"
+        )));
+    }
+
+    #[test]
+    fn defender_encodings_round_trip_exact_unicode() {
+        fn decode_utf16(encoded: &str) -> String {
+            let bytes = BASE64.decode(encoded).unwrap();
+            assert_eq!(bytes.len() % 2, 0);
+            let units = bytes
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect::<Vec<_>>();
+            String::from_utf16(&units).unwrap()
+        }
+
+        let path = PathBuf::from("C:\\O\u{2019}Brien\\emoji-\u{1f680}");
+        assert_eq!(
+            decode_utf16(&powershell_encoded_path(&path)),
+            path.to_str().unwrap()
+        );
+        let command = "$value = '\u{2019}\u{1f680}'; exit 0";
+        assert_eq!(decode_utf16(&powershell_encoded_command(command)), command);
+    }
+
+    #[test]
+    fn defender_script_treats_paths_as_data_and_checks_effective_exclusions() {
+        let paths = vec![
+            PathBuf::from(r"C:\Agent sessions"),
+            PathBuf::from(r"C:\O'Brien\$(not-code);still-a-path"),
+            PathBuf::from("C:\\proof\u{2019}); exit 77; #"),
+        ];
+        let inner = defender_verification_script(&paths);
+        assert!(inner.contains("[Convert]::FromBase64String"));
+        assert!(!inner.contains("O'Brien"));
+        assert!(!inner.contains("exit 77"));
+        assert!(inner.contains("Add-MpPreference -ExclusionPath $paths -ErrorAction Stop"));
+        assert!(inner.contains("MpCmdRun.exe"));
+        assert!(inner.contains("Where-Object { Test-Path"));
+        assert!(inner.contains("-CheckExclusion -Path $path"));
+        assert!(inner.contains("$global:LASTEXITCODE = $null"));
+        assert!(inner.contains("if ($checkExitCode -eq 1) { exit 3 }"));
+        assert!(inner.contains("if ($checkExitCode -ne 0) { exit 5 }"));
+        assert!(!inner.contains("$env:ProgramData"));
+        assert!(!inner.contains("$env:ProgramFiles"));
+
+        let outer = defender_elevation_script(&inner);
+        assert!(outer.contains("-Verb RunAs"));
+        assert!(outer.contains("-WindowStyle Hidden"));
+        assert!(outer.contains("-FilePath $powershell"));
+        assert!(outer.contains("-EncodedCommand"));
+        assert!(outer.contains("-Wait -PassThru"));
+        assert!(outer.contains("$nativeError -eq 1223"));
+        assert!(outer.contains("exit 6"));
+        assert!(!outer.contains("Add-MpPreference"));
+    }
+
+    #[test]
+    fn ordinary_config_updates_preserve_backend_defender_receipt() {
+        let receipt = DefenderExclusionReceipt {
+            version: DEFENDER_EXCLUSION_RECEIPT_VERSION,
+            configured_roots: vec![PathBuf::from(r"C:\sessions")],
+            verified_roots: vec![PathBuf::from(r"C:\sessions")],
+            verified_at: DateTime::parse_from_rfc3339("2026-07-29T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        let previous = Config {
+            defender_exclusion_receipt: Some(receipt.clone()),
+            ..Default::default()
+        };
+        let mut incoming = Config {
+            performance_tracking_enabled: true,
+            ..Default::default()
+        };
+
+        preserve_backend_owned_config(&previous, &mut incoming);
+
+        assert_eq!(incoming.defender_exclusion_receipt, Some(receipt));
+        assert!(incoming.performance_tracking_enabled);
     }
 }

@@ -272,11 +272,20 @@ export interface ScanStatus {
   elapsed_ms: number | null;
 }
 
+/** Point-in-time evidence from the explicit, elevated Defender action. */
+export interface DefenderExclusionReceipt {
+  version: number;
+  configured_roots: string[];
+  verified_roots: string[];
+  verified_at: string;
+}
+
 export interface Config {
   session_roots: string[];
   archive_roots: string[];
   session_index_path: string;
   claude_session_roots: string[];
+  defender_exclusion_receipt: DefenderExclusionReceipt | null;
   performance_tracking_enabled: boolean;
   performance_log_max_mb: number;
   instructions_enabled: boolean;
