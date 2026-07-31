@@ -10,6 +10,7 @@ pub mod instructions;
 pub mod model;
 pub mod parser;
 pub mod performance;
+pub mod provider;
 pub mod rates;
 pub mod scan_cache;
 pub mod scanner;
@@ -104,13 +105,24 @@ pub fn run() {
 
             // Start the live watcher first so changes made during the initial
             // scan are not missed; store the handle so set_config can restart it.
+            let (provider_sources, source_configuration_valid) = match config.provider_sources() {
+                Ok(sources) => (sources, true),
+                Err(error) => {
+                    // Legacy configs could express overlapping ownership.
+                    // Keep Settings reachable while declining all source
+                    // access until the user saves a valid configuration.
+                    tracing::error!(
+                        "session source configuration is invalid; scanning is disabled: {}",
+                        error
+                    );
+                    (provider::ProviderSourceSet::empty(), false)
+                }
+            };
             let watcher_started = Instant::now();
             let handle_result = watcher::start(
                 app.handle().clone(),
                 state_for_setup.clone(),
-                config.session_roots.clone(),
-                config.archive_roots.clone(),
-                config.claude_session_roots.clone(),
+                provider_sources.clone(),
                 config.session_index_path.clone(),
             );
             state_for_setup.performance.record_backend(
@@ -166,7 +178,13 @@ pub fn run() {
             // summary per parsed file. Keeping this out of setup means the
             // window is interactive immediately instead of after ~10s of
             // parsing on a large corpus.
-            commands::spawn_scan(app.handle().clone(), state_for_setup.clone(), config);
+            commands::spawn_scan(
+                app.handle().clone(),
+                state_for_setup.clone(),
+                config,
+                provider_sources,
+                source_configuration_valid,
+            );
             state_for_setup.performance.record_backend(
                 "startup.setup",
                 setup_started,

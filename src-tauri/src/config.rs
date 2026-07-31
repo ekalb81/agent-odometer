@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::provider::{
+    claude_code_provider_id, codex_provider_id, ProviderSource, ProviderSourceKind,
+    ProviderSourceSet,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstructionRoot {
     pub path: PathBuf,
@@ -107,6 +112,25 @@ fn config_path() -> Option<PathBuf> {
 }
 
 impl Config {
+    /// Projects the legacy provider-specific root fields into the shared
+    /// adapter source model without changing the persisted config contract.
+    pub fn provider_sources(&self) -> anyhow::Result<ProviderSourceSet> {
+        let codex = codex_provider_id();
+        let claude_code = claude_code_provider_id();
+        let sources =
+            self.session_roots
+                .iter()
+                .cloned()
+                .map(|root| ProviderSource::new(codex.clone(), root, ProviderSourceKind::Live))
+                .chain(self.archive_roots.iter().cloned().map(|root| {
+                    ProviderSource::new(codex.clone(), root, ProviderSourceKind::Archived)
+                }))
+                .chain(self.claude_session_roots.iter().cloned().map(|root| {
+                    ProviderSource::new(claude_code.clone(), root, ProviderSourceKind::Live)
+                }));
+        ProviderSourceSet::try_new(sources)
+    }
+
     pub fn session_sources_equal(&self, other: &Self) -> bool {
         self.session_roots == other.session_roots
             && self.archive_roots == other.archive_roots
@@ -266,6 +290,67 @@ mod tests {
         second.turn_receipts_enabled = true;
         second.turn_receipts_claude = false;
         assert!(first.session_sources_equal(&second));
+    }
+
+    #[test]
+    fn legacy_roots_project_to_provider_sources_without_changing_config() {
+        let dir = tempdir().unwrap();
+        let config = Config {
+            session_roots: vec![dir.path().join("codex-live")],
+            archive_roots: vec![dir.path().join("codex-archive")],
+            claude_session_roots: vec![dir.path().join("claude-live")],
+            ..Config::default()
+        };
+        let original_json = serde_json::to_value(&config).unwrap();
+
+        let sources = config.provider_sources().unwrap();
+        let projected: Vec<_> = sources
+            .iter()
+            .map(|source| {
+                (
+                    source.provider_id().as_str(),
+                    source.root().to_path_buf(),
+                    source.kind(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            projected,
+            vec![
+                (
+                    "codex",
+                    dir.path().join("codex-live"),
+                    ProviderSourceKind::Live
+                ),
+                (
+                    "codex",
+                    dir.path().join("codex-archive"),
+                    ProviderSourceKind::Archived
+                ),
+                (
+                    "claude_code",
+                    dir.path().join("claude-live"),
+                    ProviderSourceKind::Live
+                ),
+            ]
+        );
+        assert_eq!(serde_json::to_value(&config).unwrap(), original_json);
+    }
+
+    #[test]
+    fn ambiguous_legacy_roots_fail_closed() {
+        let dir = tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let config = Config {
+            session_roots: vec![shared.clone()],
+            archive_roots: Vec::new(),
+            claude_session_roots: vec![shared],
+            ..Config::default()
+        };
+
+        let error = config.provider_sources().unwrap_err().to_string();
+        assert!(error.contains("ambiguous ownership"));
     }
 
     #[test]

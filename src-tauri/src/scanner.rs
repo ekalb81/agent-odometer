@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -6,9 +7,20 @@ use std::time::Instant;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
+use crate::provider::{ProviderAdapter, ProviderRegistry, ProviderSourceKind, ProviderSourceSet};
 use crate::scan_cache::{self, ScanCache};
 
 pub fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
+    scan_files(root, |path| {
+        path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+    })
+}
+
+fn scan_provider_files(root: &Path, adapter: &dyn ProviderAdapter) -> Vec<PathBuf> {
+    scan_files(root, |path| adapter.accepts_path(path))
+}
+
+fn scan_files(root: &Path, accepts_path: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     if !root.exists() {
         return Vec::new();
     }
@@ -17,18 +29,9 @@ pub fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
         .follow_links(false)
         .into_iter()
         .filter_map(|entry| entry.ok())
-        .filter(|e| {
-            e.file_type().is_file()
-                && e.path().extension().and_then(|s| s.to_str()) == Some("jsonl")
-        })
+        .filter(|entry| entry.file_type().is_file() && accepts_path(entry.path()))
         .map(|e| e.path().to_path_buf())
         .collect()
-}
-
-#[derive(Clone, Copy)]
-enum FileKind {
-    Codex { archived: bool },
-    Claude,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,9 +58,7 @@ pub struct ScanReport {
 /// under multiple roots, callback order (and thus which one wins in the
 /// caller's map) is nondeterministic.
 pub fn scan_all<F, P>(
-    session_roots: &[PathBuf],
-    archive_roots: &[PathBuf],
-    claude_session_roots: &[PathBuf],
+    sources: &ProviderSourceSet,
     cache_path: Option<&Path>,
     on_session: F,
     on_progress: P,
@@ -67,21 +68,20 @@ where
     P: Fn(usize, usize) + Send + Sync,
 {
     let discovery_started = Instant::now();
-    let mut work: Vec<(PathBuf, FileKind)> = Vec::new();
+    let registry = ProviderRegistry::builtin();
+    let mut work: Vec<(PathBuf, &'static dyn ProviderAdapter, ProviderSourceKind)> = Vec::new();
+    let mut discovered = HashSet::new();
 
-    for root in session_roots {
-        for path in scan_jsonl_files(root) {
-            work.push((path, FileKind::Codex { archived: false }));
-        }
-    }
-    for root in archive_roots {
-        for path in scan_jsonl_files(root) {
-            work.push((path, FileKind::Codex { archived: true }));
-        }
-    }
-    for root in claude_session_roots {
-        for path in scan_jsonl_files(root) {
-            work.push((path, FileKind::Claude));
+    for source in sources.iter() {
+        // ProviderSourceSet construction validates this lookup. Keeping the
+        // invariant here avoids a registry lookup for every discovered file.
+        let adapter = registry
+            .adapter(source.provider_id())
+            .expect("validated provider source has a registered adapter");
+        for path in scan_provider_files(source.root(), adapter) {
+            if discovered.insert(path.clone()) {
+                work.push((path, adapter, source.kind()));
+            }
         }
     }
 
@@ -105,17 +105,19 @@ where
     let cache_lookup_total_ns = AtomicU64::new(0);
     let processing_started = Instant::now();
 
-    work.par_iter().for_each(|(path, kind)| {
+    work.par_iter().for_each(|(path, adapter, kind)| {
         let key = path.to_string_lossy().into_owned();
         // The stamp is taken BEFORE parsing so a file that grows mid-parse
         // looks changed on the next launch rather than serving stale data.
         let stamp = scan_cache::file_stamp(path);
         let cache_started = Instant::now();
-        let cached = stamp.and_then(|(size, mtime_ms)| {
-            cache
-                .as_ref()
-                .and_then(|cache| cache.lookup(&key, size, mtime_ms))
-        });
+        let cached = stamp
+            .and_then(|(size, mtime_ms)| {
+                cache
+                    .as_ref()
+                    .and_then(|cache| cache.lookup(&key, size, mtime_ms))
+            })
+            .filter(|session| adapter.accepts_cached_session(session, *kind));
         if cache.as_ref().is_some_and(ScanCache::is_enabled) {
             cache_lookup_total_ns.fetch_add(elapsed_ns(cache_started), Ordering::Relaxed);
             if cached.is_some() {
@@ -129,10 +131,7 @@ where
             Some(session) => Some(session),
             None => {
                 let parse_started = Instant::now();
-                let result = match kind {
-                    FileKind::Codex { archived } => crate::parser::parse_file(path, *archived),
-                    FileKind::Claude => crate::claude_parser::parse_file(path),
-                };
+                let result = adapter.parse_file(path, *kind);
                 let parse_ns = elapsed_ns(parse_started);
                 parsed_files.fetch_add(1, Ordering::Relaxed);
                 parse_total_ns.fetch_add(parse_ns, Ordering::Relaxed);

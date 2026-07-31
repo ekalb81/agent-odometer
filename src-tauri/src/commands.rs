@@ -708,12 +708,13 @@ pub fn set_config(
 
     // Stage the replacement before changing durable or live state. If watcher
     // construction fails, the existing configuration remains fully active.
+    let provider_sources = config
+        .provider_sources()
+        .map_err(|error| error.to_string())?;
     let replacement = crate::watcher::start(
         app.clone(),
         state.inner().clone(),
-        config.session_roots.clone(),
-        config.archive_roots.clone(),
-        config.claude_session_roots.clone(),
+        provider_sources.clone(),
         config.session_index_path.clone(),
     )
     .map_err(|e| e.to_string())?;
@@ -743,7 +744,13 @@ pub fn set_config(
     state.scan_total.store(0, Ordering::Release);
     state.scan_elapsed_ms.store(0, Ordering::Release);
 
-    spawn_scan(app.clone(), state.inner().clone(), config.clone());
+    spawn_scan(
+        app.clone(),
+        state.inner().clone(),
+        config.clone(),
+        provider_sources,
+        true,
+    );
 
     app.emit("config-updated", &config)
         .map_err(|e| e.to_string())?;
@@ -762,25 +769,35 @@ pub fn set_config(
 /// into state and emitting a "session-updated" summary for each as it
 /// parses. Applies the session-index name overlay and sets `scanned` when
 /// done. Shared by startup (lib.rs) and set_config.
-pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
+pub fn spawn_scan(
+    app: AppHandle,
+    state: Arc<AppState>,
+    config: Config,
+    provider_sources: crate::provider::ProviderSourceSet,
+    source_configuration_valid: bool,
+) {
     let generation = state.current_scan_generation();
     // Allocate the archive generation before workers start. Live watcher
     // writes during discovery use the same generation, preventing a newly
     // created file from being falsely marked missing at completion.
-    let history_generation = state.begin_history_scan();
+    let history_generation = source_configuration_valid
+        .then(|| state.begin_history_scan())
+        .flatten();
     state.scanned.store(false, Ordering::Release);
     state.scan_done.store(0, Ordering::Release);
     state.scan_total.store(0, Ordering::Release);
 
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let cache_path =
-            dirs::cache_dir().map(|d| d.join("agent-odometer").join("scan-cache-v2.sqlite3"));
+        // An invalid legacy source configuration must not prune an otherwise
+        // healthy cache merely because the fail-closed scan has no roots.
+        let cache_path = source_configuration_valid.then(|| {
+            dirs::cache_dir().map(|d| d.join("agent-odometer").join("scan-cache-v2.sqlite3"))
+        });
+        let cache_path = cache_path.flatten();
 
         let report = crate::scanner::scan_all(
-            &config.session_roots,
-            &config.archive_roots,
-            &config.claude_session_roots,
+            &provider_sources,
             cache_path.as_deref(),
             |path, session| {
                 if state.current_scan_generation() != generation {
@@ -838,7 +855,11 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
         // A parser/read failure makes a complete source observation
         // untrustworthy. Retain stale-present history rather than incorrectly
         // marking a transcript missing.
-        if report.parse_failures == 0 {
+        if !source_configuration_valid {
+            tracing::warn!(
+                "durable source availability was not finalized: invalid source configuration"
+            );
+        } else if report.parse_failures == 0 {
             if let Some(history_generation) = history_generation {
                 for session in state.finish_history_scan(history_generation) {
                     if let Err(e) = app.emit("session-updated", &SessionSummary::of(&session)) {
@@ -919,7 +940,7 @@ pub fn spawn_scan(app: AppHandle, state: Arc<AppState>, config: Config) {
         state.performance.record_backend(
             "startup.bulk_scan",
             started,
-            report.parse_failures == 0,
+            source_configuration_valid && report.parse_failures == 0,
             BTreeMap::from([
                 ("files".into(), report.files.to_string()),
                 ("discovery_ms".into(), format!("{:.3}", report.discovery_ms)),
