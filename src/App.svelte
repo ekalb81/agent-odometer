@@ -130,7 +130,9 @@
     trayTimer = setTimeout(() => {
       trayTimer = null;
       const generation = ++trayJobGeneration;
-      trayQueue = trayQueue.then(() => runTrayRefresh(generation, rateCard));
+      trayQueue = trayQueue
+        .then(() => runTrayRefresh(generation, rateCard))
+        .catch(() => {});
     }, 250);
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);
     const boundary = setTimeout(() => { trayRefreshGeneration += 1; }, next.getTime() - now.getTime());

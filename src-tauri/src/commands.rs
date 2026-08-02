@@ -67,6 +67,9 @@ pub async fn list_instruction_files(
                         );
                         if !error.contains(crate::instructions::SCAN_CANCELLED_ERROR) {
                             tracing::warn!("background instruction rescan failed: {}", error);
+                            // Without a terminal signal the view would show
+                            // "refreshing in background" forever.
+                            let _ = app.emit("instruction-inventory-error", &error);
                         }
                     }
                 }
@@ -152,14 +155,17 @@ async fn run_instruction_scan(
             .map(|file| crate::instructions::normalized_path_key(std::path::Path::new(&file.path)))
             .collect::<Vec<_>>();
         let _transition = app_state.config_transition.lock().unwrap();
-        app_state.publish_instruction_paths_if_current(scan_id, paths);
-        if instructions_enabled {
-            if let Err(error) = crate::instructions::persist_inventory(inventory) {
-                tracing::warn!("could not persist instruction inventory: {}", error);
+        // A superseded scan must not persist either: a settings transition or
+        // newer scan owns the durable state from here on.
+        if app_state.publish_instruction_paths_if_current(scan_id, paths) {
+            if instructions_enabled {
+                if let Err(error) = crate::instructions::persist_inventory(inventory) {
+                    tracing::warn!("could not persist instruction inventory: {}", error);
+                }
+            } else {
+                // The feature is off: a persisted index must not outlive that choice.
+                crate::instructions::remove_persisted_inventory();
             }
-        } else {
-            // The feature is off: a persisted index must not outlive that choice.
-            crate::instructions::remove_persisted_inventory();
         }
     }
     result
@@ -768,6 +774,10 @@ pub fn set_config(
         }
         if instruction_sources_changed {
             state.cancel_instruction_scan_and_clear_paths();
+            if !config.instructions_enabled {
+                // Disabling the feature must also retire the persisted index.
+                crate::instructions::remove_persisted_inventory();
+            }
             let previous_watcher = state
                 .config_watcher
                 .lock()
@@ -837,6 +847,10 @@ pub fn set_config(
         return Err(error);
     }
     state.cancel_instruction_scan_and_clear_paths();
+    if !config.instructions_enabled {
+        // Disabling the feature must also retire the persisted index.
+        crate::instructions::remove_persisted_inventory();
+    }
     // A commit-time cleanup warning does not undo the durable config or
     // installed hooks. Keep applying live state and emit the new config
     // before surfacing that warning to the caller.

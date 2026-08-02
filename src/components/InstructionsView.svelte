@@ -8,6 +8,7 @@
     listExternalEvents,
     listInstructionFiles,
     onConfigEvent,
+    onInstructionInventoryError,
     onInstructionInventoryUpdated,
     openInstructionFile,
     readInstructionFile,
@@ -192,6 +193,12 @@
     try {
       const scanId = await cancelInstructionScan();
       instructionScanStore.clearThrough(scanId);
+      if (!loading && inventory?.stale) {
+        // A cancelled background rescan delivers nothing: stop advertising
+        // one and let the header describe the retained results.
+        inventory = { ...inventory, stale: false };
+        cancelRequested = false;
+      }
     }
     catch (reason) {
       cancelRequested = false;
@@ -264,10 +271,23 @@
       if (disposed) dispose();
       else inventoryUnlisten = dispose;
     }).catch(() => {});
+    let inventoryErrorUnlisten: (() => void) | undefined;
+    onInstructionInventoryError((message) => {
+      if (disposed) return;
+      // Terminal failure: keep showing the retained results, surface the
+      // error, and stop advertising a refresh that will never arrive.
+      if (inventory?.stale) inventory = { ...inventory, stale: false };
+      error = message;
+      instructionScanStore.clearCurrent();
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else inventoryErrorUnlisten = dispose;
+    }).catch(() => {});
     return () => {
       disposed = true;
       configUnlisten?.();
       inventoryUnlisten?.();
+      inventoryErrorUnlisten?.();
       if (loading) {
         void cancelInstructionScan()
           .then((scanId) => instructionScanStore.clearThrough(scanId))
@@ -289,7 +309,7 @@
             {inventory?.files.length ?? 0} files · read-only
           </p>
         </div>
-        {#if loading}
+        {#if loading || inventory?.stale}
           <button
             type="button"
             onclick={() => void cancelScan()}

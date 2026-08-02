@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
@@ -197,6 +197,9 @@
   // have changed are fetched and merged into the cached result (rangeData.ts).
   let lastTableRange: string | null = null;
   let tableJobGeneration = 0;
+  // Bumped alongside cache invalidation so an in-flight job discards its
+  // fetch instead of applying stale-range data over freshly cleared state.
+  let tableEpoch = 0;
   let tableQueue: Promise<void> = Promise.resolve();
   const tableCache = new RangeDataCache();
   const tableMutations = new MutationAccumulator();
@@ -206,6 +209,7 @@
   // its pending mutations to the replacement job.
   async function runTableRefresh(
     generation: number,
+    epoch: number,
     from: string | null,
     to: string | null,
     sessionIds: string[],
@@ -228,6 +232,7 @@
           () => sessionsInRanges([{ from, to }], sessionIds),
           { sessions: sessionIds.length, ranges: 1, fetched: sessionIds.length, mode: 'full' },
         );
+        if (epoch !== tableEpoch) return;
         results = tableCache.applyFull(rangesKey, sessionIds, fetched);
       } else {
         const fetched = plan.fetchIds.length > 0
@@ -237,6 +242,7 @@
               { sessions: sessionIds.length, ranges: 1, fetched: plan.fetchIds.length, mode: 'delta' },
             )
           : null;
+        if (epoch !== tableEpoch) return;
         results = tableCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
       }
       rangeTotals = results[0];
@@ -256,6 +262,7 @@
       lastTableRange = null;
       tableCache.invalidate();
       tableJobGeneration += 1;
+      tableEpoch += 1;
       return;
     }
     if (!from && !to) {
@@ -263,6 +270,7 @@
       lastTableRange = null;
       tableCache.invalidate();
       tableJobGeneration += 1;
+      tableEpoch += 1;
       return;
     }
     const key = `${from}|${to}`;
@@ -272,13 +280,16 @@
       rangeTotals = {};
       tableCache.invalidate();
       tableJobGeneration += 1;
+      tableEpoch += 1;
     }
     lastTableRange = key;
     if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
     rangeFetchTimer = setTimeout(() => {
       rangeFetchTimer = null;
       const generation = ++tableJobGeneration;
-      tableQueue = tableQueue.then(() => runTableRefresh(generation, from, to, sessionIds));
+      tableQueue = tableQueue
+        .then(() => runTableRefresh(generation, tableEpoch, from, to, sessionIds))
+        .catch(() => {});
     }, delay);
     return () => {
       if (rangeFetchTimer !== null) {
@@ -619,6 +630,10 @@
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
   let analyticsJobGeneration = 0;
+  // Bumped whenever the cache is invalidated (range change, tab switch); an
+  // in-flight job from an older epoch discards its fetch instead of applying
+  // stale-range data over the freshly cleared state.
+  let analyticsEpoch = 0;
   let analyticsQueue: Promise<void> = Promise.resolve();
   const analyticsCache = new RangeDataCache();
   const analyticsMutations = new MutationAccumulator();
@@ -697,28 +712,35 @@
   // delta pills, which are hidden otherwise.
   async function runAnalyticsRefresh(
     generation: number,
+    epoch: number,
     startMs: number,
     endMs: number,
+    openEnded: boolean,
     sessionIds: string[],
     includePrev: boolean,
   ): Promise<void> {
     if (generation !== analyticsJobGeneration) return;
+    // An open window's end bound must be taken at job time: during sustained
+    // streaming the pulse-driven windowBounds end freezes, and a delta fetch
+    // with a stale end would permanently exclude the burst's newest events
+    // from the cached rollups.
+    const effectiveEnd = openEnded ? Date.now() : endMs;
     // Day-aligned buckets, coalesced so long ranges stay ≤14 chart points.
     const dayStart = (ms: number) => {
       const d = new Date(ms);
       d.setHours(0, 0, 0, 0);
       return d.getTime();
     };
-    const totalDays = Math.max(1, Math.ceil((endMs - dayStart(startMs)) / DAY_MS));
+    const totalDays = Math.max(1, Math.ceil((effectiveEnd - dayStart(startMs)) / DAY_MS));
     const daysPerBucket = Math.max(1, Math.ceil(totalDays / MAX_CHART_BUCKETS));
     const bounds: { from: number; to: number }[] = [];
-    for (let t = dayStart(startMs); t < endMs; t += daysPerBucket * DAY_MS) {
-      bounds.push({ from: Math.max(t, startMs), to: Math.min(t + daysPerBucket * DAY_MS - 1, endMs) });
+    for (let t = dayStart(startMs); t < effectiveEnd; t += daysPerBucket * DAY_MS) {
+      bounds.push({ from: Math.max(t, startMs), to: Math.min(t + daysPerBucket * DAY_MS - 1, effectiveEnd) });
     }
-    const prevFrom = startMs - (endMs - startMs);
+    const prevFrom = startMs - (effectiveEnd - startMs);
     const iso = (ms: number) => new Date(ms).toISOString();
     const requestedRanges = [
-      { from: iso(startMs), to: iso(endMs) },
+      { from: iso(startMs), to: iso(effectiveEnd) },
       ...(includePrev ? [{ from: iso(prevFrom), to: iso(startMs - 1) }] : []),
       ...bounds.map((b) => ({ from: iso(b.from), to: iso(b.to) })),
     ];
@@ -746,6 +768,7 @@
           () => sessionsInRanges(requestedRanges, sessionIds),
           { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: sessionIds.length, mode: 'full' },
         );
+        if (epoch !== analyticsEpoch) return;
         results = analyticsCache.applyFull(rangesKey, sessionIds, fetched);
       } else {
         const fetched = plan.fetchIds.length > 0
@@ -755,6 +778,7 @@
               { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: plan.fetchIds.length, mode: 'delta' },
             )
           : null;
+        if (epoch !== analyticsEpoch) return;
         results = analyticsCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
       }
       analyticsCurrent = results[0];
@@ -779,9 +803,11 @@
       lastAnalyticsRange = null;
       analyticsCache.invalidate();
       analyticsJobGeneration += 1;
+      analyticsEpoch += 1;
       return;
     }
     const key = `${fromUtc}|${toUtc}`;
+    const openEnded = !toUtc;
     const rangeChanged = key !== lastAnalyticsRange;
     const delay = rangeChanged ? 0 : 250;
     if (rangeChanged) {
@@ -790,6 +816,7 @@
       analyticsCurrent = null;
       analyticsCache.invalidate();
       analyticsJobGeneration += 1;
+      analyticsEpoch += 1;
     }
     lastAnalyticsRange = key;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
@@ -798,9 +825,11 @@
     analyticsTimer = setTimeout(() => {
       analyticsTimer = null;
       const generation = ++analyticsJobGeneration;
-      analyticsQueue = analyticsQueue.then(() =>
-        runAnalyticsRefresh(generation, startMs, endMs, sessionIds, includePrev),
-      );
+      analyticsQueue = analyticsQueue
+        .then(() =>
+          runAnalyticsRefresh(generation, analyticsEpoch, startMs, endMs, openEnded, sessionIds, includePrev),
+        )
+        .catch(() => {});
     }, delay);
     return () => {
       if (analyticsTimer !== null) {
@@ -1329,7 +1358,10 @@
         })
         .catch((e) => console.error('get_session_details failed:', e));
     };
-    if (selectedSession?.storage_id === id) {
+    // Untracked: the fetch below assigns selectedSession, and tracking it
+    // here would turn every completed fetch into a rerun — a permanent
+    // ~400ms self-polling loop while a session is selected.
+    if (untrack(() => selectedSession?.storage_id) === id) {
       // Refresh of an already-selected session: debounce.
       detailsFetchTimer = setTimeout(fetchDetails, 400);
     } else {

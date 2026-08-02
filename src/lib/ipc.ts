@@ -203,6 +203,11 @@ export function onInstructionInventoryUpdated(
   return listen<InstructionInventory>('instruction-inventory-updated', (event) => cb(event.payload));
 }
 
+/** Terminal failure of a background rescan (never emitted for cancellations). */
+export function onInstructionInventoryError(cb: (error: string) => void): Promise<UnlistenFn> {
+  return listen<string>('instruction-inventory-error', (event) => cb(event.payload));
+}
+
 export function onRatesUpdated(cb: (rates: RateCard) => void): Promise<UnlistenFn> {
   return listen<RateCard>('rates-updated', (event) => cb(event.payload));
 }
