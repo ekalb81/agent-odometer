@@ -377,6 +377,7 @@ function emptyInstructionInventory() {
     entries_visited: 0,
     elapsed_ms: 0,
     scanned_at: new Date(now).toISOString(),
+    stale: false,
   };
 }
 
@@ -521,6 +522,7 @@ mockIPC((cmd, payload) => {
         entries_visited: 24,
         elapsed_ms: 120,
         scanned_at: new Date(now).toISOString(),
+        stale: false,
       };
     }
     case 'read_instruction_file': {

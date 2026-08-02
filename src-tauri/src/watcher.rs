@@ -161,10 +161,12 @@ pub fn start(
                             "watcher.incremental_parse",
                             parse_started,
                             parse_result.is_ok(),
-                            std::collections::BTreeMap::from([(
-                                "harness".into(),
-                                provider_id.as_str().into(),
-                            )]),
+                            std::collections::BTreeMap::from([
+                                ("harness".into(), provider_id.as_str().into()),
+                                // Corpus size makes cost-vs-corpus scaling
+                                // measurable inside a single recording.
+                                ("corpus".into(), state_cb.sessions.len().to_string()),
+                            ]),
                         );
                         match parse_result {
                             Ok(true) => {}

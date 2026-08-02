@@ -8,6 +8,7 @@
     listExternalEvents,
     listInstructionFiles,
     onConfigEvent,
+    onInstructionInventoryUpdated,
     openInstructionFile,
     readInstructionFile,
     revealInFileManager,
@@ -153,6 +154,13 @@
     return 'Results stopped at the 10,000-instruction-file safety limit.';
   }
 
+  function adoptInventory(next: InstructionInventory) {
+    inventory = next;
+    if (!selectedId || !next.files.some((file) => file.id === selectedId)) {
+      selectedId = next.files[0]?.id ?? null;
+    }
+  }
+
   async function refresh() {
     loading = true;
     cancelRequested = false;
@@ -163,11 +171,8 @@
         listInstructionFiles(),
         listExternalEvents(),
       ]);
-      inventory = nextInventory;
+      adoptInventory(nextInventory);
       configEvents = events;
-      if (!selectedId || !nextInventory.files.some((file) => file.id === selectedId)) {
-        selectedId = nextInventory.files[0]?.id ?? null;
-      }
     } catch (reason) {
       if (!String(reason).toLocaleLowerCase().includes('instruction scan cancelled')) {
         error = String(reason);
@@ -175,7 +180,10 @@
     } finally {
       loading = false;
       cancelRequested = false;
-      instructionScanStore.clearCurrent();
+      // A stale answer means a background rescan is still running; its
+      // progress keeps flowing to the status bar until the fresh inventory
+      // arrives via instruction-inventory-updated.
+      if (!inventory?.stale) instructionScanStore.clearCurrent();
     }
   }
 
@@ -238,6 +246,7 @@
     void refresh();
     let disposed = false;
     let configUnlisten: (() => void) | undefined;
+    let inventoryUnlisten: (() => void) | undefined;
     onConfigEvent((event) => {
       if (!disposed && event.source === 'config') {
         configEvents = [...configEvents.filter((item) => item.id !== event.id), event];
@@ -246,9 +255,19 @@
       if (disposed) dispose();
       else configUnlisten = dispose;
     }).catch(() => {});
+    onInstructionInventoryUpdated((fresh) => {
+      if (disposed) return;
+      adoptInventory(fresh);
+      error = null;
+      instructionScanStore.clearCurrent();
+    }).then((dispose) => {
+      if (disposed) dispose();
+      else inventoryUnlisten = dispose;
+    }).catch(() => {});
     return () => {
       disposed = true;
       configUnlisten?.();
+      inventoryUnlisten?.();
       if (loading) {
         void cancelInstructionScan()
           .then((scanId) => instructionScanStore.clearThrough(scanId))
@@ -293,6 +312,10 @@
       </div>
       {#if loading}
         <p class="text-[11px] text-ink-faint" role="status">{scanStatusText()}</p>
+      {:else if inventory?.stale}
+        <p class="text-[11px] text-ink-faint" role="status">
+          Showing last results · refreshing in background…
+        </p>
       {:else if inventory}
         <p class="text-[10px] text-ink-faint">
           Scanned {inventory.entries_visited.toLocaleString()} entries in {formatDuration(inventory.elapsed_ms)}

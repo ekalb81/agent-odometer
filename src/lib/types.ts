@@ -346,6 +346,8 @@ export interface InstructionInventory {
   entries_visited: number;
   elapsed_ms: number;
   scanned_at: string;
+  /** True when served from the persisted copy while a background rescan runs. */
+  stale: boolean;
 }
 
 export interface InstructionScanProgress {
