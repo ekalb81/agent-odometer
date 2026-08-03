@@ -105,22 +105,23 @@ impl ScanCache {
         }
         match Self::open_existing(path) {
             Ok(cache) => Ok(cache),
-            Err(error) => {
+            Err(error) if is_corruption_error(&error) => {
                 // A garbage or partially-written file (e.g. a crash mid-write,
                 // or a foreign file at this path) must not permanently disable
                 // caching. Rebuild from scratch exactly once; a second failure
                 // is a real, unrecoverable error and disables the cache for
                 // this run same as before.
-                tracing::warn!(
-                    "scan cache at {:?} could not be opened, rebuilding: {}",
-                    path,
-                    error
-                );
+                tracing::warn!("scan cache at {:?} is corrupt, rebuilding: {}", path, error);
                 remove_sqlite_files(path);
                 let mut cache = Self::open_existing(path)?;
                 cache.cold_reason = Some(ColdReason::CacheCorrupt);
                 Ok(cache)
             }
+            // Everything else — a busy write lock held by another process,
+            // permissions, transient I/O — must never delete a valid
+            // database out from under its owner; degrade to a disabled
+            // cache for this run exactly as before.
+            Err(error) => Err(error),
         }
     }
 
@@ -425,6 +426,23 @@ fn remove_legacy_cache(legacy_path: &Path) {
 
 /// Removes the SQLite main file and its WAL/SHM/journal siblings so a
 /// corrupt or foreign file at this path can be rebuilt from scratch.
+/// True only for confirmed database corruption (`SQLITE_CORRUPT` /
+/// `SQLITE_NOTADB`). Lock contention from another process, permissions, and
+/// transient I/O must never be classified as corruption — the corruption
+/// path deletes the database file out from under its owner.
+fn is_corruption_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(inner, _))
+                if matches!(
+                    inner.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    })
+}
+
 fn remove_sqlite_files(path: &Path) {
     let base = path.as_os_str().to_os_string();
     for suffix in ["", "-wal", "-shm", "-journal"] {
@@ -710,6 +728,366 @@ mod tests {
             "1000 incremental writes: {:?}; 1000 warm reads: {:?}",
             write_elapsed,
             started.elapsed()
+        );
+    }
+
+    const EXPECTED_SESSION_WIRE_SHAPE: &str = r#"agent_nickname
+agent_path
+archived
+category_totals.coding.buckets.[].model
+category_totals.coding.buckets.[].service_tier
+category_totals.coding.buckets.[].tokens.cached_input_tokens
+category_totals.coding.buckets.[].tokens.input_tokens
+category_totals.coding.buckets.[].tokens.output_tokens
+category_totals.coding.buckets.[].tokens.reasoning_output_tokens
+category_totals.coding.buckets.[].tokens.total_tokens
+category_totals.coding.tokens.cached_input_tokens
+category_totals.coding.tokens.input_tokens
+category_totals.coding.tokens.output_tokens
+category_totals.coding.tokens.reasoning_output_tokens
+category_totals.coding.tokens.total_tokens
+category_totals.coding.tool_calls
+category_totals.coding.turns
+cli_version
+context_window
+credits_balance
+credits_unlimited
+file_path
+first_user_message
+forked_from_id
+harness
+history_mode
+id
+last_event_at
+latest_context_tokens
+memory_mode
+model
+model_provider
+optimization_findings.[].avoidable_calls
+optimization_findings.[].confidence
+optimization_findings.[].evidence
+optimization_findings.[].model
+optimization_findings.[].occurrences
+optimization_findings.[].remediation
+optimization_findings.[].rule_id
+optimization_findings.[].severity
+optimization_findings.[].timestamp
+optimization_findings.[].turn_id
+optimization_findings.[].version
+originator
+parent_thread_id
+plan_type
+rate_limits_history.[].limit_id
+rate_limits_history.[].primary.resets_at
+rate_limits_history.[].primary.used_percent
+rate_limits_history.[].primary.window_minutes
+rate_limits_history.[].secondary
+rate_limits_history.[].timestamp
+rate_limits_history.[].turn_id
+service_tier
+source
+source_availability
+started_at
+storage_id
+subagent_id_is_path_fallback
+thread_name
+tokens_by_model.m.cached_input_tokens
+tokens_by_model.m.input_tokens
+tokens_by_model.m.output_tokens
+tokens_by_model.m.reasoning_output_tokens
+tokens_by_model.m.total_tokens
+tokens_history.[].delta.cached_input_tokens
+tokens_history.[].delta.input_tokens
+tokens_history.[].delta.output_tokens
+tokens_history.[].delta.reasoning_output_tokens
+tokens_history.[].delta.total_tokens
+tokens_history.[].model
+tokens_history.[].request_input_tokens
+tokens_history.[].service_tier
+tokens_history.[].timestamp
+tokens_history.[].total_tokens
+tokens_total.cached_input_tokens
+tokens_total.input_tokens
+tokens_total.output_tokens
+tokens_total.reasoning_output_tokens
+tokens_total.total_tokens
+tool_metrics.calls
+tool_metrics.commands
+tool_metrics.duration_ms
+tool_metrics.failures
+tool_metrics.mutation_targets
+tool_metrics.mutations
+tool_metrics.one_shot_mutations
+tool_metrics.other
+tool_metrics.output_bytes
+tool_metrics.reads
+tool_metrics.retry_count
+tool_metrics.searches
+tool_metrics.successes
+tool_metrics.unknown
+tool_metrics_by_model.m.calls
+tool_metrics_by_model.m.commands
+tool_metrics_by_model.m.duration_ms
+tool_metrics_by_model.m.failures
+tool_metrics_by_model.m.mutation_targets
+tool_metrics_by_model.m.mutations
+tool_metrics_by_model.m.one_shot_mutations
+tool_metrics_by_model.m.other
+tool_metrics_by_model.m.output_bytes
+tool_metrics_by_model.m.reads
+tool_metrics_by_model.m.retry_count
+tool_metrics_by_model.m.searches
+tool_metrics_by_model.m.successes
+tool_metrics_by_model.m.unknown
+tool_observations.[].call_id
+tool_observations.[].duration_ms
+tool_observations.[].effective_tools.[]
+tool_observations.[].harness
+tool_observations.[].kind
+tool_observations.[].model
+tool_observations.[].name
+tool_observations.[].outcome
+tool_observations.[].output_bytes
+tool_observations.[].providers.[]
+tool_observations.[].resource_id
+tool_observations.[].target
+tool_observations.[].timestamp
+tool_observations.[].turn_id
+total_turns
+turns.[].abort_reason
+turns.[].classification.category
+turns.[].classification.confidence
+turns.[].classification.signals.[]
+turns.[].classification.version
+turns.[].collaboration_mode
+turns.[].completed_at
+turns.[].duration_ms
+turns.[].index
+turns.[].last_agent_message
+turns.[].model
+turns.[].reasoning_effort
+turns.[].service_tier
+turns.[].started_at
+turns.[].status
+turns.[].time_to_first_token_ms
+turns.[].tokens.cached_input_tokens
+turns.[].tokens.input_tokens
+turns.[].tokens.output_tokens
+turns.[].tokens.reasoning_output_tokens
+turns.[].tokens.total_tokens
+turns.[].tool_metrics.calls
+turns.[].tool_metrics.commands
+turns.[].tool_metrics.duration_ms
+turns.[].tool_metrics.failures
+turns.[].tool_metrics.mutation_targets
+turns.[].tool_metrics.mutations
+turns.[].tool_metrics.one_shot_mutations
+turns.[].tool_metrics.other
+turns.[].tool_metrics.output_bytes
+turns.[].tool_metrics.reads
+turns.[].tool_metrics.retry_count
+turns.[].tool_metrics.searches
+turns.[].tool_metrics.successes
+turns.[].tool_metrics.unknown
+turns.[].turn_id
+turns.[].user_message
+working_directory"#;
+
+    #[test]
+    fn only_confirmed_corruption_is_classified_for_rebuild() {
+        let corrupt = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            None,
+        ));
+        assert!(is_corruption_error(&corrupt));
+        let really_corrupt = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+        assert!(is_corruption_error(&really_corrupt));
+        // A write lock held by another Odometer process is not corruption.
+        let busy = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+        assert!(!is_corruption_error(&busy));
+        let io = anyhow::Error::new(std::io::Error::other("disk unplugged"));
+        assert!(!is_corruption_error(&io));
+    }
+
+    /// Collects the JSON field paths of a value, descending into the first
+    /// element of arrays and using fixture map keys verbatim.
+    fn collect_paths(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    collect_paths(&format!("{prefix}{key}."), inner, out);
+                }
+            }
+            serde_json::Value::Array(items) => match items.first() {
+                Some(first) => collect_paths(&format!("{prefix}[]."), first, out),
+                None => out.push(format!("{prefix}[]")),
+            },
+            _ => out.push(prefix.trim_end_matches('.').to_string()),
+        }
+    }
+
+    /// Every field populated, one element per collection, so the serialized
+    /// shape covers each nested struct the cache persists.
+    fn fully_populated_session() -> Session {
+        use crate::model::{
+            CategoryMetric, OptimizationFinding, RateLimitSnapshotPoint, RateLimitWindow,
+            SourceAvailability, TaskCategory, TierBucket, TokenHistoryPoint, ToolKind,
+            ToolObservation, ToolOutcome, TurnClassification, TurnInfo, TurnStatus,
+        };
+        let now: chrono::DateTime<chrono::Utc> = "2026-08-03T00:00:00Z".parse().unwrap();
+        let totals = TokenTotals {
+            input_tokens: 1,
+            cached_input_tokens: 1,
+            output_tokens: 1,
+            reasoning_output_tokens: 1,
+            total_tokens: 2,
+        };
+        let bucket = TierBucket {
+            model: "m".into(),
+            service_tier: Some("fast".into()),
+            tokens: totals.clone(),
+        };
+        let tool_metrics = crate::model::ToolMetrics::default();
+        Session {
+            id: "s".into(),
+            storage_id: "codex:thread:s".into(),
+            harness: Harness::Codex,
+            thread_name: Some("t".into()),
+            forked_from_id: Some("f".into()),
+            parent_thread_id: Some("p".into()),
+            agent_path: Some("a".into()),
+            agent_nickname: Some("n".into()),
+            file_path: "s.jsonl".into(),
+            source_availability: SourceAvailability::Present,
+            archived: false,
+            started_at: now,
+            last_event_at: now,
+            working_directory: Some("w".into()),
+            originator: Some("o".into()),
+            source: Some("cli".into()),
+            subagent_id_is_path_fallback: false,
+            history_mode: Some("h".into()),
+            memory_mode: Some("m".into()),
+            cli_version: Some("1".into()),
+            model_provider: Some("openai".into()),
+            model: Some("m".into()),
+            service_tier: Some("fast".into()),
+            plan_type: Some("pro".into()),
+            credits_unlimited: Some(false),
+            credits_balance: Some(1.0),
+            context_window: Some(1),
+            latest_context_tokens: Some(1),
+            total_turns: 1,
+            first_user_message: Some("hi".into()),
+            tokens_total: totals.clone(),
+            tokens_by_model: std::collections::HashMap::from([("m".to_string(), totals.clone())]),
+            tokens_history: vec![TokenHistoryPoint {
+                timestamp: now,
+                model: Some("m".into()),
+                service_tier: Some("fast".into()),
+                request_input_tokens: Some(1),
+                total_tokens: 2,
+                delta: totals.clone(),
+            }],
+            rate_limits_history: vec![RateLimitSnapshotPoint {
+                timestamp: now,
+                turn_id: Some("t1".into()),
+                limit_id: Some("l".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 1.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(now),
+                }),
+                secondary: None,
+            }],
+            turns: vec![TurnInfo {
+                turn_id: "t1".into(),
+                index: 1,
+                model: Some("m".into()),
+                reasoning_effort: Some("high".into()),
+                collaboration_mode: Some("c".into()),
+                service_tier: Some("fast".into()),
+                status: TurnStatus::Completed,
+                abort_reason: Some("r".into()),
+                started_at: Some(now),
+                completed_at: Some(now),
+                duration_ms: Some(1),
+                time_to_first_token_ms: Some(1),
+                user_message: Some("u".into()),
+                last_agent_message: Some("a".into()),
+                tokens: totals.clone(),
+                tool_metrics: tool_metrics.clone(),
+                classification: TurnClassification::default(),
+            }],
+            tool_observations: vec![ToolObservation {
+                call_id: "c".into(),
+                turn_id: Some("t1".into()),
+                harness: Harness::Codex,
+                model: Some("m".into()),
+                timestamp: now,
+                kind: ToolKind::Read,
+                name: "read".into(),
+                providers: vec!["mcp".into()],
+                effective_tools: vec!["read".into()],
+                target: Some("h".into()),
+                resource_id: Some("r".into()),
+                outcome: ToolOutcome::Success,
+                duration_ms: Some(1),
+                output_bytes: 1,
+            }],
+            tool_metrics: tool_metrics.clone(),
+            tool_metrics_by_model: std::collections::BTreeMap::from([(
+                "m".to_string(),
+                tool_metrics,
+            )]),
+            category_totals: std::collections::BTreeMap::from([(
+                TaskCategory::Coding,
+                CategoryMetric {
+                    turns: 1,
+                    tokens: totals,
+                    tool_calls: 1,
+                    buckets: vec![bucket],
+                },
+            )]),
+            optimization_findings: vec![OptimizationFinding {
+                version: 1,
+                rule_id: "rule".into(),
+                severity: "warning".into(),
+                confidence: "high".into(),
+                turn_id: Some("t1".into()),
+                model: Some("m".into()),
+                timestamp: Some(now),
+                evidence: "e".into(),
+                remediation: "r".into(),
+                occurrences: 1,
+                avoidable_calls: 1,
+            }],
+        }
+    }
+
+    /// The guard the PARSE_VERSION policy relies on: cached rows are reused
+    /// across releases, so any change to the serialized `Session` shape MUST
+    /// bump `PARSE_VERSION`. This fails when the wire shape drifts without a
+    /// bump. (Value-level parser changes with an unchanged shape still need
+    /// a human bump — this guard covers the structural hazard.)
+    #[test]
+    fn cached_session_wire_shape_is_pinned_to_parse_version() {
+        let value = serde_json::to_value(fully_populated_session()).unwrap();
+        let mut paths = Vec::new();
+        collect_paths("", &value, &mut paths);
+        paths.sort();
+        let actual = paths.join("\n");
+        assert_eq!(
+            actual, EXPECTED_SESSION_WIRE_SHAPE,
+            "\nThe serialized Session shape changed. If cached rows from the \
+             previous shape must not be reused, bump PARSE_VERSION; then \
+             update EXPECTED_SESSION_WIRE_SHAPE to the new shape.\n\nActual:\n{actual}\n"
         );
     }
 }
