@@ -23,28 +23,33 @@
   import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
   import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
-  import { APP_VIEWS, type AppView } from './lib/appViews';
+  import { appViews, providerIdForTab, type AppView } from './lib/appViews';
+  import { providersStore } from './lib/stores/providers.svelte';
+  import { providerAccent } from './lib/providerAccents';
 
   let activeView: AppView = $state('all');
   let appVersion = $state('');
   const appStarted = performance.now();
 
   // Filter state lives here per view scope so the toolbar can drive the
-  // active tab while every sessions view remains mounted.
-  let filtersByScope = $state<Record<ViewScope, FilterState>>({
+  // active tab while every sessions view remains mounted. 'all' is always
+  // present; a provider's entry is added the first time its descriptor is
+  // observed and then persists for the life of the app.
+  let filtersByScope = $state<Record<string, FilterState>>({
     all: defaultFilters(),
-    codex: defaultFilters(),
-    claude_code: defaultFilters(),
   });
 
+  $effect(() => {
+    for (const descriptor of providersStore.descriptors) {
+      if (!(descriptor.id in filtersByScope)) filtersByScope[descriptor.id] = defaultFilters();
+    }
+  });
+
+  // Tabs are generated from descriptors, so the active scope is just the
+  // active view's provider id (identity for every provider except the one
+  // legacy short tab id) — except for the two static, non-provider views.
   const activeScope = $derived<ViewScope | null>(
-    activeView === 'all'
-      ? 'all'
-      : activeView === 'codex'
-        ? 'codex'
-        : activeView === 'claude'
-          ? 'claude_code'
-          : null,
+    activeView === 'instructions' || activeView === 'settings' ? null : providerIdForTab(activeView),
   );
 
   const toolbarSessions = $derived(
@@ -417,6 +422,7 @@
       const rateRevision = ratesEventRevision;
       await Promise.allSettled([
         reloadSessions('frontend.initial_list_sessions'),
+        providersStore.init(),
         measureAsync('frontend.initial_scan_status', getScanStatus).then((status) => {
           if (!disposed && scanRevision === scanEventRevision) scanStore.set(status);
         }).catch((error) => console.error('getScanStatus failed:', error)),
@@ -456,16 +462,10 @@
     `px-4 py-[5px] rounded-md text-xs transition-colors ${
       isActive ? `${fill} text-white font-semibold` : 'text-ink-muted hover:text-ink font-normal'
     }`;
-
-  function tabFill(view: AppView): string {
-    if (view === 'codex') return 'bg-[#2b58c9]';
-    if (view === 'claude') return 'bg-[#e8935a]';
-    return 'bg-ink text-app!';
-  }
 </script>
 
 <div
-  class="flex flex-col h-screen bg-app text-ink text-[13px] {activeView === 'claude' ? 'accent-claude' : 'accent-codex'}"
+  class="flex flex-col h-screen bg-app text-ink text-[13px] {activeScope === 'claude_code' ? 'accent-claude' : 'accent-codex'}"
   data-visual-scenario={visualScenario ?? undefined}
 >
   <!-- Update banner -->
@@ -537,9 +537,9 @@
     </span>
 
     <nav class="flex bg-app rounded-lg p-[2px] gap-[2px] border border-edge" aria-label="Views">
-      {#each APP_VIEWS as view (view.id)}
+      {#each appViews(providersStore.descriptors) as view (view.id)}
         {#if view.id !== 'instructions' || ($config.instructions_enabled && $config.instructions_tab_visible)}
-          <button class={tabClass(activeView === view.id, tabFill(view.id))} onclick={() => (activeView = view.id)}>
+          <button class={tabClass(activeView === view.id, providerAccent(providerIdForTab(view.id)).tabFill)} onclick={() => (activeView = view.id)}>
             {view.label}
           </button>
         {/if}
@@ -550,7 +550,7 @@
       <div class="ml-auto">
         {#key activeScope}
           <Filters
-            filters={filtersByScope[activeScope]}
+            filters={filtersByScope[activeScope] ?? defaultFilters()}
             sessions={toolbarSessions}
             onchange={(f) => { if (activeScope) filtersByScope[activeScope] = f; }}
           />
@@ -569,22 +569,16 @@
         onfilterschange={(f) => (filtersByScope.all = f)}
       />
     </div>
-    <div class="h-full accent-codex {activeView === 'codex' ? '' : 'hidden'}">
-      <SessionsView
-        harness="codex"
-        active={activeView === 'codex'}
-        filters={filtersByScope.codex}
-        onfilterschange={(f) => (filtersByScope.codex = f)}
-      />
-    </div>
-    <div class="h-full accent-claude {activeView === 'claude' ? '' : 'hidden'}">
-      <SessionsView
-        harness="claude_code"
-        active={activeView === 'claude'}
-        filters={filtersByScope.claude_code}
-        onfilterschange={(f) => (filtersByScope.claude_code = f)}
-      />
-    </div>
+    {#each providersStore.descriptors as descriptor (descriptor.id)}
+      <div class="h-full {providerAccent(descriptor.id).accentClass ?? ''} {activeScope === descriptor.id ? '' : 'hidden'}">
+        <SessionsView
+          harness={descriptor.id}
+          active={activeScope === descriptor.id}
+          filters={filtersByScope[descriptor.id] ?? defaultFilters()}
+          onfilterschange={(f) => (filtersByScope[descriptor.id] = f)}
+        />
+      </div>
+    {/each}
     {#if activeView === 'instructions'}
       <InstructionsView onhide={hideInstructionsTab} />
     {/if}

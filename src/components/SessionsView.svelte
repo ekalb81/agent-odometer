@@ -41,6 +41,7 @@
   import SessionGridControls from './SessionGridControls.svelte';
   import SessionContextMenu from './SessionContextMenu.svelte';
   import SubscriptionUsage from './SubscriptionUsage.svelte';
+  import { providersStore } from '../lib/stores/providers.svelte';
 
   interface Props {
     harness?: ViewScope;
@@ -1080,7 +1081,7 @@
     const sorted = windowStats.byModel;
     const max = sorted[0]?.cost ?? 0;
     const rows = (showAllCostModels ? sorted : sorted.slice(0, 4)).map((m) => ({
-      model: `${harness === 'all' ? `${m.harness} · ` : ''}${m.model}`,
+      model: `${harness === 'all' ? `${providersStore.displayName(m.harness)} · ` : ''}${m.model}`,
       cost: m.cost,
       pct: max > 0 ? Math.max(2, Math.round((m.cost / max) * 100)) : 0,
     }));
@@ -1583,7 +1584,7 @@
             <tbody>
               {#each modelComparison as metric (`${metric.harness}:${metric.model}`)}
                 <tr class="border-t border-edgerow">
-                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{metric.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {metric.model}{#if metric.unpriced}<span class="text-amber-500" title="Excluded because no published rate is available"> ◇</span>{:else if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
+                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{providersStore.displayName(metric.harness)}</span> · {metric.model}{#if metric.unpriced}<span class="text-amber-500" title="Excluded because no published rate is available"> ◇</span>{:else if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
                   <td class="text-right">{fmt.format(metric.tokens.input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.cached_input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.output_tokens)}</td>
@@ -1618,7 +1619,7 @@
           <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
             <div class="section-label col-span-2">Harness / category</div><div class="section-label text-right">Turns</div><div class="section-label text-right">Tokens</div><div class="section-label text-right">Tools</div><div class="section-label text-right">Cost</div>
             {#each categoryRows as row (`${row.harness}:${row.category}`)}
-              <div class="col-span-2 border-t border-edgerow pt-1"><span class="text-ink-faint">{row.harness === 'codex' ? 'Codex' : 'Claude'}</span> · {row.category}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.turns}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{fmt.format(row.tokens.total_tokens)}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.calls}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{formatCredits(row.cost, row.currency)}</div>
+              <div class="col-span-2 border-t border-edgerow pt-1"><span class="text-ink-faint">{providersStore.displayName(row.harness)}</span> · {row.category}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.turns}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{fmt.format(row.tokens.total_tokens)}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.calls}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{formatCredits(row.cost, row.currency)}</div>
             {/each}
           </div>
         {/if}
@@ -1694,12 +1695,12 @@
             <p class="text-xs">Results appear as files are parsed. The first launch reads everything; later launches use a cache and are much faster.</p>
           {:else}
             <p class="text-base text-ink-muted">No sessions found</p>
-            {#if harness === 'claude_code'}
-              <p class="text-xs">Start a Claude Code session or check your Claude session roots in Settings.</p>
-            {:else if harness === 'all'}
-              <p class="text-xs">Start a Codex or Claude Code task, or check both session roots in Settings.</p>
-            {:else}
+            {#if harness === 'codex'}
               <p class="text-xs">Start a Codex task in ChatGPT or check your config roots.</p>
+            {:else if harness === 'all'}
+              <p class="text-xs">Start a session with a connected provider, or check your session roots in Settings.</p>
+            {:else}
+              <p class="text-xs">Start a {providersStore.displayName(harness)} session or check your session roots in Settings.</p>
             {/if}
           {/if}
         </div>
@@ -1772,7 +1773,7 @@
                       {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
                       {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap" title="The saved transcript source is currently unavailable">source missing</span>{/if}
                       {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg) ml-1 whitespace-nowrap">archived</span>{/if}
-                      {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{session.harness === 'codex' ? 'Codex' : 'Claude'}</span>{/if}
+                      {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{providersStore.displayName(session.harness)}</span>{/if}
                     </span>
                   {:else if column.id === 'started'}
                     <span class="text-ink-muted font-mono text-xs" title={`UTC: ${session.started_at}`}>{formatStartedLocal(session.startedMs)}</span>

@@ -261,7 +261,7 @@
         {#if sourceMissing}
           <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-amber-500/10 text-amber-500 border border-amber-500/20">source missing</span>
         {/if}
-        {#if session.harness !== 'claude_code'}
+        {#if session.harness === 'codex'}
           <button
             onclick={handleOpenTask}
             class="ml-auto text-[10px] font-medium px-2 py-[2px] rounded-full border border-edge text-ink-muted hover:text-ink transition-colors whitespace-nowrap"

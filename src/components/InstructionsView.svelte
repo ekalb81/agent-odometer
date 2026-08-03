@@ -15,6 +15,7 @@
     revealInFileManager,
   } from '../lib/ipc';
   import { instructionScanStore } from '../lib/stores/instructionScan.svelte';
+  import { providersStore } from '../lib/stores/providers.svelte';
   import type { ExternalEvent, InstructionFile, InstructionInventory } from '../lib/types';
 
   interface Props { onhide: () => void | Promise<void>; }
@@ -100,9 +101,7 @@
   })());
 
   function harnessLabel(harness: string): string {
-    if (harness === 'codex') return 'Codex';
-    if (harness === 'claude_code') return 'Claude Code';
-    return harness;
+    return providersStore.displayName(harness);
   }
 
   function groupLabel(key: string, files: InstructionFile[]): string {
