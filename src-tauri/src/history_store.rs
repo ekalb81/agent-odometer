@@ -62,6 +62,9 @@ pub struct HistoryStats {
 /// failed archive must not quietly behave like a disposable cache.
 pub struct HistoryStore {
     connection: Mutex<Connection>,
+    /// Retained so aggregation can open dedicated read connections instead
+    /// of serializing behind the writer mutex (WAL permits concurrent reads).
+    path: PathBuf,
 }
 
 impl HistoryStore {
@@ -99,6 +102,7 @@ impl HistoryStore {
         migrate(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
+            path: path.to_path_buf(),
         })
     }
 
@@ -210,6 +214,12 @@ impl HistoryStore {
             store_tool_events(&transaction, &key, &session.tool_observations)?;
             store_finding_events(&transaction, &key, &session.optimization_findings)?;
         }
+        // A successful observe realigns snapshot and facts; any overlay-set
+        // dirty marking is resolved.
+        transaction.execute(
+            "UPDATE durable_sessions SET ledger_dirty = 0 WHERE session_key = ?1",
+            [key.as_str()],
+        )?;
         refresh_collision_flags(&transaction, &identity)?;
         transaction.commit()?;
         drop(connection);
@@ -279,7 +289,38 @@ impl HistoryStore {
         if exists.is_none() {
             bail!("cannot update snapshot for unknown durable session {key}");
         }
-        if store_snapshot(
+        // A metadata overlay may legitimately carry history that differs from
+        // the durable snapshot (its caller's in-memory copy can be ahead when
+        // an observe failed, or behind by design). Fact tables are only ever
+        // written by the observe path's monotonic flow — an overlay that
+        // advances the snapshot past the facts marks the session dirty so
+        // aggregation computes it from memory, durably, until the next
+        // successful observe realigns everything and clears the flag.
+        let history_matches_durable = {
+            let current: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT s.session_json FROM durable_sessions d
+                     JOIN session_snapshots s
+                       ON s.session_key = d.session_key
+                      AND s.version = d.current_snapshot_version
+                     WHERE d.session_key = ?1",
+                    [key.as_str()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match current.and_then(|raw| serde_json::from_slice::<Session>(&raw).ok()) {
+                Some(durable) => {
+                    durable.tokens_history.len() == archived.tokens_history.len()
+                        && durable.tokens_history.last().map(|point| point.timestamp)
+                            == archived.tokens_history.last().map(|point| point.timestamp)
+                        && durable.tool_observations.len() == archived.tool_observations.len()
+                        && durable.optimization_findings.len()
+                            == archived.optimization_findings.len()
+                }
+                None => false,
+            }
+        };
+        store_snapshot(
             &transaction,
             &key,
             &archived,
@@ -287,38 +328,62 @@ impl HistoryStore {
             &snapshot_hash,
             now,
             SnapshotPolicy::MetadataOverlay,
-        )? {
-            store_tool_events(&transaction, &key, &archived.tool_observations)?;
-            store_finding_events(&transaction, &key, &archived.optimization_findings)?;
-        }
+        )?;
         transaction.execute(
-            "UPDATE durable_sessions SET last_seen_at_ms = ?2 WHERE session_key = ?1",
-            params![key, now],
+            "UPDATE durable_sessions SET last_seen_at_ms = ?2, ledger_dirty = ?3 WHERE session_key = ?1",
+            params![key, now, !history_matches_durable],
         )?;
         transaction.commit()?;
         drop(connection);
         self.load_one(&key)
     }
 
-    /// Window-scoped rollups computed from the normalized ledger, mirroring
-    /// `Session::range_totals_multi` over in-memory history exactly, except
-    /// that timestamps compare at the ledger's millisecond storage
-    /// granularity. Returns one map per window containing only sessions with
-    /// data in that window (the `sessions_in_ranges` wire contract).
+    /// Window-scoped rollups computed from the normalized ledger. Each
+    /// session's in-span facts are fetched once on a dedicated read
+    /// connection (WAL keeps the writer unblocked), rebuilt into a minimal
+    /// session shell, and evaluated through the same
+    /// `Session::range_totals_multi` the in-memory path uses — the two paths
+    /// share one implementation and cannot diverge semantically. Timestamps
+    /// carry the ledger's millisecond storage granularity, which the oracle
+    /// also compares at. Returns one map per window containing only sessions
+    /// with data in that window (the `sessions_in_ranges` wire contract).
     pub fn range_totals_multi(
         &self,
         session_keys: &[String],
         windows: &[RangeWindow],
     ) -> Result<Vec<HashMap<String, RangeTotals>>> {
-        let connection = self.connection()?;
+        let connection = Connection::open(&self.path)
+            .with_context(|| format!("could not open history reader {}", self.path.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); windows.len()];
+        // Events outside the union of all requested windows cannot affect any
+        // window, so each session's rows are fetched once over that span and
+        // every window is evaluated in Rust against the same rows.
+        let span_from = if windows.iter().any(|(from, _)| from.is_none()) {
+            i64::MIN
+        } else {
+            windows
+                .iter()
+                .filter_map(|(from, _)| from.map(|value| value.timestamp_millis()))
+                .min()
+                .unwrap_or(i64::MIN)
+        };
+        let span_to = if windows.iter().any(|(_, to)| to.is_none()) {
+            i64::MAX
+        } else {
+            windows
+                .iter()
+                .filter_map(|(_, to)| to.map(|value| value.timestamp_millis()))
+                .max()
+                .unwrap_or(i64::MAX)
+        };
         let mut token_query = connection.prepare(
-            "SELECT model, service_tier,
-                    SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
-                    SUM(reasoning_output_tokens), SUM(total_tokens)
+            "SELECT timestamp_ms, model, service_tier, request_input_tokens,
+                    cumulative_total_tokens, input_tokens, cached_input_tokens,
+                    output_tokens, reasoning_output_tokens, total_tokens
              FROM durable_token_events
              WHERE session_key = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
-             GROUP BY model, service_tier",
+             ORDER BY timestamp_ms, event_index",
         )?;
         let mut tool_query = connection.prepare(
             "SELECT timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes
@@ -330,116 +395,93 @@ impl HistoryStore {
             "SELECT timestamp_ms, rule_id, severity, avoidable_calls
              FROM durable_finding_events WHERE session_key = ?1",
         )?;
-        for (window_index, (from, to)) in windows.iter().enumerate() {
-            let from_ms = from
-                .map(|value| value.timestamp_millis())
-                .unwrap_or(i64::MIN);
-            let to_ms = to.map(|value| value.timestamp_millis()).unwrap_or(i64::MAX);
-            for key in session_keys {
-                let mut tokens = TokenTotals::default();
-                let mut buckets: Vec<TierBucket> = Vec::new();
-                let groups = token_query.query_map(params![key, from_ms, to_ms], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        TokenTotals {
-                            input_tokens: row.get::<_, i64>(2).unwrap_or(0) as u64,
-                            cached_input_tokens: row.get::<_, i64>(3).unwrap_or(0) as u64,
-                            output_tokens: row.get::<_, i64>(4).unwrap_or(0) as u64,
-                            reasoning_output_tokens: row.get::<_, i64>(5).unwrap_or(0) as u64,
-                            total_tokens: row.get::<_, i64>(6).unwrap_or(0) as u64,
+        for key in session_keys {
+            let tokens_history: Vec<TokenHistoryPoint> = token_query
+                .query_map(params![key, span_from, span_to], |row| {
+                    Ok(TokenHistoryPoint {
+                        timestamp: chrono::Utc
+                            .timestamp_millis_opt(row.get::<_, i64>(0)?)
+                            .single()
+                            .unwrap_or_default(),
+                        model: row.get(1)?,
+                        service_tier: row.get(2)?,
+                        request_input_tokens: row
+                            .get::<_, Option<i64>>(3)?
+                            .map(|value| value as u64),
+                        total_tokens: row.get::<_, i64>(4)? as u64,
+                        delta: TokenTotals {
+                            input_tokens: row.get::<_, i64>(5)? as u64,
+                            cached_input_tokens: row.get::<_, i64>(6)? as u64,
+                            output_tokens: row.get::<_, i64>(7)? as u64,
+                            reasoning_output_tokens: row.get::<_, i64>(8)? as u64,
+                            total_tokens: row.get::<_, i64>(9)? as u64,
                         },
-                    ))
-                })?;
-                for group in groups {
-                    let (model, service_tier, group_totals) = group?;
-                    add_totals(&mut tokens, &group_totals);
-                    if let Some(model) = model {
-                        buckets.push(TierBucket {
-                            model,
-                            service_tier,
-                            tokens: group_totals,
-                        });
-                    }
-                }
-                buckets.sort_by(|a, b| {
-                    a.model
-                        .cmp(&b.model)
-                        .then_with(|| a.service_tier.cmp(&b.service_tier))
-                });
-
-                let observations: Vec<ToolObservation> = tool_query
-                    .query_map(params![key, from_ms, to_ms], |row| {
-                        Ok(ToolObservation {
-                            call_id: String::new(),
-                            turn_id: row.get(4)?,
-                            harness: codex_provider_id(),
-                            model: row.get(1)?,
-                            timestamp: chrono::Utc
-                                .timestamp_millis_opt(row.get::<_, i64>(0)?)
-                                .single()
-                                .unwrap_or_default(),
-                            kind: tool_kind_from_str(&row.get::<_, String>(2)?),
-                            name: String::new(),
-                            providers: Vec::new(),
-                            effective_tools: Vec::new(),
-                            target: row.get(5)?,
-                            resource_id: None,
-                            outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
-                            duration_ms: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
-                            output_bytes: row.get::<_, i64>(7)? as u64,
-                        })
-                    })?
-                    .collect::<std::result::Result<_, _>>()?;
-                let (tool_metrics, tool_metrics_by_model) =
-                    crate::telemetry::metrics_with_models(observations.iter());
-
-                let selected_findings: Vec<OptimizationFinding> = finding_query
-                    .query_map([key.as_str()], |row| {
-                        Ok((
-                            row.get::<_, Option<i64>>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    })?
-                    .filter_map(|row| row.ok())
-                    .filter(|(timestamp_ms, _, _, _)| match timestamp_ms {
-                        // Mirrors the in-memory rule: dated findings filter by
-                        // the window; undated findings only appear in a fully
-                        // open window.
-                        Some(ms) => *ms >= from_ms && *ms <= to_ms,
-                        None => from.is_none() && to.is_none(),
                     })
-                    .map(
-                        |(timestamp_ms, rule_id, severity, avoidable_calls)| OptimizationFinding {
-                            rule_id,
-                            severity,
-                            avoidable_calls: avoidable_calls as u64,
-                            timestamp: timestamp_ms
-                                .and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()),
-                            ..OptimizationFinding::default()
-                        },
-                    )
-                    .collect();
-                let optimization_findings_count = selected_findings.len() as u64;
-                let optimization_summary =
-                    OptimizationSummary::from_findings(selected_findings.iter());
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            let tool_observations: Vec<ToolObservation> = tool_query
+                .query_map(params![key, span_from, span_to], |row| {
+                    Ok(ToolObservation {
+                        call_id: String::new(),
+                        turn_id: row.get(4)?,
+                        // Not persisted: metric reconstruction reads only
+                        // kind/outcome/model/turn/target/duration/bytes. Any
+                        // future metric keyed on harness or name must extend
+                        // the fact schema first.
+                        harness: codex_provider_id(),
+                        model: row.get(1)?,
+                        timestamp: chrono::Utc
+                            .timestamp_millis_opt(row.get::<_, i64>(0)?)
+                            .single()
+                            .unwrap_or_default(),
+                        kind: tool_kind_from_str(&row.get::<_, String>(2)?),
+                        name: String::new(),
+                        providers: Vec::new(),
+                        effective_tools: Vec::new(),
+                        target: row.get(5)?,
+                        resource_id: None,
+                        outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
+                        duration_ms: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+                        output_bytes: row.get::<_, i64>(7)? as u64,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            let optimization_findings: Vec<OptimizationFinding> = finding_query
+                .query_map([key.as_str()], |row| {
+                    Ok(OptimizationFinding {
+                        timestamp: row
+                            .get::<_, Option<i64>>(0)?
+                            .and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()),
+                        rule_id: row.get(1)?,
+                        severity: row.get(2)?,
+                        avoidable_calls: row.get::<_, i64>(3)? as u64,
+                        ..OptimizationFinding::default()
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
 
-                let range = RangeTotals {
-                    tokens,
-                    buckets,
-                    tool_metrics,
-                    tool_metrics_by_model,
-                    optimization_findings_count,
-                    optimization_summary,
-                };
+            let shell =
+                ledger_session_shell(tokens_history, tool_observations, optimization_findings);
+            for (window_index, range) in shell.range_totals_multi(windows).into_iter().enumerate() {
                 if crate::commands::range_has_data(&range) {
                     out[window_index].insert(key.clone(), range);
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Sessions whose ledger facts cannot be trusted (an overlay advanced
+    /// their snapshot while an observe failure left facts behind). Survives
+    /// restarts, unlike the in-process stale set.
+    pub fn dirty_session_keys(&self) -> Result<Vec<String>> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT session_key FROM durable_sessions WHERE ledger_dirty = 1")?;
+        let keys = query
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(keys)
     }
 
     /// Returns all archived sessions, including those whose sources are gone.
@@ -522,7 +564,8 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                current_snapshot_version INTEGER NOT NULL DEFAULT 0,
                current_snapshot_hash TEXT,
                created_at_ms INTEGER NOT NULL,
-               last_seen_at_ms INTEGER NOT NULL
+               last_seen_at_ms INTEGER NOT NULL,
+               ledger_dirty INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key);
              CREATE TABLE source_artifacts (
@@ -629,30 +672,39 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                severity TEXT NOT NULL,
                avoidable_calls INTEGER NOT NULL
              );
-             CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key);",
+             CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key);
+             ALTER TABLE durable_sessions ADD COLUMN ledger_dirty INTEGER NOT NULL DEFAULT 0;",
         )?;
         // Backfill facts for every existing session from its current snapshot
         // so ledger-backed range queries cover historical data immediately.
         // A snapshot that no longer deserializes is skipped with a warning:
         // its facts repopulate on that session's next observe.
         {
+            // Streamed: snapshots can serialize to megabytes each, so the
+            // cursor row is the only blob resident at a time. Interleaved
+            // inserts on other tables are safe while the cursor is open.
             let mut select = transaction.prepare(
                 "SELECT d.session_key, s.session_json
                  FROM durable_sessions d JOIN session_snapshots s
                    ON s.session_key = d.session_key
                   AND s.version = d.current_snapshot_version",
             )?;
-            let rows: Vec<(String, Vec<u8>)> = select
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<std::result::Result<_, _>>()?;
-            drop(select);
-            for (key, raw) in rows {
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                let raw: Vec<u8> = row.get(1)?;
                 match serde_json::from_slice::<Session>(&raw) {
                     Ok(session) => {
                         store_tool_events(&transaction, &key, &session.tool_observations)?;
                         store_finding_events(&transaction, &key, &session.optimization_findings)?;
                     }
                     Err(error) => {
+                        // NOTE: a skipped session only heals when its snapshot
+                        // next changes (the observe hash gate); it stays
+                        // fact-less until then and is undercounted by ledger
+                        // aggregation. In practice a blob that fails here also
+                        // fails observe-side deserialization and gets marked
+                        // stale, routing it through memory.
                         tracing::warn!(
                             "could not backfill facts for {key}: snapshot did not deserialize: {error}"
                         );
@@ -960,6 +1012,58 @@ fn tool_outcome_from_str(value: &str) -> ToolOutcome {
         "success" => ToolOutcome::Success,
         "failure" => ToolOutcome::Failure,
         _ => ToolOutcome::Unknown,
+    }
+}
+
+/// Minimal session carrying only the fact-backed collections, so ledger
+/// aggregation can reuse `Session::range_totals_multi` verbatim. Every other
+/// field is display metadata the rollup math never reads.
+fn ledger_session_shell(
+    tokens_history: Vec<TokenHistoryPoint>,
+    tool_observations: Vec<ToolObservation>,
+    optimization_findings: Vec<OptimizationFinding>,
+) -> Session {
+    Session {
+        id: String::new(),
+        storage_id: String::new(),
+        harness: codex_provider_id(),
+        thread_name: None,
+        forked_from_id: None,
+        parent_thread_id: None,
+        agent_path: None,
+        agent_nickname: None,
+        file_path: String::new(),
+        source_availability: SourceAvailability::Present,
+        archived: false,
+        started_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+        last_event_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
+        working_directory: None,
+        originator: None,
+        source: None,
+        subagent_id_is_path_fallback: false,
+        history_mode: None,
+        memory_mode: None,
+        cli_version: None,
+        model_provider: None,
+        model: None,
+        service_tier: None,
+        plan_type: None,
+        credits_unlimited: None,
+        credits_balance: None,
+        context_window: None,
+        latest_context_tokens: None,
+        total_turns: 0,
+        first_user_message: None,
+        tokens_total: TokenTotals::default(),
+        tokens_by_model: std::collections::HashMap::new(),
+        tokens_history,
+        rate_limits_history: Vec::new(),
+        turns: Vec::new(),
+        tool_observations,
+        tool_metrics: Default::default(),
+        tool_metrics_by_model: std::collections::BTreeMap::new(),
+        category_totals: std::collections::BTreeMap::new(),
+        optimization_findings,
     }
 }
 
@@ -1377,7 +1481,9 @@ mod tests {
         fixture.tokens_history = vec![
             event("2026-01-01T00:00:01Z", Some("gpt-a"), None, 100),
             event("2026-01-01T06:00:00Z", Some("gpt-a"), Some("fast"), 40),
-            event("2026-01-01T12:00:00Z", Some("gpt-b"), None, 70),
+            // Sub-millisecond precision at an exact window bound: both paths
+            // must classify it identically (comparisons are ms-floored).
+            event("2026-01-01T12:00:00.000441Z", Some("gpt-b"), None, 70),
             event("2026-01-01T18:00:00Z", None, None, 30),
             event("2026-01-02T00:00:00Z", Some("gpt-b"), Some("fast"), 55),
             event("2026-01-02T09:30:00Z", Some("gpt-a"), None, 20),
@@ -1530,6 +1636,117 @@ mod tests {
     }
 
     #[test]
+    fn appended_history_keeps_ledger_and_oracle_equal() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut fixture = rich_session("append");
+        let key = store
+            .observe(Path::new("append.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+        // Append: more events, another straddling mutation, one more finding.
+        fixture.tokens_history.push(TokenHistoryPoint {
+            timestamp: timestamp("2026-01-03T04:00:00Z"),
+            model: Some("gpt-a".into()),
+            service_tier: Some("fast".into()),
+            request_input_tokens: Some(15),
+            total_tokens: 0,
+            delta: totals(15),
+        });
+        fixture.tool_observations.push(tool(
+            "2026-01-03T05:00:00Z",
+            crate::model::ToolKind::Mutation,
+            ToolOutcome::Success,
+            Some("gpt-a"),
+            Some("t1"),
+            Some("hash-x"),
+        ));
+        fixture.optimization_findings.push(OptimizationFinding {
+            rule_id: "rule-a".into(),
+            severity: "warning".into(),
+            avoidable_calls: 2,
+            timestamp: Some(timestamp("2026-01-03T06:00:00Z")),
+            ..OptimizationFinding::default()
+        });
+        fixture.last_event_at = timestamp("2026-01-03T06:00:00Z");
+        store
+            .observe(Path::new("append.jsonl"), &fixture, generation)
+            .unwrap();
+
+        let bound = |value: &str| Some(timestamp(value));
+        let windows: Vec<RangeWindow> = vec![
+            (None, None),
+            (bound("2026-01-03T00:00:00Z"), None),
+            (bound("2026-01-01T00:00:00Z"), bound("2026-01-02T12:00:00Z")),
+        ];
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let expected = fixture.range_totals_multi(&windows);
+        for (window_index, expected_range) in expected.iter().enumerate() {
+            let actual = from_ledger[window_index]
+                .get(&key)
+                .expect("window has data after append");
+            assert_eq!(
+                &actual.tokens, &expected_range.tokens,
+                "window {window_index}"
+            );
+            assert_eq!(
+                &actual.buckets, &expected_range.buckets,
+                "window {window_index}"
+            );
+            assert_eq!(
+                &actual.tool_metrics, &expected_range.tool_metrics,
+                "window {window_index}"
+            );
+            assert_eq!(
+                actual.optimization_findings_count, expected_range.optimization_findings_count,
+                "window {window_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_overlay_marks_diverged_history_dirty_and_observe_clears_it() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut fixture = rich_session("overlay");
+        let key = store
+            .observe(Path::new("overlay.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+        // Same history, new display name: overlay stays clean.
+        fixture.thread_name = Some("Renamed".into());
+        store.update_snapshot(&fixture).unwrap();
+        assert!(store.dirty_session_keys().unwrap().is_empty());
+
+        // History advanced without an observe (the failed-persist scenario):
+        // the overlay must durably mark the ledger facts untrustworthy.
+        fixture.tokens_history.push(TokenHistoryPoint {
+            timestamp: timestamp("2026-01-04T00:00:00Z"),
+            model: Some("gpt-a".into()),
+            service_tier: None,
+            request_input_tokens: Some(5),
+            total_tokens: 0,
+            delta: totals(5),
+        });
+        store.update_snapshot(&fixture).unwrap();
+        assert_eq!(store.dirty_session_keys().unwrap(), vec![key.clone()]);
+
+        // A successful observe realigns facts and clears the marking.
+        store
+            .observe(Path::new("overlay.jsonl"), &fixture, generation)
+            .unwrap();
+        assert!(store.dirty_session_keys().unwrap().is_empty());
+        let windows: Vec<RangeWindow> = vec![(None, None)];
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let expected = &fixture.range_totals_multi(&windows)[0];
+        assert_eq!(&from_ledger[0][&key].tokens, &expected.tokens);
+    }
+
+    #[test]
     fn v3_migration_backfills_facts_from_snapshots() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("history.sqlite3");
@@ -1552,6 +1769,7 @@ mod tests {
                 .execute_batch(
                     "DROP TABLE durable_tool_events;
                      DROP TABLE durable_finding_events;
+                     ALTER TABLE durable_sessions DROP COLUMN ledger_dirty;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '2')
                        ON CONFLICT(key) DO UPDATE SET value = '2';
                      PRAGMA user_version = 2;",

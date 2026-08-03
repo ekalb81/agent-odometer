@@ -622,6 +622,9 @@ pub async fn sessions_in_ranges(
                         "ledger range aggregation failed; recomputing in memory: {}",
                         error
                     );
+                    // Distinct from store-absent "memory" so recordings can
+                    // spot ledger regressions rather than configuration.
+                    source = "fallback";
                     memory_keys.extend(ledger_keys);
                 }
             }

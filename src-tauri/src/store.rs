@@ -338,6 +338,19 @@ impl AppState {
                 return Vec::new();
             }
         };
+        // Dirty markings survive restarts in the store itself; rebuild the
+        // in-process stale set so ledger-backed aggregation keeps routing
+        // these sessions through in-memory history.
+        match history.dirty_session_keys() {
+            Ok(keys) => {
+                for key in keys {
+                    self.ledger_stale.insert(key, ());
+                }
+            }
+            Err(error) => {
+                tracing::warn!("could not load ledger-dirty markings: {}", error);
+            }
+        }
         let mut changed = Vec::new();
         for stored in stored {
             let session = stored.session;
