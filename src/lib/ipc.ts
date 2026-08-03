@@ -3,7 +3,11 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+<<<<<<< HEAD
 import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry } from './types';
+=======
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt } from './types';
+>>>>>>> ffc4897 (Add the versioned provider-keyed config map and descriptor IPC)
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -77,6 +81,11 @@ export function addDefenderExclusions(): Promise<DefenderExclusionReceipt> {
 
 export function getConfig(): Promise<Config> {
   return invoke<Config>('get_config');
+}
+
+/** Registered providers with display names and capability flags. */
+export function listProviders(): Promise<ProviderDescriptor[]> {
+  return invoke<ProviderDescriptor[]>('list_providers');
 }
 
 export function setConfig(config: Config): Promise<void> {

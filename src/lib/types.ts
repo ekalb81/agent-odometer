@@ -384,6 +384,14 @@ export interface InstructionContent {
   content: string;
 }
 
+/** Registered provider, for descriptor-driven UI surfaces. */
+export interface ProviderDescriptor {
+  id: string;
+  display_name: string;
+  archived_sources: boolean;
+  session_index: boolean;
+}
+
 export interface HarnessIntegrationStatus {
   requested: boolean;
   configured: boolean;

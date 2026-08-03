@@ -446,6 +446,11 @@ mockIPC((cmd, payload) => {
     }
     case 'get_subscription_usage':
       return subscriptionUsage();
+    case 'list_providers':
+      return [
+        { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true },
+        { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false },
+      ];
     case 'sessions_in_ranges': {
       const { ranges, sessionIds } = payload as {
         ranges: { from: string | null; to: string | null }[];
