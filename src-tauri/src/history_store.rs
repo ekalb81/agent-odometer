@@ -7,15 +7,21 @@
 //! store has no application-version invalidation path and never removes a
 //! session or token event during a scan.
 
-use crate::model::{Session, SourceAvailability, TokenHistoryPoint};
-use crate::provider::claude_code_provider_id;
+use crate::model::{
+    add_totals, OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session,
+    SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolKind, ToolObservation,
+    ToolOutcome,
+};
+use crate::provider::{claude_code_provider_id, codex_provider_id};
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::TimeZone;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 
 /// One path at which an archived transcript has been observed. Paths are
@@ -201,6 +207,8 @@ impl HistoryStore {
             SnapshotPolicy::Source,
         )? {
             store_token_events(&transaction, &key, &session.tokens_history)?;
+            store_tool_events(&transaction, &key, &session.tool_observations)?;
+            store_finding_events(&transaction, &key, &session.optimization_findings)?;
         }
         refresh_collision_flags(&transaction, &identity)?;
         transaction.commit()?;
@@ -271,7 +279,7 @@ impl HistoryStore {
         if exists.is_none() {
             bail!("cannot update snapshot for unknown durable session {key}");
         }
-        store_snapshot(
+        if store_snapshot(
             &transaction,
             &key,
             &archived,
@@ -279,7 +287,10 @@ impl HistoryStore {
             &snapshot_hash,
             now,
             SnapshotPolicy::MetadataOverlay,
-        )?;
+        )? {
+            store_tool_events(&transaction, &key, &archived.tool_observations)?;
+            store_finding_events(&transaction, &key, &archived.optimization_findings)?;
+        }
         transaction.execute(
             "UPDATE durable_sessions SET last_seen_at_ms = ?2 WHERE session_key = ?1",
             params![key, now],
@@ -287,6 +298,148 @@ impl HistoryStore {
         transaction.commit()?;
         drop(connection);
         self.load_one(&key)
+    }
+
+    /// Window-scoped rollups computed from the normalized ledger, mirroring
+    /// `Session::range_totals_multi` over in-memory history exactly, except
+    /// that timestamps compare at the ledger's millisecond storage
+    /// granularity. Returns one map per window containing only sessions with
+    /// data in that window (the `sessions_in_ranges` wire contract).
+    pub fn range_totals_multi(
+        &self,
+        session_keys: &[String],
+        windows: &[RangeWindow],
+    ) -> Result<Vec<HashMap<String, RangeTotals>>> {
+        let connection = self.connection()?;
+        let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); windows.len()];
+        let mut token_query = connection.prepare(
+            "SELECT model, service_tier,
+                    SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
+                    SUM(reasoning_output_tokens), SUM(total_tokens)
+             FROM durable_token_events
+             WHERE session_key = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
+             GROUP BY model, service_tier",
+        )?;
+        let mut tool_query = connection.prepare(
+            "SELECT timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes
+             FROM durable_tool_events
+             WHERE session_key = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
+             ORDER BY timestamp_ms",
+        )?;
+        let mut finding_query = connection.prepare(
+            "SELECT timestamp_ms, rule_id, severity, avoidable_calls
+             FROM durable_finding_events WHERE session_key = ?1",
+        )?;
+        for (window_index, (from, to)) in windows.iter().enumerate() {
+            let from_ms = from
+                .map(|value| value.timestamp_millis())
+                .unwrap_or(i64::MIN);
+            let to_ms = to.map(|value| value.timestamp_millis()).unwrap_or(i64::MAX);
+            for key in session_keys {
+                let mut tokens = TokenTotals::default();
+                let mut buckets: Vec<TierBucket> = Vec::new();
+                let groups = token_query.query_map(params![key, from_ms, to_ms], |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        TokenTotals {
+                            input_tokens: row.get::<_, i64>(2).unwrap_or(0) as u64,
+                            cached_input_tokens: row.get::<_, i64>(3).unwrap_or(0) as u64,
+                            output_tokens: row.get::<_, i64>(4).unwrap_or(0) as u64,
+                            reasoning_output_tokens: row.get::<_, i64>(5).unwrap_or(0) as u64,
+                            total_tokens: row.get::<_, i64>(6).unwrap_or(0) as u64,
+                        },
+                    ))
+                })?;
+                for group in groups {
+                    let (model, service_tier, group_totals) = group?;
+                    add_totals(&mut tokens, &group_totals);
+                    if let Some(model) = model {
+                        buckets.push(TierBucket {
+                            model,
+                            service_tier,
+                            tokens: group_totals,
+                        });
+                    }
+                }
+                buckets.sort_by(|a, b| {
+                    a.model
+                        .cmp(&b.model)
+                        .then_with(|| a.service_tier.cmp(&b.service_tier))
+                });
+
+                let observations: Vec<ToolObservation> = tool_query
+                    .query_map(params![key, from_ms, to_ms], |row| {
+                        Ok(ToolObservation {
+                            call_id: String::new(),
+                            turn_id: row.get(4)?,
+                            harness: codex_provider_id(),
+                            model: row.get(1)?,
+                            timestamp: chrono::Utc
+                                .timestamp_millis_opt(row.get::<_, i64>(0)?)
+                                .single()
+                                .unwrap_or_default(),
+                            kind: tool_kind_from_str(&row.get::<_, String>(2)?),
+                            name: String::new(),
+                            providers: Vec::new(),
+                            effective_tools: Vec::new(),
+                            target: row.get(5)?,
+                            resource_id: None,
+                            outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
+                            duration_ms: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+                            output_bytes: row.get::<_, i64>(7)? as u64,
+                        })
+                    })?
+                    .collect::<std::result::Result<_, _>>()?;
+                let (tool_metrics, tool_metrics_by_model) =
+                    crate::telemetry::metrics_with_models(observations.iter());
+
+                let selected_findings: Vec<OptimizationFinding> = finding_query
+                    .query_map([key.as_str()], |row| {
+                        Ok((
+                            row.get::<_, Option<i64>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })?
+                    .filter_map(|row| row.ok())
+                    .filter(|(timestamp_ms, _, _, _)| match timestamp_ms {
+                        // Mirrors the in-memory rule: dated findings filter by
+                        // the window; undated findings only appear in a fully
+                        // open window.
+                        Some(ms) => *ms >= from_ms && *ms <= to_ms,
+                        None => from.is_none() && to.is_none(),
+                    })
+                    .map(
+                        |(timestamp_ms, rule_id, severity, avoidable_calls)| OptimizationFinding {
+                            rule_id,
+                            severity,
+                            avoidable_calls: avoidable_calls as u64,
+                            timestamp: timestamp_ms
+                                .and_then(|ms| chrono::Utc.timestamp_millis_opt(ms).single()),
+                            ..OptimizationFinding::default()
+                        },
+                    )
+                    .collect();
+                let optimization_findings_count = selected_findings.len() as u64;
+                let optimization_summary =
+                    OptimizationSummary::from_findings(selected_findings.iter());
+
+                let range = RangeTotals {
+                    tokens,
+                    buckets,
+                    tool_metrics,
+                    tool_metrics_by_model,
+                    optimization_findings_count,
+                    optimization_summary,
+                };
+                if crate::commands::range_has_data(&range) {
+                    out[window_index].insert(key.clone(), range);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Returns all archived sessions, including those whose sources are gone.
@@ -415,7 +568,27 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                total_tokens INTEGER NOT NULL,
                PRIMARY KEY(session_key, event_key)
              );
-             CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms);",
+             CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms);
+             CREATE TABLE durable_tool_events (
+               session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+               timestamp_ms INTEGER NOT NULL,
+               model TEXT,
+               kind TEXT NOT NULL,
+               outcome TEXT NOT NULL,
+               turn_id TEXT,
+               target TEXT,
+               duration_ms INTEGER,
+               output_bytes INTEGER NOT NULL
+             );
+             CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms);
+             CREATE TABLE durable_finding_events (
+               session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+               timestamp_ms INTEGER,
+               rule_id TEXT NOT NULL,
+               severity TEXT NOT NULL,
+               avoidable_calls INTEGER NOT NULL
+             );
+             CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key);",
         )?;
         transaction.execute(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', ?1)",
@@ -431,6 +604,66 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              INSERT INTO history_meta(key, value) VALUES('schema_version', '2')
                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
              PRAGMA user_version = 2;",
+        )?;
+        transaction.commit()?;
+    }
+    if (1..=2).contains(&version) {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE durable_tool_events (
+               session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+               timestamp_ms INTEGER NOT NULL,
+               model TEXT,
+               kind TEXT NOT NULL,
+               outcome TEXT NOT NULL,
+               turn_id TEXT,
+               target TEXT,
+               duration_ms INTEGER,
+               output_bytes INTEGER NOT NULL
+             );
+             CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms);
+             CREATE TABLE durable_finding_events (
+               session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+               timestamp_ms INTEGER,
+               rule_id TEXT NOT NULL,
+               severity TEXT NOT NULL,
+               avoidable_calls INTEGER NOT NULL
+             );
+             CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key);",
+        )?;
+        // Backfill facts for every existing session from its current snapshot
+        // so ledger-backed range queries cover historical data immediately.
+        // A snapshot that no longer deserializes is skipped with a warning:
+        // its facts repopulate on that session's next observe.
+        {
+            let mut select = transaction.prepare(
+                "SELECT d.session_key, s.session_json
+                 FROM durable_sessions d JOIN session_snapshots s
+                   ON s.session_key = d.session_key
+                  AND s.version = d.current_snapshot_version",
+            )?;
+            let rows: Vec<(String, Vec<u8>)> = select
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(select);
+            for (key, raw) in rows {
+                match serde_json::from_slice::<Session>(&raw) {
+                    Ok(session) => {
+                        store_tool_events(&transaction, &key, &session.tool_observations)?;
+                        store_finding_events(&transaction, &key, &session.optimization_findings)?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "could not backfill facts for {key}: snapshot did not deserialize: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        transaction.execute_batch(
+            "INSERT INTO history_meta(key, value) VALUES('schema_version', '3')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 3;",
         )?;
         transaction.commit()?;
     }
@@ -707,6 +940,94 @@ fn store_token_events(
             to_i64(event.delta.output_tokens)?,
             to_i64(event.delta.reasoning_output_tokens)?,
             to_i64(event.delta.total_tokens)?,
+        ])?;
+    }
+    Ok(())
+}
+
+fn tool_outcome_str(outcome: ToolOutcome) -> &'static str {
+    match outcome {
+        ToolOutcome::Pending => "pending",
+        ToolOutcome::Success => "success",
+        ToolOutcome::Failure => "failure",
+        ToolOutcome::Unknown => "unknown",
+    }
+}
+
+fn tool_outcome_from_str(value: &str) -> ToolOutcome {
+    match value {
+        "pending" => ToolOutcome::Pending,
+        "success" => ToolOutcome::Success,
+        "failure" => ToolOutcome::Failure,
+        _ => ToolOutcome::Unknown,
+    }
+}
+
+fn tool_kind_from_str(value: &str) -> ToolKind {
+    match value {
+        "read" => ToolKind::Read,
+        "search" => ToolKind::Search,
+        "mutation" => ToolKind::Mutation,
+        "command" => ToolKind::Command,
+        _ => ToolKind::Other,
+    }
+}
+
+/// Replaceable per-session materialization of tool observations, carrying
+/// exactly the fields window-scoped `ToolMetrics` reconstruction needs.
+/// Unlike token events these are not append-only: the snapshot-hash gate at
+/// the call sites already limits rewrites to sessions that actually changed.
+fn store_tool_events(
+    transaction: &Transaction<'_>,
+    key: &str,
+    observations: &[ToolObservation],
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM durable_tool_events WHERE session_key = ?1",
+        [key],
+    )?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO durable_tool_events(session_key, timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    for item in observations {
+        insert.execute(params![
+            key,
+            item.timestamp.timestamp_millis(),
+            item.model,
+            item.kind.as_str(),
+            tool_outcome_str(item.outcome),
+            item.turn_id,
+            item.target,
+            item.duration_ms.map(|value| value as i64),
+            to_i64(item.output_bytes)?,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Replaceable per-session materialization of optimization findings, carrying
+/// the fields window-scoped counts and `OptimizationSummary` need.
+fn store_finding_events(
+    transaction: &Transaction<'_>,
+    key: &str,
+    findings: &[OptimizationFinding],
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM durable_finding_events WHERE session_key = ?1",
+        [key],
+    )?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO durable_finding_events(session_key, timestamp_ms, rule_id, severity, avoidable_calls)
+         VALUES(?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for finding in findings {
+        insert.execute(params![
+            key,
+            finding.timestamp.map(|value| value.timestamp_millis()),
+            finding.rule_id,
+            finding.severity,
+            to_i64(finding.avoidable_calls)?,
         ])?;
     }
     Ok(())
@@ -1011,6 +1332,247 @@ mod tests {
         (directory, store)
     }
 
+    fn tool(
+        at: &str,
+        kind: crate::model::ToolKind,
+        outcome: ToolOutcome,
+        model: Option<&str>,
+        turn: Option<&str>,
+        target: Option<&str>,
+    ) -> ToolObservation {
+        ToolObservation {
+            call_id: format!("call-{at}"),
+            turn_id: turn.map(Into::into),
+            harness: codex_provider_id(),
+            model: model.map(Into::into),
+            timestamp: timestamp(at),
+            kind,
+            name: "tool".into(),
+            providers: Vec::new(),
+            effective_tools: Vec::new(),
+            target: target.map(Into::into),
+            resource_id: None,
+            outcome,
+            duration_ms: Some(40),
+            output_bytes: 128,
+        }
+    }
+
+    /// Adversarial rollup fixture: multiple models and tiers, a model-less
+    /// event, mutation-target repeats that straddle window boundaries (so
+    /// retry/one-shot counts differ per window), and dated plus undated
+    /// findings.
+    fn rich_session(id: &str) -> Session {
+        use crate::model::ToolKind;
+        let mut fixture = session(id, 100);
+        let event =
+            |at: &str, model: Option<&str>, tier: Option<&str>, input: u64| TokenHistoryPoint {
+                timestamp: timestamp(at),
+                model: model.map(Into::into),
+                service_tier: tier.map(Into::into),
+                request_input_tokens: Some(input),
+                total_tokens: 0,
+                delta: totals(input),
+            };
+        fixture.tokens_history = vec![
+            event("2026-01-01T00:00:01Z", Some("gpt-a"), None, 100),
+            event("2026-01-01T06:00:00Z", Some("gpt-a"), Some("fast"), 40),
+            event("2026-01-01T12:00:00Z", Some("gpt-b"), None, 70),
+            event("2026-01-01T18:00:00Z", None, None, 30),
+            event("2026-01-02T00:00:00Z", Some("gpt-b"), Some("fast"), 55),
+            event("2026-01-02T09:30:00Z", Some("gpt-a"), None, 20),
+        ];
+        fixture.tool_observations = vec![
+            tool(
+                "2026-01-01T01:00:00Z",
+                ToolKind::Read,
+                ToolOutcome::Success,
+                Some("gpt-a"),
+                Some("t1"),
+                None,
+            ),
+            tool(
+                "2026-01-01T05:00:00Z",
+                ToolKind::Mutation,
+                ToolOutcome::Success,
+                Some("gpt-a"),
+                Some("t1"),
+                Some("hash-x"),
+            ),
+            // Same (turn, target) mutated again the next day: a retry when the
+            // window spans both days, two one-shots when windows split them.
+            tool(
+                "2026-01-02T05:00:00Z",
+                ToolKind::Mutation,
+                ToolOutcome::Failure,
+                Some("gpt-b"),
+                Some("t1"),
+                Some("hash-x"),
+            ),
+            tool(
+                "2026-01-02T06:00:00Z",
+                ToolKind::Command,
+                ToolOutcome::Unknown,
+                None,
+                None,
+                None,
+            ),
+            tool(
+                "2026-01-02T07:00:00Z",
+                ToolKind::Search,
+                ToolOutcome::Pending,
+                Some("gpt-b"),
+                Some("t2"),
+                None,
+            ),
+        ];
+        fixture.optimization_findings = vec![
+            OptimizationFinding {
+                rule_id: "rule-a".into(),
+                severity: "warning".into(),
+                avoidable_calls: 3,
+                timestamp: Some(timestamp("2026-01-01T13:00:00Z")),
+                ..OptimizationFinding::default()
+            },
+            OptimizationFinding {
+                rule_id: "rule-b".into(),
+                severity: "info".into(),
+                avoidable_calls: 1,
+                timestamp: Some(timestamp("2026-01-02T08:00:00Z")),
+                ..OptimizationFinding::default()
+            },
+            OptimizationFinding {
+                rule_id: "rule-c".into(),
+                severity: "warning".into(),
+                avoidable_calls: 0,
+                timestamp: None,
+                ..OptimizationFinding::default()
+            },
+        ];
+        fixture.last_event_at = timestamp("2026-01-02T09:30:00Z");
+        fixture
+    }
+
+    #[test]
+    fn ledger_range_totals_match_in_memory_rollups() {
+        let (_directory, store) = store();
+        let sessions = vec![rich_session("golden-a"), rich_session("golden-b")];
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut keys = Vec::new();
+        for (index, fixture) in sessions.iter().enumerate() {
+            let stored = store
+                .observe(
+                    Path::new(&format!("golden-{index}.jsonl")),
+                    fixture,
+                    generation,
+                )
+                .unwrap();
+            keys.push(stored.key);
+        }
+
+        let bound = |value: &str| Some(timestamp(value));
+        let windows: Vec<RangeWindow> = vec![
+            (None, None),
+            // Exactly the first day; the upper bound hits an event timestamp.
+            (bound("2026-01-01T00:00:00Z"), bound("2026-01-02T00:00:00Z")),
+            // Second day only: splits the repeated mutation target.
+            (bound("2026-01-02T00:00:01Z"), None),
+            // Open start.
+            (None, bound("2026-01-01T11:59:59Z")),
+            // Empty window.
+            (bound("2027-01-01T00:00:00Z"), bound("2027-06-01T00:00:00Z")),
+            // Single instant equal to an event timestamp.
+            (bound("2026-01-01T12:00:00Z"), bound("2026-01-01T12:00:00Z")),
+        ];
+
+        let from_ledger = store.range_totals_multi(&keys, &windows).unwrap();
+        for (window_index, window) in windows.iter().enumerate() {
+            for (fixture, key) in sessions.iter().zip(&keys) {
+                let expected = fixture.range_totals_multi(std::slice::from_ref(window));
+                let expected = &expected[0];
+                match from_ledger[window_index].get(key) {
+                    Some(actual) => {
+                        assert_eq!(
+                            &actual.tokens, &expected.tokens,
+                            "tokens window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            &actual.buckets, &expected.buckets,
+                            "buckets window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            &actual.tool_metrics, &expected.tool_metrics,
+                            "tool_metrics window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            &actual.tool_metrics_by_model, &expected.tool_metrics_by_model,
+                            "tool_metrics_by_model window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            actual.optimization_findings_count,
+                            expected.optimization_findings_count,
+                            "findings count window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            &actual.optimization_summary, &expected.optimization_summary,
+                            "findings summary window {window_index} {key}"
+                        );
+                    }
+                    None => {
+                        assert!(
+                            !crate::commands::range_has_data(expected),
+                            "ledger omitted a window with data: window {window_index} {key}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v3_migration_backfills_facts_from_snapshots() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            store
+                .observe(
+                    Path::new("backfill.jsonl"),
+                    &rich_session("backfill"),
+                    generation,
+                )
+                .unwrap();
+        }
+        // Rewind to schema v2: drop the fact tables and the version marker,
+        // exactly what a store written by the previous release looks like.
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE durable_tool_events;
+                     DROP TABLE durable_finding_events;
+                     INSERT INTO history_meta(key, value) VALUES('schema_version', '2')
+                       ON CONFLICT(key) DO UPDATE SET value = '2';
+                     PRAGMA user_version = 2;",
+                )
+                .unwrap();
+        }
+        let store = HistoryStore::open(&path).unwrap();
+        let fixture = rich_session("backfill");
+        let key = crate::model::storage_id_for_session(&codex_provider_id(), "backfill");
+        let windows: Vec<RangeWindow> = vec![(None, None)];
+        let from_ledger = store.range_totals_multi(&[key.clone()], &windows).unwrap();
+        let expected = &fixture.range_totals_multi(&windows)[0];
+        let actual = from_ledger[0].get(&key).expect("backfilled facts present");
+        assert_eq!(&actual.tool_metrics, &expected.tool_metrics);
+        assert_eq!(
+            actual.optimization_findings_count,
+            expected.optimization_findings_count
+        );
+        assert_eq!(&actual.optimization_summary, &expected.optimization_summary);
+    }
+
     #[test]
     fn migrates_schema_v1_request_evidence_forward() {
         let directory = tempdir().unwrap();
@@ -1034,6 +1596,28 @@ mod tests {
                    reasoning_output_tokens INTEGER NOT NULL,
                    total_tokens INTEGER NOT NULL,
                    PRIMARY KEY(session_key, event_key)
+                 );
+                 -- Present in every real v1 store; the v3 fact backfill reads
+                 -- current snapshots through these tables.
+                 CREATE TABLE durable_sessions (
+                   session_key TEXT PRIMARY KEY,
+                   identity_key TEXT NOT NULL,
+                   first_event_fingerprint TEXT NOT NULL,
+                   fingerprint_is_final INTEGER NOT NULL,
+                   collision INTEGER NOT NULL DEFAULT 0,
+                   current_snapshot_version INTEGER NOT NULL DEFAULT 0,
+                   current_snapshot_hash TEXT,
+                   created_at_ms INTEGER NOT NULL,
+                   last_seen_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE session_snapshots (
+                   session_key TEXT NOT NULL,
+                   version INTEGER NOT NULL,
+                   format_version INTEGER NOT NULL,
+                   snapshot_hash TEXT NOT NULL,
+                   captured_at_ms INTEGER NOT NULL,
+                   session_json BLOB NOT NULL,
+                   PRIMARY KEY(session_key, version)
                  );
                  PRAGMA user_version = 1;",
             )

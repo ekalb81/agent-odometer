@@ -751,7 +751,7 @@ pub async fn compare_tool_impact(
     result
 }
 
-fn range_has_data(range: &RangeTotals) -> bool {
+pub(crate) fn range_has_data(range: &RangeTotals) -> bool {
     range.tokens.total_tokens != 0 || range.tool_metrics.calls != 0
 }
 

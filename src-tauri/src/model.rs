@@ -511,7 +511,7 @@ impl SessionSummary {
     }
 }
 
-fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
+pub(crate) fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
     dst.input_tokens += src.input_tokens;
     dst.cached_input_tokens += src.cached_input_tokens;
     dst.output_tokens += src.output_tokens;
