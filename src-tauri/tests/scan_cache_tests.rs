@@ -23,9 +23,10 @@ fn scan_ids(
         ProviderSourceKind::Live,
     )])
     .unwrap();
+    let cache = cache_path.map(ScanCache::load);
     let report = scanner::scan_all(
         &sources,
-        cache_path,
+        cache,
         |_path, s| sessions.lock().unwrap().push(s.id.clone()),
         |done, total| progress.lock().unwrap().push((done, total)),
     );
@@ -142,7 +143,7 @@ fn cache_hit_with_a_stale_archive_classification_is_reparsed() {
     let archived = Mutex::new(Vec::new());
     let report = scanner::scan_all(
         &sources,
-        Some(&cache_path),
+        Some(ScanCache::load(&cache_path)),
         |_path, session| archived.lock().unwrap().push(session.archived),
         |_done, _total| {},
     );
