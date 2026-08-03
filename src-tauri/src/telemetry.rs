@@ -673,6 +673,7 @@ pub fn refresh_session(session: &mut crate::model::Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::codex_provider_id;
 
     #[test]
     fn target_identity_is_stable_and_does_not_retain_arguments() {
@@ -701,7 +702,7 @@ mod tests {
         let make = |id: &str, target: &str| ToolObservation {
             call_id: id.into(),
             turn_id: Some("t".into()),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             model: Some("m".into()),
             timestamp: ts,
             kind: ToolKind::Mutation,
@@ -728,7 +729,7 @@ mod tests {
             .map(|i| ToolObservation {
                 call_id: i.to_string(),
                 turn_id: Some("t".into()),
-                harness: Harness::Codex,
+                harness: codex_provider_id(),
                 model: None,
                 timestamp: ts,
                 kind: ToolKind::Read,
@@ -809,7 +810,7 @@ mod tests {
         ToolObservation {
             call_id: id.to_string(),
             turn_id: Some("t".into()),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             model: Some("m".into()),
             timestamp: DateTime::from_timestamp(id as i64, 0).unwrap(),
             kind,

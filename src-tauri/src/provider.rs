@@ -1,4 +1,4 @@
-use crate::model::{Harness, Session};
+use crate::model::Session;
 use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -38,6 +38,21 @@ impl ProviderId {
 impl Borrow<str> for ProviderId {
     fn borrow(&self) -> &str {
         self.as_str()
+    }
+}
+
+// Serialized as the bare id string so it is wire- and storage-compatible with
+// the snake_case strings the legacy Harness enum has always persisted.
+impl serde::Serialize for ProviderId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ProviderId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(&value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -305,7 +320,7 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn accepts_cached_session(&self, session: &Session, kind: ProviderSourceKind) -> bool {
-        session.harness == Harness::Codex && session.archived == kind.is_archived()
+        session.harness == codex_provider_id() && session.archived == kind.is_archived()
     }
 
     fn parse_file(&self, path: &Path, kind: ProviderSourceKind) -> anyhow::Result<Option<Session>> {
@@ -334,7 +349,7 @@ impl ProviderAdapter for ClaudeCodeAdapter {
     }
 
     fn accepts_cached_session(&self, session: &Session, kind: ProviderSourceKind) -> bool {
-        session.harness == Harness::ClaudeCode && !kind.is_archived() && !session.archived
+        session.harness == claude_code_provider_id() && !kind.is_archived() && !session.archived
     }
 
     fn parse_file(&self, path: &Path, kind: ProviderSourceKind) -> anyhow::Result<Option<Session>> {
@@ -427,8 +442,22 @@ fn strip_verbatim_prefix(path: &Path) -> Cow<'_, Path> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_verbatim_prefix;
+    use super::{strip_verbatim_prefix, ProviderId};
     use std::path::Path;
+
+    #[test]
+    fn provider_id_serde_round_trips_as_bare_string() {
+        let id = ProviderId::new("claude_code").unwrap();
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"claude_code\"");
+        let back: ProviderId = serde_json::from_str("\"claude_code\"").unwrap();
+        assert_eq!(back, id);
+        // Legacy Harness snake_case strings deserialize unchanged.
+        let codex: ProviderId = serde_json::from_str("\"codex\"").unwrap();
+        assert_eq!(codex.as_str(), "codex");
+        // Validation still applies on the deserialization path.
+        assert!(serde_json::from_str::<ProviderId>("\"Not Valid\"").is_err());
+        assert!(serde_json::from_str::<ProviderId>("\"\"").is_err());
+    }
 
     #[test]
     fn verbatim_prefix_normalization_preserves_disk_and_unc_roots() {

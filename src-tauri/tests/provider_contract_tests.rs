@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProviderCase {
     id: &'static str,
     fixture: &'static str,
@@ -22,13 +22,13 @@ fn cases() -> [ProviderCase; 2] {
             id: "codex",
             fixture: "sample-session.jsonl",
             expected_session_id: "019e2ba6-95be-7bd2-a255-238cdf02936c",
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
         },
         ProviderCase {
             id: "claude_code",
             fixture: "claude-session.jsonl",
             expected_session_id: "11111111-2222-3333-4444-555555555555",
-            harness: Harness::ClaudeCode,
+            harness: claude_code_provider_id(),
         },
     ]
 }
@@ -286,10 +286,12 @@ fn mixed_provider_scan_uses_adapters_and_keeps_progress_monotonic() {
     let mut sessions = sessions.into_inner().unwrap();
     sessions.sort_by(|left, right| left.1.cmp(&right.1));
     assert_eq!(sessions.len(), 2);
-    assert!(sessions.iter().any(|session| session.0 == Harness::Codex));
     assert!(sessions
         .iter()
-        .any(|session| session.0 == Harness::ClaudeCode));
+        .any(|session| session.0 == codex_provider_id()));
+    assert!(sessions
+        .iter()
+        .any(|session| session.0 == claude_code_provider_id()));
     assert_eq!(report.files, 2);
     assert_eq!(report.parsed_files, 2);
     assert_eq!(report.parse_failures, 0);

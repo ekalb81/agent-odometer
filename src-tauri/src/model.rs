@@ -2,18 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-/// Which agent harness produced a session's transcript. Serialized as
-/// snake_case strings; defaults to Codex so previously-serialized sessions
-/// and frontends without the field keep working.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Harness {
-    #[default]
-    Codex,
-    ClaudeCode,
-}
+use crate::provider::{claude_code_provider_id, codex_provider_id, ProviderId};
+
+/// Open provider identity for a session's transcript. The name `Harness` is
+/// retained crate-wide during the migration off the closed two-variant enum;
+/// the wire form is unchanged (bare snake_case strings such as "codex" and
+/// "claude_code"), and sessions persisted without the field still default to
+/// codex via the serde defaults on the structs below.
+pub type Harness = ProviderId;
 
 /// Whether Odometer can currently read the transcript that supplied this
 /// session. Durable storage retains the parsed session even after a source is
@@ -28,10 +24,14 @@ pub enum SourceAvailability {
 
 /// Stable identity for a provider session. Unlike `Session::id`, this is
 /// namespaced by harness and is safe to use as a durable storage key.
-pub fn storage_id_for_session(harness: Harness, provider_session_id: &str) -> String {
-    match harness {
-        Harness::Codex => format!("codex:thread:{provider_session_id}"),
-        Harness::ClaudeCode => format!("claude_code:session:{provider_session_id}"),
+pub fn storage_id_for_session(provider: &ProviderId, provider_session_id: &str) -> String {
+    // Codex threads keep their historical "thread" segment; every other
+    // provider (including claude_code) uses the generic "session" segment,
+    // which preserves all previously persisted storage ids byte-for-byte.
+    if *provider == codex_provider_id() {
+        format!("codex:thread:{provider_session_id}")
+    } else {
+        format!("{provider}:session:{provider_session_id}")
     }
 }
 
@@ -76,10 +76,11 @@ pub enum ToolOutcome {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolObservation {
     pub call_id: String,
     pub turn_id: Option<String>,
+    #[serde(default = "crate::provider::codex_provider_id")]
     pub harness: Harness,
     pub model: Option<String>,
     pub timestamp: DateTime<Utc>,
@@ -324,7 +325,7 @@ pub struct Session {
     /// path, allowing a transcript to move or temporarily disappear.
     #[serde(default)]
     pub storage_id: String,
-    #[serde(default)]
+    #[serde(default = "crate::provider::codex_provider_id")]
     pub harness: Harness,
     pub thread_name: Option<String>,
     pub forked_from_id: Option<String>,
@@ -475,7 +476,7 @@ impl SessionSummary {
         Self {
             id: s.id.clone(),
             storage_id: s.effective_storage_id(),
-            harness: s.harness,
+            harness: s.harness.clone(),
             thread_name: s.thread_name.clone(),
             forked_from_id: s.forked_from_id.clone(),
             parent_thread_id: s.parent_thread_id.clone(),
@@ -550,13 +551,13 @@ impl Session {
             return self.storage_id.clone();
         }
 
-        if self.harness == Harness::ClaudeCode && self.source.as_deref() == Some("subagent") {
+        if self.harness == claude_code_provider_id() && self.source.as_deref() == Some("subagent") {
             if let Some(parent_session_id) = self.parent_thread_id.as_deref() {
                 return storage_id_for_claude_subagent(parent_session_id, &self.id);
             }
         }
 
-        storage_id_for_session(self.harness, &self.id)
+        storage_id_for_session(&self.harness, &self.id)
     }
 
     /// All-time (model, tier) usage buckets. Derived from history when
@@ -730,8 +731,8 @@ mod tests {
     fn session_with_history(history: Vec<TokenHistoryPoint>) -> Session {
         Session {
             id: "s".into(),
-            storage_id: storage_id_for_session(Harness::Codex, "s"),
-            harness: Harness::Codex,
+            storage_id: storage_id_for_session(&codex_provider_id(), "s"),
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -886,7 +887,7 @@ mod tests {
             .map(|second| ToolObservation {
                 call_id: second.to_string(),
                 turn_id: Some("turn".into()),
-                harness: Harness::Codex,
+                harness: codex_provider_id(),
                 model: Some("m".into()),
                 timestamp: format!("2026-01-01T00:00:0{second}Z").parse().unwrap(),
                 kind: ToolKind::Read,

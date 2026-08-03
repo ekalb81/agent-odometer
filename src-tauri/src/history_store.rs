@@ -7,7 +7,8 @@
 //! store has no application-version invalidation path and never removes a
 //! session or token event during a scan.
 
-use crate::model::{Harness, Session, SourceAvailability, TokenHistoryPoint};
+use crate::model::{Session, SourceAvailability, TokenHistoryPoint};
+use crate::provider::claude_code_provider_id;
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::{Path, PathBuf};
@@ -820,7 +821,7 @@ fn first_event_fingerprint(session: &Session) -> String {
 }
 
 fn is_legacy_claude_subagent(session: &Session) -> bool {
-    session.harness == Harness::ClaudeCode
+    session.harness == claude_code_provider_id()
         && session.source.as_deref() == Some("subagent")
         && session.subagent_id_is_path_fallback
         && session
@@ -929,9 +930,10 @@ fn count(connection: &Connection, query: &str) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::model::{
-        CategoryMetric, Harness, OptimizationFinding, RateLimitSnapshotPoint, TokenTotals,
-        ToolMetrics, ToolObservation, TurnInfo,
+        CategoryMetric, OptimizationFinding, RateLimitSnapshotPoint, TokenTotals, ToolMetrics,
+        ToolObservation, TurnInfo,
     };
+    use crate::provider::codex_provider_id;
     use chrono::{DateTime, Utc};
     use std::collections::{BTreeMap, HashMap};
     use tempfile::tempdir;
@@ -961,8 +963,8 @@ mod tests {
         };
         Session {
             id: id.into(),
-            storage_id: crate::model::storage_id_for_session(Harness::Codex, id),
-            harness: Harness::Codex,
+            storage_id: crate::model::storage_id_for_session(&codex_provider_id(), id),
+            harness: codex_provider_id(),
             thread_name: Some("Test".into()),
             forked_from_id: None,
             parent_thread_id: None,
@@ -1168,7 +1170,7 @@ mod tests {
         let (_directory, store) = store();
         let generation = store.begin_scan().unwrap();
         let mut original = session("old-file-stem", 10);
-        original.harness = Harness::ClaudeCode;
+        original.harness = claude_code_provider_id();
         original.source = Some("subagent".into());
         original.subagent_id_is_path_fallback = true;
         original.parent_thread_id = Some("parent-session".into());
@@ -1199,7 +1201,7 @@ mod tests {
         let (_directory, store) = store();
         let generation = store.begin_scan().unwrap();
         let mut first = session("provider-agent-a", 10);
-        first.harness = Harness::ClaudeCode;
+        first.harness = claude_code_provider_id();
         first.source = Some("subagent".into());
         first.parent_thread_id = Some("parent-session".into());
         first.storage_id =

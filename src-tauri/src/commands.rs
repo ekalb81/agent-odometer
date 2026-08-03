@@ -510,14 +510,14 @@ fn newest_subscription_usage_by_harness<'a>(
                 .get(&session.harness)
                 .is_none_or(|(_, existing)| point.timestamp > existing.timestamp);
             if is_newer {
-                newest.insert(session.harness, (session, point));
+                newest.insert(session.harness.clone(), (session, point));
             }
         }
     }
     newest
         .into_values()
         .map(|(session, point)| SubscriptionUsageEntry {
-            harness: session.harness,
+            harness: session.harness.clone(),
             captured_at: point.timestamp,
             plan_type: session.plan_type.clone(),
             credits_unlimited: session.credits_unlimited,
@@ -1947,7 +1947,7 @@ mod tests {
 
         let codex_a = subscription_fixture_session(
             "codex-a",
-            Harness::Codex,
+            crate::provider::codex_provider_id(),
             Some("pro"),
             Some(false),
             Some(12.5),
@@ -1967,7 +1967,7 @@ mod tests {
         // account fields — its plan/credits must win, not codex_a's.
         let codex_b = subscription_fixture_session(
             "codex-b",
-            Harness::Codex,
+            crate::provider::codex_provider_id(),
             Some("plus"),
             Some(true),
             None,
@@ -1991,7 +1991,7 @@ mod tests {
         // appear in the result at all.
         let claude = subscription_fixture_session(
             "claude-a",
-            Harness::ClaudeCode,
+            crate::provider::claude_code_provider_id(),
             None,
             None,
             None,
@@ -2003,7 +2003,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         let entry = &result[0];
-        assert_eq!(entry.harness, Harness::Codex);
+        assert_eq!(entry.harness, crate::provider::codex_provider_id());
         assert_eq!(entry.captured_at, newer);
         assert_eq!(entry.plan_type.as_deref(), Some("plus"));
         assert_eq!(entry.credits_unlimited, Some(true));

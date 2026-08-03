@@ -1,5 +1,6 @@
 use odometer_lib::claude_parser::{self, ClaudeSessionParser};
-use odometer_lib::model::{Harness, TurnStatus};
+use odometer_lib::model::TurnStatus;
+use odometer_lib::provider::claude_code_provider_id;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -15,7 +16,7 @@ fn parses_session_identity() {
         s.storage_id,
         "claude_code:session:11111111-2222-3333-4444-555555555555"
     );
-    assert_eq!(s.harness, Harness::ClaudeCode);
+    assert_eq!(s.harness, claude_code_provider_id());
     assert_eq!(
         s.working_directory.as_deref(),
         Some("D:\\projects\\demo-app")
@@ -206,7 +207,7 @@ fn subagent_transcript_gets_own_identity_and_parent_link() {
         Some("11111111-2222-3333-4444-555555555555")
     );
     assert_eq!(s.source.as_deref(), Some("subagent"));
-    assert_eq!(s.harness, Harness::ClaudeCode);
+    assert_eq!(s.harness, claude_code_provider_id());
     // Sidechain records form turns inside a subagent transcript.
     assert_eq!(s.turns.len(), 1);
     assert_eq!(

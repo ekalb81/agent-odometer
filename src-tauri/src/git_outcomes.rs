@@ -223,14 +223,15 @@ pub fn evaluate<S: Borrow<Session>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Harness, TokenTotals, ToolMetrics};
+    use crate::model::{TokenTotals, ToolMetrics};
+    use crate::provider::{claude_code_provider_id, codex_provider_id};
     use std::process::Command;
 
     fn session(id: &str, cwd: Option<&Path>, started_at: &str, last_event_at: &str) -> Session {
         Session {
             id: id.into(),
             storage_id: format!("codex:thread:{id}"),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -483,7 +484,7 @@ mod tests {
             "2026-04-03T00:00:00Z",
             "2026-04-03T02:00:00Z",
         );
-        claude.harness = Harness::ClaudeCode;
+        claude.harness = claude_code_provider_id();
         claude.storage_id = "claude_code:session:shared".into();
 
         let (outcomes, events) = evaluate(&[codex, claude], 0);

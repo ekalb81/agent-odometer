@@ -1,5 +1,6 @@
 use crate::config::{claude_config_dir, codex_home_dir, Config};
 use crate::model::Harness;
+use crate::provider::{claude_code_provider_id, codex_provider_id};
 use crate::turn_receipts::{load_run_record, HookRunRecord};
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -392,7 +393,7 @@ pub fn status(config: &Config) -> TurnReceiptIntegrationStatus {
             &codex_command,
         ),
         claude_code: json_status(
-            Harness::ClaudeCode,
+            claude_code_provider_id(),
             config.turn_receipts_enabled && config.turn_receipts_claude,
             ConfigSource::ClaudeSettingsJson,
             &claude_config_dir().join("settings.json"),
@@ -447,7 +448,7 @@ fn codex_status(
         Ok(inspection) => inspection,
         Err(failure) => {
             return error_status(
-                Harness::Codex,
+                codex_provider_id(),
                 requested,
                 failure.source,
                 &failure.path,
@@ -462,7 +463,7 @@ fn codex_status(
         ConfigSource::ClaudeSettingsJson => unreachable!(),
     };
     build_status(
-        Harness::Codex,
+        codex_provider_id(),
         requested,
         source,
         path,
@@ -524,7 +525,7 @@ fn build_status(
         success,
         last_receipt,
         detail: last_run_detail,
-    } = load_run_record(harness);
+    } = load_run_record(harness.clone());
     let configured = inspection.current();
     let observation_is_current = observation_is_current(last_run_at, freshness_paths);
     let duplicate_or_stale = inspection.owned_count > 1
@@ -554,9 +555,13 @@ fn build_status(
             "Off. Harness configuration is unchanged.".to_owned(),
         )
     } else if hooks_disabled {
-        let detail = match harness {
-            Harness::Codex => "Configured, but Codex hooks are disabled in config.toml. Enable [features].hooks (or remove the deprecated [features].codex_hooks = false), review /hooks, then start a fresh task.",
-            Harness::ClaudeCode => "Configured, but disableAllHooks is true in Claude Code user settings. Re-enable hooks, inspect /hooks, then start a fresh task.",
+        let detail = if harness == codex_provider_id() {
+            "Configured, but Codex hooks are disabled in config.toml. Enable [features].hooks (or remove the deprecated [features].codex_hooks = false), review /hooks, then start a fresh task."
+        } else if harness == claude_code_provider_id() {
+            "Configured, but disableAllHooks is true in Claude Code user settings. Re-enable hooks, inspect /hooks, then start a fresh task."
+        } else {
+            // Neutral fallback for a provider without dedicated guidance text.
+            "Configured, but hooks are disabled for this provider. Re-enable them, review /hooks, then start a fresh task."
         };
         ("hooks_disabled", detail.to_owned())
     } else if !configured && inspection.owned() {
@@ -587,13 +592,13 @@ fn build_status(
             "Configured, and a receipt from this configuration was observed.".to_owned(),
         )
     } else {
-        let guidance = match harness {
-            Harness::Codex => {
-                "Review and trust the command in /hooks, then start a fresh task to observe a receipt."
-            }
-            Harness::ClaudeCode => {
-                "Requires Claude Code 2.1.139 or later. Inspect it in /hooks, then start a fresh CLI or local Desktop task to observe a receipt."
-            }
+        let guidance = if harness == codex_provider_id() {
+            "Review and trust the command in /hooks, then start a fresh task to observe a receipt."
+        } else if harness == claude_code_provider_id() {
+            "Requires Claude Code 2.1.139 or later. Inspect it in /hooks, then start a fresh CLI or local Desktop task to observe a receipt."
+        } else {
+            // Neutral fallback for a provider without dedicated guidance text.
+            "Inspect it in /hooks, then start a fresh task to observe a receipt."
         };
         (
             "awaiting_receipt",
@@ -610,7 +615,8 @@ fn build_status(
         diagnostic_code: diagnostic_code.to_owned(),
         detail,
         restart_recommended: requested && configured && !receipt_observed,
-        trust_review_recommended: matches!(harness, Harness::Codex)
+        // Codex-specific trust-review guidance; other providers never trigger it.
+        trust_review_recommended: harness == codex_provider_id()
             && requested
             && configured
             && !receipt_observed,
@@ -2696,7 +2702,7 @@ command = "odometer --integration-id odometer-turn-receipts-v\u0031"
         )
         .unwrap();
         let status = json_status(
-            Harness::ClaudeCode,
+            claude_code_provider_id(),
             true,
             ConfigSource::ClaudeSettingsJson,
             &claude_path,
