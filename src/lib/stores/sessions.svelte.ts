@@ -1,4 +1,5 @@
 import type { SessionSummary } from '../types';
+import type { SessionMutationLog } from '../rangeData';
 
 export interface TrackedSession extends SessionSummary {
   /** Epoch ms of the last upsert — used to drive the pulse animation. */
@@ -20,6 +21,20 @@ function track(s: SessionSummary, lastUpdatedAt: number): TrackedSession {
 
 function createSessionsStore() {
   let map = $state<Map<string, TrackedSession>>(new Map());
+  // Which ids the latest store change touched. Range-rollup consumers use it
+  // to fetch deltas instead of the whole corpus on every live flush.
+  let mutationLog = $state<SessionMutationLog>({
+    generation: 0,
+    changed: [],
+    removed: [],
+    replaced: true,
+  });
+  let generation = 0;
+
+  function logMutation(changed: string[], removed: string[], replaced: boolean): void {
+    generation += 1;
+    mutationLog = { generation, changed, removed, replaced };
+  }
 
   /** Replace the entire collection (used at startup after listSessions). */
   function replaceAll(list: SessionSummary[]): void {
@@ -28,6 +43,7 @@ function createSessionsStore() {
       next.set(s.storage_id, track(s, 0));
     }
     map = next;
+    logMutation([], [], true);
   }
 
   /** Insert or update a single session (called on session-updated events). */
@@ -45,6 +61,7 @@ function createSessionsStore() {
       next.set(s.storage_id, track(s, now));
     }
     map = next;
+    logMutation(list.map((s) => s.storage_id), [], false);
   }
 
   /** Apply one coalesced event batch with a single map clone. Each id must be
@@ -57,6 +74,7 @@ function createSessionsStore() {
     for (const s of list) next.set(s.storage_id, track(s, now));
     for (const id of removals) next.delete(id);
     map = next;
+    logMutation(list.map((s) => s.storage_id), removals, false);
   }
 
   /** Remove a session by id (called on session-removed events). */
@@ -64,6 +82,7 @@ function createSessionsStore() {
     const next = new Map(map);
     next.delete(id);
     map = next;
+    logMutation([], [id], false);
   }
 
   /** All sessions sorted by last_event_at descending. */
@@ -77,6 +96,9 @@ function createSessionsStore() {
     },
     get sorted() {
       return sorted;
+    },
+    get mutationLog() {
+      return mutationLog;
     },
     replaceAll,
     upsert,

@@ -8,6 +8,8 @@
     listExternalEvents,
     listInstructionFiles,
     onConfigEvent,
+    onInstructionInventoryError,
+    onInstructionInventoryUpdated,
     openInstructionFile,
     readInstructionFile,
     revealInFileManager,
@@ -153,6 +155,13 @@
     return 'Results stopped at the 10,000-instruction-file safety limit.';
   }
 
+  function adoptInventory(next: InstructionInventory) {
+    inventory = next;
+    if (!selectedId || !next.files.some((file) => file.id === selectedId)) {
+      selectedId = next.files[0]?.id ?? null;
+    }
+  }
+
   async function refresh() {
     loading = true;
     cancelRequested = false;
@@ -163,11 +172,8 @@
         listInstructionFiles(),
         listExternalEvents(),
       ]);
-      inventory = nextInventory;
+      adoptInventory(nextInventory);
       configEvents = events;
-      if (!selectedId || !nextInventory.files.some((file) => file.id === selectedId)) {
-        selectedId = nextInventory.files[0]?.id ?? null;
-      }
     } catch (reason) {
       if (!String(reason).toLocaleLowerCase().includes('instruction scan cancelled')) {
         error = String(reason);
@@ -175,7 +181,10 @@
     } finally {
       loading = false;
       cancelRequested = false;
-      instructionScanStore.clearCurrent();
+      // A stale answer means a background rescan is still running; its
+      // progress keeps flowing to the status bar until the fresh inventory
+      // arrives via instruction-inventory-updated.
+      if (!inventory?.stale) instructionScanStore.clearCurrent();
     }
   }
 
@@ -184,6 +193,12 @@
     try {
       const scanId = await cancelInstructionScan();
       instructionScanStore.clearThrough(scanId);
+      if (!loading && inventory?.stale) {
+        // A cancelled background rescan delivers nothing: stop advertising
+        // one and let the header describe the retained results.
+        inventory = { ...inventory, stale: false };
+        cancelRequested = false;
+      }
     }
     catch (reason) {
       cancelRequested = false;
@@ -235,9 +250,10 @@
   }
 
   onMount(() => {
-    void refresh();
     let disposed = false;
     let configUnlisten: (() => void) | undefined;
+    let inventoryUnlisten: (() => void) | undefined;
+    let inventoryErrorUnlisten: (() => void) | undefined;
     onConfigEvent((event) => {
       if (!disposed && event.source === 'config') {
         configEvents = [...configEvents.filter((item) => item.id !== event.id), event];
@@ -246,9 +262,39 @@
       if (disposed) dispose();
       else configUnlisten = dispose;
     }).catch(() => {});
+    const inventoryUpdatedRegistration = onInstructionInventoryUpdated((fresh) => {
+      if (disposed) return;
+      adoptInventory(fresh);
+      error = null;
+      instructionScanStore.clearCurrent();
+    });
+    inventoryUpdatedRegistration.then((dispose) => {
+      if (disposed) dispose();
+      else inventoryUnlisten = dispose;
+    }).catch(() => {});
+    const inventoryErrorRegistration = onInstructionInventoryError((message) => {
+      if (disposed) return;
+      // Terminal failure: keep showing the retained results, surface the
+      // error, and stop advertising a refresh that will never arrive.
+      if (inventory?.stale) inventory = { ...inventory, stale: false };
+      error = message;
+      instructionScanStore.clearCurrent();
+    });
+    inventoryErrorRegistration.then((dispose) => {
+      if (disposed) dispose();
+      else inventoryErrorUnlisten = dispose;
+    }).catch(() => {});
+    // Establish event delivery before the stale-while-revalidate read: a
+    // fast background rescan can finish before a late-registered listener
+    // exists, stranding the view on the stale copy with no update coming.
+    void Promise.allSettled([inventoryUpdatedRegistration, inventoryErrorRegistration]).then(() => {
+      if (!disposed) void refresh();
+    });
     return () => {
       disposed = true;
       configUnlisten?.();
+      inventoryUnlisten?.();
+      inventoryErrorUnlisten?.();
       if (loading) {
         void cancelInstructionScan()
           .then((scanId) => instructionScanStore.clearThrough(scanId))
@@ -270,7 +316,7 @@
             {inventory?.files.length ?? 0} files · read-only
           </p>
         </div>
-        {#if loading}
+        {#if loading || inventory?.stale}
           <button
             type="button"
             onclick={() => void cancelScan()}
@@ -293,6 +339,10 @@
       </div>
       {#if loading}
         <p class="text-[11px] text-ink-faint" role="status">{scanStatusText()}</p>
+      {:else if inventory?.stale}
+        <p class="text-[11px] text-ink-faint" role="status">
+          Showing last results · refreshing in background…
+        </p>
       {:else if inventory}
         <p class="text-[10px] text-ink-faint">
           Scanned {inventory.entries_visited.toLocaleString()} entries in {formatDuration(inventory.elapsed_ms)}

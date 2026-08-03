@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy, onMount, untrack } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
@@ -30,6 +30,7 @@
   import GitOutcomes from './GitOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
+  import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
   import { formatStartedLocal, formatTokenCategory, modelProviderVisual } from '../lib/sessionGrid';
   import {
     collectSessionExportTree,
@@ -190,50 +191,107 @@
   // ---------------------------------------------------------------------------
   let rangeTotals = $state<Record<string, RangeTotals>>({});
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
-  let rangeRequestGeneration = 0;
-  // Debounce is only for coalescing live store flushes (~150ms apart). A
-  // changed range is a discrete user action (preset click, committed input)
-  // and fetches immediately.
+  // Debounce is only for coalescing live store flushes. A changed range is a
+  // discrete user action (preset click, committed input) and fetches
+  // immediately. Between range changes, only the sessions whose rollups can
+  // have changed are fetched and merged into the cached result (rangeData.ts).
   let lastTableRange: string | null = null;
+  let tableJobGeneration = 0;
+  // Bumped alongside cache invalidation so an in-flight job discards its
+  // fetch instead of applying stale-range data over freshly cleared state.
+  let tableEpoch = 0;
+  let tableQueue: Promise<void> = Promise.resolve();
+  const tableCache = new RangeDataCache();
+  const tableMutations = new MutationAccumulator();
+
+  // Jobs are serialized so a drain/plan never races an unapplied fetch; a job
+  // superseded by a range change or tab switch skips before draining, leaving
+  // its pending mutations to the replacement job.
+  async function runTableRefresh(
+    generation: number,
+    epoch: number,
+    from: string | null,
+    to: string | null,
+    sessionIds: string[],
+  ): Promise<void> {
+    if (generation !== tableJobGeneration) return;
+    const rangesKey = `table:${from}|${to}`;
+    const drained = tableMutations.drain();
+    const plan = tableCache.plan({
+      rangesKey,
+      ids: sessionIds,
+      changedIds: drained.changedIds,
+      removedIds: drained.removedIds,
+    });
+    if (plan.mode === 'none') return;
+    try {
+      let results: Record<string, RangeTotals>[];
+      if (plan.mode === 'full') {
+        const fetched = await measureAsync(
+          'frontend.table_range_fetch',
+          () => sessionsInRanges([{ from, to }], sessionIds),
+          { sessions: sessionIds.length, ranges: 1, fetched: sessionIds.length, mode: 'full' },
+        );
+        if (epoch !== tableEpoch) return;
+        results = tableCache.applyFull(rangesKey, sessionIds, fetched);
+      } else {
+        const fetched = plan.fetchIds.length > 0
+          ? await measureAsync(
+              'frontend.table_range_fetch',
+              () => sessionsInRanges([{ from, to }], plan.fetchIds),
+              { sessions: sessionIds.length, ranges: 1, fetched: plan.fetchIds.length, mode: 'delta' },
+            )
+          : null;
+        if (epoch !== tableEpoch) return;
+        results = tableCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
+      }
+      rangeTotals = results[0];
+    } catch (e) {
+      tableCache.invalidate();
+      console.error('sessions_in_ranges failed:', e);
+    }
+  }
 
   $effect(() => {
-    const generation = ++rangeRequestGeneration;
     const from = fromUtc;
     const to = toUtc;
     const sessionIds = filteredIds;
-    // Depend on the session map so live session updates refresh range data;
-    // skip entirely while this tab is hidden.
-    void sessionsStore.map;
+    tableMutations.observe(sessionsStore.mutationLog);
     if (!active) {
       rangeTotals = {};
       lastTableRange = null;
+      tableCache.invalidate();
+      tableJobGeneration += 1;
+      tableEpoch += 1;
       return;
     }
     if (!from && !to) {
       rangeTotals = {};
       lastTableRange = null;
+      tableCache.invalidate();
+      tableJobGeneration += 1;
+      tableEpoch += 1;
       return;
     }
     const key = `${from}|${to}`;
     const rangeChanged = key !== lastTableRange;
     const delay = rangeChanged ? 0 : 250;
-    if (rangeChanged) rangeTotals = {};
+    if (rangeChanged) {
+      rangeTotals = {};
+      tableCache.invalidate();
+      tableJobGeneration += 1;
+      tableEpoch += 1;
+    }
     lastTableRange = key;
     if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
     rangeFetchTimer = setTimeout(() => {
       rangeFetchTimer = null;
-      measureAsync(
-        'frontend.table_range_fetch',
-        () => sessionsInRanges([{ from, to }], sessionIds),
-        { sessions: sessionIds.length, ranges: 1 },
-      )
-        .then(([result]) => {
-          if (active && generation === rangeRequestGeneration) rangeTotals = result;
-        })
-        .catch((e) => console.error('sessions_in_ranges failed:', e));
+      const generation = ++tableJobGeneration;
+      tableQueue = tableQueue
+        .then(() => runTableRefresh(generation, tableEpoch, from, to, sessionIds))
+        .catch(() => {});
     }, delay);
     return () => {
-      if (generation === rangeRequestGeneration) rangeRequestGeneration += 1;
       if (rangeFetchTimer !== null) {
         clearTimeout(rangeFetchTimer);
         rangeFetchTimer = null;
@@ -571,7 +629,14 @@
   let analyticsPrev = $state<Record<string, RangeTotals> | null>(null);
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
-  let analyticsRequestGeneration = 0;
+  let analyticsJobGeneration = 0;
+  // Bumped whenever the cache is invalidated (range change, tab switch); an
+  // in-flight job from an older epoch discards its fetch instead of applying
+  // stale-range data over the freshly cleared state.
+  let analyticsEpoch = 0;
+  let analyticsQueue: Promise<void> = Promise.resolve();
+  const analyticsCache = new RangeDataCache();
+  const analyticsMutations = new MutationAccumulator();
 
   const DAY_MS = 86_400_000;
   const MAX_CHART_BUCKETS = 14;
@@ -642,68 +707,131 @@
   // — the default window's endMs is "now", which moves on every recompute.
   let lastAnalyticsRange: string | null = null;
 
+  // Serialized so a drain/plan never races an unapplied fetch. The previous
+  // window is only requested when a date filter is active — it feeds the
+  // delta pills, which are hidden otherwise.
+  async function runAnalyticsRefresh(
+    generation: number,
+    epoch: number,
+    startMs: number,
+    endMs: number,
+    openEnded: boolean,
+    sessionIds: string[],
+    includePrev: boolean,
+  ): Promise<void> {
+    if (generation !== analyticsJobGeneration) return;
+    // An open window's end bound must be taken at job time: during sustained
+    // streaming the pulse-driven windowBounds end freezes, and a delta fetch
+    // with a stale end would permanently exclude the burst's newest events
+    // from the cached rollups.
+    const effectiveEnd = openEnded ? Date.now() : endMs;
+    // Day-aligned buckets, coalesced so long ranges stay ≤14 chart points.
+    const dayStart = (ms: number) => {
+      const d = new Date(ms);
+      d.setHours(0, 0, 0, 0);
+      return d.getTime();
+    };
+    const totalDays = Math.max(1, Math.ceil((effectiveEnd - dayStart(startMs)) / DAY_MS));
+    const daysPerBucket = Math.max(1, Math.ceil(totalDays / MAX_CHART_BUCKETS));
+    const bounds: { from: number; to: number }[] = [];
+    for (let t = dayStart(startMs); t < effectiveEnd; t += daysPerBucket * DAY_MS) {
+      bounds.push({ from: Math.max(t, startMs), to: Math.min(t + daysPerBucket * DAY_MS - 1, effectiveEnd) });
+    }
+    const prevFrom = startMs - (effectiveEnd - startMs);
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const requestedRanges = [
+      { from: iso(startMs), to: iso(effectiveEnd) },
+      ...(includePrev ? [{ from: iso(prevFrom), to: iso(startMs - 1) }] : []),
+      ...bounds.map((b) => ({ from: iso(b.from), to: iso(b.to) })),
+    ];
+    // Layout signature only. The open-ended current bound advances with the
+    // clock while unchanged sessions' cached rollups stay valid (rangeData.ts);
+    // the previous window's from-bound is minute-quantized so an open-ended
+    // date filter fully refreshes prev at most once a minute.
+    const rangesKey = [
+      'analytics', dayStart(startMs), daysPerBucket, bounds.length,
+      includePrev ? Math.floor(prevFrom / 60_000) : 'noprev',
+    ].join('|');
+    const drained = analyticsMutations.drain();
+    const plan = analyticsCache.plan({
+      rangesKey,
+      ids: sessionIds,
+      changedIds: drained.changedIds,
+      removedIds: drained.removedIds,
+    });
+    if (plan.mode === 'none') return;
+    try {
+      let results: Record<string, RangeTotals>[];
+      if (plan.mode === 'full') {
+        const fetched = await measureAsync(
+          'frontend.analytics_range_fetch',
+          () => sessionsInRanges(requestedRanges, sessionIds),
+          { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: sessionIds.length, mode: 'full' },
+        );
+        if (epoch !== analyticsEpoch) return;
+        results = analyticsCache.applyFull(rangesKey, sessionIds, fetched);
+      } else {
+        const fetched = plan.fetchIds.length > 0
+          ? await measureAsync(
+              'frontend.analytics_range_fetch',
+              () => sessionsInRanges(requestedRanges, plan.fetchIds),
+              { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: plan.fetchIds.length, mode: 'delta' },
+            )
+          : null;
+        if (epoch !== analyticsEpoch) return;
+        results = analyticsCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
+      }
+      analyticsCurrent = results[0];
+      analyticsPrev = includePrev ? results[1] : null;
+      const days = results.slice(includePrev ? 2 : 1);
+      analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
+    } catch (e) {
+      analyticsCache.invalidate();
+      console.error('analytics sessions_in_ranges failed:', e);
+    }
+  }
+
   $effect(() => {
-    const generation = ++analyticsRequestGeneration;
     const { startMs, endMs } = windowBounds;
     const sessionIds = analyticsSessionIds;
-    void sessionsStore.map;
+    const includePrev = dateScoped;
+    analyticsMutations.observe(sessionsStore.mutationLog);
     if (!active) {
       analyticsBuckets = [];
       analyticsPrev = null;
       analyticsCurrent = null;
       lastAnalyticsRange = null;
+      analyticsCache.invalidate();
+      analyticsJobGeneration += 1;
+      analyticsEpoch += 1;
       return;
     }
     const key = `${fromUtc}|${toUtc}`;
+    const openEnded = !toUtc;
     const rangeChanged = key !== lastAnalyticsRange;
     const delay = rangeChanged ? 0 : 250;
     if (rangeChanged) {
       analyticsBuckets = [];
       analyticsPrev = null;
       analyticsCurrent = null;
+      analyticsCache.invalidate();
+      analyticsJobGeneration += 1;
+      analyticsEpoch += 1;
     }
     lastAnalyticsRange = key;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
-    // Debounced so a burst of store flushes (150ms apart) coalesces into one
-    // refresh. All ~16 windows go in a single batched call the backend
-    // computes in one pass, so the refresh itself is cheap.
-    analyticsTimer = setTimeout(async () => {
+    // Debounced so a burst of store flushes coalesces into one refresh; the
+    // refresh fetches only changed sessions unless the window layout changed.
+    analyticsTimer = setTimeout(() => {
       analyticsTimer = null;
-      // Day-aligned buckets, coalesced so long ranges stay ≤14 chart points.
-      const dayStart = (ms: number) => {
-        const d = new Date(ms);
-        d.setHours(0, 0, 0, 0);
-        return d.getTime();
-      };
-      const totalDays = Math.max(1, Math.ceil((endMs - dayStart(startMs)) / DAY_MS));
-      const daysPerBucket = Math.max(1, Math.ceil(totalDays / MAX_CHART_BUCKETS));
-      const bounds: { from: number; to: number }[] = [];
-      for (let t = dayStart(startMs); t < endMs; t += daysPerBucket * DAY_MS) {
-        bounds.push({ from: Math.max(t, startMs), to: Math.min(t + daysPerBucket * DAY_MS - 1, endMs) });
-      }
-      const prevFrom = startMs - (endMs - startMs);
-      const iso = (ms: number) => new Date(ms).toISOString();
-      try {
-        const requestedRanges = [
-          { from: iso(startMs), to: iso(endMs) },
-          { from: iso(prevFrom), to: iso(startMs - 1) },
-          ...bounds.map((b) => ({ from: iso(b.from), to: iso(b.to) })),
-        ];
-        const [current, prev, ...days] = await measureAsync(
-          'frontend.analytics_range_fetch',
-          () => sessionsInRanges(requestedRanges, sessionIds),
-          { sessions: sessionIds.length, ranges: requestedRanges.length },
-        );
-        if (!active || generation !== analyticsRequestGeneration) return;
-        analyticsCurrent = current;
-        analyticsPrev = prev;
-        analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
-      } catch (e) {
-        console.error('analytics sessions_in_ranges failed:', e);
-      }
+      const generation = ++analyticsJobGeneration;
+      analyticsQueue = analyticsQueue
+        .then(() =>
+          runAnalyticsRefresh(generation, analyticsEpoch, startMs, endMs, openEnded, sessionIds, includePrev),
+        )
+        .catch(() => {});
     }, delay);
     return () => {
-      if (generation === analyticsRequestGeneration) analyticsRequestGeneration += 1;
       if (analyticsTimer !== null) {
         clearTimeout(analyticsTimer);
         analyticsTimer = null;
@@ -715,8 +843,10 @@
    *  non-date-filtered set: the rollup itself scopes usage to its window, and
    *  the previous window's sessions may not intersect the current date range. */
   // Pricing is linear per bucket, so a range's cost equals the sum of its
-  // sessions' costs. Price each fetched rollup map once (keyed by identity),
-  // then every recompute — keystrokes, store flushes — just sums numbers.
+  // sessions' costs. Priced values are cached by RangeTotals object identity:
+  // delta merges reuse unchanged sessions' RangeTotals objects, so their
+  // prices survive a merge and every recompute — keystrokes, store flushes —
+  // just sums numbers.
   type RangePrice = {
     cost: number;
     tokens: number;
@@ -735,9 +865,9 @@
     apiFallbackModels: string[];
     apiUnpricedModels: string[];
   };
-  const rangePriceCache = new WeakMap<object, {
+  const rangePriceCache = new WeakMap<RangeTotals, {
     rates: unknown;
-    perSession: Map<string, RangeSessionPrice>;
+    value: RangeSessionPrice;
   }>();
 
   function priceRangeSession(
@@ -747,13 +877,8 @@
   ): RangeSessionPrice | null {
     const totals = data[session.storage_id];
     if (!totals || totals.tokens.total_tokens === 0) return null;
-    let cached = rangePriceCache.get(data);
-    if (!cached || cached.rates !== rateCard) {
-      cached = { rates: rateCard, perSession: new Map() };
-      rangePriceCache.set(data, cached);
-    }
-    const existing = cached.perSession.get(session.storage_id);
-    if (existing) return existing;
+    const cached = rangePriceCache.get(totals);
+    if (cached && cached.rates === rateCard) return cached.value;
     const plan = creditsFromBuckets(totals.buckets, rateCard, session.harness);
     const api = session.harness === 'codex'
       ? apiCostFromBuckets(totals.buckets, rateCard, session.harness)
@@ -767,7 +892,7 @@
       apiFallbackModels: api?.missingModels ?? [],
       apiUnpricedModels: api?.unpricedModels ?? [],
     };
-    cached.perSession.set(session.storage_id, value);
+    rangePriceCache.set(totals, { rates: rateCard, value });
     return value;
   }
 
@@ -1203,6 +1328,15 @@
   let detailsFetchTimer: ReturnType<typeof setTimeout> | null = null;
   let detailsRequestGeneration = 0;
 
+  // Value-memoized so the fetch effect reruns only when the selected
+  // session's own summary changes — a derived on the raw map would refire on
+  // every store flush and re-serialize the full session ~1/s while streaming.
+  const selectedLastUpdated = $derived(
+    selectedSessionId !== null
+      ? (sessionsStore.map.get(selectedSessionId)?.lastUpdatedAt ?? null)
+      : null,
+  );
+
   $effect(() => {
     const generation = ++detailsRequestGeneration;
     const id = selectedSessionId;
@@ -1211,7 +1345,7 @@
       return;
     }
     // Reactive dep: refetch details when this session's summary updates.
-    void (id !== null ? sessionsStore.map.get(id)?.lastUpdatedAt : undefined);
+    void selectedLastUpdated;
     if (id === null) {
       selectedSession = null;
       return;
@@ -1224,7 +1358,10 @@
         })
         .catch((e) => console.error('get_session_details failed:', e));
     };
-    if (selectedSession?.storage_id === id) {
+    // Untracked: the fetch below assigns selectedSession, and tracking it
+    // here would turn every completed fetch into a rerun — a permanent
+    // ~400ms self-polling loop while a session is selected.
+    if (untrack(() => selectedSession?.storage_id) === id) {
       // Refresh of an already-selected session: debounce.
       detailsFetchTimer = setTimeout(fetchDetails, 400);
     } else {

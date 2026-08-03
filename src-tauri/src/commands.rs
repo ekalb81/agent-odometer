@@ -29,16 +29,98 @@ pub async fn list_instruction_files(
     state: State<'_, Arc<AppState>>,
 ) -> Result<crate::instructions::InstructionInventory, String> {
     let started = Instant::now();
+    let app_state = state.inner().clone();
+    // Racy-but-benign read for the cache decision only; the authoritative
+    // enabled check happens inside the scan's config-transition snapshot.
+    let instructions_enabled = Config::load()
+        .map(|config| config.instructions_enabled)
+        .unwrap_or(false);
+    if instructions_enabled {
+        if let Some(mut cached) = crate::instructions::load_persisted_inventory() {
+            // Stale-while-revalidate: answer from the persisted inventory
+            // immediately and rescan in the background. The fresh result is
+            // persisted and delivered via `instruction-inventory-updated`.
+            cached.stale = true;
+            let cached_files = cached.files.len();
+            let rescan_state = app_state.clone();
+            tauri::async_runtime::spawn(async move {
+                let rescan_started = Instant::now();
+                match run_instruction_scan(app.clone(), rescan_state.clone()).await {
+                    Ok(inventory) => {
+                        rescan_state.performance.record_backend(
+                            "instructions.background_rescan",
+                            rescan_started,
+                            true,
+                            BTreeMap::from([
+                                ("files".into(), inventory.files.len().to_string()),
+                                ("entries".into(), inventory.entries_visited.to_string()),
+                            ]),
+                        );
+                        let _ = app.emit("instruction-inventory-updated", &inventory);
+                    }
+                    Err(error) => {
+                        rescan_state.performance.record_backend(
+                            "instructions.background_rescan",
+                            rescan_started,
+                            false,
+                            BTreeMap::new(),
+                        );
+                        if !error.contains(crate::instructions::SCAN_CANCELLED_ERROR) {
+                            tracing::warn!("background instruction rescan failed: {}", error);
+                            // Without a terminal signal the view would show
+                            // "refreshing in background" forever.
+                            let _ = app.emit("instruction-inventory-error", &error);
+                        }
+                    }
+                }
+            });
+            app_state.performance.record_backend(
+                "ipc.list_instruction_files",
+                started,
+                true,
+                BTreeMap::from([
+                    ("files".into(), cached_files.to_string()),
+                    ("cache".into(), "hit".into()),
+                ]),
+            );
+            return Ok(cached);
+        }
+    }
+    let result = run_instruction_scan(app, app_state.clone()).await;
+    app_state.performance.record_backend(
+        "ipc.list_instruction_files",
+        started,
+        result.is_ok(),
+        BTreeMap::from([
+            (
+                "files".into(),
+                result
+                    .as_ref()
+                    .map(|inventory| inventory.files.len())
+                    .unwrap_or(0)
+                    .to_string(),
+            ),
+            ("cache".into(), "miss".into()),
+        ]),
+    );
+    result
+}
+
+async fn run_instruction_scan(
+    app: AppHandle,
+    app_state: Arc<AppState>,
+) -> Result<crate::instructions::InstructionInventory, String> {
     let (config, scan_id) = {
         // Capture the durable roots and allocate their scan generation in the
         // same config transition. A settings save can therefore only happen
         // wholly before or wholly after this snapshot.
-        let _transition = state.config_transition.lock().unwrap();
+        let _transition = app_state.config_transition.lock().unwrap();
         let config = Config::load().map_err(|error| error.to_string())?;
-        let scan_id = state.begin_instruction_scan();
+        let scan_id = app_state.begin_instruction_scan();
         (config, scan_id)
     };
-    let sessions = state
+    let instructions_enabled = config.instructions_enabled;
+    let sessions = app_state
         .sessions
         .iter()
         .filter_map(|entry| {
@@ -51,7 +133,6 @@ pub async fn list_instruction_files(
             })
         })
         .collect::<Vec<_>>();
-    let app_state = state.inner().clone();
     let scan_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         crate::instructions::discover_with_progress(
@@ -74,21 +155,19 @@ pub async fn list_instruction_files(
             .map(|file| crate::instructions::normalized_path_key(std::path::Path::new(&file.path)))
             .collect::<Vec<_>>();
         let _transition = app_state.config_transition.lock().unwrap();
-        app_state.publish_instruction_paths_if_current(scan_id, paths);
+        // A superseded scan must not persist either: a settings transition or
+        // newer scan owns the durable state from here on.
+        if app_state.publish_instruction_paths_if_current(scan_id, paths) {
+            if instructions_enabled {
+                if let Err(error) = crate::instructions::persist_inventory(inventory) {
+                    tracing::warn!("could not persist instruction inventory: {}", error);
+                }
+            } else {
+                // The feature is off: a persisted index must not outlive that choice.
+                crate::instructions::remove_persisted_inventory();
+            }
+        }
     }
-    app_state.performance.record_backend(
-        "ipc.list_instruction_files",
-        started,
-        result.is_ok(),
-        BTreeMap::from([(
-            "files".into(),
-            result
-                .as_ref()
-                .map(|inventory| inventory.files.len())
-                .unwrap_or(0)
-                .to_string(),
-        )]),
-    );
     result
 }
 
@@ -695,6 +774,10 @@ pub fn set_config(
         }
         if instruction_sources_changed {
             state.cancel_instruction_scan_and_clear_paths();
+            if !config.instructions_enabled {
+                // Disabling the feature must also retire the persisted index.
+                crate::instructions::remove_persisted_inventory();
+            }
             let previous_watcher = state
                 .config_watcher
                 .lock()
@@ -764,6 +847,10 @@ pub fn set_config(
         return Err(error);
     }
     state.cancel_instruction_scan_and_clear_paths();
+    if !config.instructions_enabled {
+        // Disabling the feature must also retire the persisted index.
+        crate::instructions::remove_persisted_inventory();
+    }
     // A commit-time cleanup warning does not undo the durable config or
     // installed hooks. Keep applying live state and emit the new config
     // before surfacing that warning to the caller.

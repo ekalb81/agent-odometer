@@ -17,9 +17,11 @@
   import { defenderActionStore } from './lib/stores/defender.svelte';
   import { defenderReceiptStatus, isWindowsDefenderSurface } from './lib/defenderStatus';
   import { getVersion } from '@tauri-apps/api/app';
-  import type { InstructionScanProgress, SessionSummary } from './lib/types';
+  import type { InstructionScanProgress, RateCard, SessionSummary } from './lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
-  import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from './lib/credits';
+  import { computeTrayTotals } from './lib/trayTotals';
+  import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
+  import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
   import { APP_VIEWS, type AppView } from './lib/appViews';
 
@@ -69,45 +71,68 @@
 
   let trayRefreshGeneration = $state(0);
   let trayTimer: ReturnType<typeof setTimeout> | null = null;
+  let trayJobGeneration = 0;
+  let trayQueue: Promise<void> = Promise.resolve();
+  const trayCache = new RangeDataCache();
+  const trayMutations = new MutationAccumulator();
+
+  // The queue serializes refresh jobs so a drain/plan never runs against a
+  // cache that an in-flight fetch hasn't updated yet. A superseded job skips
+  // before draining, leaving its pending mutations to the newer job.
+  async function runTrayRefresh(generation: number, rateCard: RateCard): Promise<void> {
+    if (generation !== trayJobGeneration) return;
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const end = new Date(start); end.setDate(end.getDate() + 1); end.setMilliseconds(-1);
+    const trayRange = [{ from: start.toISOString(), to: end.toISOString() }];
+    // The day is the only variable in the range, so rollover forces a full fetch.
+    const rangesKey = `tray:${trayRange[0].from}`;
+    const ids = [...sessionsStore.map.keys()];
+    const drained = trayMutations.drain();
+    const plan = trayCache.plan({
+      rangesKey,
+      ids,
+      changedIds: drained.changedIds,
+      removedIds: drained.removedIds,
+    });
+    try {
+      let results = trayCache.current();
+      if (plan.mode === 'full') {
+        const fetched = await measureAsync(
+          'frontend.tray_range_fetch',
+          () => sessionsInRanges(trayRange),
+          { sessions: ids.length, fetched: ids.length, mode: 'full' },
+        );
+        results = trayCache.applyFull(rangesKey, ids, fetched);
+      } else if (plan.mode === 'delta') {
+        const fetched = plan.fetchIds.length > 0
+          ? await measureAsync(
+              'frontend.tray_range_fetch',
+              () => sessionsInRanges(trayRange, plan.fetchIds),
+              { sessions: ids.length, fetched: plan.fetchIds.length, mode: 'delta' },
+            )
+          : null;
+        results = trayCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
+      }
+      if (!results) return;
+      await setTrayTotals(computeTrayTotals(sessionsStore.map.values(), results[0], rateCard));
+    } catch (error) {
+      trayCache.invalidate();
+      console.error('tray totals refresh failed:', error);
+    }
+  }
+
   $effect(() => {
-    void sessionsStore.map;
+    trayMutations.observe(sessionsStore.mutationLog);
     const rateCard = $rates;
     void trayRefreshGeneration;
     if (!rateCard) return;
     if (trayTimer !== null) clearTimeout(trayTimer);
-    trayTimer = setTimeout(async () => {
-      const start = new Date(); start.setHours(0, 0, 0, 0);
-      const end = new Date(start); end.setDate(end.getDate() + 1); end.setMilliseconds(-1);
-      try {
-        const [ranges] = await measureAsync(
-          'frontend.tray_range_fetch',
-          () => sessionsInRanges([{ from: start.toISOString(), to: end.toISOString() }]),
-          { sessions: sessionsStore.map.size },
-        );
-        let tokens = 0; let codexCredits = 0; let codexApi = 0; let claudeUsd = 0;
-        let unlimited = 0; let missingCredits = false; let missingApi = false; let missingClaude = false;
-        let unpricedCredits = false; let unpricedApi = false; let unpricedClaude = false;
-        for (const session of sessionsStore.map.values()) {
-          const range = ranges[session.storage_id]; if (!range) continue;
-          tokens += range.tokens.total_tokens;
-          const plan = creditsFromBuckets(range.buckets, rateCard, session.harness);
-          if (session.harness === 'codex') {
-            if (session.credits_unlimited) unlimited++; else codexCredits += plan.total;
-            missingCredits ||= plan.missingModels.length > 0;
-            unpricedCredits ||= plan.unpricedModels.length > 0;
-            const api = apiCostFromBuckets(range.buckets, rateCard, session.harness);
-            codexApi += api?.total ?? 0; missingApi ||= !api || api.missingModels.length > 0;
-            unpricedApi ||= (api?.unpricedModels.length ?? 0) > 0;
-          } else {
-            claudeUsd += plan.total; missingClaude ||= plan.missingModels.length > 0;
-            unpricedClaude ||= plan.unpricedModels.length > 0;
-          }
-        }
-        const creditText = unlimited > 0 && codexCredits === 0 ? `unlimited (${unlimited})` : `${codexCredits.toFixed(2)}${unlimited ? ` + ${unlimited} unlimited` : ''}${unpricedCredits ? ' · excludes unpriced' : missingCredits ? ' · fallback' : ''}`;
-        await setTrayTotals({ tokens: tokens.toLocaleString(), codex_credits: creditText,
-          codex_api_usd: missingApi ? 'unavailable · missing direct rate' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
-          claude_usd: `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}` });
-      } catch (error) { console.error('tray totals refresh failed:', error); }
+    trayTimer = setTimeout(() => {
+      trayTimer = null;
+      const generation = ++trayJobGeneration;
+      trayQueue = trayQueue
+        .then(() => runTrayRefresh(generation, rateCard))
+        .catch(() => {});
     }, 250);
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);
     const boundary = setTimeout(() => { trayRefreshGeneration += 1; }, next.getTime() - now.getTime());
@@ -169,9 +194,11 @@
   let pendingMutations = new Map<string, PendingMutation>();
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionsReady = false;
+  const flushHistory: number[] = [];
 
   function flushMutations() {
     if (!sessionsReady || pendingMutations.size === 0) return;
+    recordFlush(flushHistory, Date.now());
     const batch = pendingMutations;
     pendingMutations = new Map();
     const upserts: SessionSummary[] = [];
@@ -191,10 +218,12 @@
 
   function scheduleMutationFlush() {
     if (!sessionsReady || flushTimer !== null || pendingMutations.size === 0) return;
+    // The window widens under sustained streaming so continuous agent output
+    // coalesces into ~1Hz-or-slower paints instead of one per parse.
     flushTimer = setTimeout(() => {
       flushTimer = null;
       flushMutations();
-    }, 150);
+    }, computeFlushDelay(flushHistory, Date.now()));
   }
 
   function queueUpsert(s: SessionSummary) {
