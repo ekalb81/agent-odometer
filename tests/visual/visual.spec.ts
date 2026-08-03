@@ -2,7 +2,7 @@ import { expect, test, type Page, type TestInfo } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { APP_VIEWS } from '../../src/lib/appViews';
+import { appViews } from '../../src/lib/appViews';
 import visualManifest from './manifest.json' with { type: 'json' };
 
 type Theme = 'light' | 'dark';
@@ -367,7 +367,12 @@ visualTest('updater-error', 'updater installation error', async (page) => {
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {
-  const registeredIds = APP_VIEWS.map((view) => view.id).sort();
+  // Mirrors the dev-mock `list_providers` fixture (see src/dev-mock.ts) since
+  // tabs are generated from provider descriptors rather than a static list.
+  const registeredIds = appViews([
+    { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true },
+    { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false },
+  ]).map((view) => view.id).sort();
   const expectedIds = primaryViews.map((view) => view.id).sort();
   expect(registeredIds).toEqual(expectedIds);
 });

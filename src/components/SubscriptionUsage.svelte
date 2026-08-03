@@ -9,6 +9,7 @@
   import type { RangeTotals, RateLimitWindow, SubscriptionUsageEntry } from '../lib/types';
   import type { ViewScope } from '../lib/sessionProjection';
   import { remainingPercent, resetCountdown, windowLabel } from '../lib/subscriptionUsage';
+  import { providersStore } from '../lib/stores/providers.svelte';
 
   interface Props {
     /** Gate on `active && analyticsOpen`: `<details>` keeps collapsed
@@ -88,9 +89,7 @@
   }
 
   function harnessLabel(harness: string): string {
-    if (harness === 'codex') return 'Codex';
-    if (harness === 'claude_code') return 'Claude Code';
-    return harness;
+    return providersStore.displayName(harness);
   }
 
   function planBadge(entry: SubscriptionUsageEntry): string {

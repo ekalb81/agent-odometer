@@ -1,7 +1,11 @@
 // TypeScript types mirroring Rust structs in src-tauri/src/model.rs, config.rs, and rates.rs.
 // Keep in sync when Rust types change.
 
-export type Harness = 'codex' | 'claude_code';
+// Open provider identity: the backend now supports an arbitrary ProviderId
+// (see ProviderDescriptor / list_providers below), not just the two builtin
+// providers. Kept as `Harness` for now to minimize churn across call sites
+// that pass it through as an opaque id/key.
+export type Harness = string;
 
 export interface TokenTotals {
   input_tokens: number;
