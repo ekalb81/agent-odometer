@@ -3,6 +3,7 @@ use crate::config::DEFENDER_EXCLUSION_RECEIPT_VERSION;
 use crate::config::{Config, DefenderExclusionReceipt};
 use crate::model::{RangeTotals, Session, SessionSummary};
 use crate::rates::RateCard;
+use crate::scan_cache;
 use crate::store::AppState;
 #[cfg(any(windows, test))]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -873,6 +874,7 @@ pub fn set_config(
     state.scan_done.store(0, Ordering::Release);
     state.scan_total.store(0, Ordering::Release);
     state.scan_elapsed_ms.store(0, Ordering::Release);
+    *state.cold_reason.lock().unwrap() = None;
 
     spawn_scan(
         app.clone(),
@@ -929,6 +931,7 @@ pub fn spawn_scan(
     state.scanned.store(false, Ordering::Release);
     state.scan_done.store(0, Ordering::Release);
     state.scan_total.store(0, Ordering::Release);
+    *state.cold_reason.lock().unwrap() = None;
 
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -939,9 +942,24 @@ pub fn spawn_scan(
         });
         let cache_path = cache_path.flatten();
 
+        // Opened here, not inside scan_all: the caller needs cold_reason
+        // before the scan's progress events start firing, and a cache must
+        // only ever be opened once (a second open on the same file would see
+        // this open's just-written version metadata and report a false-warm
+        // cache).
+        let cache_open_started = Instant::now();
+        let cache = cache_path.as_deref().map(scan_cache::ScanCache::load);
+        let cache_open_ms = cache_open_started.elapsed().as_secs_f64() * 1_000.0;
+        let cold_reason = cache.as_ref().and_then(scan_cache::ScanCache::cold_reason);
+        let cache_invalidation_ms = cache
+            .as_ref()
+            .map(scan_cache::ScanCache::invalidation_ms)
+            .unwrap_or(0.0);
+        *state.cold_reason.lock().unwrap() = cold_reason;
+
         let report = crate::scanner::scan_all(
             &provider_sources,
-            cache_path.as_deref(),
+            cache,
             |path, session| {
                 if state.current_scan_generation() != generation {
                     return;
@@ -985,6 +1003,7 @@ pub fn spawn_scan(
                             total,
                             complete: false,
                             elapsed_ms: None,
+                            cold_reason,
                         },
                     );
                 }
@@ -1072,6 +1091,7 @@ pub fn spawn_scan(
                 total: state.scan_total.load(Ordering::Acquire),
                 complete: true,
                 elapsed_ms: Some(elapsed_ms),
+                cold_reason,
             },
         );
         tracing::info!(
@@ -1091,9 +1111,10 @@ pub fn spawn_scan(
                     "processing_ms".into(),
                     format!("{:.3}", report.processing_ms),
                 ),
+                ("cache_open_ms".into(), format!("{:.3}", cache_open_ms)),
                 (
-                    "cache_open_ms".into(),
-                    format!("{:.3}", report.cache_open_ms),
+                    "cache_invalidation_ms".into(),
+                    format!("{:.3}", cache_invalidation_ms),
                 ),
                 ("cache_hits".into(), report.cache_hits.to_string()),
                 ("cache_misses".into(), report.cache_misses.to_string()),
@@ -1121,6 +1142,9 @@ pub struct ScanStatus {
     pub complete: bool,
     /// Wall-clock duration of the last completed scan; None while running.
     pub elapsed_ms: Option<u64>,
+    /// Why this scan's cache could not be treated as fully warm; None for an
+    /// ordinary warm scan.
+    pub cold_reason: Option<scan_cache::ColdReason>,
 }
 
 /// Returns the current bulk-scan progress. The frontend calls this once on
@@ -1136,6 +1160,7 @@ pub fn get_scan_status(state: State<'_, Arc<AppState>>) -> ScanStatus {
         elapsed_ms: complete
             .then(|| state.scan_elapsed_ms.load(Ordering::Acquire))
             .filter(|ms| *ms > 0),
+        cold_reason: *state.cold_reason.lock().unwrap(),
     }
 }
 

@@ -39,7 +39,6 @@ pub struct ScanReport {
     pub files: usize,
     pub discovery_ms: f64,
     pub processing_ms: f64,
-    pub cache_open_ms: f64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub parsed_files: u64,
@@ -52,14 +51,19 @@ pub struct ScanReport {
 /// Scans all roots in parallel, invoking `on_session(path, session)` from
 /// worker threads as each file finishes. Progress callbacks are serialized
 /// and monotonic.
-/// When `cache_path` is set, files whose (size, mtime) match the cache are
+/// When `cache` is `Some`, files whose (size, mtime) match the cache are
 /// served from it without being read or parsed, and cache rows are updated
-/// individually. When duplicate session IDs exist
-/// under multiple roots, callback order (and thus which one wins in the
-/// caller's map) is nondeterministic.
+/// individually. The cache must already be open: opening it is the caller's
+/// job, both because it must happen only once (a second `ScanCache::load` on
+/// the same file would see this open's just-written version metadata and
+/// report a false warm cache) and because the caller needs the freshly
+/// opened cache's `cold_reason` before this function's first progress
+/// callback fires. When duplicate session IDs exist under multiple roots,
+/// callback order (and thus which one wins in the caller's map) is
+/// nondeterministic.
 pub fn scan_all<F, P>(
     sources: &ProviderSourceSet,
-    cache_path: Option<&Path>,
+    cache: Option<ScanCache>,
     on_session: F,
     on_progress: P,
 ) -> ScanReport
@@ -89,9 +93,6 @@ where
     let discovery_ms = discovery_started.elapsed().as_secs_f64() * 1_000.0;
     on_progress(0, total);
 
-    let cache_started = Instant::now();
-    let cache = cache_path.map(ScanCache::load);
-    let cache_open_ms = cache_started.elapsed().as_secs_f64() * 1_000.0;
     // The callback mutates shared UI progress. Keep both sequence allocation
     // and delivery under one lock so parallel workers cannot publish 25, then
     // regress to a delayed 24.
@@ -169,7 +170,6 @@ where
         files: total,
         discovery_ms,
         processing_ms: processing_started.elapsed().as_secs_f64() * 1_000.0,
-        cache_open_ms,
         cache_hits: cache_hits.load(Ordering::Relaxed),
         cache_misses: cache_misses.load(Ordering::Relaxed),
         parsed_files: parsed_files.load(Ordering::Relaxed),

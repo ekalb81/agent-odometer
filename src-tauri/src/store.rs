@@ -82,6 +82,10 @@ pub struct AppState {
     pub scan_total: AtomicUsize,
     /// Duration of the last completed scan in ms (0 = none yet).
     pub scan_elapsed_ms: AtomicU64,
+    /// Why the current/last scan's cache could not be treated as fully warm;
+    /// None for an ordinary warm scan. Set once the cache is opened, before
+    /// the scan's progress events start firing.
+    pub cold_reason: Mutex<Option<crate::scan_cache::ColdReason>>,
     /// Identifies the configuration generation allowed to publish scan work.
     pub scan_generation: AtomicU64,
     /// Identifies the instruction-inventory scan allowed to publish results.
@@ -115,6 +119,7 @@ impl AppState {
             scan_done: AtomicUsize::new(0),
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
+            cold_reason: Mutex::new(None),
             // Startup watcher events and the initial bulk scan share generation 1.
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
@@ -564,6 +569,7 @@ mod tests {
             scan_done: AtomicUsize::new(0),
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
+            cold_reason: Mutex::new(None),
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),

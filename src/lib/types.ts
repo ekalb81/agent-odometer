@@ -263,6 +263,9 @@ export interface SessionSummary {
   optimization_summary?: OptimizationSummary;
 }
 
+/** Why a scan's cache could not be treated as fully warm. */
+export type ColdReason = 'parse_version_changed' | 'cache_missing' | 'cache_corrupt';
+
 /** Bulk-scan progress, from get_scan_status and "scan-progress" events. */
 export interface ScanStatus {
   done: number;
@@ -270,6 +273,8 @@ export interface ScanStatus {
   complete: boolean;
   /** Wall-clock duration of the last completed scan; null while running. */
   elapsed_ms: number | null;
+  /** Why the cache could not be treated as fully warm; null for a warm scan. */
+  cold_reason: ColdReason | null;
 }
 
 /** Point-in-time evidence from the explicit, elevated Defender action. */

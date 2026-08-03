@@ -322,13 +322,19 @@ function visibleFixtures(): Fixture[] {
 
 function scanStatus() {
   if (visualScenario === 'sessions-scanning') {
-    return { done: 3, total: 12, complete: false, elapsed_ms: null };
+    return { done: 3, total: 12, complete: false, elapsed_ms: null, cold_reason: null };
   }
   if (visualScenario === 'defender-slow' || visualScenario === 'defender-error') {
-    return { done: FIXTURES.length, total: FIXTURES.length, complete: true, elapsed_ms: 31_000 };
+    return {
+      done: FIXTURES.length,
+      total: FIXTURES.length,
+      complete: true,
+      elapsed_ms: 31_000,
+      cold_reason: null,
+    };
   }
   const sessions = visibleFixtures();
-  return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240 };
+  return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240, cold_reason: null };
 }
 
 function turnReceiptStatus(): TurnReceiptIntegrationStatus {

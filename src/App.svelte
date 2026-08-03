@@ -245,6 +245,14 @@
       ($config.claude_session_roots?.length ?? 0),
   );
 
+  // A parser-version bump forces one cold rescan of every transcript; say so
+  // explicitly rather than leaving the user staring at an unexplained delay.
+  const scanningLabel = $derived(
+    scanStore.status.cold_reason === 'parse_version_changed'
+      ? 'Re-indexing after update'
+      : 'Scanning sessions',
+  );
+
   const instructionScanStatus = $derived(instructionScanStore.status);
   const instructionScanActive = $derived(
     instructionScanStatus !== null &&
@@ -594,9 +602,9 @@
           <path d="M22 12a10 10 0 0 0-10-10" stroke="currentColor" stroke-width="4" stroke-linecap="round" />
         </svg>
         {#if scanStore.status.total > 0}
-          Scanning sessions… {scanStore.status.done}/{scanStore.status.total} files
+          {scanningLabel}… {scanStore.status.done}/{scanStore.status.total} files
         {:else}
-          Scanning sessions…
+          {scanningLabel}…
         {/if}
       </span>
     {:else}
