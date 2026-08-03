@@ -582,37 +582,72 @@ pub async fn sessions_in_ranges(
         .map(|r| Ok((parse(&r.from)?, parse(&r.to)?)))
         .collect::<Result<Vec<_>, String>>()?;
     let app_state = state.inner().clone();
-    let sessions: Vec<_> = match session_ids {
-        Some(ids) => ids
-            .into_iter()
-            .filter_map(|id| {
-                app_state
-                    .sessions
-                    .get(&id)
-                    .map(|entry| (id, entry.value().clone()))
-            })
-            .collect(),
+    let keys: Vec<String> = match session_ids {
+        Some(ids) => ids,
         None => app_state
             .sessions
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .map(|entry| entry.key().clone())
             .collect(),
     };
-    let session_count = sessions.len();
+    let session_count = keys.len();
     let range_count = bounds.len();
+    let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // The ledger is authoritative when available; sessions whose latest
+        // persist failed (plus everything, when the store never opened) fall
+        // back to walking in-memory history, keeping answers complete.
+        let (ledger_keys, memory_keys): (Vec<String>, Vec<String>) =
+            match blocking_state.history.as_ref() {
+                Some(_) => keys
+                    .into_iter()
+                    .partition(|key| !blocking_state.ledger_is_stale(key)),
+                None => (Vec::new(), keys),
+            };
+        let mut source = "memory";
         let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); bounds.len()];
-        for (id, session) in sessions {
-            for (i, rt) in session.range_totals_multi(&bounds).into_iter().enumerate() {
-                if range_has_data(&rt) {
-                    out[i].insert(id.clone(), rt);
+        let mut memory_keys = memory_keys;
+        if let Some(history) = blocking_state.history.as_ref() {
+            match history.range_totals_multi(&ledger_keys, &bounds) {
+                Ok(maps) => {
+                    source = if memory_keys.is_empty() {
+                        "ledger"
+                    } else {
+                        "mixed"
+                    };
+                    out = maps;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "ledger range aggregation failed; recomputing in memory: {}",
+                        error
+                    );
+                    memory_keys.extend(ledger_keys);
                 }
             }
         }
-        out
+        for key in memory_keys {
+            let Some(session) = blocking_state
+                .sessions
+                .get(&key)
+                .map(|entry| entry.value().clone())
+            else {
+                continue;
+            };
+            for (i, rt) in session.range_totals_multi(&bounds).into_iter().enumerate() {
+                if range_has_data(&rt) {
+                    out[i].insert(key.clone(), rt);
+                }
+            }
+        }
+        (out, source)
     })
     .await
     .map_err(|e| e.to_string());
+    let source = result
+        .as_ref()
+        .map(|(_, source)| *source)
+        .unwrap_or("failed");
     app_state.performance.record_backend(
         "ipc.sessions_in_ranges",
         started,
@@ -620,9 +655,10 @@ pub async fn sessions_in_ranges(
         BTreeMap::from([
             ("sessions".into(), session_count.to_string()),
             ("ranges".into(), range_count.to_string()),
+            ("source".into(), source.to_string()),
         ]),
     );
-    result
+    result.map(|(out, _)| out)
 }
 
 #[derive(Debug, serde::Deserialize)]
