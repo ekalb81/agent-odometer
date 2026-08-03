@@ -118,6 +118,19 @@ export interface RateLimitSnapshotPoint {
   secondary: RateLimitWindow | null;
 }
 
+/** Most-recent provider-reported subscription-usage snapshot for one
+ *  harness, from get_subscription_usage. Harnesses with no snapshots
+ *  (Claude Code transcripts, today) are simply absent from the result. */
+export interface SubscriptionUsageEntry {
+  harness: Harness;
+  captured_at: string; // ISO8601
+  plan_type: string | null;
+  credits_unlimited: boolean | null;
+  credits_balance: number | null;
+  primary: RateLimitWindow | null;
+  secondary: RateLimitWindow | null;
+}
+
 export interface Session {
   id: string;
   /** Durable, harness-namespaced storage identity; provider id remains in `id`. */

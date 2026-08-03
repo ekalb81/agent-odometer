@@ -40,6 +40,7 @@
   } from '../lib/sessionExport';
   import SessionGridControls from './SessionGridControls.svelte';
   import SessionContextMenu from './SessionContextMenu.svelte';
+  import SubscriptionUsage from './SubscriptionUsage.svelte';
 
   interface Props {
     harness?: ViewScope;
@@ -1556,6 +1557,7 @@
       Analytics &amp; exports · {windowLabel}
     </summary>
     <div class="mt-2 flex flex-col gap-2">
+      <SubscriptionUsage {active} />
       {#if harness === 'all'}
       <div class="grid grid-cols-3 gap-2 text-xs">
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex credits</span><div class="font-mono font-semibold">{fmtAmount(windowTotals.codexCredits)}</div></div>
