@@ -9,6 +9,7 @@ import type {
   RateCard,
   Session,
   SessionSummary,
+  SubscriptionUsageEntry,
   TierBucket,
   TokenTotals,
   TurnReceiptIntegrationStatus,
@@ -284,6 +285,28 @@ const RATES: RateCard = {
   pricing_catalog: { rate_periods: [], conditional_modifiers: [], notes: [] },
 };
 
+function subscriptionUsage(): SubscriptionUsageEntry[] {
+  return [
+    {
+      harness: 'codex',
+      captured_at: new Date(now - 3 * 60_000).toISOString(),
+      plan_type: 'pro',
+      credits_unlimited: null,
+      credits_balance: null,
+      primary: {
+        used_percent: 63,
+        window_minutes: 300,
+        resets_at: new Date(now + 2 * 3_600_000 + 12 * 60_000).toISOString(),
+      },
+      secondary: {
+        used_percent: 22,
+        window_minutes: 10_080,
+        resets_at: new Date(now + 4 * DAY).toISOString(),
+      },
+    },
+  ];
+}
+
 function rangeTotals(
   from: string | null,
   to: string | null,
@@ -421,6 +444,8 @@ mockIPC((cmd, payload) => {
       const f = visibleFixtures().find((x) => summary(x).storage_id === sessionId);
       return f ? details(f) : null;
     }
+    case 'get_subscription_usage':
+      return subscriptionUsage();
     case 'sessions_in_ranges': {
       const { ranges, sessionIds } = payload as {
         ranges: { from: string | null; to: string | null }[];

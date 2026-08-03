@@ -25,11 +25,11 @@ pub mod watcher;
 use commands::{
     add_defender_exclusions, cancel_instruction_scan, compare_tool_impact, correlate_events,
     export_performance_data, get_bundled_rates, get_config, get_performance_status, get_rates,
-    get_scan_status, get_session_details, get_turn_receipt_status, list_external_events,
-    list_instruction_files, list_sessions, list_tool_impact_targets, open_instruction_file,
-    open_task_in_chatgpt, read_instruction_file, record_frontend_performance,
-    repair_turn_receipt_integrations, reveal_in_file_manager, scan_git_outcomes,
-    sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
+    get_scan_status, get_session_details, get_subscription_usage, get_turn_receipt_status,
+    list_external_events, list_instruction_files, list_sessions, list_tool_impact_targets,
+    open_instruction_file, open_task_in_chatgpt, read_instruction_file,
+    record_frontend_performance, repair_turn_receipt_integrations, reveal_in_file_manager,
+    scan_git_outcomes, sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -56,6 +56,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             get_session_details,
+            get_subscription_usage,
             sessions_in_ranges,
             list_tool_impact_targets,
             compare_tool_impact,

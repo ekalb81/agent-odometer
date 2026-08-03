@@ -1,7 +1,9 @@
 #[cfg(windows)]
 use crate::config::DEFENDER_EXCLUSION_RECEIPT_VERSION;
 use crate::config::{Config, DefenderExclusionReceipt};
-use crate::model::{RangeTotals, Session, SessionSummary};
+use crate::model::{
+    Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SessionSummary,
+};
 use crate::rates::RateCard;
 use crate::scan_cache;
 use crate::store::AppState;
@@ -476,6 +478,73 @@ pub fn get_session_details(state: State<'_, Arc<AppState>>, session_id: String) 
         started,
         result.is_some(),
         BTreeMap::from([("found".into(), result.is_some().to_string())]),
+    );
+    result
+}
+
+/// Wire form of one provider's most-recent subscription-usage snapshot,
+/// returned by `get_subscription_usage`.
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct SubscriptionUsageEntry {
+    pub harness: Harness,
+    pub captured_at: DateTime<Utc>,
+    pub plan_type: Option<String>,
+    pub credits_unlimited: Option<bool>,
+    pub credits_balance: Option<f64>,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+}
+
+/// For each harness with at least one rate-limit snapshot, picks the newest
+/// snapshot (by timestamp) across all of that harness's sessions and pairs
+/// it with the account fields (`plan_type`/`credits_*`) from the session
+/// that recorded it. Harnesses with no snapshots — Claude Code transcripts
+/// carry none today — are omitted rather than padded with nulls.
+fn newest_subscription_usage_by_harness<'a>(
+    sessions: impl Iterator<Item = &'a Session>,
+) -> Vec<SubscriptionUsageEntry> {
+    let mut newest: BTreeMap<Harness, (&'a Session, &'a RateLimitSnapshotPoint)> = BTreeMap::new();
+    for session in sessions {
+        for point in &session.rate_limits_history {
+            let is_newer = newest
+                .get(&session.harness)
+                .is_none_or(|(_, existing)| point.timestamp > existing.timestamp);
+            if is_newer {
+                newest.insert(session.harness, (session, point));
+            }
+        }
+    }
+    newest
+        .into_values()
+        .map(|(session, point)| SubscriptionUsageEntry {
+            harness: session.harness,
+            captured_at: point.timestamp,
+            plan_type: session.plan_type.clone(),
+            credits_unlimited: session.credits_unlimited,
+            credits_balance: session.credits_balance,
+            primary: point.primary.clone(),
+            secondary: point.secondary.clone(),
+        })
+        .collect()
+}
+
+/// Most-recent provider-reported subscription-usage snapshot per harness.
+/// Loads full sessions just for this scan (cheap `Arc` clones) since list
+/// summaries omit `rate_limits_history`.
+#[tauri::command]
+pub fn get_subscription_usage(state: State<'_, Arc<AppState>>) -> Vec<SubscriptionUsageEntry> {
+    let started = Instant::now();
+    let sessions: Vec<Arc<Session>> = state
+        .sessions
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect();
+    let result = newest_subscription_usage_by_harness(sessions.iter().map(Arc::as_ref));
+    state.performance.record_backend(
+        "ipc.get_subscription_usage",
+        started,
+        true,
+        BTreeMap::from([("providers".into(), result.len().to_string())]),
     );
     result
 }
@@ -1635,11 +1704,15 @@ pub async fn add_defender_exclusions(
 mod tests {
     use super::{
         configured_defender_roots, defender_elevation_script, defender_root_is_scoped,
-        defender_verification_script, powershell_encoded_command, powershell_encoded_path,
-        preserve_backend_owned_config, range_has_data, valid_session_id, write_export_file,
+        defender_verification_script, newest_subscription_usage_by_harness,
+        powershell_encoded_command, powershell_encoded_path, preserve_backend_owned_config,
+        range_has_data, valid_session_id, write_export_file,
     };
     use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
-    use crate::model::{RangeTotals, TokenTotals, ToolMetrics};
+    use crate::model::{
+        Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
+        TokenTotals, ToolMetrics,
+    };
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use chrono::{DateTime, Utc};
     use std::path::PathBuf;
@@ -1812,5 +1885,133 @@ mod tests {
 
         assert_eq!(incoming.defender_exclusion_receipt, Some(receipt));
         assert!(incoming.performance_tracking_enabled);
+    }
+
+    fn subscription_fixture_session(
+        id: &str,
+        harness: Harness,
+        plan_type: Option<&str>,
+        credits_unlimited: Option<bool>,
+        credits_balance: Option<f64>,
+        rate_limits_history: Vec<RateLimitSnapshotPoint>,
+    ) -> Session {
+        let timestamp: DateTime<Utc> = "2026-07-29T09:00:00Z".parse().unwrap();
+        Session {
+            id: id.into(),
+            storage_id: format!("{harness:?}:{id}"),
+            harness,
+            thread_name: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            file_path: format!("{id}.jsonl"),
+            source_availability: SourceAvailability::Present,
+            archived: false,
+            started_at: timestamp,
+            last_event_at: timestamp,
+            working_directory: None,
+            originator: None,
+            source: None,
+            subagent_id_is_path_fallback: false,
+            history_mode: None,
+            memory_mode: None,
+            cli_version: None,
+            model_provider: None,
+            model: None,
+            service_tier: None,
+            plan_type: plan_type.map(str::to_owned),
+            credits_unlimited,
+            credits_balance,
+            context_window: None,
+            latest_context_tokens: None,
+            total_turns: 0,
+            first_user_message: None,
+            tokens_total: TokenTotals::default(),
+            tokens_by_model: Default::default(),
+            tokens_history: Vec::new(),
+            rate_limits_history,
+            turns: Vec::new(),
+            tool_observations: Vec::new(),
+            tool_metrics: ToolMetrics::default(),
+            tool_metrics_by_model: Default::default(),
+            category_totals: Default::default(),
+            optimization_findings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn subscription_usage_picks_newest_snapshot_per_harness_and_omits_silent_harnesses() {
+        let older: DateTime<Utc> = "2026-07-29T10:00:00Z".parse().unwrap();
+        let newer: DateTime<Utc> = "2026-07-29T12:00:00Z".parse().unwrap();
+
+        let codex_a = subscription_fixture_session(
+            "codex-a",
+            Harness::Codex,
+            Some("pro"),
+            Some(false),
+            Some(12.5),
+            vec![RateLimitSnapshotPoint {
+                timestamp: older,
+                turn_id: None,
+                limit_id: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 40.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                secondary: None,
+            }],
+        );
+        // Second Codex session reports a newer snapshot with different
+        // account fields — its plan/credits must win, not codex_a's.
+        let codex_b = subscription_fixture_session(
+            "codex-b",
+            Harness::Codex,
+            Some("plus"),
+            Some(true),
+            None,
+            vec![RateLimitSnapshotPoint {
+                timestamp: newer,
+                turn_id: None,
+                limit_id: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 63.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(newer),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: 10.0,
+                    window_minutes: Some(10_080),
+                    resets_at: None,
+                }),
+            }],
+        );
+        // Claude Code session with no rate-limit history: harness must not
+        // appear in the result at all.
+        let claude = subscription_fixture_session(
+            "claude-a",
+            Harness::ClaudeCode,
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+
+        let sessions = [codex_a, codex_b, claude];
+        let result = newest_subscription_usage_by_harness(sessions.iter());
+
+        assert_eq!(result.len(), 1);
+        let entry = &result[0];
+        assert_eq!(entry.harness, Harness::Codex);
+        assert_eq!(entry.captured_at, newer);
+        assert_eq!(entry.plan_type.as_deref(), Some("plus"));
+        assert_eq!(entry.credits_unlimited, Some(true));
+        assert_eq!(entry.credits_balance, None);
+        assert_eq!(entry.primary.as_ref().unwrap().used_percent, 63.0);
+        assert_eq!(
+            entry.secondary.as_ref().unwrap().window_minutes,
+            Some(10_080)
+        );
     }
 }

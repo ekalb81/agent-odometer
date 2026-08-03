@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, TurnReceiptIntegrationStatus, DefenderExclusionReceipt } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -29,6 +29,12 @@ export function sessionsInRanges(
     ranges,
     sessionIds: sessionIds ?? null,
   });
+}
+
+/** Most-recent provider-reported subscription-usage snapshot per harness.
+ *  Omits harnesses with no rate-limit history (Claude Code transcripts, today). */
+export function getSubscriptionUsage(): Promise<SubscriptionUsageEntry[]> {
+  return invoke<SubscriptionUsageEntry[]>('get_subscription_usage');
 }
 
 export function listToolImpactTargets(
