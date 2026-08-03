@@ -249,7 +249,10 @@ pub fn remove_persisted_inventory() {
     };
     if let Err(error) = std::fs::remove_file(&path) {
         if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!("could not remove persisted instruction inventory: {}", error);
+            tracing::warn!(
+                "could not remove persisted instruction inventory: {}",
+                error
+            );
         }
     }
 }

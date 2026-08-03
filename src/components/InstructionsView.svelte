@@ -250,10 +250,10 @@
   }
 
   onMount(() => {
-    void refresh();
     let disposed = false;
     let configUnlisten: (() => void) | undefined;
     let inventoryUnlisten: (() => void) | undefined;
+    let inventoryErrorUnlisten: (() => void) | undefined;
     onConfigEvent((event) => {
       if (!disposed && event.source === 'config') {
         configEvents = [...configEvents.filter((item) => item.id !== event.id), event];
@@ -262,27 +262,34 @@
       if (disposed) dispose();
       else configUnlisten = dispose;
     }).catch(() => {});
-    onInstructionInventoryUpdated((fresh) => {
+    const inventoryUpdatedRegistration = onInstructionInventoryUpdated((fresh) => {
       if (disposed) return;
       adoptInventory(fresh);
       error = null;
       instructionScanStore.clearCurrent();
-    }).then((dispose) => {
+    });
+    inventoryUpdatedRegistration.then((dispose) => {
       if (disposed) dispose();
       else inventoryUnlisten = dispose;
     }).catch(() => {});
-    let inventoryErrorUnlisten: (() => void) | undefined;
-    onInstructionInventoryError((message) => {
+    const inventoryErrorRegistration = onInstructionInventoryError((message) => {
       if (disposed) return;
       // Terminal failure: keep showing the retained results, surface the
       // error, and stop advertising a refresh that will never arrive.
       if (inventory?.stale) inventory = { ...inventory, stale: false };
       error = message;
       instructionScanStore.clearCurrent();
-    }).then((dispose) => {
+    });
+    inventoryErrorRegistration.then((dispose) => {
       if (disposed) dispose();
       else inventoryErrorUnlisten = dispose;
     }).catch(() => {});
+    // Establish event delivery before the stale-while-revalidate read: a
+    // fast background rescan can finish before a late-registered listener
+    // exists, stranding the view on the stale copy with no update coming.
+    void Promise.allSettled([inventoryUpdatedRegistration, inventoryErrorRegistration]).then(() => {
+      if (!disposed) void refresh();
+    });
     return () => {
       disposed = true;
       configUnlisten?.();
