@@ -2,18 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-/// Which agent harness produced a session's transcript. Serialized as
-/// snake_case strings; defaults to Codex so previously-serialized sessions
-/// and frontends without the field keep working.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Harness {
-    #[default]
-    Codex,
-    ClaudeCode,
-}
+use crate::provider::{claude_code_provider_id, codex_provider_id, ProviderId};
+
+/// Open provider identity for a session's transcript. The name `Harness` is
+/// retained crate-wide during the migration off the closed two-variant enum;
+/// the wire form is unchanged (bare snake_case strings such as "codex" and
+/// "claude_code"), and sessions persisted without the field still default to
+/// codex via the serde defaults on the structs below.
+pub type Harness = ProviderId;
 
 /// Whether Odometer can currently read the transcript that supplied this
 /// session. Durable storage retains the parsed session even after a source is
@@ -28,10 +24,14 @@ pub enum SourceAvailability {
 
 /// Stable identity for a provider session. Unlike `Session::id`, this is
 /// namespaced by harness and is safe to use as a durable storage key.
-pub fn storage_id_for_session(harness: Harness, provider_session_id: &str) -> String {
-    match harness {
-        Harness::Codex => format!("codex:thread:{provider_session_id}"),
-        Harness::ClaudeCode => format!("claude_code:session:{provider_session_id}"),
+pub fn storage_id_for_session(provider: &ProviderId, provider_session_id: &str) -> String {
+    // Codex threads keep their historical "thread" segment; every other
+    // provider (including claude_code) uses the generic "session" segment,
+    // which preserves all previously persisted storage ids byte-for-byte.
+    if *provider == codex_provider_id() {
+        format!("codex:thread:{provider_session_id}")
+    } else {
+        format!("{provider}:session:{provider_session_id}")
     }
 }
 
@@ -76,10 +76,11 @@ pub enum ToolOutcome {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolObservation {
     pub call_id: String,
     pub turn_id: Option<String>,
+    #[serde(default = "crate::provider::codex_provider_id")]
     pub harness: Harness,
     pub model: Option<String>,
     pub timestamp: DateTime<Utc>,
@@ -324,7 +325,7 @@ pub struct Session {
     /// path, allowing a transcript to move or temporarily disappear.
     #[serde(default)]
     pub storage_id: String,
-    #[serde(default)]
+    #[serde(default = "crate::provider::codex_provider_id")]
     pub harness: Harness,
     pub thread_name: Option<String>,
     pub forked_from_id: Option<String>,
@@ -550,7 +551,7 @@ impl Session {
             return self.storage_id.clone();
         }
 
-        if self.harness == Harness::ClaudeCode && self.source.as_deref() == Some("subagent") {
+        if self.harness == claude_code_provider_id() && self.source.as_deref() == Some("subagent") {
             if let Some(parent_session_id) = self.parent_thread_id.as_deref() {
                 return storage_id_for_claude_subagent(parent_session_id, &self.id);
             }
