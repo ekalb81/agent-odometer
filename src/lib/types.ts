@@ -298,7 +298,19 @@ export interface DefenderExclusionReceipt {
   verified_at: string;
 }
 
+/** Per-provider session sources; authoritative from config_version 1. */
+export interface ProviderSourceConfig {
+  live_roots: string[];
+  archive_roots: string[];
+  session_index_path: string | null;
+}
+
 export interface Config {
+  /** 0 = legacy flat-field layout; 1 = `providers` is authoritative and the
+   *  flat fields mirror its builtin entries. The Settings UI still edits the
+   *  flat fields; the backend treats submitted payloads as legacy-authoritative. */
+  config_version: number;
+  providers: Record<string, ProviderSourceConfig>;
   session_roots: string[];
   archive_roots: string[];
   session_index_path: string;
@@ -382,6 +394,14 @@ export interface InstructionScanProgress {
 export interface InstructionContent {
   path: string;
   content: string;
+}
+
+/** Registered provider, for descriptor-driven UI surfaces. */
+export interface ProviderDescriptor {
+  id: string;
+  display_name: string;
+  archived_sources: boolean;
+  session_index: boolean;
 }
 
 export interface HarnessIntegrationStatus {

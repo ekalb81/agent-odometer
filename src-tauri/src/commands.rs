@@ -975,8 +975,53 @@ pub fn set_config(
     Ok(())
 }
 
+/// Wire form of a registered provider, for descriptor-driven frontend
+/// surfaces (tabs, badges, filters, empty states).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderDescriptorWire {
+    pub id: crate::provider::ProviderId,
+    pub display_name: String,
+    pub archived_sources: bool,
+    pub session_index: bool,
+}
+
+#[tauri::command]
+pub fn list_providers() -> Vec<ProviderDescriptorWire> {
+    crate::provider::ProviderRegistry::builtin()
+        .descriptors()
+        .map(|descriptor| ProviderDescriptorWire {
+            id: descriptor.id.clone(),
+            display_name: descriptor.display_name.to_string(),
+            archived_sources: descriptor.capabilities.archived_sources,
+            session_index: descriptor.capabilities.session_index,
+        })
+        .collect()
+}
+
 fn preserve_backend_owned_config(previous: &Config, next: &mut Config) {
     next.defender_exclusion_receipt = previous.defender_exclusion_receipt.clone();
+    // The Settings UI still edits the legacy flat root fields — but it echoes
+    // back every wire field it received, including a `providers` map and
+    // `config_version: 1` from get_config. Left versioned, normalization
+    // would rebuild the flat fields from that stale map and silently discard
+    // the user's root edits. Until the UI edits the map directly, an incoming
+    // payload is always treated as legacy-authoritative for the builtin
+    // providers; its flat fields win.
+    next.config_version = 0;
+    // Carry over provider-map entries for providers the frontend does not
+    // know about, so a config written by a newer build (or for a
+    // not-yet-registered provider) survives a settings save even through
+    // clients that strip unknown wire fields. Legacy-branch normalization
+    // only rewrites builtin entries, leaving these untouched.
+    let registry = crate::provider::ProviderRegistry::builtin();
+    let builtin_ids: Vec<_> = registry.descriptors().map(|d| d.id.clone()).collect();
+    for (id, entry) in &previous.providers {
+        if !builtin_ids.contains(id) {
+            next.providers
+                .entry(id.clone())
+                .or_insert_with(|| entry.clone());
+        }
+    }
 }
 
 /// Scans all configured roots on a background thread, inserting sessions

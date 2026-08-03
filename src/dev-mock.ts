@@ -446,6 +446,11 @@ mockIPC((cmd, payload) => {
     }
     case 'get_subscription_usage':
       return subscriptionUsage();
+    case 'list_providers':
+      return [
+        { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true },
+        { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false },
+      ];
     case 'sessions_in_ranges': {
       const { ranges, sessionIds } = payload as {
         ranges: { from: string | null; to: string | null }[];
@@ -496,7 +501,22 @@ mockIPC((cmd, payload) => {
     case 'repair_turn_receipt_integrations':
       return turnReceiptStatus();
     case 'get_config':
+      // Mirrors the backend's normalized shape: versioned provider map with
+      // the legacy flat fields as its builtin mirror.
       return {
+        config_version: 1,
+        providers: {
+          codex: {
+            live_roots: ['/home/dev/.codex/sessions'],
+            archive_roots: ['/home/dev/.codex/archived_sessions'],
+            session_index_path: '/home/dev/.codex/session_index.jsonl',
+          },
+          claude_code: {
+            live_roots: ['/home/dev/.claude/projects'],
+            archive_roots: [],
+            session_index_path: null,
+          },
+        },
         session_roots: ['/home/dev/.codex/sessions'],
         archive_roots: ['/home/dev/.codex/archived_sessions'],
         session_index_path: '/home/dev/.codex/session_index.jsonl',

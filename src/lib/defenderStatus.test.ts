@@ -9,6 +9,8 @@ import type { Config, DefenderExclusionReceipt } from './types';
 
 function config(receipt: DefenderExclusionReceipt | null = null): Config {
   return {
+    config_version: 0,
+    providers: {},
     session_roots: ['C:\\Users\\dev\\.codex\\sessions'],
     archive_roots: ['C:\\Users\\dev\\.codex\\archived_sessions'],
     session_index_path: 'C:\\Users\\dev\\.codex\\session_index.jsonl',

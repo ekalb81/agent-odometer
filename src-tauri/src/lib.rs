@@ -26,8 +26,8 @@ use commands::{
     add_defender_exclusions, cancel_instruction_scan, compare_tool_impact, correlate_events,
     export_performance_data, get_bundled_rates, get_config, get_performance_status, get_rates,
     get_scan_status, get_session_details, get_subscription_usage, get_turn_receipt_status,
-    list_external_events, list_instruction_files, list_sessions, list_tool_impact_targets,
-    open_instruction_file, open_task_in_chatgpt, read_instruction_file,
+    list_external_events, list_instruction_files, list_providers, list_sessions,
+    list_tool_impact_targets, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
     record_frontend_performance, repair_turn_receipt_integrations, reveal_in_file_manager,
     scan_git_outcomes, sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
 };
@@ -62,6 +62,7 @@ pub fn run() {
             compare_tool_impact,
             get_scan_status,
             get_config,
+            list_providers,
             set_config,
             get_turn_receipt_status,
             repair_turn_receipt_integrations,
