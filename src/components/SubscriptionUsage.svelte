@@ -7,14 +7,23 @@
   // elsewhere (see rangeData.ts).
   import { getSubscriptionUsage, sessionsInRanges } from '../lib/ipc';
   import type { RangeTotals, RateLimitWindow, SubscriptionUsageEntry } from '../lib/types';
+  import type { ViewScope } from '../lib/sessionProjection';
   import { remainingPercent, resetCountdown, windowLabel } from '../lib/subscriptionUsage';
 
   interface Props {
-    /** Mirrors SessionsView's own `active` prop — only the currently
-     *  selected harness tab polls; inactive tabs stay idle. */
+    /** Gate on `active && analyticsOpen`: `<details>` keeps collapsed
+     *  children mounted, so without the disclosure state this would poll
+     *  for the lifetime of the active tab even if Analytics is never
+     *  opened. */
     active?: boolean;
+    /** The enclosing tab's scope; quota rows and trailing consumption are
+     *  filtered to it so per-harness tabs stay internally consistent. */
+    harness?: ViewScope;
+    /** Session ids in the tab's (non-date-filtered) scope, for the trailing
+     *  consumption query. */
+    sessionIds?: string[];
   }
-  let { active = true }: Props = $props();
+  let { active = true, harness = 'all', sessionIds = [] }: Props = $props();
 
   const REFRESH_INTERVAL_MS = 60_000;
   const TICK_INTERVAL_MS = 30_000;
@@ -40,11 +49,14 @@
     try {
       const [usage, ranges] = await Promise.all([
         getSubscriptionUsage(),
+        // Scoped to the tab's sessions so a per-harness tab's trailing
+        // figures match the analytics beside them ('all' passes every id).
         sessionsInRanges(
           TRAILING_WINDOWS.map(({ ms }) => ({ from: new Date(Date.now() - ms).toISOString(), to: null })),
+          sessionIds,
         ),
       ]);
-      entries = usage;
+      entries = harness === 'all' ? usage : usage.filter((entry) => entry.harness === harness);
       trailingTokens = ranges.map(sumTokens);
       error = null;
     } catch (reason) {
@@ -110,8 +122,10 @@
     return `as of ${Math.floor(diffMin / 60)}h ago`;
   }
 
+  // Only meaningful on the combined tab: per-harness tabs filter entries to
+  // their own provider, so the absence of a Claude row there is deliberate.
   const showClaudeCodeNote = $derived(
-    entries.length > 0 && !entries.some((entry) => entry.harness === 'claude_code'),
+    harness === 'all' && entries.length > 0 && !entries.some((entry) => entry.harness === 'claude_code'),
   );
 </script>
 
