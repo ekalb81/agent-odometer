@@ -501,7 +501,22 @@ mockIPC((cmd, payload) => {
     case 'repair_turn_receipt_integrations':
       return turnReceiptStatus();
     case 'get_config':
+      // Mirrors the backend's normalized shape: versioned provider map with
+      // the legacy flat fields as its builtin mirror.
       return {
+        config_version: 1,
+        providers: {
+          codex: {
+            live_roots: ['/home/dev/.codex/sessions'],
+            archive_roots: ['/home/dev/.codex/archived_sessions'],
+            session_index_path: '/home/dev/.codex/session_index.jsonl',
+          },
+          claude_code: {
+            live_roots: ['/home/dev/.claude/projects'],
+            archive_roots: [],
+            session_index_path: null,
+          },
+        },
         session_roots: ['/home/dev/.codex/sessions'],
         archive_roots: ['/home/dev/.codex/archived_sessions'],
         session_index_path: '/home/dev/.codex/session_index.jsonl',

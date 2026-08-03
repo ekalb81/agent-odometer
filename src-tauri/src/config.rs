@@ -47,6 +47,10 @@ pub struct ProviderSourceConfig {
     /// Provider-maintained session index, when the provider has one.
     #[serde(default)]
     pub session_index_path: Option<PathBuf>,
+    /// Fields written by a newer schema. Preserved verbatim so saving from
+    /// this build never strips them.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +98,10 @@ pub struct Config {
     /// Install the receipt hook for Claude Code when the feature is enabled.
     #[serde(default = "default_true")]
     pub turn_receipts_claude: bool,
+    /// Top-level fields written by a newer schema. Preserved verbatim so a
+    /// round-trip through this build never strips them.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 fn default_true() -> bool {
@@ -153,6 +161,7 @@ impl Default for Config {
             turn_receipts_enabled: false,
             turn_receipts_codex: true,
             turn_receipts_claude: true,
+            extra: BTreeMap::new(),
         }
         // Deliberately NOT normalized: struct-update construction
         // (`Config { custom_roots, ..Config::default() }`) must stay in the
@@ -173,6 +182,16 @@ impl Config {
     /// entries are never touched, so configs written by newer builds
     /// survive round-trips through set_config unchanged.
     pub fn normalized(mut self) -> Self {
+        if self.config_version > CONFIG_VERSION {
+            // Written by a newer build. Unknown fields are preserved via the
+            // flatten catch-alls and the version marker is kept as-is so the
+            // file is never falsely relabeled as this schema; the builtin
+            // mirror is still refreshed from the map so this build works.
+            tracing::warn!(
+                "config was written by a newer schema (version {}); preserving its fields verbatim",
+                self.config_version
+            );
+        }
         if self.config_version < CONFIG_VERSION {
             let codex = self.providers.entry(codex_provider_id()).or_default();
             codex.live_roots = self.session_roots.clone();
@@ -309,6 +328,7 @@ mod tests {
         let cfg = Config {
             config_version: 0,
             providers: BTreeMap::new(),
+            extra: BTreeMap::new(),
             session_roots: vec![dir.path().join("sessions")],
             archive_roots: vec![dir.path().join("archived")],
             session_index_path: dir.path().join("session_index.jsonl"),
@@ -453,6 +473,32 @@ mod tests {
         let sources = cfg.provider_sources().unwrap();
         assert!(sources.iter().all(|s| s.provider_id() != &cursor));
         assert_eq!(sources.len(), 3);
+    }
+
+    #[test]
+    fn newer_schema_round_trips_without_stripping_fields() {
+        let raw = r#"{
+            "config_version": 2,
+            "providers": {
+                "codex": {"live_roots": ["/live"], "quota_source": "api"}
+            },
+            "session_roots": [],
+            "archive_roots": [],
+            "team_sync": {"enabled": true}
+        }"#;
+        let cfg = serde_json::from_str::<Config>(raw).unwrap().normalized();
+        // Never relabeled as the current schema.
+        assert_eq!(cfg.config_version, 2);
+        // The builtin mirror still works for this build.
+        assert_eq!(cfg.session_roots, vec![PathBuf::from("/live")]);
+        // Unknown top-level and per-provider fields survive a save cycle.
+        let rewritten = serde_json::to_value(cfg.clone().normalized()).unwrap();
+        assert_eq!(rewritten["team_sync"]["enabled"], serde_json::json!(true));
+        assert_eq!(
+            rewritten["providers"]["codex"]["quota_source"],
+            serde_json::json!("api")
+        );
+        assert_eq!(rewritten["config_version"], serde_json::json!(2));
     }
 
     #[test]
