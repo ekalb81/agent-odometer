@@ -958,7 +958,7 @@ working_directory"#;
         Session {
             id: "s".into(),
             storage_id: "codex:thread:s".into(),
-            harness: Harness::Codex,
+            harness: crate::provider::codex_provider_id(),
             thread_name: Some("t".into()),
             forked_from_id: Some("f".into()),
             parent_thread_id: Some("p".into()),
@@ -1029,7 +1029,7 @@ working_directory"#;
             tool_observations: vec![ToolObservation {
                 call_id: "c".into(),
                 turn_id: Some("t1".into()),
-                harness: Harness::Codex,
+                harness: crate::provider::codex_provider_id(),
                 model: Some("m".into()),
                 timestamp: now,
                 kind: ToolKind::Read,
