@@ -2,6 +2,7 @@ use crate::model::{
     storage_id_for_session, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
     TokenHistoryPoint, TokenTotals, TurnStatus,
 };
+use crate::provider::codex_provider_id;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -190,7 +191,7 @@ impl SessionParser {
                         crate::telemetry::ToolCallInput {
                             call_id: call_id.to_owned(),
                             turn_id: self.current_turn_id.clone(),
-                            harness: crate::model::Harness::Codex,
+                            harness: codex_provider_id(),
                             model: self.current_model.clone(),
                             timestamp,
                             name: name.to_owned(),
@@ -340,9 +341,9 @@ impl SessionParser {
             .map(str::to_owned);
 
         self.session = Some(Session {
-            storage_id: storage_id_for_session(crate::model::Harness::Codex, &id),
+            storage_id: storage_id_for_session(&codex_provider_id(), &id),
             id,
-            harness: crate::model::Harness::Codex,
+            harness: codex_provider_id(),
             thread_name,
             forked_from_id,
             parent_thread_id,

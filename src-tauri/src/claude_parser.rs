@@ -24,9 +24,10 @@
 //! (and clobber) the parent in the session map.
 
 use crate::model::{
-    storage_id_for_claude_subagent, storage_id_for_session, Harness, Session, SourceAvailability,
+    storage_id_for_claude_subagent, storage_id_for_session, Session, SourceAvailability,
     TokenHistoryPoint, TokenTotals, TurnStatus,
 };
+use crate::provider::claude_code_provider_id;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -232,32 +233,33 @@ impl ClaudeSessionParser {
         // Subagent transcripts reuse the parent's sessionId; their agentId
         // is stable across source moves. Filename stems remain a fallback for
         // older transcripts that do not provide agentId.
-        let (id, storage_id, parent_thread_id, source, subagent_id_is_path_fallback) =
-            if self.is_subagent {
-                let parent_thread_id = record_session_id;
-                let provider_agent_id = root
-                    .get("agentId")
-                    .and_then(Value::as_str)
-                    .filter(|id| !id.is_empty())
-                    .map(str::to_owned);
-                let subagent_id_is_path_fallback = provider_agent_id.is_none();
-                let agent_id = provider_agent_id.unwrap_or_else(|| file_stem.clone());
-                let storage_id = parent_thread_id
-                    .as_deref()
-                    .map(|parent| storage_id_for_claude_subagent(parent, &agent_id))
-                    .unwrap_or_else(|| storage_id_for_session(Harness::ClaudeCode, &agent_id));
-                (
-                    agent_id,
-                    storage_id,
-                    parent_thread_id,
-                    Some("subagent".to_owned()),
-                    subagent_id_is_path_fallback,
-                )
-            } else {
-                let id = record_session_id.unwrap_or(file_stem);
-                let storage_id = storage_id_for_session(Harness::ClaudeCode, &id);
-                (id, storage_id, None, None, false)
-            };
+        let (id, storage_id, parent_thread_id, source, subagent_id_is_path_fallback) = if self
+            .is_subagent
+        {
+            let parent_thread_id = record_session_id;
+            let provider_agent_id = root
+                .get("agentId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            let subagent_id_is_path_fallback = provider_agent_id.is_none();
+            let agent_id = provider_agent_id.unwrap_or_else(|| file_stem.clone());
+            let storage_id = parent_thread_id
+                .as_deref()
+                .map(|parent| storage_id_for_claude_subagent(parent, &agent_id))
+                .unwrap_or_else(|| storage_id_for_session(&claude_code_provider_id(), &agent_id));
+            (
+                agent_id,
+                storage_id,
+                parent_thread_id,
+                Some("subagent".to_owned()),
+                subagent_id_is_path_fallback,
+            )
+        } else {
+            let id = record_session_id.unwrap_or(file_stem);
+            let storage_id = storage_id_for_session(&claude_code_provider_id(), &id);
+            (id, storage_id, None, None, false)
+        };
         if id.is_empty() {
             return;
         }
@@ -265,7 +267,7 @@ impl ClaudeSessionParser {
         self.session = Some(Session {
             id,
             storage_id,
-            harness: Harness::ClaudeCode,
+            harness: claude_code_provider_id(),
             thread_name: self.pending_thread_name.take(),
             forked_from_id: None,
             parent_thread_id,
@@ -509,7 +511,7 @@ impl ClaudeSessionParser {
                     crate::telemetry::ToolCallInput {
                         call_id,
                         turn_id: self.current_turn_id.clone(),
-                        harness: Harness::ClaudeCode,
+                        harness: claude_code_provider_id(),
                         model: model.clone(),
                         timestamp: ts,
                         name,

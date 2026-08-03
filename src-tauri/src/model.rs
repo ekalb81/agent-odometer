@@ -476,7 +476,7 @@ impl SessionSummary {
         Self {
             id: s.id.clone(),
             storage_id: s.effective_storage_id(),
-            harness: s.harness,
+            harness: s.harness.clone(),
             thread_name: s.thread_name.clone(),
             forked_from_id: s.forked_from_id.clone(),
             parent_thread_id: s.parent_thread_id.clone(),
@@ -557,7 +557,7 @@ impl Session {
             }
         }
 
-        storage_id_for_session(self.harness, &self.id)
+        storage_id_for_session(&self.harness, &self.id)
     }
 
     /// All-time (model, tier) usage buckets. Derived from history when
@@ -731,8 +731,8 @@ mod tests {
     fn session_with_history(history: Vec<TokenHistoryPoint>) -> Session {
         Session {
             id: "s".into(),
-            storage_id: storage_id_for_session(Harness::Codex, "s"),
-            harness: Harness::Codex,
+            storage_id: storage_id_for_session(&codex_provider_id(), "s"),
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -887,7 +887,7 @@ mod tests {
             .map(|second| ToolObservation {
                 call_id: second.to_string(),
                 turn_id: Some("turn".into()),
-                harness: Harness::Codex,
+                harness: codex_provider_id(),
                 model: Some("m".into()),
                 timestamp: format!("2026-01-01T00:00:0{second}Z").parse().unwrap(),
                 kind: ToolKind::Read,

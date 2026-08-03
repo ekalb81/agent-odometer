@@ -1,4 +1,4 @@
-use crate::model::{Harness, Session};
+use crate::model::Session;
 use std::borrow::{Borrow, Cow};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -320,7 +320,7 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn accepts_cached_session(&self, session: &Session, kind: ProviderSourceKind) -> bool {
-        session.harness == Harness::Codex && session.archived == kind.is_archived()
+        session.harness == codex_provider_id() && session.archived == kind.is_archived()
     }
 
     fn parse_file(&self, path: &Path, kind: ProviderSourceKind) -> anyhow::Result<Option<Session>> {
@@ -349,7 +349,7 @@ impl ProviderAdapter for ClaudeCodeAdapter {
     }
 
     fn accepts_cached_session(&self, session: &Session, kind: ProviderSourceKind) -> bool {
-        session.harness == Harness::ClaudeCode && !kind.is_archived() && !session.archived
+        session.harness == claude_code_provider_id() && !kind.is_archived() && !session.archived
     }
 
     fn parse_file(&self, path: &Path, kind: ProviderSourceKind) -> anyhow::Result<Option<Session>> {

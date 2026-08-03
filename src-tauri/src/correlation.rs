@@ -116,13 +116,11 @@ fn redacted_scope_matches(cwd: &str, event_scope: &str) -> bool {
 fn scope_matches(session: &Session, event: &ExternalEvent) -> bool {
     // Harness is optional source metadata, not a source-specific branch. Any
     // event producer can constrain its observations to one harness while the
-    // core remains agnostic to config/git event kinds.
+    // core remains agnostic to config/git event kinds. ProviderId's own
+    // string form is the harness label, so no per-provider branching is
+    // needed here (and unknown providers compare correctly by construction).
     if let Some(harness) = event.metadata.get("harness") {
-        let session_harness = match session.harness {
-            Harness::Codex => "codex",
-            Harness::ClaudeCode => "claude_code",
-        };
-        if harness != session_harness {
+        if harness != session.harness.as_str() {
             return false;
         }
     }
@@ -207,7 +205,10 @@ fn add_range(
         window.1,
     );
     add_tokens(&mut out.tokens, &range.tokens);
-    let harness_buckets = out.buckets_by_harness.entry(session.harness).or_default();
+    let harness_buckets = out
+        .buckets_by_harness
+        .entry(session.harness.clone())
+        .or_default();
     for bucket in &range.buckets {
         add_bucket(harness_buckets, bucket);
     }
@@ -359,7 +360,8 @@ fn correlate_at<S: Borrow<Session>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Harness, TokenHistoryPoint};
+    use crate::model::TokenHistoryPoint;
+    use crate::provider::{claude_code_provider_id, codex_provider_id};
     use std::collections::{BTreeMap, HashMap};
 
     fn session(id: &str, cwd: Option<&str>, points: &[(&str, u64)], subagent: bool) -> Session {
@@ -381,7 +383,7 @@ mod tests {
         Session {
             id: id.into(),
             storage_id: format!("codex:thread:{id}"),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: subagent.then(|| "parent".into()),
@@ -534,7 +536,7 @@ mod tests {
             session("codex", None, &[("2026-01-02T00:00:00Z", 10)], false),
             {
                 let mut claude = session("claude", None, &[("2026-01-02T00:00:00Z", 20)], false);
-                claude.harness = Harness::ClaudeCode;
+                claude.harness = claude_code_provider_id();
                 claude
             },
         ];

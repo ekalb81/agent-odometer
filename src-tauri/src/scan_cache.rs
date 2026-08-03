@@ -460,14 +460,15 @@ fn remove_sqlite_files(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Harness, TokenTotals};
+    use crate::model::TokenTotals;
+    use crate::provider::codex_provider_id;
     use std::collections::HashMap as StdHashMap;
 
     fn session(id: &str) -> Session {
         Session {
             id: id.into(),
             storage_id: format!("codex:thread:{id}"),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
