@@ -8,9 +8,8 @@
 //! session or token event during a scan.
 
 use crate::model::{
-    add_totals, OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session,
-    SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolKind, ToolObservation,
-    ToolOutcome,
+    OptimizationFinding, RangeTotals, RangeWindow, Session, SourceAvailability, TokenHistoryPoint,
+    TokenTotals, ToolKind, ToolObservation, ToolOutcome,
 };
 use crate::provider::{claude_code_provider_id, codex_provider_id};
 use anyhow::{anyhow, bail, Context, Result};
@@ -1562,7 +1561,7 @@ mod tests {
     #[test]
     fn ledger_range_totals_match_in_memory_rollups() {
         let (_directory, store) = store();
-        let sessions = vec![rich_session("golden-a"), rich_session("golden-b")];
+        let sessions = [rich_session("golden-a"), rich_session("golden-b")];
         let generation = store.begin_scan().unwrap().max(1);
         let mut keys = Vec::new();
         for (index, fixture) in sessions.iter().enumerate() {
@@ -1780,7 +1779,9 @@ mod tests {
         let fixture = rich_session("backfill");
         let key = crate::model::storage_id_for_session(&codex_provider_id(), "backfill");
         let windows: Vec<RangeWindow> = vec![(None, None)];
-        let from_ledger = store.range_totals_multi(&[key.clone()], &windows).unwrap();
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
         let expected = &fixture.range_totals_multi(&windows)[0];
         let actual = from_ledger[0].get(&key).expect("backfilled facts present");
         assert_eq!(&actual.tool_metrics, &expected.tool_metrics);
