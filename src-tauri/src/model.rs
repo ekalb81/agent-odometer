@@ -511,7 +511,7 @@ impl SessionSummary {
     }
 }
 
-fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
+pub(crate) fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
     dst.input_tokens += src.input_tokens;
     dst.cached_input_tokens += src.cached_input_tokens;
     dst.output_tokens += src.output_tokens;
@@ -629,12 +629,14 @@ impl Session {
             };
             if history_sorted {
                 let start = from.as_ref().map_or(0, |from| {
-                    self.tokens_history
-                        .partition_point(|event| event.timestamp < *from)
+                    self.tokens_history.partition_point(|event| {
+                        event.timestamp.timestamp_millis() < from.timestamp_millis()
+                    })
                 });
                 let end = to.as_ref().map_or(self.tokens_history.len(), |to| {
-                    self.tokens_history
-                        .partition_point(|event| event.timestamp <= *to)
+                    self.tokens_history.partition_point(|event| {
+                        event.timestamp.timestamp_millis() <= to.timestamp_millis()
+                    })
                 });
                 for event in &self.tokens_history[start.min(end)..end] {
                     add_event(event);
@@ -642,8 +644,13 @@ impl Session {
             } else {
                 for event in &self.tokens_history {
                     if (from.is_none()
-                        || from.as_ref().is_some_and(|start| event.timestamp >= *start))
-                        && (to.is_none() || to.as_ref().is_some_and(|end| event.timestamp <= *end))
+                        || from.as_ref().is_some_and(|start| {
+                            event.timestamp.timestamp_millis() >= start.timestamp_millis()
+                        }))
+                        && (to.is_none()
+                            || to.as_ref().is_some_and(|end| {
+                                event.timestamp.timestamp_millis() <= end.timestamp_millis()
+                            }))
                     {
                         add_event(event);
                     }
@@ -652,12 +659,14 @@ impl Session {
 
             let (tool_metrics, tool_metrics_by_model) = if observations_sorted {
                 let start = from.as_ref().map_or(0, |from| {
-                    self.tool_observations
-                        .partition_point(|item| item.timestamp < *from)
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() < from.timestamp_millis()
+                    })
                 });
                 let end = to.as_ref().map_or(self.tool_observations.len(), |to| {
-                    self.tool_observations
-                        .partition_point(|item| item.timestamp <= *to)
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() <= to.timestamp_millis()
+                    })
                 });
                 let selected = &self.tool_observations[start.min(end)..end];
                 crate::telemetry::metrics_with_models(selected.iter())
@@ -665,9 +674,13 @@ impl Session {
                 crate::telemetry::metrics_with_models(self.tool_observations.iter().filter(
                     |item| {
                         (from.is_none()
-                            || from.as_ref().is_some_and(|start| item.timestamp >= *start))
+                            || from.as_ref().is_some_and(|start| {
+                                item.timestamp.timestamp_millis() >= start.timestamp_millis()
+                            }))
                             && (to.is_none()
-                                || to.as_ref().is_some_and(|end| item.timestamp <= *end))
+                                || to.as_ref().is_some_and(|end| {
+                                    item.timestamp.timestamp_millis() <= end.timestamp_millis()
+                                }))
                     },
                 ))
             };
@@ -676,8 +689,10 @@ impl Session {
                 .iter()
                 .filter(|finding| match finding.timestamp {
                     Some(timestamp) => {
-                        from.is_none_or(|from| timestamp >= from)
-                            && to.is_none_or(|to| timestamp <= to)
+                        from.is_none_or(|from| {
+                            timestamp.timestamp_millis() >= from.timestamp_millis()
+                        }) && to
+                            .is_none_or(|to| timestamp.timestamp_millis() <= to.timestamp_millis())
                     }
                     None => from.is_none() && to.is_none(),
                 })

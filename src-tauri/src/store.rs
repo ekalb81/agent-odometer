@@ -96,6 +96,11 @@ pub struct AppState {
     pub config_watcher: Mutex<Option<ConfigWatcherHandle>>,
     instruction_paths: Mutex<HashSet<String>>,
     session_paths: DashMap<String, PathSessionState>,
+    /// Storage ids whose most recent history-store persist failed: their
+    /// ledger rows may be stale or absent, so ledger-backed aggregation must
+    /// compute exactly these sessions from in-memory history instead.
+    /// Cleared per id on the next successful persist.
+    ledger_stale: DashMap<String, ()>,
     pub external_events: Mutex<ExternalEventStore>,
     pub performance: crate::performance::PerformanceRecorder,
     pub tray: Mutex<Option<crate::tray::TrayState>>,
@@ -128,6 +133,7 @@ impl AppState {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            ledger_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(
                 crate::config_events::load_events(),
             )),
@@ -273,6 +279,7 @@ impl AppState {
         };
         match history.observe_with_displaced(path, &session, generation) {
             Ok((stored, displaced)) => {
+                self.ledger_stale.remove(&stored.key);
                 let displaced = displaced.map(|stored| {
                     self.sessions
                         .insert(stored.key, Arc::new(stored.session.clone()));
@@ -289,12 +296,19 @@ impl AppState {
                     path,
                     error
                 );
+                self.ledger_stale.insert(session.effective_storage_id(), ());
                 ReconciledSession {
                     session,
                     displaced: None,
                 }
             }
         }
+    }
+
+    /// True when this session's ledger rows cannot be trusted for
+    /// aggregation because its latest persist failed.
+    pub fn ledger_is_stale(&self, storage_id: &str) -> bool {
+        self.ledger_stale.contains_key(storage_id)
     }
 
     /// Completes an error-free current scan and rehydrates the archive so
@@ -324,6 +338,19 @@ impl AppState {
                 return Vec::new();
             }
         };
+        // Dirty markings survive restarts in the store itself; rebuild the
+        // in-process stale set so ledger-backed aggregation keeps routing
+        // these sessions through in-memory history.
+        match history.dirty_session_keys() {
+            Ok(keys) => {
+                for key in keys {
+                    self.ledger_stale.insert(key, ());
+                }
+            }
+            Err(error) => {
+                tracing::warn!("could not load ledger-dirty markings: {}", error);
+            }
+        }
         let mut changed = Vec::new();
         for stored in stored {
             let session = stored.session;
@@ -578,6 +605,7 @@ mod tests {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            ledger_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(Vec::new())),
             performance: crate::performance::PerformanceRecorder::default(),
             tray: Mutex::new(None),
