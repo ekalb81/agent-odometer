@@ -68,14 +68,23 @@
   }
 
   // Codex additionally shows what the usage would cost at OpenAI API rates;
-  // its money column and analytics use that figure. Claude Code prices at
-  // Anthropic API rates directly.
-  const showApiCost = $derived(harness !== 'claude_code' && Object.keys($rates?.api_models ?? {}).length > 0);
+  // its money column and analytics use that figure. Every other provider
+  // prices directly in USD already (see `ProviderCapabilities.currency`), so
+  // it has no separate "estimated at API rates" figure to show.
+  const showApiCost = $derived(
+    (harness === 'all' || harness === 'codex')
+    && Object.keys($rates?.api_models ?? {}).length > 0,
+  );
+  // Sanity-checks that every registered non-Codex provider (all USD-priced
+  // today) actually resolves to USD before the "All" scope combines Codex's
+  // converted API-USD estimate with their native USD costs.
   const allUsdAvailable = $derived(
     harness !== 'all' || Boolean(
       $rates &&
       Object.keys($rates.api_models ?? {}).length > 0 &&
-      harnessCurrency($rates, 'claude_code') === 'USD'
+      providersStore.descriptors
+        .filter((descriptor) => descriptor.id !== 'codex')
+        .every((descriptor) => harnessCurrency($rates!, descriptor.id) === 'USD')
     ),
   );
 

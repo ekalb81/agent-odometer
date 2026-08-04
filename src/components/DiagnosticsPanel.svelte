@@ -110,6 +110,13 @@
             {#if provider.capabilities.session_index}
               <span class="px-1.5 py-0.5 rounded-sm text-[10px] bg-app border border-edge text-ink-faint">session index</span>
             {/if}
+            <span class="px-1.5 py-0.5 rounded-sm text-[10px] bg-app border border-edge text-ink-faint">{provider.capabilities.currency}</span>
+            {#if provider.capabilities.deep_link}
+              <span class="px-1.5 py-0.5 rounded-sm text-[10px] bg-app border border-edge text-ink-faint">deep link</span>
+            {/if}
+            {#if provider.capabilities.quota_source}
+              <span class="px-1.5 py-0.5 rounded-sm text-[10px] bg-app border border-edge text-ink-faint">quota source</span>
+            {/if}
           </div>
 
           {#if provider.reasons.length > 0}

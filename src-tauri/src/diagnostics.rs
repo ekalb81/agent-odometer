@@ -158,10 +158,13 @@ fn quota_health() -> QuotaHealth {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProviderCapabilitiesWire {
     pub archived_sources: bool,
     pub session_index: bool,
+    pub currency: String,
+    pub deep_link: bool,
+    pub quota_source: bool,
 }
 
 impl From<ProviderCapabilities> for ProviderCapabilitiesWire {
@@ -169,6 +172,9 @@ impl From<ProviderCapabilities> for ProviderCapabilitiesWire {
         Self {
             archived_sources: value.archived_sources,
             session_index: value.session_index,
+            currency: value.currency.to_string(),
+            deep_link: value.deep_link,
+            quota_source: value.quota_source,
         }
     }
 }
@@ -472,6 +478,8 @@ fn default_live_roots(id: &ProviderId) -> Vec<PathBuf> {
         vec![crate::config::codex_home_dir().join("sessions")]
     } else if id == &crate::provider::claude_code_provider_id() {
         vec![crate::config::claude_config_dir().join("projects")]
+    } else if id == &crate::provider::gemini_cli_provider_id() {
+        vec![crate::config::gemini_cli_tmp_dir()]
     } else {
         Vec::new()
     }
@@ -496,7 +504,7 @@ fn default_session_index_roots(id: &ProviderId) -> Vec<PathBuf> {
 fn provider_roots(
     id: &ProviderId,
     provider_config: &crate::config::ProviderSourceConfig,
-    capabilities: ProviderCapabilitiesWire,
+    capabilities: &ProviderCapabilitiesWire,
 ) -> Vec<DiagnosticRoot> {
     let default_live = default_live_roots(id);
     let default_archive = default_archive_roots(id);
@@ -545,7 +553,7 @@ pub fn generate_report(state: &AppState, config: &Config, rates: &RateCard) -> D
             .get(&descriptor.id)
             .cloned()
             .unwrap_or_default();
-        let roots = provider_roots(&descriptor.id, &provider_config, capabilities);
+        let roots = provider_roots(&descriptor.id, &provider_config, &capabilities);
 
         let counts = scan_summary
             .as_ref()
@@ -595,7 +603,7 @@ pub fn generate_report(state: &AppState, config: &Config, rates: &RateCard) -> D
             continue;
         }
         let capabilities = ProviderCapabilitiesWire::default();
-        let roots = provider_roots(id, provider_config, capabilities);
+        let roots = provider_roots(id, provider_config, &capabilities);
         providers.push(build_provider_diagnostic(ProviderDiagnosticInput {
             id: id.clone(),
             display_name: id.as_str().to_string(),
@@ -714,6 +722,9 @@ mod tests {
             capabilities: ProviderCapabilitiesWire {
                 archived_sources: true,
                 session_index: false,
+                currency: "USD".to_string(),
+                deep_link: false,
+                quota_source: false,
             },
             roots: Vec::new(),
             discovery: DiscoveryHealth::default(),
@@ -730,6 +741,9 @@ mod tests {
             capabilities: ProviderCapabilitiesWire {
                 archived_sources: false,
                 session_index: false,
+                currency: "USD".to_string(),
+                deep_link: false,
+                quota_source: false,
             },
             ..base.clone()
         };

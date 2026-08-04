@@ -122,9 +122,15 @@
   }
 
   // Only meaningful on the combined tab: per-harness tabs filter entries to
-  // their own provider, so the absence of a Claude row there is deliberate.
-  const showClaudeCodeNote = $derived(
-    harness === 'all' && entries.length > 0 && !entries.some((entry) => entry.harness === 'claude_code'),
+  // their own provider, so a missing row there is deliberate. Capability-
+  // driven (`quota_source`) rather than a hardcoded Claude Code check, so a
+  // future provider without local quota telemetry is covered automatically.
+  const providersWithoutQuota = $derived(
+    harness === 'all' && entries.length > 0
+      ? providersStore.descriptors.filter(
+          (descriptor) => !descriptor.quota_source && !entries.some((entry) => entry.harness === descriptor.id),
+        )
+      : [],
   );
 </script>
 
@@ -171,9 +177,9 @@
           {/each}
         </div>
       {/each}
-      {#if showClaudeCodeNote}
-        <p class="text-[11px] text-ink-faint">Claude Code does not report quota in transcripts</p>
-      {/if}
+      {#each providersWithoutQuota as descriptor (descriptor.id)}
+        <p class="text-[11px] text-ink-faint">{descriptor.display_name} does not report quota in transcripts</p>
+      {/each}
     </div>
   {/if}
 </div>

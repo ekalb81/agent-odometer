@@ -3,6 +3,7 @@
   import { rates } from '../lib/stores/rates';
   import { computeSessionApiCostScenarios, computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
+  import { providersStore } from '../lib/stores/providers.svelte';
   import {
     findingAvoidableCalls,
     findingConfidence,
@@ -27,6 +28,13 @@
       amount,
       session && $rates ? harnessCurrency($rates, session.harness) : ($rates?.currency ?? 'credits'),
     );
+
+  /** Whether this session's provider supports opening its transcript via a
+   *  native deep link. Only Codex does today; capability-driven so a future
+   *  provider with its own deep link does not require another id check. */
+  const hasDeepLink = $derived(
+    session ? (providersStore.byId(session.harness)?.deep_link ?? false) : false,
+  );
 
   function fmt(n: number): string {
     return numFmt.format(n);
@@ -261,7 +269,7 @@
         {#if sourceMissing}
           <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-amber-500/10 text-amber-500 border border-amber-500/20">source missing</span>
         {/if}
-        {#if session.harness === 'codex'}
+        {#if hasDeepLink}
           <button
             onclick={handleOpenTask}
             class="ml-auto text-[10px] font-medium px-2 py-[2px] rounded-full border border-edge text-ink-muted hover:text-ink transition-colors whitespace-nowrap"

@@ -23,6 +23,9 @@ fn healthy_input() -> ProviderDiagnosticInput {
         capabilities: ProviderCapabilitiesWire {
             archived_sources: true,
             session_index: true,
+            currency: "USD".to_string(),
+            deep_link: false,
+            quota_source: false,
         },
         roots: vec![
             DiagnosticRoot {
@@ -188,6 +191,9 @@ fn archive_roots_configured_for_a_provider_without_archive_support_are_flagged()
         capabilities: ProviderCapabilitiesWire {
             archived_sources: false,
             session_index: false,
+            currency: "USD".to_string(),
+            deep_link: false,
+            quota_source: false,
         },
         archive_roots_configured: 1,
         roots: vec![DiagnosticRoot {
@@ -216,6 +222,9 @@ fn ledger_unavailable_raises_retention_risk_to_high_without_archive_support() {
         capabilities: ProviderCapabilitiesWire {
             archived_sources: false,
             session_index: false,
+            currency: "USD".to_string(),
+            deep_link: false,
+            quota_source: false,
         },
         ledger: LedgerHealth {
             history_store_available: false,

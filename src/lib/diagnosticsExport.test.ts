@@ -10,7 +10,7 @@ function provider(overrides: Partial<ProviderDiagnostic> = {}): ProviderDiagnost
     state: 'ready',
     reasons: [],
     notices: [{ code: 'healthy', message: 'No issues detected for this provider.' }],
-    capabilities: { archived_sources: true, session_index: true },
+    capabilities: { archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true },
     roots: [
       { kind: 'live', path: 'C:\\Users\\dev\\.codex\\sessions', exists: true, is_default: true },
       { kind: 'archive', path: 'C:\\Users\\dev\\.codex\\archived_sessions', exists: false, is_default: true },
