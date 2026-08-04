@@ -183,6 +183,11 @@ function summary(f: Fixture): SessionSummary {
     started_at: f.started,
     last_event_at: new Date(new Date(f.started).getTime() + f.hoursActive * 3_600_000).toISOString(),
     working_directory: '/home/dev/projects/demo',
+    // Every fixture shares one working directory, so they resolve to one
+    // project — matches the 'resolve_projects' mock handler below.
+    project_key: 'repo:demo-fixture',
+    project_label: 'demo',
+    project_provenance: 'repository_root',
     originator: f.harness === 'codex' ? 'chatgpt' : 'cli',
     source: f.parent ? 'subagent' : null,
     cli_version: '1.4.2',
@@ -534,6 +539,23 @@ mockIPC((cmd, payload) => {
           display_path: '…/Codex/2026-08-04/ser',
         },
       ];
+    case 'resolve_projects':
+      return [
+        {
+          project_key: 'repo:demo-fixture',
+          label: 'demo',
+          provenance: 'repository_root',
+          member_keys: ['repo:demo-fixture'],
+          session_count: visibleFixtures().length,
+        },
+      ];
+    case 'set_project_alias':
+    case 'merge_projects':
+    case 'unmerge_project':
+    case 'clear_session_project_override':
+      return null;
+    case 'reassign_session_project':
+      return 'repo:demo-fixture';
     case 'list_providers':
       // Kept to the two shipped-and-visually-baselined providers; Gemini CLI
       // is registered but intentionally left out of this dev fixture so it

@@ -52,6 +52,7 @@ describe('session grid formatting', () => {
       context_window: null, total_turns: 0, first_user_message: null, tokens_total: allTime,
       buckets: [], tool_metrics: zeroToolMetrics(), tool_metrics_by_model: {}, category_totals: {},
       optimization_findings_count: 0,
+      project_key: null, project_label: null, project_provenance: null,
     };
     const range: RangeTotals = {
       tokens: scoped,

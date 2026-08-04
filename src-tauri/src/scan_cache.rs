@@ -30,7 +30,7 @@ const LEGACY_CACHE_NAME: &str = "scan-cache.json";
 /// invalidate the cache — that was the old `APP_VERSION`-keyed behavior,
 /// and it turned every release into a full cold re-parse of every
 /// transcript.
-const PARSE_VERSION: u32 = 2;
+const PARSE_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
@@ -506,6 +506,9 @@ mod tests {
             tool_metrics_by_model: Default::default(),
             category_totals: Default::default(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -780,6 +783,9 @@ optimization_findings.[].version
 originator
 parent_thread_id
 plan_type
+project_key
+project_label
+project_provenance
 rate_limits_history.[].limit_id
 rate_limits_history.[].primary.resets_at
 rate_limits_history.[].primary.used_percent
@@ -1076,6 +1082,9 @@ working_directory"#;
                 occurrences: 1,
                 avoidable_calls: 1,
             }],
+            project_key: Some("repo:abc".into()),
+            project_label: Some("odometer".into()),
+            project_provenance: Some(crate::project_identity::ProjectProvenance::RepositoryRoot),
         }
     }
 

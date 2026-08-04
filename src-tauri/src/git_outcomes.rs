@@ -48,6 +48,46 @@ pub(crate) fn discover_repository_root(path: &Path) -> Option<PathBuf> {
     gix::discover(path).ok().map(|repo| repository_scope(&repo))
 }
 
+/// Richer discovery result used by the project-identity dimension (#41),
+/// alongside [`discover_repository_root`] rather than a second `gix::discover`
+/// call site.
+pub(crate) struct RepositoryIdentity {
+    /// The shared repository root: for a linked worktree this resolves
+    /// through its `commondir` file to the *main* worktree's repository, so
+    /// every linked worktree of one repository collapses to the same
+    /// project identity instead of fragmenting per checkout.
+    pub common_root: PathBuf,
+}
+
+/// Resolves the repository containing `path`, if any, exposing the
+/// worktree-shared `common_root` used for project-identity grouping.
+pub(crate) fn discover_repository_identity(path: &Path) -> Option<RepositoryIdentity> {
+    let repo = gix::discover(path).ok()?;
+    let common_dir = repo.common_dir();
+    // A linked worktree's `commondir` file is conventionally a *relative*
+    // path (e.g. `../..`) read straight off disk with no normalization: its
+    // literal final component is `..`, not `.git`, even though it resolves
+    // to the shared `.git` directory. Canonicalize before inspecting the
+    // final component so that check (and every caller's comparison) sees the
+    // real resolved path rather than the unresolved spelling; a moved or
+    // deleted repository falls back to the unresolved path rather than
+    // failing discovery outright.
+    let common_dir = std::fs::canonicalize(common_dir).unwrap_or_else(|_| common_dir.to_path_buf());
+    // The resolved common dir is the shared `.git` directory (or, for a bare
+    // repository, the repository directory itself). Its parent names the
+    // conventional repository root when it is literally named `.git`; a bare
+    // repository has no such parent to prefer.
+    let common_root = if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        common_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(common_dir)
+    } else {
+        common_dir
+    };
+    Some(RepositoryIdentity { common_root })
+}
+
 fn load_commits(repo: &gix::Repository) -> anyhow::Result<Vec<CommitInfo>> {
     let head = repo.head_commit()?;
     let mut commits = Vec::new();
@@ -277,6 +317,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 

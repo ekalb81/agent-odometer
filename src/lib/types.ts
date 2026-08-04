@@ -193,7 +193,21 @@ export interface Session {
   tool_metrics_by_model: Record<string, ToolMetrics>;
   category_totals: Partial<Record<TaskCategory, CategoryMetric>>;
   optimization_findings: OptimizationFinding[];
+  /** Auto-computed project-identity key (#41); null when there is no working directory. */
+  project_key: string | null;
+  /** Auto-computed local display label for `project_key`. A local alias may override the effective
+   *  label shown in the UI — join through `resolveProjects()`/the project store rather than reading
+   *  this field directly when displaying to the user. */
+  project_label: string | null;
+  project_provenance: ProjectProvenance | null;
 }
+
+/** How a project identity was resolved (#41), stored alongside it rather than re-derived. */
+export type ProjectProvenance =
+  | 'repository_root'
+  | 'workspace_root'
+  | 'provider_project_id'
+  | 'fallback_path_identity';
 
 /** Token usage grouped by (model, service_tier); prices usage exactly without the full event history. */
 export interface TierBucket {
@@ -283,6 +297,9 @@ export interface SessionSummary {
   category_totals: Partial<Record<TaskCategory, CategoryMetric>>;
   optimization_findings_count: number;
   optimization_summary?: OptimizationSummary;
+  project_key: string | null;
+  project_label: string | null;
+  project_provenance: ProjectProvenance | null;
 }
 
 /** Why a scan's cache could not be treated as fully warm. */
@@ -680,6 +697,20 @@ export interface WorkingDirectoryInfo {
   relative_path: string | null;
   /** Shortened absolute path, home collapsed to `~`. */
   display_path: string;
+}
+
+/** One resolved project (#41), after local alias/merge/split overrides.
+ *  The one backend aggregation the dashboard, tables, and export all join
+ *  a session's `project_key` against — see `resolveProjects()`. */
+export interface ProjectInfo {
+  /** Effective (post-merge) project key. */
+  project_key: string;
+  /** Effective display label — a local alias when set, else the auto-computed label. */
+  label: string;
+  provenance: ProjectProvenance;
+  /** Every auto-computed `project_key` folded into this project; more than one only after a merge. */
+  member_keys: string[];
+  session_count: number;
 }
 
 // ---------------------------------------------------------------------------

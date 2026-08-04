@@ -309,6 +309,9 @@ impl ClaudeSessionParser {
             tool_metrics_by_model: Default::default(),
             category_totals: Default::default(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         });
         self.refresh_metadata(root);
     }

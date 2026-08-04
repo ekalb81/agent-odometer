@@ -114,6 +114,7 @@ function session(
     tokens_by_model: tokensByModel, tokens_history: events, rate_limits_history: [], turns: [], tool_observations: [],
     tool_metrics: { calls: 0, reads: 0, searches: 0, mutations: 0, commands: 0, other: 0, successes: 0, failures: 0, unknown: 0, mutation_targets: 0, one_shot_mutations: 0, retry_count: 0, duration_ms: 0, output_bytes: 0 },
     tool_metrics_by_model: {}, category_totals: {}, optimization_findings: [],
+    project_key: null, project_label: null, project_provenance: null,
   };
 }
 

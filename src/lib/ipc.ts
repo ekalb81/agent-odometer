@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -95,6 +95,40 @@ export function getProviderDiagnostics(): Promise<DiagnosticsReport> {
 
 export function resolveWorkingDirectories(): Promise<WorkingDirectoryInfo[]> {
   return invoke<WorkingDirectoryInfo[]>('resolve_working_directories');
+}
+
+/** Every resolved project (#41), after local alias/merge/split overrides —
+ *  the one map every project-scoped surface (grid label/grouping, cards,
+ *  export) joins a session's `project_key` against. Fetch-once-until-refreshed,
+ *  like `resolveWorkingDirectories`: overrides change rarely. */
+export function resolveProjects(): Promise<ProjectInfo[]> {
+  return invoke<ProjectInfo[]>('resolve_projects');
+}
+
+/** Sets (`label`) or clears (`null`) a local display-label alias for a project. */
+export function setProjectAlias(projectKey: string, displayLabel: string | null): Promise<void> {
+  return invoke<void>('set_project_alias', { projectKey, displayLabel });
+}
+
+/** Merges `sourceProjectKey` to display under `canonicalProjectKey`. Rejects a self-merge or a cycle. */
+export function mergeProjects(sourceProjectKey: string, canonicalProjectKey: string): Promise<void> {
+  return invoke<void>('merge_projects', { sourceProjectKey, canonicalProjectKey });
+}
+
+/** Reverses a previous `mergeProjects` call for `projectKey`. */
+export function unmergeProject(projectKey: string): Promise<void> {
+  return invoke<void>('unmerge_project', { projectKey });
+}
+
+/** Manually reassigns one session to `projectKey` (or, when `null`, splits it into a fresh
+ *  standalone project). Returns the effective project key applied. */
+export function reassignSessionProject(sessionKey: string, projectKey: string | null): Promise<string> {
+  return invoke<string>('reassign_session_project', { sessionKey, projectKey });
+}
+
+/** Reverses a previous `reassignSessionProject` call for `sessionKey`. */
+export function clearSessionProjectOverride(sessionKey: string): Promise<void> {
+  return invoke<void>('clear_session_project_override', { sessionKey });
 }
 
 export function setConfig(config: Config): Promise<void> {
