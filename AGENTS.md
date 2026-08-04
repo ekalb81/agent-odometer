@@ -24,6 +24,26 @@ Start with [README.md](README.md) for commands and [docs/ARCHITECTURE.md](docs/A
 - Use the established Svelte 5 rune style (`$state`, `$derived`, `$effect`). Module-level rune state belongs in `*.svelte.ts` files.
 - Keep Tauri capabilities minimal. Do not add remote content, network access, shell execution, or broader capabilities without an explicit requirement and a security review. Current exceptions: `updater:default` and `process:allow-restart` exist solely for the in-app auto-updater.
 
+### Authorized outbound network
+
+The maintainer reviewed and approved three specific uses on 2026-08-04. Nothing else is authorized, and this list does not generalize — a new outbound use needs its own review, even if it resembles one below.
+
+**Everything except the existing updater channel must be opt-in: shipped off by default, enabled by an explicit user action, and fully functional when left off.** A feature that degrades into a broken or misleading state when its network source is disabled has not met this bar.
+
+| Use | Issue | Boundary |
+| --- | --- | --- |
+| Signed price-card refresh | #42 | Distributed through the **existing** updater channel. No new capability, no new host. If it ever becomes a separate fetch, it needs its own opt-in. |
+| Provider service-status polling | #48 | Public, unauthenticated, read-only. Bounded frequency with backoff. Must never write usage, pricing, or quota history — a status outage cannot alter accounting. |
+| Live quota polling | #43 | Opt-in **and** per-provider explicit consent before any credential is used. |
+
+Live quota polling carries constraints the other two do not, and they are not negotiable:
+
+- Reuse an existing provider session only with explicit consent. **Never copy passwords, tokens, or cookies into Odometer's config, logs, diagnostics, exports, performance recordings, or fixtures.**
+- Response bodies are not diagnostic material. Record status and provenance, never payloads.
+- Outages, expired auth, rate limiting, and offline states must produce honest unavailable states — never a fabricated zero, and never a stale number presented as current.
+
+Historical usage always comes from the ledger. Network sources supply external, provenance-bearing state and must never become an accounting authority.
+
 ## Parser and accounting invariants
 
 Parser and credit changes are high risk. Preserve these behaviors and add focused tests:
