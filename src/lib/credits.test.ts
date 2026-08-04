@@ -6,7 +6,18 @@ import {
   resolveModelPricing,
   tokensCost,
 } from './credits';
+import rawBundledRates from '../../src-tauri/rates.json';
 import type { ModelRate, RateCard, Session, TokenTotals } from './types';
+
+/** The same rates.json Rust bundles via `include_str!` (see
+ * `RateCard::load_bundled` and the mirrored regression tests in
+ * `src-tauri/src/turn_receipts.rs`) — loaded here so the Rust and
+ * TypeScript pricing paths are checked against identical, real catalog
+ * data rather than two hand-picked fixtures that could drift apart. */
+const bundledRates = rawBundledRates as unknown as {
+  models: Record<string, ModelRate>;
+  api_models: Record<string, ModelRate>;
+};
 
 const zero: TokenTotals = {
   input_tokens: 0,
@@ -281,6 +292,48 @@ describe('cache dimensions', () => {
     // A direct, explicit 0 rate is still an authoritative direct price, not
     // an estimate — only an *absent* rate downgrades the basis.
     expect(result.byModel[0].basis).toBe('direct');
+  });
+});
+
+describe('bundled rate-card regression guard', () => {
+  // Mirrors src-tauri/src/turn_receipts.rs's
+  // `every_bundled_model_prices_added_dimensions_at_or_above_their_folded_cost`
+  // and `bundled_models_without_a_published_premium_fall_back_to_the_input_rate`.
+  // Rust and TypeScript both compute prices from TokenTotals + ModelRate and
+  // must never disagree, so both get the same guard against the next token
+  // dimension being added the wrong way: defaulting to a zero rate instead
+  // of falling back to the ordinary rate of the bucket it is a subset of.
+  const bundledModels = (): Array<[string, ModelRate]> => [
+    ...Object.entries(bundledRates.models),
+    ...Object.entries(bundledRates.api_models),
+  ];
+
+  it('prices every bundled model no lower than folding cache-creation and reasoning into ordinary input/output', () => {
+    // cached_input_tokens is deliberately left distinguished (and identical)
+    // in both totals: a cache *read* is a genuine, intentional discount
+    // below the input rate, not a premium-or-fallback dimension, so it is
+    // not part of this invariant.
+    const full = totals(1_000_000, 200_000, 500_000, 100_000, 150_000);
+    const folded: TokenTotals = { ...full, cache_creation_input_tokens: 0, reasoning_output_tokens: 0 };
+
+    const models = bundledModels();
+    expect(models.length).toBeGreaterThan(0);
+    for (const [model, rate] of models) {
+      const fullCost = tokensCost(full, model, bundledRates as RateCard, null, 'codex', { [model]: rate }).cost;
+      const foldedCost = tokensCost(folded, model, bundledRates as RateCard, null, 'codex', { [model]: rate }).cost;
+      expect(fullCost).toBeGreaterThanOrEqual(foldedCost - 1e-9);
+    }
+  });
+
+  it('falls back every bundled model without a published cache-creation premium to its input rate, not zero', () => {
+    const modelsWithoutPremium = bundledModels().filter(([, rate]) => rate.cache_creation_input == null);
+    expect(modelsWithoutPremium.length).toBeGreaterThan(0);
+    for (const [model, rate] of modelsWithoutPremium) {
+      const pureCacheCreation = totals(0, 0, 0, 0, 1_000_000);
+      const result = tokensCost(pureCacheCreation, model, bundledRates as RateCard, null, 'codex', { [model]: rate });
+      expect(result.cost).toBeCloseTo(rate.input, 9);
+      expect(result.cost).not.toBe(0);
+    }
   });
 });
 
