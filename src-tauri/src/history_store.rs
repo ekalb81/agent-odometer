@@ -1503,52 +1503,121 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 /// current snapshot deserializes cleanly. A snapshot that fails to
 /// deserialize is skipped with a warning, exactly like the v1->v2 fact
 /// backfill: it heals the next time that session is observed.
+///
+/// Two things this deliberately avoids, both measured problems on a real
+/// corpus (`AGENTS.md` notes full sessions running ~200 MB in aggregate; a
+/// real ledger here holds thousands of sessions):
+///
+/// - It never materializes every session's snapshot blob at once. Only the
+///   (short) session keys are collected up front; each iteration then fetches
+///   *one* snapshot with a targeted single-row query. That query's cursor is
+///   fully closed by the time the following `UPDATE durable_sessions` runs —
+///   necessary because SQLite does not support writing to a table through an
+///   open `SELECT` cursor spanning that same table on one connection, which
+///   is exactly what running the `UPDATE` under the original all-rows cursor
+///   would have done. Peak memory is bounded by one snapshot, not the whole
+///   database.
+/// - It never probes the filesystem/Git once per session. Repository and
+///   workspace-marker discovery (`resolve_directory`) depends only on the
+///   working directory, so it is resolved at most once per *distinct*
+///   directory string and reused for every session sharing one — the same
+///   ~30x reduction `commands::resolve_working_directories` already relies
+///   on (124 distinct directories against 4,083 sessions on a real corpus).
+///   A session with no working directory never reaches the cache at all.
 fn backfill_project_identities(transaction: &Transaction<'_>) -> Result<()> {
     let home = dirs::home_dir();
-    let rows: Vec<(String, Vec<u8>)> = {
-        let mut select = transaction.prepare(
-            "SELECT d.session_key, s.session_json
-             FROM durable_sessions d JOIN session_snapshots s
-               ON s.session_key = d.session_key
-              AND s.version = d.current_snapshot_version",
-        )?;
-        let rows = select
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows
+
+    let keys: Vec<String> = {
+        let mut select = transaction.prepare("SELECT session_key FROM durable_sessions")?;
+        let rows = select.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for (key, raw) in rows {
-        match serde_json::from_slice::<Session>(&raw) {
-            Ok(session) => {
-                let identity = crate::project_identity::resolve_project_identity(
-                    session.working_directory.as_deref(),
-                    &session.harness,
-                    &session.file_path,
-                    home.as_deref(),
-                );
-                transaction.execute(
-                    "UPDATE durable_sessions
-                     SET project_key = ?2, project_label = ?3, project_provenance = ?4, project_source_directory = ?5
-                     WHERE session_key = ?1",
-                    params![
-                        key,
-                        identity.as_ref().map(|i| i.project_key.as_str()),
-                        identity.as_ref().map(|i| i.label.as_str()),
-                        identity.as_ref().map(|i| i.provenance.as_str()),
-                        session.working_directory,
-                    ],
-                )?;
-            }
+
+    let mut directory_cache: HashMap<String, crate::project_identity::DirectoryResolution> =
+        HashMap::new();
+
+    for key in keys {
+        let raw: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT s.session_json
+                 FROM durable_sessions d JOIN session_snapshots s
+                   ON s.session_key = d.session_key
+                  AND s.version = d.current_snapshot_version
+                 WHERE d.session_key = ?1",
+                [key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(raw) = raw else {
+            // No current snapshot recorded for this session; nothing to
+            // backfill (it heals on its next observe).
+            continue;
+        };
+        let session: Session = match serde_json::from_slice(&raw) {
+            Ok(session) => session,
             Err(error) => {
                 tracing::warn!(
                     "could not backfill project identity for {key}: snapshot did not deserialize: {error}"
                 );
+                continue;
             }
-        }
+        };
+        let identity = resolve_with_directory_cache(
+            session.working_directory.as_deref(),
+            &session.harness,
+            &session.file_path,
+            home.as_deref(),
+            &mut directory_cache,
+            crate::project_identity::resolve_directory,
+        );
+        transaction.execute(
+            "UPDATE durable_sessions
+             SET project_key = ?2, project_label = ?3, project_provenance = ?4, project_source_directory = ?5
+             WHERE session_key = ?1",
+            params![
+                key,
+                identity.as_ref().map(|i| i.project_key.as_str()),
+                identity.as_ref().map(|i| i.label.as_str()),
+                identity.as_ref().map(|i| i.provenance.as_str()),
+                session.working_directory,
+            ],
+        )?;
     }
     Ok(())
+}
+
+/// Resolves one session's project identity against `cache`, calling
+/// `resolve_directory` (the filesystem/Git-probing tier) only on a cache
+/// miss for its exact working-directory string. Split out from
+/// `backfill_project_identities` so the "at most one probe per distinct
+/// directory" guarantee is directly testable with a counting stand-in for
+/// `resolve_directory` instead of real repositories on disk — see
+/// `resolving_many_sessions_probes_each_distinct_directory_at_most_once`.
+fn resolve_with_directory_cache<F>(
+    working_directory: Option<&str>,
+    harness: &crate::provider::ProviderId,
+    file_path: &str,
+    home: Option<&Path>,
+    cache: &mut HashMap<String, crate::project_identity::DirectoryResolution>,
+    mut resolve_directory: F,
+) -> Option<crate::project_identity::ProjectIdentity>
+where
+    F: FnMut(&str, Option<&Path>) -> crate::project_identity::DirectoryResolution,
+{
+    let directory = working_directory?;
+    let resolution = cache
+        .entry(directory.to_owned())
+        .or_insert_with(|| resolve_directory(directory, home));
+    Some(match &resolution.identity {
+        Some(identity) => identity.clone(),
+        None => crate::project_identity::resolve_fallback_identity(
+            directory,
+            &resolution.resolved,
+            harness,
+            file_path,
+            home,
+        ),
+    })
 }
 
 /// Shared by both the fresh-database path (`version == 0`, already at the
@@ -3437,6 +3506,80 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn performance_v5_migration_backfill_4000_sessions_120_directories() {
+        // Deliberately non-existent working directories: `resolve_directory`
+        // fails `canonicalize` immediately and falls through to the
+        // `fallback_path_identity` tier without a real `gix::discover` walk.
+        // This isolates and measures the cost this PR actually adds inside
+        // the migration's write transaction — per-session SQL point
+        // queries/updates plus the directory-cache bookkeeping — separate
+        // from Git discovery cost, which is capped at one probe per distinct
+        // directory and is the same cost `resolve_working_directories`
+        // already pays interactively today (measured elsewhere at 124
+        // distinct directories for 4,083 sessions on a real corpus). Total
+        // real-world backfill time is this measurement plus that many
+        // `gix::discover` calls, not multiplied by session count.
+        const SESSIONS: usize = 4_000;
+        const DIRECTORIES: usize = 120;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            for index in 0..SESSIONS {
+                let mut fixture = session(&format!("perf-{index}"), 10);
+                fixture.working_directory = Some(format!(
+                    "/synthetic/does-not-exist/project-{}",
+                    index % DIRECTORIES
+                ));
+                store
+                    .observe(
+                        Path::new(&format!("perf-{index}.jsonl")),
+                        &fixture,
+                        generation,
+                    )
+                    .unwrap();
+            }
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE durable_sessions SET
+                       project_key = NULL, project_label = NULL,
+                       project_provenance = NULL, project_source_directory = NULL;
+                     DROP TABLE IF EXISTS project_overrides;
+                     DROP TABLE IF EXISTS project_session_overrides;
+                     INSERT INTO history_meta(key, value) VALUES('schema_version', '5')
+                       ON CONFLICT(key) DO UPDATE SET value = '5';
+                     PRAGMA user_version = 5;",
+                )
+                .unwrap();
+        }
+
+        let started = std::time::Instant::now();
+        let store = HistoryStore::open(&path).unwrap();
+        let elapsed = started.elapsed();
+        eprintln!(
+            "v5->v6 migration backfill: {SESSIONS} sessions across {DIRECTORIES} distinct \
+             (non-existent, no Git discovery) directories in {elapsed:?}"
+        );
+
+        let count: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM durable_sessions WHERE project_key IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, SESSIONS as i64);
+    }
+
+    #[test]
     fn set_project_alias_overrides_the_label_and_is_reversible() {
         let (_directory, store) = store();
         store
@@ -3532,6 +3675,73 @@ mod tests {
         assert!(store
             .reassign_session_project("does-not-exist", Some("repo:x"))
             .is_err());
+    }
+
+    /// The backfill migration's whole reason for grouping by directory
+    /// first (rather than resolving every session independently) is to
+    /// avoid thousands of Git/filesystem probes on a real corpus. This
+    /// proves the cache actually delivers that: a counting stand-in for the
+    /// expensive `resolve_directory` tier, called through the same
+    /// `resolve_with_directory_cache` the real backfill uses, must be
+    /// invoked exactly once per distinct working directory no matter how
+    /// many sessions share it — and never at all for a session with none.
+    #[test]
+    fn resolving_many_sessions_probes_each_distinct_directory_at_most_once() {
+        use std::cell::RefCell;
+
+        let probe_calls: RefCell<HashMap<String, u32>> = RefCell::new(HashMap::new());
+        let resolve = |directory: &str, _home: Option<&Path>| {
+            *probe_calls
+                .borrow_mut()
+                .entry(directory.to_string())
+                .or_insert(0) += 1;
+            crate::project_identity::DirectoryResolution {
+                resolved: PathBuf::from(directory),
+                identity: Some(crate::project_identity::ProjectIdentity {
+                    project_key: format!("repo:{directory}"),
+                    label: directory.to_string(),
+                    provenance: crate::project_identity::ProjectProvenance::RepositoryRoot,
+                }),
+            }
+        };
+
+        // Ten sessions, only two distinct working directories, plus one
+        // session with none at all.
+        let sessions: [(Option<&str>, &str); 10] = [
+            (Some("/repo/alpha"), "a1.jsonl"),
+            (Some("/repo/alpha"), "a2.jsonl"),
+            (Some("/repo/beta"), "b1.jsonl"),
+            (Some("/repo/alpha"), "a3.jsonl"),
+            (Some("/repo/beta"), "b2.jsonl"),
+            (Some("/repo/alpha"), "a4.jsonl"),
+            (None, "no-cwd.jsonl"),
+            (Some("/repo/beta"), "b3.jsonl"),
+            (Some("/repo/alpha"), "a5.jsonl"),
+            (Some("/repo/beta"), "b4.jsonl"),
+        ];
+
+        let mut cache: HashMap<String, crate::project_identity::DirectoryResolution> =
+            HashMap::new();
+        for (working_directory, file_path) in sessions {
+            let identity = resolve_with_directory_cache(
+                working_directory,
+                &codex_provider_id(),
+                file_path,
+                None,
+                &mut cache,
+                resolve,
+            );
+            assert_eq!(identity.is_some(), working_directory.is_some());
+        }
+
+        let counts = probe_calls.borrow();
+        assert_eq!(counts.get("/repo/alpha"), Some(&1));
+        assert_eq!(counts.get("/repo/beta"), Some(&1));
+        assert_eq!(
+            counts.len(),
+            2,
+            "a session with no working directory must never reach the resolver"
+        );
     }
 
     fn append_event(session: &mut Session, input: u64, at: &str) {

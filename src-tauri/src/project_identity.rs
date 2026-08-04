@@ -172,22 +172,31 @@ fn provider_project_slug(file_path: &str) -> Option<String> {
     (grandparent_name == "projects" && !slug.is_empty()).then_some(slug)
 }
 
-/// Resolves the project identity for one session's working directory.
-///
-/// Returns `None` when there is no working directory at all — a session
-/// without one is never forced into a synthetic bucket, since that would be
-/// a guess rather than an observation.
-pub fn resolve_project_identity(
-    working_directory: Option<&str>,
-    harness: &ProviderId,
-    file_path: &str,
+/// The filesystem/git-probing part of resolution (`repository_root` and
+/// `workspace_root`): it depends only on the working directory, never on a
+/// session's harness or transcript path. Split out from
+/// [`resolve_project_identity`] so a caller resolving many sessions can
+/// probe the filesystem **once per distinct working directory** and reuse
+/// the result for every session that shares one — exactly the ~30x
+/// reduction `commands::resolve_working_directories` already relies on
+/// (measured: 124 distinct directories against 4,083 sessions on a real
+/// corpus). `history_store::backfill_project_identities` is the caller that
+/// needs this; a single live `apply_project_identity` call for one session
+/// does not, and keeps calling [`resolve_project_identity`] directly.
+pub(crate) struct DirectoryResolution {
+    /// Symlink-resolved (where reachable) working directory, reused by
+    /// [`resolve_fallback_identity`] so it never re-canonicalizes.
+    pub(crate) resolved: PathBuf,
+    /// Set only when a repository or workspace root was found; `None` means
+    /// the caller must fall through to [`resolve_fallback_identity`].
+    pub(crate) identity: Option<ProjectIdentity>,
+}
+
+pub(crate) fn resolve_directory(
+    raw_working_directory: &str,
     home: Option<&Path>,
-) -> Option<ProjectIdentity> {
-    let raw = working_directory?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let raw_path = Path::new(raw);
+) -> DirectoryResolution {
+    let raw_path = Path::new(raw_working_directory);
     let resolved = resolvable_path(raw_path);
 
     if let Some(identity) = discover_repository_identity(&resolved) {
@@ -211,11 +220,14 @@ pub fn resolve_project_identity(
             "repo:{}",
             stable_hash(&normalized_path_key(&repo_root, true))
         );
-        return Some(ProjectIdentity {
-            project_key,
-            label,
-            provenance: ProjectProvenance::RepositoryRoot,
-        });
+        return DirectoryResolution {
+            resolved,
+            identity: Some(ProjectIdentity {
+                project_key,
+                label,
+                provenance: ProjectProvenance::RepositoryRoot,
+            }),
+        };
     }
 
     if let Some(root) = workspace_marker_root(&resolved) {
@@ -223,33 +235,82 @@ pub fn resolve_project_identity(
             "workspace:{}",
             stable_hash(&normalized_path_key(&root, true))
         );
-        return Some(ProjectIdentity {
-            project_key,
-            label: crate::commands::shorten_display_path(raw_path, home, 3),
-            provenance: ProjectProvenance::WorkspaceRoot,
-        });
+        return DirectoryResolution {
+            resolved,
+            identity: Some(ProjectIdentity {
+                project_key,
+                label: crate::commands::shorten_display_path(raw_path, home, 3),
+                provenance: ProjectProvenance::WorkspaceRoot,
+            }),
+        };
     }
+
+    DirectoryResolution {
+        resolved,
+        identity: None,
+    }
+}
+
+/// The remaining tiers (`provider_project_id` and `fallback_path_identity`):
+/// no filesystem/git probing beyond the already-resolved `resolved` path, so
+/// this is cheap enough to call once per session even when
+/// [`resolve_directory`]'s result is cached and shared.
+pub(crate) fn resolve_fallback_identity(
+    raw_working_directory: &str,
+    resolved: &Path,
+    harness: &ProviderId,
+    file_path: &str,
+    home: Option<&Path>,
+) -> ProjectIdentity {
+    let raw_path = Path::new(raw_working_directory);
 
     if *harness == claude_code_provider_id() {
         if let Some(slug) = provider_project_slug(file_path) {
             let project_key = format!("provider:{harness}:{}", stable_hash(&slug));
-            return Some(ProjectIdentity {
+            return ProjectIdentity {
                 project_key,
                 label: crate::commands::shorten_display_path(raw_path, home, 3),
                 provenance: ProjectProvenance::ProviderProjectId,
-            });
+            };
         }
     }
 
-    let project_key = format!(
-        "path:{}",
-        stable_hash(&normalized_path_key(&resolved, true))
-    );
-    Some(ProjectIdentity {
+    let project_key = format!("path:{}", stable_hash(&normalized_path_key(resolved, true)));
+    ProjectIdentity {
         project_key,
         label: crate::commands::shorten_display_path(raw_path, home, 3),
         provenance: ProjectProvenance::FallbackPathIdentity,
-    })
+    }
+}
+
+/// Resolves the project identity for one session's working directory.
+///
+/// Returns `None` when there is no working directory at all — a session
+/// without one is never forced into a synthetic bucket, since that would be
+/// a guess rather than an observation. Resolving many sessions at once
+/// (e.g. a ledger backfill) should not call this directly — see
+/// [`resolve_directory`].
+pub fn resolve_project_identity(
+    working_directory: Option<&str>,
+    harness: &ProviderId,
+    file_path: &str,
+    home: Option<&Path>,
+) -> Option<ProjectIdentity> {
+    let raw = working_directory?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let directory = resolve_directory(raw, home);
+    if let Some(identity) = directory.identity {
+        return Some(identity);
+    }
+    Some(resolve_fallback_identity(
+        raw,
+        &directory.resolved,
+        harness,
+        file_path,
+        home,
+    ))
 }
 
 #[cfg(test)]
