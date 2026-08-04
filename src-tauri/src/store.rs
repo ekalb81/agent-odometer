@@ -2,7 +2,9 @@ use crate::config_events::ConfigWatcherHandle;
 use crate::correlation::ExternalEvent;
 use crate::history_store::HistoryStore;
 use crate::model::{Session, SourceAvailability};
+use crate::scanner::ScanReport;
 use crate::watcher::WatcherHandle;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -10,6 +12,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
 const MAX_EXTERNAL_EVENTS: usize = 10_000;
+
+/// The most recently completed bulk/incremental scan's per-provider counters,
+/// retained for the provider diagnostics report (issue #39). This is a plain
+/// cache of the last `ScanReport`; it is never a source of truth and is
+/// overwritten by the next scan.
+#[derive(Debug, Clone)]
+pub struct ScanSummary {
+    pub completed_at: DateTime<Utc>,
+    pub report: ScanReport,
+}
 
 #[derive(Debug)]
 struct PathSessionState {
@@ -105,6 +117,10 @@ pub struct AppState {
     pub performance: crate::performance::PerformanceRecorder,
     pub tray: Mutex<Option<crate::tray::TrayState>>,
     pub tray_available: AtomicBool,
+    /// Per-provider counters from the most recently completed scan, read by
+    /// the on-demand provider diagnostics report. Never populated eagerly
+    /// beyond the scan that already runs at startup/config-save.
+    last_scan_report: Mutex<Option<ScanSummary>>,
 }
 
 impl AppState {
@@ -140,6 +156,7 @@ impl AppState {
             performance: crate::performance::PerformanceRecorder::default(),
             tray: Mutex::new(None),
             tray_available: AtomicBool::new(false),
+            last_scan_report: Mutex::new(None),
         };
         state.hydrate_history();
         state
@@ -556,6 +573,20 @@ impl AppState {
     pub fn extend_external_events(&self, events: impl IntoIterator<Item = ExternalEvent>) {
         self.external_events.lock().unwrap().extend(events);
     }
+
+    /// Records the most recently completed scan's counters for the provider
+    /// diagnostics report. Overwrites any previous summary.
+    pub fn record_scan_report(&self, report: ScanReport) {
+        *self.last_scan_report.lock().unwrap() = Some(ScanSummary {
+            completed_at: Utc::now(),
+            report,
+        });
+    }
+
+    /// The last completed scan's counters, if any scan has finished yet.
+    pub fn last_scan_summary(&self) -> Option<ScanSummary> {
+        self.last_scan_report.lock().unwrap().clone()
+    }
 }
 
 fn path_key(path: &Path) -> String {
@@ -603,6 +634,7 @@ mod tests {
             performance: crate::performance::PerformanceRecorder::default(),
             tray: Mutex::new(None),
             tray_available: AtomicBool::new(false),
+            last_scan_report: Mutex::new(None),
         }
     }
 

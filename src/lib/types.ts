@@ -587,3 +587,105 @@ export interface WorkingDirectoryInfo {
   /** Shortened absolute path, home collapsed to `~`. */
   display_path: string;
 }
+
+// ---------------------------------------------------------------------------
+// Provider diagnostics (issue #39). Local display may show exact paths;
+// export redaction is a frontend transform — see lib/diagnosticsExport.ts.
+// ---------------------------------------------------------------------------
+
+export type ProviderHealthState = 'ready' | 'degraded' | 'unsupported' | 'not_detected';
+
+/** Machine-stable code plus human text explaining a state or observation. */
+export interface DiagnosticReason {
+  code: string;
+  message: string;
+}
+
+export type DiagnosticRootKind = 'live' | 'archive' | 'session_index';
+
+export interface DiagnosticRoot {
+  kind: DiagnosticRootKind;
+  /** Exact local path. Present here for local display; stripped by default
+   *  when building a redacted export (see diagnosticsExport.ts). */
+  path: string;
+  exists: boolean;
+  is_default: boolean;
+}
+
+export interface DiagnosticsCapabilities {
+  archived_sources: boolean;
+  session_index: boolean;
+}
+
+export interface DiscoveryHealth {
+  discovered_files: number;
+  parsed_files: number;
+  skipped_files: number;
+  parse_failures: number;
+  cache_hits: number;
+  cache_misses: number;
+}
+
+export interface LedgerHealth {
+  history_store_available: boolean;
+  durable_sessions: number;
+  available_sessions: number;
+  collision_sessions: number;
+}
+
+export interface PricingHealth {
+  models_observed: number;
+  models_priced: number;
+  /** Bounded sample of used models known to have no published price. */
+  unpriced_models_used: string[];
+  /** Bounded sample of used models priced only via the harness fallback rate. */
+  fallback_models_used: string[];
+  fallback_used: boolean;
+  rates_fetched_at: string | null;
+  rates_stale: boolean;
+}
+
+export type RetentionRiskLevel = 'none' | 'moderate' | 'high';
+
+export interface RetentionHealth {
+  level: RetentionRiskLevel;
+  supports_archive: boolean;
+  archive_roots_configured: number;
+}
+
+export type QuotaStatus = 'not_available';
+
+export interface QuotaHealth {
+  status: QuotaStatus;
+  reason_code: string;
+  message: string;
+}
+
+export interface ProviderDiagnostic {
+  id: string;
+  display_name: string;
+  registered: boolean;
+  state: ProviderHealthState;
+  /** Reasons that drove `state` (blocking). */
+  reasons: DiagnosticReason[];
+  /** Additional non-blocking observations. */
+  notices: DiagnosticReason[];
+  capabilities: DiagnosticsCapabilities;
+  roots: DiagnosticRoot[];
+  discovery: DiscoveryHealth;
+  ledger: LedgerHealth;
+  pricing: PricingHealth;
+  retention: RetentionHealth;
+  quota: QuotaHealth;
+}
+
+export interface DiagnosticsReport {
+  generated_at: string;
+  /** False when the saved session-source configuration is ambiguous or
+   *  otherwise invalid, disabling scanning for every provider until it is
+   *  corrected in Settings. */
+  source_configuration_valid: boolean;
+  cache_cold_reason: ColdReason | null;
+  last_scan_at: string | null;
+  providers: ProviderDiagnostic[];
+}

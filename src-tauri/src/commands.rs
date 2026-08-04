@@ -1038,6 +1038,32 @@ pub fn list_providers() -> Vec<ProviderDescriptorWire> {
         .collect()
 }
 
+/// The provider-registry diagnostics report (issue #39): capability flags,
+/// configured/default roots and their existence, discovery/parse counters
+/// from the last completed scan, ledger health, pricing coverage, retention
+/// risk, and quota-source status, per provider. Synchronous and bounded — a
+/// handful of `Path::exists()` checks plus one pass over the already-loaded
+/// session map — so it never delays startup and needs no cancellation path.
+/// The local UI may show the exact paths this returns; redaction for export
+/// happens in the frontend before the JSON leaves the app (see
+/// `src/lib/diagnosticsExport.ts`).
+#[tauri::command]
+pub fn get_provider_diagnostics(
+    state: State<'_, Arc<AppState>>,
+) -> crate::diagnostics::DiagnosticsReport {
+    let started = Instant::now();
+    let config = Config::load().unwrap_or_default();
+    let rates = get_rates();
+    let report = crate::diagnostics::generate_report(&state, &config, &rates);
+    state.performance.record_backend(
+        "ipc.get_provider_diagnostics",
+        started,
+        true,
+        BTreeMap::from([("providers".into(), report.providers.len().to_string())]),
+    );
+    report
+}
+
 fn preserve_backend_owned_config(previous: &Config, next: &mut Config) {
     next.defender_exclusion_receipt = previous.defender_exclusion_receipt.clone();
     // The Settings UI still edits the legacy flat root fields — but it echoes
@@ -1167,6 +1193,10 @@ pub fn spawn_scan(
         if state.current_scan_generation() != generation {
             return;
         }
+
+        // Retained for the on-demand provider diagnostics report (issue #39).
+        // Only the newest still-current scan's counters are kept.
+        state.record_scan_report(report.clone());
 
         // A parser/read failure makes a complete source observation
         // untrustworthy. Retain stale-present history rather than incorrectly

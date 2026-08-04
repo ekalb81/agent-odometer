@@ -5,6 +5,8 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } from './dev-mock/visualScenario';
 import type {
+  DiagnosticsReport,
+  ProviderDiagnostic,
   RangeTotals,
   RateCard,
   Session,
@@ -397,6 +399,54 @@ function turnReceiptStatus(): TurnReceiptIntegrationStatus {
   };
 }
 
+function providerDiagnostics(): DiagnosticsReport {
+  const generatedAt = new Date(now).toISOString();
+  const healthy: ProviderDiagnostic = {
+    id: 'codex',
+    display_name: 'Codex',
+    registered: true,
+    state: 'ready',
+    reasons: [],
+    notices: [{ code: 'healthy', message: 'No issues detected for this provider.' }],
+    capabilities: { archived_sources: true, session_index: true },
+    roots: [
+      { kind: 'live', path: '/home/dev/.codex/sessions', exists: true, is_default: true },
+      { kind: 'archive', path: '/home/dev/.codex/archived_sessions', exists: true, is_default: true },
+      { kind: 'session_index', path: '/home/dev/.codex/session_index.jsonl', exists: true, is_default: true },
+    ],
+    discovery: { discovered_files: 42, parsed_files: 42, skipped_files: 0, parse_failures: 0, cache_hits: 39, cache_misses: 3 },
+    ledger: { history_store_available: true, durable_sessions: 42, available_sessions: 42, collision_sessions: 0 },
+    pricing: { models_observed: 3, models_priced: 3, unpriced_models_used: [], fallback_models_used: [], fallback_used: false, rates_fetched_at: generatedAt, rates_stale: false },
+    retention: { level: 'none', supports_archive: true, archive_roots_configured: 1 },
+    quota: { status: 'not_available', reason_code: 'quota_source_not_implemented', message: 'Odometer does not read a live quota or rate-limit API for this provider yet.' },
+  };
+  const degraded: ProviderDiagnostic = {
+    id: 'claude_code',
+    display_name: 'Claude Code',
+    registered: true,
+    state: 'degraded',
+    reasons: [
+      { code: 'parse_failures_detected', message: 'The most recent scan could not parse one or more files for this provider.' },
+      { code: 'pricing_fallback_used', message: 'One or more models used by this provider have no published rate and are estimated with the configured fallback rate.' },
+    ],
+    notices: [],
+    capabilities: { archived_sources: false, session_index: false },
+    roots: [{ kind: 'live', path: '/home/dev/.claude/projects', exists: true, is_default: true }],
+    discovery: { discovered_files: 18, parsed_files: 18, skipped_files: 1, parse_failures: 2, cache_hits: 16, cache_misses: 2 },
+    ledger: { history_store_available: true, durable_sessions: 16, available_sessions: 16, collision_sessions: 0 },
+    pricing: { models_observed: 2, models_priced: 1, unpriced_models_used: [], fallback_models_used: ['claude-preview'], fallback_used: true, rates_fetched_at: generatedAt, rates_stale: false },
+    retention: { level: 'moderate', supports_archive: false, archive_roots_configured: 0 },
+    quota: { status: 'not_available', reason_code: 'quota_source_not_implemented', message: 'Odometer does not read a live quota or rate-limit API for this provider yet.' },
+  };
+  return {
+    generated_at: generatedAt,
+    source_configuration_valid: true,
+    cache_cold_reason: null,
+    last_scan_at: generatedAt,
+    providers: [healthy, degraded],
+  };
+}
+
 function emptyInstructionInventory() {
   return {
     files: [],
@@ -468,6 +518,8 @@ mockIPC((cmd, payload) => {
         { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true },
         { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false },
       ];
+    case 'get_provider_diagnostics':
+      return providerDiagnostics();
     case 'sessions_in_ranges': {
       const { ranges, sessionIds } = payload as {
         ranges: { from: string | null; to: string | null }[];

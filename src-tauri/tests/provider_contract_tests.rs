@@ -296,6 +296,18 @@ fn mixed_provider_scan_uses_adapters_and_keeps_progress_monotonic() {
     assert_eq!(report.parsed_files, 2);
     assert_eq!(report.parse_failures, 0);
 
+    // Per-provider breakdown (issue #39 diagnostics) must attribute each
+    // discovered/parsed file to its owning provider, not just the aggregate.
+    assert_eq!(report.per_provider.len(), 2);
+    let codex_counts = &report.per_provider[&codex_provider_id()];
+    assert_eq!(codex_counts.discovered, 1);
+    assert_eq!(codex_counts.parsed, 1);
+    assert_eq!(codex_counts.parse_failures, 0);
+    let claude_counts = &report.per_provider[&claude_code_provider_id()];
+    assert_eq!(claude_counts.discovered, 1);
+    assert_eq!(claude_counts.parsed, 1);
+    assert_eq!(claude_counts.parse_failures, 0);
+
     let progress = progress.into_inner().unwrap();
     assert_eq!(progress.first(), Some(&(0, 2)));
     assert_eq!(progress.last(), Some(&(2, 2)));
