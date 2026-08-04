@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { orderSessionsForDisplay, type OrderableSession } from './sessionProjection';
+import {
+  costIsUnmeasured,
+  disambiguateSiblingNames,
+  orderSessionsForDisplay,
+  type OrderableSession,
+} from './sessionProjection';
 
 interface Row extends OrderableSession {
   parent: string | null;
@@ -85,5 +90,80 @@ describe('orderSessionsForDisplay', () => {
     const { list } = orderSessionsForDisplay([b, a], { parentOf });
 
     expect(list.map((r) => r.storage_id).sort()).toEqual(['a', 'b']);
+  });
+});
+
+describe('disambiguateSiblingNames', () => {
+  const TEMPLATE =
+    'You are a read-only telemetry analyst. Analyze the local Codex diagnostics database at ';
+
+  it('reveals the divergent span of templated fan-out names', () => {
+    const out = disambiguateSiblingNames([
+      `${TEMPLATE}C:/data/alpha and report retries`,
+      `${TEMPLATE}C:/data/beta and report retries`,
+    ]);
+
+    expect(out).toEqual(['…C:/data/alpha and report retries', '…C:/data/beta and report retries']);
+  });
+
+  it('leaves a single name alone', () => {
+    expect(disambiguateSiblingNames([`${TEMPLATE}x`])).toEqual([`${TEMPLATE}x`]);
+  });
+
+  it('keeps a short shared prefix, which is still informative', () => {
+    const names = ['Fix login bug', 'Fix logout bug'];
+    expect(disambiguateSiblingNames(names)).toEqual(names);
+  });
+
+  it('leaves wholly identical names alone so the ordinal disambiguates instead', () => {
+    const names = [`${TEMPLATE}same`, `${TEMPLATE}same`];
+    expect(disambiguateSiblingNames(names)).toEqual(names);
+  });
+
+  it('snaps the cut to a word boundary rather than mid-word', () => {
+    const out = disambiguateSiblingNames([
+      'Analyze the local diagnostics database alpha',
+      'Analyze the local diagnostics database beta',
+    ]);
+
+    // Cut lands before "alpha"/"beta", not inside a shared word.
+    expect(out).toEqual(['…alpha', '…beta']);
+  });
+
+  it('cuts both at the same point when one name extends another', () => {
+    const out = disambiguateSiblingNames([
+      `${TEMPLATE}C:/data`,
+      `${TEMPLATE}C:/data and report`,
+    ]);
+
+    // A shared cut keeps the pair comparable; cutting each at its own
+    // divergence would strip the shorter one to nothing.
+    expect(out).toEqual(['…C:/data', '…C:/data and report']);
+  });
+
+  it('never returns an empty label', () => {
+    // No space in the shared prefix, so the cut lands at its full length and
+    // the name equal to the prefix would otherwise render as a bare ellipsis.
+    const out = disambiguateSiblingNames(['abcdefghijklmnopqrstuvwxyz', 'abcdefghijklmnopqrstuvwxyz1']);
+
+    expect(out[0]).toBe('abcdefghijklmnopqrstuvwxyz');
+    expect(out.every((name) => name.replace('…', '').length > 0)).toBe(true);
+  });
+});
+
+describe('costIsUnmeasured', () => {
+  it('flags a zero total that comes from having no published rate', () => {
+    expect(costIsUnmeasured(['gpt-5.3-codex-spark'], 0)).toBe(true);
+  });
+
+  it('leaves a genuine zero alone when every model is priced', () => {
+    expect(costIsUnmeasured([], 0)).toBe(false);
+    expect(costIsUnmeasured(undefined, 0)).toBe(false);
+  });
+
+  it('does not claim a partially priced session is unmeasured', () => {
+    // Some usage priced, some not: the total is a floor, not an absence, and
+    // the existing unpriced marker already communicates that.
+    expect(costIsUnmeasured(['gpt-5.3-codex-spark'], 12.5)).toBe(false);
   });
 });

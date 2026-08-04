@@ -485,3 +485,58 @@ export function orderSessionsForDisplay<T extends OrderableSession>(
   }
   return { list, anchorMs };
 }
+
+/** Below this, a shared prefix is still informative enough to keep. */
+const SIBLING_PREFIX_MIN = 24;
+
+/**
+ * Strips the uninformative shared prefix from a set of sibling subagent names.
+ *
+ * Fan-out spawns children from one templated prompt, so their names are
+ * identical for hundreds of characters and the grid shows N rows of the same
+ * truncated text. Cutting at the first divergence — snapped back to a word
+ * boundary — surfaces the part that actually differs.
+ *
+ * Returns names unchanged when there is only one sibling, when the shared
+ * prefix is short enough to be meaningful on its own, or when the names are
+ * wholly identical (nothing to reveal, so the caller's ordinal is the only
+ * available disambiguator).
+ */
+export function disambiguateSiblingNames(names: readonly string[]): string[] {
+  if (names.length < 2) return [...names];
+
+  let prefix = names[0];
+  for (const name of names.slice(1)) {
+    let index = 0;
+    const max = Math.min(prefix.length, name.length);
+    while (index < max && prefix[index] === name[index]) index += 1;
+    prefix = prefix.slice(0, index);
+    if (prefix.length < SIBLING_PREFIX_MIN) return [...names];
+  }
+
+  // Every name identical: there is no divergent span to show.
+  if (names.every((name) => name.length === prefix.length)) return [...names];
+
+  // Snap back to a word boundary so the visible text starts mid-phrase rather
+  // than mid-word. Falls back to the raw cut when the prefix has no space.
+  const boundary = prefix.lastIndexOf(' ');
+  const cut = boundary >= SIBLING_PREFIX_MIN ? boundary + 1 : prefix.length;
+  return names.map((name) => {
+    const rest = name.slice(cut).trimStart();
+    return rest ? `…${rest}` : name;
+  });
+}
+
+/**
+ * True when a zero cost means "not measured" rather than "cost nothing".
+ *
+ * A session whose every priceable model lacks a published rate produces a
+ * total of exactly zero. Rendering that as `0.00` asserts the run was free,
+ * which for a multi-million-token subagent is the opposite of what happened.
+ */
+export function costIsUnmeasured(
+  unpricedModels: readonly string[] | undefined,
+  displayCost: number,
+): boolean {
+  return (unpricedModels?.length ?? 0) > 0 && displayCost === 0;
+}

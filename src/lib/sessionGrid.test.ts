@@ -1,14 +1,24 @@
 import { describe, expect, it } from 'vitest';
-import { formatStartedLocal, formatTokenCategory, groupSessionsByRepository, modelProviderVisual } from './sessionGrid';
+import { formatStartedLocal, formatTokenCategory, formatTokenTotal, groupSessionsByRepository, modelProviderVisual } from './sessionGrid';
 import { exportRows, projectSession, repositoryLabel, zeroToolMetrics, zeroTotals } from './sessionProjection';
 import type { RangeTotals, SessionSummary, TokenTotals } from './types';
 
 describe('session grid formatting', () => {
   it('uses local wall-clock time and honors daylight-saving transitions', () => {
     expect(formatStartedLocal(Date.parse('2026-03-08T06:59:59Z'), 'en-US', 'America/New_York'))
-      .toBe('Mar 8, 2026, 1:59:59 AM');
+      .toBe('Mar 8, 2026, 1:59 AM');
     expect(formatStartedLocal(Date.parse('2026-03-08T07:00:00Z'), 'en-US', 'America/New_York'))
-      .toBe('Mar 8, 2026, 3:00:00 AM');
+      .toBe('Mar 8, 2026, 3:00 AM');
+  });
+
+  it('keeps corpus-scale totals inside a numeric column', () => {
+    // Per-row magnitudes stay fully grouped...
+    expect(formatTokenTotal(0, 'en-US')).toBe('—');
+    expect(formatTokenTotal(12_345, 'en-US')).toBe('12,345');
+    expect(formatTokenTotal(999_999_999, 'en-US')).toBe('999,999,999');
+    // ...while corpus totals compact rather than overflow into the next cell.
+    expect(formatTokenTotal(1_000_000_000, 'en-US')).toBe('1B');
+    expect(formatTokenTotal(652_372_161_231, 'en-US')).toBe('652.37B');
   });
 
   it('distinguishes unavailable token categories from measured values', () => {

@@ -16,6 +16,8 @@
     defaultFilters,
     exportRows,
     filterSessions,
+    costIsUnmeasured,
+    disambiguateSiblingNames,
     isSubagent,
     orderSessionsForDisplay,
     projectSessions,
@@ -32,7 +34,7 @@
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
-  import { formatStartedLocal, formatTokenCategory, modelProviderVisual } from '../lib/sessionGrid';
+  import { formatStartedLocal, formatTokenCategory, formatTokenTotal, modelProviderVisual } from '../lib/sessionGrid';
   import {
     collectSessionExportTree,
     sessionExportContent,
@@ -478,6 +480,45 @@
   const displayed = $derived(displayedWithAnchors.list);
 
 
+  // Fan-out spawns siblings from one templated prompt, so their names are
+  // identical for hundreds of characters and the grid shows N rows of the same
+  // truncated text. Per parent, strip the shared prefix and number the runs in
+  // start order so a row is identifiable without opening it.
+  const siblingDisplay = $derived((() => {
+    const out = new Map<string, { label: string; ordinal: number; total: number }>();
+    const groups = new Map<string, TrackedSession[]>();
+    for (const session of filtered) {
+      if (!isSubagent(session)) continue;
+      const parentId = parentStorageId(session);
+      if (!parentId) continue;
+      const arr = groups.get(parentId);
+      if (arr) arr.push(session);
+      else groups.set(parentId, [session]);
+    }
+    for (const siblings of groups.values()) {
+      if (siblings.length < 2) continue;
+      // Start order, so the ordinal reads as run order rather than sort order.
+      const ordered = [...siblings].sort((a, b) => a.startedMs - b.startedMs);
+      const labels = disambiguateSiblingNames(ordered.map((session) => sessionName(session)));
+      ordered.forEach((session, index) => {
+        out.set(session.storage_id, {
+          label: labels[index],
+          ordinal: index + 1,
+          total: ordered.length,
+        });
+      });
+    }
+    return out;
+  })());
+
+  interface CombinedUsage {
+    tokens: number;
+    cost: number;
+    /** True when this session or any in-view descendant ran a model with no
+     *  published rate, so the summed cost is a floor rather than a total. */
+    unpriced: boolean;
+  }
+
   // Combined usage (session + all in-view descendant subagents) per row that
   // has in-view children. Primary cells stay per-thread; these feed the Σ lines.
   const combinedUsage = $derived((() => {
@@ -491,27 +532,35 @@
         else childrenOf.set(parentId, [s]);
       }
     }
-    const memo = new Map<string, { tokens: number; cost: number }>();
-    const total = (session: TrackedSession): { tokens: number; cost: number } => {
+    // `unpriced` propagates up the subtree: a parent whose descendant ran an
+    // unpriced model cannot report a complete cost, and a Σ that silently
+    // omits that usage reads as "these runs were cheap" rather than
+    // "these runs were not measured".
+    const memo = new Map<string, CombinedUsage>();
+    const total = (session: TrackedSession): CombinedUsage => {
       const cached = memo.get(session.storage_id);
       if (cached !== undefined) return cached;
+      const display = sessionDisplayMap.get(session.storage_id);
       const own = {
-        tokens: sessionDisplayMap.get(session.storage_id)?.tokens.total_tokens ?? session.tokens_total.total_tokens,
+        tokens: display?.tokens.total_tokens ?? session.tokens_total.total_tokens,
         cost: costOf(session.storage_id),
+        unpriced: (display?.unpricedModels.length ?? 0) > 0,
       };
       memo.set(session.storage_id, own); // pre-set guards against parent-id cycles
       let tokens = own.tokens;
       let cost = own.cost;
+      let unpriced = own.unpriced;
       for (const childSession of childrenOf.get(session.storage_id) ?? []) {
         const child = total(childSession);
         tokens += child.tokens;
         cost += child.cost;
+        unpriced = unpriced || child.unpriced;
       }
-      const sum = { tokens, cost };
+      const sum = { tokens, cost, unpriced };
       memo.set(session.storage_id, sum);
       return sum;
     };
-    const out = new Map<string, { tokens: number; cost: number }>();
+    const out = new Map<string, CombinedUsage>();
     for (const s of filtered) {
       if ((childrenOf.get(s.storage_id)?.length ?? 0) > 0) out.set(s.storage_id, total(s));
     }
@@ -1823,6 +1872,7 @@
             {:else}
               {@const session = row.session}
               {@const name = sessionName(session)}
+              {@const sibling = siblingDisplay.get(session.storage_id)}
               {@const display = sessionDisplayMap.get(session.storage_id)}
               {@const rowTokens = display?.tokens ?? session.tokens_total}
               {@const sub = isSubagent(session)}
@@ -1853,8 +1903,8 @@
                   {#if column.id === 'name'}
                     <span class="flex items-center min-w-0 whitespace-nowrap {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-(--row-name)'}" title={name}>
                       {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center shrink-0" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.storage_id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
-                      {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5 shrink-0" aria-hidden="true">↳</span>{/if}<span class="truncate">{truncate(name, 90)}</span>
-                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0">subagent</span>{:else if kids > 0}<button type="button" class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0 hover:ring-1 hover:ring-accent focus:outline-hidden focus:ring-1 focus:ring-accent" onclick={(e) => { e.stopPropagation(); focusedParentId = session.storage_id; }} title="Show only this session and its subagent runs" aria-label="Show only {name} and its {kids} subagent {kids === 1 ? 'run' : 'runs'}">{kids} {kids === 1 ? 'subagent' : 'subagents'}</button>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap shrink-0" title="The saved transcript source is currently unavailable">source missing</span>{/if}
+                      {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5 shrink-0" aria-hidden="true">↳</span>{/if}<span class="truncate">{truncate(sibling?.label ?? name, 90)}</span>
+                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0" title={sibling ? `Run ${sibling.ordinal} of ${sibling.total} spawned by this parent, in start order` : undefined}>subagent{#if sibling}&nbsp;{sibling.ordinal}/{sibling.total}{/if}</span>{:else if kids > 0}<button type="button" class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0 hover:ring-1 hover:ring-accent focus:outline-hidden focus:ring-1 focus:ring-accent" onclick={(e) => { e.stopPropagation(); focusedParentId = session.storage_id; }} title="Show only this session and its subagent runs" aria-label="Show only {name} and its {kids} subagent {kids === 1 ? 'run' : 'runs'}">{kids} {kids === 1 ? 'subagent' : 'subagents'}</button>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap shrink-0" title="The saved transcript source is currently unavailable">source missing</span>{/if}
                       {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg) ml-1 whitespace-nowrap shrink-0">archived</span>{/if}
                       {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap shrink-0">{providersStore.displayName(session.harness)}</span>{/if}
                     </span>
@@ -1886,7 +1936,8 @@
                   {:else if column.id === 'total'}
                     <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmt.format(combined.tokens)}</span>{/if}</span>
                   {:else if column.id === 'cost'}
-                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{allUsdAvailable ? fmtAmount(costOf(session.storage_id)) : 'unavailable'}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmtAmount(combined.cost)}</div>{/if}</span>
+                    {@const unpricedOnly = costIsUnmeasured(display?.unpricedModels, costOf(session.storage_id))}
+                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{#if !allUsdAvailable}unavailable{:else if unpricedOnly}<span class="text-ink-faint cursor-help" title="Not measured: every model in this session is unpriced ({display?.unpricedModels.join(', ')}). This is not a zero cost.">—</span>{:else}{fmtAmount(costOf(session.storage_id))}{/if}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] {combined.unpriced ? 'text-amber-500/80' : 'text-ink-faint'} font-normal cursor-help" title={combined.unpriced ? 'At least one thread in this subtree ran an unpriced model, so this is a floor, not a total.' : 'This session plus its subagent threads (in view)'}>Σ {fmtAmount(combined.cost)}{combined.unpriced ? '+' : ''}</div>{/if}</span>
                   {/if}
                 {/each}
               </div>
@@ -1901,10 +1952,10 @@
           >
             {#each visibleColumns as column (column.id)}
               {#if column.id === 'name'}<span class="section-label">Totals · in view</span>
-              {:else if column.id === 'input'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.input_tokens)}</span>
-              {:else if column.id === 'cached'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.cached_input_tokens)}</span>
-              {:else if column.id === 'output'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.output_tokens)}</span>
-              {:else if column.id === 'total'}<span class="text-right font-mono text-xs text-ink">{fmt.format(filteredTotal)}</span>
+              {:else if column.id === 'input'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTokenTotals.input_tokens)}>{formatTokenTotal(filteredTokenTotals.input_tokens)}</span>
+              {:else if column.id === 'cached'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTokenTotals.cached_input_tokens)}>{formatTokenTotal(filteredTokenTotals.cached_input_tokens)}</span>
+              {:else if column.id === 'output'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTokenTotals.output_tokens)}>{formatTokenTotal(filteredTokenTotals.output_tokens)}</span>
+              {:else if column.id === 'total'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTotal)}>{formatTokenTotal(filteredTotal)}</span>
               {:else if column.id === 'cost'}<span class="text-right font-mono text-xs text-accent-cost">{allUsdAvailable ? fmtAmount(costTotal) : 'unavailable'}</span>
               {:else}<span></span>{/if}
             {/each}

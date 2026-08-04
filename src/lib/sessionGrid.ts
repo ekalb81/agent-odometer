@@ -2,7 +2,12 @@ import { repositoryLabel } from './sessionProjection';
 import type { SessionSummary } from './types';
 
 /** Format a session start in the viewer's local wall-clock time. Optional
- * locale/time-zone arguments keep DST behavior deterministic in tests. */
+ * locale/time-zone arguments keep DST behavior deterministic in tests.
+ *
+ * Minute precision, not second: the medium time style overflowed the grid's
+ * started column, wrapping every row onto two lines and halving how many
+ * sessions fit on screen. The exact instant stays available in the cell's
+ * title attribute. */
 export function formatStartedLocal(
   startedMs: number,
   locales?: Intl.LocalesArgument,
@@ -10,7 +15,7 @@ export function formatStartedLocal(
 ): string {
   return new Intl.DateTimeFormat(locales, {
     dateStyle: 'medium',
-    timeStyle: 'medium',
+    timeStyle: 'short',
     timeZone,
   }).format(new Date(startedMs));
 }
@@ -19,6 +24,19 @@ export function formatStartedLocal(
  * measured as zero, omitted, or not applicable. Keep that ambiguity visible. */
 export function formatTokenCategory(value: number, locales?: Intl.LocalesArgument): string {
   return value === 0 ? '—' : new Intl.NumberFormat(locales).format(value);
+}
+
+/** Grouped digits for a per-row value, compact notation once the magnitude
+ * would overflow a numeric column. Corpus-wide totals reach twelve digits,
+ * which at the grid's fixed column width ran into the neighbouring cell; the
+ * exact value stays available in a title attribute. */
+export function formatTokenTotal(value: number, locales?: Intl.LocalesArgument): string {
+  if (value === 0) return '—';
+  if (Math.abs(value) < 1_000_000_000) return new Intl.NumberFormat(locales).format(value);
+  return new Intl.NumberFormat(locales, {
+    notation: 'compact',
+    maximumFractionDigits: 2,
+  }).format(value);
 }
 
 export interface ModelProviderVisual {
