@@ -1,4 +1,3 @@
-import { repositoryLabel } from './sessionProjection';
 import type { SessionSummary } from './types';
 
 /** Format a session start in the viewer's local wall-clock time. Optional
@@ -65,50 +64,4 @@ export function modelProviderVisual(
     return { key: 'xai', label: 'xAI', tint: 'var(--provider-xai-row)' };
   }
   return { key: 'other', label: raw?.slice(0, 40) || 'Other provider', tint: 'var(--provider-other-row)' };
-}
-
-export function groupSessionsByRepository<T extends Pick<
-  SessionSummary,
-  'id' | 'storage_id' | 'harness' | 'parent_thread_id' | 'working_directory'
->>(sessions: T[]): { label: string; sessions: T[] }[] {
-  const groups = new Map<string, { label: string; sessions: T[] }>();
-  const byStorageId = new Map(sessions.map((session) => [session.storage_id, session]));
-  const providerToStorageIds = new Map<string, string[]>();
-  for (const session of sessions) {
-    const key = `${session.harness}\0${session.id}`;
-    const ids = providerToStorageIds.get(key);
-    if (ids) ids.push(session.storage_id);
-    else providerToStorageIds.set(key, [session.storage_id]);
-  }
-
-  for (const session of sessions) {
-    // A visible subagent stays with its parent even if its transcript records
-    // another (or no) project folder. This preserves the nested row contract.
-    let anchor = session;
-    const seen = new Set<string>();
-    while (anchor.parent_thread_id && !seen.has(anchor.storage_id)) {
-      seen.add(anchor.storage_id);
-      const parentIds = providerToStorageIds.get(`${anchor.harness}\0${anchor.parent_thread_id}`);
-      const parent = parentIds?.length === 1 ? byStorageId.get(parentIds[0]) : undefined;
-      if (!parent) break;
-      anchor = parent;
-    }
-    const workingDirectory = anchor.working_directory;
-    const normalized = workingDirectory?.replace(/\\/g, '/').replace(/\/+$/, '') ?? '';
-    const windowsStyle = Boolean(workingDirectory && (/\\/.test(workingDirectory) || /^[A-Za-z]:[\\/]/.test(workingDirectory)));
-    // The normalized path is the grouping identity; the label is derived
-    // separately. Prefix missing paths to avoid collisions with a real
-    // directory whose name happens to match the fallback label.
-    const key = workingDirectory
-      ? `path:${windowsStyle ? normalized.toLowerCase() : normalized}`
-      : 'missing:';
-    const group = groups.get(key);
-    if (group) group.sessions.push(session);
-    else groups.set(key, {
-      label: repositoryLabel(anchor) ?? 'No repository recorded',
-      sessions: [session],
-    });
-  }
-
-  return [...groups.values()];
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatStartedLocal, formatTokenCategory, formatTokenTotal, groupSessionsByRepository, modelProviderVisual } from './sessionGrid';
+import { formatStartedLocal, formatTokenCategory, formatTokenTotal, modelProviderVisual } from './sessionGrid';
 import { exportRows, projectSession, repositoryLabel, zeroToolMetrics, zeroTotals } from './sessionProjection';
 import type { RangeTotals, SessionSummary, TokenTotals } from './types';
 
@@ -37,40 +37,6 @@ describe('session grid formatting', () => {
     expect(repositoryLabel({ working_directory: 'C:\\workspace\\sample-repository' })).toBe('sample-repository');
     expect(repositoryLabel({ working_directory: '/home/demo/work/repository' })).toBe('repository');
     expect(repositoryLabel({ working_directory: null })).toBeNull();
-  });
-
-  it('groups sessions by repository while keeping subagents with their parent', () => {
-    const parent = { id: 'parent', storage_id: 'codex:thread:parent', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\workspace\\alpha' };
-    const child = { id: 'child', storage_id: 'codex:thread:child', harness: 'codex' as const, parent_thread_id: 'parent', working_directory: 'C:\\workspace\\beta' };
-    const unscoped = { id: 'unscoped', storage_id: 'codex:thread:unscoped', harness: 'codex' as const, parent_thread_id: null, working_directory: null };
-
-    expect(groupSessionsByRepository([parent, child, unscoped])).toEqual([
-      { label: 'alpha', sessions: [parent, child] },
-      { label: 'No repository recorded', sessions: [unscoped] },
-    ]);
-  });
-
-  it('keeps distinct repositories separate when their folder labels match', () => {
-    const client = { id: 'client', storage_id: 'codex:thread:client', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\clients\\shared-name' };
-    const personal = { id: 'personal', storage_id: 'codex:thread:personal', harness: 'codex' as const, parent_thread_id: null, working_directory: 'D:\\personal\\shared-name' };
-    const clientVariant = { id: 'client-variant', storage_id: 'codex:thread:client-variant', harness: 'codex' as const, parent_thread_id: null, working_directory: 'c:/CLIENTS/shared-name/' };
-
-    expect(groupSessionsByRepository([client, personal, clientVariant])).toEqual([
-      { label: 'shared-name', sessions: [client, clientVariant] },
-      { label: 'shared-name', sessions: [personal] },
-    ]);
-  });
-
-  it('leaves a child separate when its provider parent id resolves to multiple durable sessions', () => {
-    const first = { id: 'duplicate', storage_id: 'codex:thread:duplicate:first', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\workspace\\first' };
-    const second = { id: 'duplicate', storage_id: 'codex:thread:duplicate:second', harness: 'codex' as const, parent_thread_id: null, working_directory: 'C:\\workspace\\second' };
-    const child = { id: 'child', storage_id: 'codex:thread:child', harness: 'codex' as const, parent_thread_id: 'duplicate', working_directory: 'C:\\workspace\\child' };
-
-    expect(groupSessionsByRepository([first, second, child])).toEqual([
-      { label: 'first', sessions: [first] },
-      { label: 'second', sessions: [second] },
-      { label: 'child', sessions: [child] },
-    ]);
   });
 
   it('uses range token categories when the grid is date scoped', () => {
