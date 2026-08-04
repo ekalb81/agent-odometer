@@ -35,11 +35,13 @@ document.documentElement.dataset.visualScenario = visualScenario;
 function tok(total: number): TokenTotals {
   const input = Math.round(total * 0.62);
   const cached = Math.round(total * 0.24);
+  const cacheCreation = Math.round(total * 0.08);
   const output = total - input;
   const reasoning = Math.round(output * 0.3);
   return {
     input_tokens: input,
     cached_input_tokens: cached,
+    cache_creation_input_tokens: cacheCreation,
     output_tokens: output,
     reasoning_output_tokens: reasoning,
     total_tokens: total,
@@ -50,6 +52,7 @@ function scaleTok(t: TokenTotals, f: number): TokenTotals {
   return {
     input_tokens: Math.round(t.input_tokens * f),
     cached_input_tokens: Math.round(t.cached_input_tokens * f),
+    cache_creation_input_tokens: Math.round(t.cache_creation_input_tokens * f),
     output_tokens: Math.round(t.output_tokens * f),
     reasoning_output_tokens: Math.round(t.reasoning_output_tokens * f),
     total_tokens: Math.round(t.total_tokens * f),
@@ -265,26 +268,31 @@ const RATES: RateCard = {
   source_url: 'https://example.invalid/rates',
   fetched_at: new Date(now - 2 * DAY).toISOString(),
   models: {
-    'gpt-5.6-sol': { input: 1.1, cached_input: 0.11, output: 8.8, reasoning: 8.8 },
-    'gpt-5.6-terra': { input: 0.5, cached_input: 0.05, output: 4, reasoning: 4 },
-    'gpt-5.6-luna': { input: 0.15, cached_input: 0.015, output: 1.2, reasoning: 1.2 },
-    'gpt-5.5': { input: 0.8, cached_input: 0.08, output: 6.4, reasoning: 6.4 },
-    'claude-opus-4-8': { input: 3.2, cached_input: 0.32, output: 16, reasoning: 16 },
-    'claude-fable-5': { input: 2.4, cached_input: 0.24, output: 12, reasoning: 12 },
-    'claude-sonnet-5': { input: 1.2, cached_input: 0.12, output: 6, reasoning: 6 },
-    'claude-haiku-4-5': { input: 0.35, cached_input: 0.035, output: 1.75, reasoning: 1.75 },
+    'gpt-5.6-sol': { input: 1.1, cached_input: 0.11, cache_creation_input: 0, output: 8.8, reasoning: 8.8 },
+    'gpt-5.6-terra': { input: 0.5, cached_input: 0.05, cache_creation_input: 0, output: 4, reasoning: 4 },
+    'gpt-5.6-luna': { input: 0.15, cached_input: 0.015, cache_creation_input: 0, output: 1.2, reasoning: 1.2 },
+    'gpt-5.5': { input: 0.8, cached_input: 0.08, cache_creation_input: 0, output: 6.4, reasoning: 6.4 },
+    'claude-opus-4-8': { input: 3.2, cached_input: 0.32, cache_creation_input: 4, output: 16, reasoning: 16 },
+    'claude-fable-5': { input: 2.4, cached_input: 0.24, cache_creation_input: 3, output: 12, reasoning: 12 },
+    'claude-sonnet-5': { input: 1.2, cached_input: 0.12, cache_creation_input: 1.5, output: 6, reasoning: 6 },
+    'claude-haiku-4-5': { input: 0.35, cached_input: 0.035, cache_creation_input: 0.4375, output: 1.75, reasoning: 1.75 },
   },
   fallback_model: 'gpt-5.6-sol',
   currencies: { codex: 'credits', claude_code: 'USD' },
   fallback_models: { codex: 'gpt-5.6-sol', claude_code: 'claude-sonnet-5' },
   api_models: {
-    'gpt-5.6-sol': { input: 1.25, cached_input: 0.125, output: 10, reasoning: 10 },
-    'gpt-5.6-terra': { input: 0.6, cached_input: 0.06, output: 4.8, reasoning: 4.8 },
-    'gpt-5.6-luna': { input: 0.18, cached_input: 0.018, output: 1.44, reasoning: 1.44 },
-    'gpt-5.5': { input: 1, cached_input: 0.1, output: 8, reasoning: 8 },
+    'gpt-5.6-sol': { input: 1.25, cached_input: 0.125, cache_creation_input: 0, output: 10, reasoning: 10 },
+    'gpt-5.6-terra': { input: 0.6, cached_input: 0.06, cache_creation_input: 0, output: 4.8, reasoning: 4.8 },
+    'gpt-5.6-luna': { input: 0.18, cached_input: 0.018, cache_creation_input: 0, output: 1.44, reasoning: 1.44 },
+    'gpt-5.5': { input: 1, cached_input: 0.1, cache_creation_input: 0, output: 8, reasoning: 8 },
   },
   unpriced_models: ['gpt-5.3-codex-spark'],
   pricing_catalog: { rate_periods: [], conditional_modifiers: [], notes: [] },
+  model_aliases: {},
+  free_local_models: [],
+  subscription_plans: {},
+  display_currency: null,
+  refresh: { last_success_at: null, last_attempt_at: null, last_failure_reason: null, max_cache_age_secs: 604_800 },
 };
 
 function subscriptionUsage(): SubscriptionUsageEntry[] {

@@ -235,6 +235,13 @@ impl OptimizationSummary {
 pub struct TokenTotals {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Anthropic cache-creation ("cache write") tokens. A subset of
+    /// `input_tokens`, disjoint from `cached_input_tokens` (cache reads).
+    /// Always 0 for Codex, whose provider does not report this dimension.
+    /// Defaulted for backward compatibility with durable/cached data written
+    /// before this field existed.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
@@ -251,6 +258,7 @@ impl std::ops::AddAssign<&TokenTotals> for TokenTotals {
     fn add_assign(&mut self, other: &TokenTotals) {
         self.input_tokens += other.input_tokens;
         self.cached_input_tokens += other.cached_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.output_tokens += other.output_tokens;
         self.reasoning_output_tokens += other.reasoning_output_tokens;
         self.total_tokens += other.total_tokens;
@@ -739,6 +747,7 @@ mod tests {
         TokenTotals {
             input_tokens: n,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             output_tokens: n / 2,
             reasoning_output_tokens: 0,
             total_tokens: n + n / 2,

@@ -1364,6 +1364,7 @@ pub fn get_rates() -> RateCard {
         api_models: std::collections::HashMap::new(),
         unpriced_models: Vec::new(),
         pricing_catalog: Default::default(),
+        ..Default::default()
     })
 }
 
@@ -1384,6 +1385,7 @@ pub fn get_bundled_rates() -> RateCard {
         api_models: std::collections::HashMap::new(),
         unpriced_models: Vec::new(),
         pricing_catalog: Default::default(),
+        ..Default::default()
     })
 }
 

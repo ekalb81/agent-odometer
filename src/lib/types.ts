@@ -10,6 +10,11 @@ export type Harness = string;
 export interface TokenTotals {
   input_tokens: number;
   cached_input_tokens: number;
+  /** Anthropic cache-creation ("cache write") tokens: a subset of
+   * input_tokens distinct from cached_input_tokens (cache reads). Always 0
+   * for Codex. See credits.ts eventCost — never double-price this against
+   * cached_input_tokens or the plain input rate. */
+  cache_creation_input_tokens: number;
   output_tokens: number;
   reasoning_output_tokens: number;
   total_tokens: number;
@@ -442,6 +447,10 @@ export interface PerformanceStatus {
 export interface ModelRate {
   input: number;
   cached_input: number;
+  /** Cache-creation ("cache write") rate — a normalized dimension distinct
+   * from both `input` and `cached_input`. Defaults to 0 for rate-card
+   * entries written before this field existed (see rates.rs ModelRate). */
+  cache_creation_input: number;
   output: number;
   reasoning: number;
 }
@@ -505,6 +514,61 @@ export interface PricingCatalog {
   notes: string[];
 }
 
+/** Provenance recorded for every priced amount — see rates.rs PricingBasis.
+ * These states must render as visually and structurally distinct in the UI,
+ * never collapsed into one number. */
+export type PricingBasis =
+  | 'direct'
+  | 'aliased'
+  | 'fallback'
+  | 'estimated'
+  | 'free_local'
+  | 'subscription'
+  | 'stale'
+  | 'unavailable';
+
+/** The resolved pricing-table key and provenance for one raw model id. */
+export interface PricedModelResolution {
+  resolved_model: string;
+  basis: PricingBasis;
+}
+
+/** A user-declared subscription or custom plan for one harness. Odometer
+ * records exactly what the user enters; it never infers a plan-equivalent
+ * token allowance. */
+export interface SubscriptionPlan {
+  name: string;
+  monthly_price: number | null;
+  currency: string | null;
+  notes: string | null;
+  /** User-declared estimated monthly savings from a local/proxy baseline
+   * versus a metered API-equivalent cost — never derived from token counts. */
+  local_baseline_savings: number | null;
+}
+
+/** A user-supplied display-currency conversion. Odometer performs no FX
+ * fetch: `rate` and `as_of` are exactly what the user entered. The original
+ * amount and currency are always retained separately alongside the
+ * converted total. */
+export interface CurrencyConversion {
+  target_currency: string;
+  rate: number;
+  as_of: string;
+  source: string;
+}
+
+/** Coarse freshness classification for RateRefreshState. */
+export type RateFreshness = 'fresh' | 'stale' | 'unknown';
+
+/** Bounded-cache-age bookkeeping for the (currently unimplemented) price
+ * refresh/rollback flow — see rates.rs module docs for the network seam. */
+export interface RateRefreshState {
+  last_success_at: string | null;
+  last_attempt_at: string | null;
+  last_failure_reason: string | null;
+  max_cache_age_secs: number;
+}
+
 export interface RateCard {
   version: number;
   currency: string;
@@ -523,6 +587,19 @@ export interface RateCard {
   unpriced_models: string[];
   /** Dated and conditional scenario rules. Kept intact by the settings editor. */
   pricing_catalog: PricingCatalog;
+  /** Raw provider model id -> canonical rate-table key, resolved before any
+   * fallback lookup. */
+  model_aliases: Record<string, string>;
+  /** Models explicitly zero-cost (free tier, local/self-hosted) — distinct
+   * from unpriced_models and from an ordinary unresolved rate. */
+  free_local_models: string[];
+  /** Per-harness user-declared subscription/custom plan configuration. */
+  subscription_plans: Record<string, SubscriptionPlan>;
+  /** User-supplied display-currency conversion; null means show the
+   * original currency. Odometer never invents or fetches a rate. */
+  display_currency: CurrencyConversion | null;
+  /** Bounded-cache-age bookkeeping for the refresh flow. */
+  refresh: RateRefreshState;
 }
 
 export interface ExternalEvent {

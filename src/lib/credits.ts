@@ -1,6 +1,8 @@
 import type {
+  CurrencyConversion,
   Harness,
   ModelRate,
+  PricingBasis,
   PricingCatalog,
   PricingSurface,
   RateCard,
@@ -15,6 +17,10 @@ export interface ModelCredit {
   cost: number;
   fallbackUsed: boolean;
   unpriced: boolean;
+  /** Provenance for this priced amount — see rates.rs PricingBasis. Computed
+   * by `resolveModelPricing`, the same resolver the rate-card contract uses
+   * everywhere, so no call site re-derives direct/alias/fallback logic. */
+  basis: PricingBasis;
 }
 
 export interface SessionCredits {
@@ -73,17 +79,108 @@ function serviceTierMultiplier(model: string | null, serviceTier: string | null)
   return 1;
 }
 
-/** Cost of one event's token delta under a given rate, with OpenAI subset semantics. */
+/** Cost of one event's token delta under a given rate. Cached-read and
+ * cache-creation are both disjoint subsets of input_tokens (never the same
+ * tokens counted twice), and reasoning is a subset of output_tokens. */
 function eventCost(delta: TokenTotals, rate: ModelRate, multiplier = 1): number {
-  const nonCachedInput = Math.max(0, delta.input_tokens - delta.cached_input_tokens);
+  const nonCachedInput = Math.max(
+    0,
+    delta.input_tokens - delta.cached_input_tokens - delta.cache_creation_input_tokens,
+  );
   const nonReasoningOutput = Math.max(0, delta.output_tokens - delta.reasoning_output_tokens);
   return (
     (nonCachedInput * rate.input +
       delta.cached_input_tokens * rate.cached_input +
+      delta.cache_creation_input_tokens * rate.cache_creation_input +
       nonReasoningOutput * rate.output +
       delta.reasoning_output_tokens * rate.reasoning) /
     1_000_000
   ) * multiplier;
+}
+
+/**
+ * Resolves a raw model id through `model_aliases` before any fallback path.
+ * A chain can never take more steps than the table has entries — a longer
+ * walk means a cycle, and resolution stops instead of looping forever.
+ */
+function resolveAlias(model: string, aliases: Record<string, string>): { resolved: string; hopped: boolean } {
+  let current = model;
+  const seen = new Set<string>();
+  let hopped = false;
+  const maxSteps = Object.keys(aliases).length;
+  for (let step = 0; step <= maxSteps; step += 1) {
+    const next = aliases[current];
+    if (next === undefined) break;
+    if (seen.has(current)) break; // Cycle: `current` was already visited.
+    seen.add(current);
+    current = next;
+    hopped = true;
+  }
+  return { resolved: current, hopped };
+}
+
+function cardFreshness(rates: RateCard, now: number): 'fresh' | 'stale' | 'unknown' {
+  const lastSuccessAt = rates.refresh?.last_success_at;
+  if (!lastSuccessAt) return 'unknown';
+  const at = Date.parse(lastSuccessAt);
+  if (!Number.isFinite(at)) return 'unknown';
+  const ageSecs = (now - at) / 1000;
+  return ageSecs <= (rates.refresh?.max_cache_age_secs ?? Number.POSITIVE_INFINITY) ? 'fresh' : 'stale';
+}
+
+/**
+ * Resolves a raw model id to a rate-table key and records why that key was
+ * chosen — the one place every surface should call instead of re-deriving
+ * direct/alias/fallback lookup (mirrors `RateCard::resolve_model_pricing` in
+ * rates.rs exactly; keep both in sync).
+ *
+ * Order: explicit free/local declaration, explicit known-unpriced
+ * declaration, direct match, alias match, harness (or card-wide) fallback,
+ * else unavailable. A resolution that would otherwise be
+ * direct/aliased/fallback downgrades to `stale` when the card's own refresh
+ * bookkeeping is older than its configured bound.
+ */
+export function resolveModelPricing(
+  rates: RateCard,
+  model: string,
+  harness: Harness,
+  table: Record<string, ModelRate>,
+  now: number = Date.now(),
+): { resolvedModel: string; basis: PricingBasis } {
+  const downgradeIfStale = (basis: PricingBasis): PricingBasis =>
+    cardFreshness(rates, now) === 'stale' ? 'stale' : basis;
+
+  if ((rates.free_local_models ?? []).includes(model)) {
+    return { resolvedModel: model, basis: 'free_local' };
+  }
+  if (isUnpricedModel(rates, model)) {
+    return { resolvedModel: model, basis: 'unavailable' };
+  }
+  if (Object.hasOwn(table, model)) {
+    return { resolvedModel: model, basis: downgradeIfStale('direct') };
+  }
+  const { resolved, hopped } = resolveAlias(model, rates.model_aliases ?? {});
+  if (hopped && Object.hasOwn(table, resolved)) {
+    return { resolvedModel: resolved, basis: downgradeIfStale('aliased') };
+  }
+  const fallbackModel = fallbackModelFor(rates, harness);
+  if (Object.hasOwn(table, fallbackModel)) {
+    return { resolvedModel: fallbackModel, basis: downgradeIfStale('fallback') };
+  }
+  return { resolvedModel: model, basis: 'unavailable' };
+}
+
+/** Converts one original-currency amount using a user-supplied conversion.
+ * Odometer performs no FX fetch — `conversion` is exactly what the user
+ * entered, or null/absent, in which case the caller must show the original
+ * currency rather than inventing a rate. Returns null for a non-finite or
+ * non-positive rate. */
+export function convertDisplayCurrency(
+  amountInOriginalCurrency: number,
+  conversion: CurrencyConversion | null | undefined,
+): number | null {
+  if (!conversion || !Number.isFinite(conversion.rate) || conversion.rate <= 0) return null;
+  return amountInOriginalCurrency * conversion.rate;
 }
 
 /**
@@ -100,18 +197,22 @@ export function tokensCost(
   serviceTier: string | null = null,
   harness: Harness = 'codex',
   table: Record<string, ModelRate> = rates.models,
-): { cost: number; fallbackUsed: boolean; unpriced: boolean } {
+): { cost: number; fallbackUsed: boolean; unpriced: boolean; basis: PricingBasis } {
   if (isUnpricedModel(rates, model)) {
-    return { cost: 0, fallbackUsed: false, unpriced: true };
+    return { cost: 0, fallbackUsed: false, unpriced: true, basis: 'unavailable' };
   }
-  const directRate = model ? table[model] : undefined;
-  const fallbackUsed = directRate === undefined;
-  const rate = directRate ?? table[fallbackModelFor(rates, harness)];
-  if (!rate) return { cost: 0, fallbackUsed, unpriced: false };
+  if (model === null) {
+    return { cost: 0, fallbackUsed: false, unpriced: false, basis: 'unavailable' };
+  }
+  const { resolvedModel, basis } = resolveModelPricing(rates, model, harness, table);
+  const rate = table[resolvedModel];
+  const fallbackUsed = basis === 'fallback';
+  if (!rate) return { cost: 0, fallbackUsed, unpriced: false, basis };
   return {
     cost: eventCost(tokens, rate, serviceTierMultiplier(model, serviceTier)),
     fallbackUsed,
     unpriced: false,
+    basis,
   };
 }
 
@@ -125,7 +226,7 @@ export function creditsFromBuckets(
   rates: RateCard,
   harness: Harness,
 ): SessionCredits {
-  return bucketsCost(buckets, rates.models, fallbackModelFor(rates, harness), rates.unpriced_models);
+  return bucketsCost(buckets, rates, harness, rates.models);
 }
 
 /**
@@ -139,32 +240,32 @@ export function apiCostFromBuckets(
   harness: Harness,
 ): SessionCredits | null {
   if (Object.keys(rates.api_models ?? {}).length === 0) return null;
-  return bucketsCost(buckets, rates.api_models, fallbackModelFor(rates, harness), rates.unpriced_models);
+  return bucketsCost(buckets, rates, harness, rates.api_models);
 }
 
 function bucketsCost(
   buckets: TierBucket[],
+  rates: RateCard,
+  harness: Harness,
   table: Record<string, ModelRate>,
-  fallbackName: string,
-  unpricedModelNames: string[] = [],
 ): SessionCredits {
   const byModelMap = new Map<string, number>();
+  const basisByModel = new Map<string, PricingBasis>();
   const missingModels = new Set<string>();
   const unpricedModels = new Set<string>();
-  const unpriced = new Set(unpricedModelNames);
+
   let total = 0;
 
-  const fallbackRate = table[fallbackName];
-
   for (const b of buckets) {
-    if (unpriced.has(b.model)) {
+    const { resolvedModel, basis } = resolveModelPricing(rates, b.model, harness, table);
+    basisByModel.set(b.model, basis);
+    if (basis === 'unavailable' && isUnpricedModel(rates, b.model)) {
       unpricedModels.add(b.model);
       byModelMap.set(b.model, byModelMap.get(b.model) ?? 0);
       continue;
     }
-    const directRate = table[b.model];
-    if (directRate === undefined) missingModels.add(b.model);
-    const rate = directRate ?? fallbackRate;
+    if (basis === 'fallback' || basis === 'unavailable') missingModels.add(b.model);
+    const rate = table[resolvedModel];
     if (!rate) continue;
 
     const cost = eventCost(b.tokens, rate, serviceTierMultiplier(b.model, b.service_tier));
@@ -177,8 +278,9 @@ function bucketsCost(
     byModel: Array.from(byModelMap, ([model, cost]) => ({
       model,
       cost,
-      fallbackUsed: table[model] === undefined && !unpriced.has(model),
-      unpriced: unpriced.has(model),
+      fallbackUsed: basisByModel.get(model) === 'fallback',
+      unpriced: unpricedModels.has(model),
+      basis: basisByModel.get(model) ?? 'unavailable',
     })),
     missingModels: Array.from(missingModels),
     unpricedModels: Array.from(unpricedModels),
@@ -193,7 +295,7 @@ export function computeSummaryCredits(summary: SessionSummary, rates: RateCard):
 /** All-time OpenAI-API-rate cost for a full session (drawer). Null when unconfigured. */
 export function computeSessionApiCost(session: Session, rates: RateCard): SessionCredits | null {
   if (Object.keys(rates.api_models ?? {}).length === 0) return null;
-  return historyCost(session, rates.api_models, fallbackModelFor(rates, session.harness), rates.unpriced_models);
+  return historyCost(session, rates, rates.api_models);
 }
 
 function apiSurfaceForHarness(harness: Harness): PricingSurface {
@@ -253,18 +355,24 @@ export function computeSessionApiCostScenarios(
 ): SessionApiCostScenarios {
   const flat = session.harness === 'codex'
     ? computeSessionApiCost(session, rates)
-    : historyCost(session, rates.models, fallbackModelFor(rates, session.harness), rates.unpriced_models);
+    : historyCost(session, rates, rates.models);
   if (session.tokens_history.length === 0 || rates.pricing_catalog.rate_periods.length === 0) {
     return { flat, timeAware: null };
   }
 
   const surface = apiSurfaceForHarness(session.harness);
   const byModelMap = new Map<string, number>();
+  const basisByModel = new Map<string, PricingBasis>();
   const periodIds = new Set<string>();
   const modifierIds = new Set<string>();
   const missingConditionalEvidence = new Set<string>();
   const unpriced = new Set(rates.unpriced_models ?? []);
   const cacheWriteMultipliers = new Set<number>();
+  // True once any event in this session reports cache-creation tokens under
+  // a period that declares a cache_write_input_multiplier — at that point
+  // the premium is priced directly via period.rate.cache_creation_input
+  // rather than remaining purely documented, unobserved metadata.
+  let cacheCreationObserved = false;
   let total = 0;
 
   for (const event of session.tokens_history) {
@@ -301,19 +409,25 @@ export function computeSessionApiCostScenarios(
     }
     const inputMultiplier = modifiers.reduce((value, modifier) => value * modifier.multipliers.input, 1);
     const outputMultiplier = modifiers.reduce((value, modifier) => value * modifier.multipliers.output, 1);
-    const nonCachedInput = Math.max(0, event.delta.input_tokens - event.delta.cached_input_tokens);
+    const nonCachedInput = Math.max(
+      0,
+      event.delta.input_tokens - event.delta.cached_input_tokens - event.delta.cache_creation_input_tokens,
+    );
     const nonReasoningOutput = Math.max(0, event.delta.output_tokens - event.delta.reasoning_output_tokens);
     const cost = (
       (nonCachedInput * period.rate.input * inputMultiplier)
       + (event.delta.cached_input_tokens * period.rate.cached_input * inputMultiplier)
+      + (event.delta.cache_creation_input_tokens * period.rate.cache_creation_input * inputMultiplier)
       + (nonReasoningOutput * period.rate.output * outputMultiplier)
       + (event.delta.reasoning_output_tokens * period.rate.reasoning * outputMultiplier)
     ) / 1_000_000 * serviceTierMultiplier(event.model, event.service_tier);
     total += cost;
     byModelMap.set(event.model, (byModelMap.get(event.model) ?? 0) + cost);
+    basisByModel.set(event.model, 'direct');
     periodIds.add(period.id);
     if (period.cache_write_input_multiplier !== null && period.cache_write_input_multiplier !== undefined) {
       cacheWriteMultipliers.add(period.cache_write_input_multiplier);
+      if (event.delta.cache_creation_input_tokens > 0) cacheCreationObserved = true;
     }
     for (const modifier of modifiers) modifierIds.add(modifier.id);
   }
@@ -327,6 +441,7 @@ export function computeSessionApiCostScenarios(
         cost,
         fallbackUsed: false,
         unpriced: unpriced.has(model),
+        basis: basisByModel.get(model) ?? 'direct',
       })),
       missingModels: [],
       unpricedModels: [],
@@ -334,7 +449,7 @@ export function computeSessionApiCostScenarios(
       appliedRatePeriods: Array.from(periodIds),
       appliedModifiers: Array.from(modifierIds),
       conditionalEvidenceMissing: Array.from(missingConditionalEvidence),
-      cacheWritePricingUnmodeled: cacheWriteMultipliers.size > 0,
+      cacheWritePricingUnmodeled: cacheWriteMultipliers.size > 0 && !cacheCreationObserved,
       unobservedCacheWriteInputMultipliers: Array.from(cacheWriteMultipliers),
     },
   };
@@ -342,7 +457,7 @@ export function computeSessionApiCostScenarios(
 
 export function computeSessionCredits(session: Session, rates: RateCard): SessionCredits {
   if (session.tokens_history.length > 0) {
-    return historyCost(session, rates.models, fallbackModelFor(rates, session.harness), rates.unpriced_models);
+    return historyCost(session, rates, rates.models);
   }
   const entries = Object.entries(session.tokens_by_model);
 
@@ -356,32 +471,29 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
   let total = 0;
 
   for (const [model, totals] of entries) {
-    const unpriced = isUnpricedModel(rates, model);
-    if (unpriced) {
+    const { resolvedModel, basis } = resolveModelPricing(rates, model, session.harness, rates.models);
+    if (basis === 'unavailable' && isUnpricedModel(rates, model)) {
       unpricedModels.push(model);
-      byModel.push({ model, cost: 0, fallbackUsed: false, unpriced: true });
+      byModel.push({ model, cost: 0, fallbackUsed: false, unpriced: true, basis });
       continue;
     }
-    const directRate = rates.models[model];
-    const fallbackRate = rates.models[fallbackModelFor(rates, session.harness)];
-    const fallbackUsed = directRate === undefined;
-
-    if (fallbackUsed) {
+    const fallbackUsed = basis === 'fallback';
+    if (fallbackUsed || basis === 'unavailable') {
       missingModels.push(model);
     }
 
-    const rate = directRate ?? fallbackRate;
+    const rate = rates.models[resolvedModel];
 
     if (!rate) {
-      // Neither the model nor the fallback exists in the rate card.
-      byModel.push({ model, cost: 0, fallbackUsed, unpriced: false });
+      // Neither the model, an alias, nor the fallback exists in the rate card.
+      byModel.push({ model, cost: 0, fallbackUsed, unpriced: false, basis });
       continue;
     }
 
     const cost = eventCost(totals, rate);
 
     total += cost;
-    byModel.push({ model, cost, fallbackUsed, unpriced: false });
+    byModel.push({ model, cost, fallbackUsed, unpriced: false, basis });
   }
 
   return { total, byModel, missingModels, unpricedModels };
@@ -389,30 +501,26 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
 
 function historyCost(
   session: Session,
+  rates: RateCard,
   table: Record<string, ModelRate>,
-  fallbackName: string,
-  unpricedModelNames: string[] = [],
 ): SessionCredits {
   const byModelMap = new Map<string, number>();
+  const basisByModel = new Map<string, PricingBasis>();
   const missingModels = new Set<string>();
   const unpricedModels = new Set<string>();
-  const unpriced = new Set(unpricedModelNames);
   let total = 0;
-
-  const fallbackRate = table[fallbackName];
 
   for (const ev of session.tokens_history) {
     if (!ev.model) continue;
-    if (unpriced.has(ev.model)) {
+    const { resolvedModel, basis } = resolveModelPricing(rates, ev.model, session.harness, table);
+    basisByModel.set(ev.model, basis);
+    if (basis === 'unavailable' && isUnpricedModel(rates, ev.model)) {
       unpricedModels.add(ev.model);
       byModelMap.set(ev.model, byModelMap.get(ev.model) ?? 0);
       continue;
     }
-
-    const directRate = table[ev.model];
-    const fallbackUsed = directRate === undefined;
-    if (fallbackUsed) missingModels.add(ev.model);
-    const rate = directRate ?? fallbackRate;
+    if (basis === 'fallback' || basis === 'unavailable') missingModels.add(ev.model);
+    const rate = table[resolvedModel];
     if (!rate) continue;
 
     const cost = eventCost(
@@ -429,8 +537,9 @@ function historyCost(
     byModel: Array.from(byModelMap, ([model, cost]) => ({
       model,
       cost,
-      fallbackUsed: table[model] === undefined && !unpriced.has(model),
-      unpriced: unpriced.has(model),
+      fallbackUsed: basisByModel.get(model) === 'fallback',
+      unpriced: unpricedModels.has(model),
+      basis: basisByModel.get(model) ?? 'unavailable',
     })),
     missingModels: Array.from(missingModels),
     unpricedModels: Array.from(unpricedModels),

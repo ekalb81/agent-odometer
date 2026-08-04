@@ -906,6 +906,8 @@ fn parse_token_totals(v: &Value) -> TokenTotals {
             .get("cached_input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        // Codex does not report a separate cache-write dimension.
+        cache_creation_input_tokens: 0,
         output_tokens: v.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
         reasoning_output_tokens: v
             .get("reasoning_output_tokens")
@@ -963,6 +965,9 @@ fn subtract_totals_saturating(a: &TokenTotals, b: &TokenTotals) -> TokenTotals {
     TokenTotals {
         input_tokens: a.input_tokens.saturating_sub(b.input_tokens),
         cached_input_tokens: a.cached_input_tokens.saturating_sub(b.cached_input_tokens),
+        cache_creation_input_tokens: a
+            .cache_creation_input_tokens
+            .saturating_sub(b.cache_creation_input_tokens),
         output_tokens: a.output_tokens.saturating_sub(b.output_tokens),
         reasoning_output_tokens: a
             .reasoning_output_tokens

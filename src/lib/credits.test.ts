@@ -1,24 +1,49 @@
 import { describe, expect, it } from 'vitest';
-import { computeSessionApiCostScenarios } from './credits';
-import type { RateCard, Session, TokenTotals } from './types';
+import {
+  computeSessionApiCostScenarios,
+  computeSessionCredits,
+  creditsFromBuckets,
+  resolveModelPricing,
+  tokensCost,
+} from './credits';
+import type { ModelRate, RateCard, Session, TokenTotals } from './types';
 
 const zero: TokenTotals = {
   input_tokens: 0,
   cached_input_tokens: 0,
+  cache_creation_input_tokens: 0,
   output_tokens: 0,
   reasoning_output_tokens: 0,
   total_tokens: 0,
 };
 
-function totals(input: number, cached: number, output: number, reasoning: number): TokenTotals {
+function totals(
+  input: number,
+  cached: number,
+  output: number,
+  reasoning: number,
+  cacheCreation = 0,
+): TokenTotals {
   return {
     input_tokens: input,
     cached_input_tokens: cached,
+    cache_creation_input_tokens: cacheCreation,
     output_tokens: output,
     reasoning_output_tokens: reasoning,
     total_tokens: input + output,
   };
 }
+
+function rate(input: number, cached: number, output: number, reasoning: number, cacheCreation = 0): ModelRate {
+  return { input, cached_input: cached, cache_creation_input: cacheCreation, output, reasoning };
+}
+
+const defaultRefresh: RateCard['refresh'] = {
+  last_success_at: null,
+  last_attempt_at: null,
+  last_failure_reason: null,
+  max_cache_age_secs: 604_800,
+};
 
 const rateCard: RateCard = {
   version: 7,
@@ -26,11 +51,11 @@ const rateCard: RateCard = {
   unit: 'per_1m_tokens',
   source_url: 'https://example.test/rates',
   fetched_at: null,
-  models: { 'gpt-5.6-sol': { input: 125, cached_input: 12.5, output: 750, reasoning: 750 } },
+  models: { 'gpt-5.6-sol': rate(125, 12.5, 750, 750) },
   fallback_model: 'gpt-5.6-sol',
   currencies: { codex: 'credits', claude_code: 'USD' },
   fallback_models: { codex: 'gpt-5.6-sol', claude_code: 'gpt-5.6-sol' },
-  api_models: { 'gpt-5.6-sol': { input: 5, cached_input: 0.5, output: 30, reasoning: 30 } },
+  api_models: { 'gpt-5.6-sol': rate(5, 0.5, 30, 30, 6.25) },
   unpriced_models: [],
   pricing_catalog: {
     notes: ['cache writes are unobserved'],
@@ -40,7 +65,7 @@ const rateCard: RateCard = {
       model: 'gpt-5.6-sol',
       from: '2026-01-01T00:00:00Z',
       to: null,
-      rate: { input: 5, cached_input: 0.5, output: 30, reasoning: 30 },
+      rate: rate(5, 0.5, 30, 30, 6.25),
       cache_write_input_multiplier: 1.25,
       provenance: { evidence: 'test', source_url: 'https://example.test/source', verified_at: '2026-07-25T00:00:00Z', note: null },
       label: 'base API rate',
@@ -57,12 +82,18 @@ const rateCard: RateCard = {
       label: 'high context API rate',
     }],
   },
+  model_aliases: {},
+  free_local_models: [],
+  subscription_plans: {},
+  display_currency: null,
+  refresh: defaultRefresh,
 };
 
 function session(
   events: Session['tokens_history'],
   harness: Session['harness'] = 'codex',
   model = 'gpt-5.6-sol',
+  tokensByModel: Session['tokens_by_model'] = {},
 ): Session {
   return {
     id: 'thread', storage_id: `${harness}:thread:thread`, harness, thread_name: null,
@@ -74,7 +105,7 @@ function session(
     cli_version: null, model_provider: harness === 'codex' ? 'openai' : 'anthropic', model, service_tier: null,
     plan_type: 'pro', credits_unlimited: null, credits_balance: null, context_window: null,
     latest_context_tokens: null, total_turns: 0, first_user_message: null, tokens_total: zero,
-    tokens_by_model: {}, tokens_history: events, rate_limits_history: [], turns: [], tool_observations: [],
+    tokens_by_model: tokensByModel, tokens_history: events, rate_limits_history: [], turns: [], tool_observations: [],
     tool_metrics: { calls: 0, reads: 0, searches: 0, mutations: 0, commands: 0, other: 0, successes: 0, failures: 0, unknown: 0, mutation_targets: 0, one_shot_mutations: 0, retry_count: 0, duration_ms: 0, output_bytes: 0 },
     tool_metrics_by_model: {}, category_totals: {}, optimization_findings: [],
   };
@@ -129,7 +160,7 @@ describe('time-aware API pricing scenarios', () => {
       ...rateCard,
       models: {
         ...rateCard.models,
-        'claude-sonnet-5': { input: 3, cached_input: 0.3, output: 15, reasoning: 15 },
+        'claude-sonnet-5': rate(3, 0.3, 15, 15, 3.75),
       },
       pricing_catalog: {
         notes: [],
@@ -138,7 +169,7 @@ describe('time-aware API pricing scenarios', () => {
           {
             id: 'anthropic/claude-sonnet-5/intro', surface: 'anthropic_api_usd', model: 'claude-sonnet-5',
             from: '2026-01-01T00:00:00Z', to: '2026-09-01T00:00:00Z',
-            rate: { input: 2, cached_input: 0.2, output: 10, reasoning: 10 },
+            rate: rate(2, 0.2, 10, 10, 2.5),
             cache_write_input_multiplier: 1.25,
             provenance: { evidence: 'test', source_url: 'https://example.test/sonnet', verified_at: '2026-07-27T00:00:00Z', note: null },
             label: 'introductory',
@@ -146,7 +177,7 @@ describe('time-aware API pricing scenarios', () => {
           {
             id: 'anthropic/claude-sonnet-5/standard', surface: 'anthropic_api_usd', model: 'claude-sonnet-5',
             from: '2026-09-01T00:00:00Z', to: null,
-            rate: { input: 3, cached_input: 0.3, output: 15, reasoning: 15 },
+            rate: rate(3, 0.3, 15, 15, 3.75),
             cache_write_input_multiplier: 1.25,
             provenance: { evidence: 'test', source_url: 'https://example.test/sonnet', verified_at: '2026-07-27T00:00:00Z', note: null },
             label: 'standard',
@@ -167,5 +198,164 @@ describe('time-aware API pricing scenarios', () => {
     ]);
     expect(result.timeAware?.cacheWritePricingUnmodeled).toBe(true);
     expect(result.timeAware?.unobservedCacheWriteInputMultipliers).toEqual([1.25]);
+  });
+});
+
+describe('cache dimensions', () => {
+  it('prices cache-creation and cached-read as disjoint subsets of input, never double-counted', () => {
+    // 100 input tokens total: 60 plain, 25 cache-read, 15 cache-creation.
+    // A double-counting bug would price more than 100 input-side tokens.
+    const model = rate(10, 1, 0, 0, 12.5); // input=$10, cached=$1, cache-creation=$12.5 per 1M
+    const delta = totals(100, 25, 0, 0, 15);
+    const plainInputTokens = delta.input_tokens - delta.cached_input_tokens - delta.cache_creation_input_tokens;
+    expect(plainInputTokens).toBe(60);
+
+    const cost = computeSessionCredits(
+      session([], 'claude_code', 'claude-sonnet-5', { 'claude-sonnet-5': delta }),
+      { ...rateCard, models: { 'claude-sonnet-5': model }, fallback_model: 'claude-sonnet-5' },
+    );
+    const expected = (60 * 10 + 25 * 1 + 15 * 12.5) / 1_000_000;
+    expect(cost.total).toBeCloseTo(expected, 12);
+  });
+
+  it('applies the cache-write premium distinctly from the plain input rate', () => {
+    const cheapInput = rate(1, 0.1, 0, 0, 1.25); // cache-creation priced 1.25x input
+    const buckets = [{
+      model: 'claude-sonnet-5', service_tier: null,
+      tokens: totals(0, 0, 0, 0, 1_000_000), // pure cache-creation event
+    }];
+    const result = creditsFromBuckets(buckets, {
+      ...rateCard, models: { 'claude-sonnet-5': cheapInput }, fallback_model: 'claude-sonnet-5',
+    }, 'claude_code');
+    expect(result.total).toBeCloseTo(1.25, 9);
+    expect(result.total).not.toBeCloseTo(1.0, 9); // would be the plain-input (undercounted) price
+  });
+});
+
+describe('unknown models', () => {
+  it('falls back to the configured harness fallback model and flags it', () => {
+    const result = tokensCost(totals(1_000_000, 0, 0, 0), 'totally-unknown-model', rateCard, null, 'codex', rateCard.models);
+    expect(result.basis).toBe('fallback');
+    expect(result.fallbackUsed).toBe(true);
+    expect(result.cost).toBeCloseTo((1_000_000 * 125) / 1_000_000, 9);
+  });
+
+  it('is unavailable, not silently zero-priced-as-fallback, when no fallback rate exists either', () => {
+    const cardWithoutFallbackRate: RateCard = { ...rateCard, models: {}, fallback_model: 'nonexistent' };
+    const resolution = resolveModelPricing(cardWithoutFallbackRate, 'totally-unknown-model', 'codex', cardWithoutFallbackRate.models);
+    expect(resolution.basis).toBe('unavailable');
+  });
+
+  it('excludes a known-unpriced model from cost rather than fallback-pricing it', () => {
+    const cardWithUnpriced: RateCard = { ...rateCard, unpriced_models: ['preview-model'] };
+    const result = tokensCost(totals(1_000_000, 0, 0, 0), 'preview-model', cardWithUnpriced, null, 'codex', cardWithUnpriced.models);
+    expect(result.unpriced).toBe(true);
+    expect(result.cost).toBe(0);
+    expect(result.basis).toBe('unavailable');
+  });
+});
+
+describe('aliases and alias cycles', () => {
+  it('resolves an alias before falling back, distinct from a direct match', () => {
+    const card: RateCard = {
+      ...rateCard,
+      model_aliases: { 'claude-sonnet-5-20260815': 'claude-sonnet-5' },
+      models: { 'claude-sonnet-5': rate(3, 0.3, 15, 15) },
+      fallback_model: 'claude-sonnet-5',
+    };
+    const resolution = resolveModelPricing(card, 'claude-sonnet-5-20260815', 'claude_code', card.models);
+    expect(resolution.basis).toBe('aliased');
+    expect(resolution.resolvedModel).toBe('claude-sonnet-5');
+
+    const direct = resolveModelPricing(card, 'claude-sonnet-5', 'claude_code', card.models);
+    expect(direct.basis).toBe('direct');
+  });
+
+  it('follows a multi-hop alias chain to its canonical target', () => {
+    const aliases = { a: 'b', b: 'c' };
+    const resolution = resolveModelPricing(
+      { ...rateCard, model_aliases: aliases, models: { c: rate(1, 0.1, 5, 5) }, fallback_model: 'c' },
+      'a', 'codex', { c: rate(1, 0.1, 5, 5) },
+    );
+    expect(resolution.basis).toBe('aliased');
+    expect(resolution.resolvedModel).toBe('c');
+  });
+
+  it('terminates on an alias cycle instead of hanging, and falls through to fallback', () => {
+    const cyclicAliases = { a: 'b', b: 'a' };
+    const card: RateCard = {
+      ...rateCard,
+      model_aliases: cyclicAliases,
+      models: { 'fallback-model': rate(9, 0.9, 9, 9) },
+      fallback_model: 'fallback-model',
+      fallback_models: {},
+    };
+    // The real assertion is that this call returns at all (a naive
+    // implementation without cycle detection would loop forever), and
+    // resolves deterministically to the configured fallback since neither
+    // "a" nor "b" is ever a real rate-table key in this scenario.
+    const resolution = resolveModelPricing(card, 'a', 'codex', card.models);
+    expect(resolution.basis).toBe('fallback');
+    expect(resolution.resolvedModel).toBe('fallback-model');
+  });
+
+  it('a self-referencing alias terminates without hanging', () => {
+    const card: RateCard = {
+      ...rateCard,
+      model_aliases: { a: 'a' },
+      models: { 'fallback-model': rate(9, 0.9, 9, 9) },
+      fallback_model: 'fallback-model',
+      fallback_models: {},
+    };
+    const resolution = resolveModelPricing(card, 'a', 'codex', card.models);
+    expect(resolution.basis).toBe('fallback');
+  });
+});
+
+describe('precision', () => {
+  it('sums fractional per-1M rates without cent-level rounding drift across many small events', () => {
+    // 37 events of 333,333 tokens is not evenly divisible by 1e6 — a naive
+    // per-event rounding step would drift from the closed-form total.
+    const perEventTokens = 333_333;
+    const eventCount = 37;
+    const rateCardForModel = rate(3.0, 0.3, 15, 15, 3.75);
+    const buckets = Array.from({ length: eventCount }, () => ({
+      model: 'claude-sonnet-5', service_tier: null,
+      tokens: totals(perEventTokens, 0, 0, 0),
+    }));
+    const result = creditsFromBuckets(buckets, {
+      ...rateCard, models: { 'claude-sonnet-5': rateCardForModel }, fallback_model: 'claude-sonnet-5',
+    }, 'claude_code');
+    const expected = (perEventTokens * eventCount * 3.0) / 1_000_000;
+    expect(result.total).toBeCloseTo(expected, 9);
+  });
+
+  it('keeps sub-cent precision instead of collapsing tiny amounts to zero', () => {
+    const buckets = [{ model: 'claude-sonnet-5', service_tier: null, tokens: totals(1, 0, 0, 0) }];
+    const result = creditsFromBuckets(buckets, {
+      ...rateCard, models: { 'claude-sonnet-5': rate(3, 0.3, 15, 15) }, fallback_model: 'claude-sonnet-5',
+    }, 'claude_code');
+    expect(result.total).toBeGreaterThan(0);
+    expect(result.total).toBeCloseTo(3 / 1_000_000, 12);
+  });
+});
+
+describe('fast-tier service multipliers', () => {
+  it('applies the documented 2.5x multiplier to fast GPT-5.5', () => {
+    const card: RateCard = { ...rateCard, models: { 'gpt-5.5': rate(100, 10, 500, 500) }, fallback_model: 'gpt-5.5' };
+    const result = tokensCost(totals(1_000_000, 0, 0, 0), 'gpt-5.5', card, 'fast', 'codex', card.models);
+    expect(result.cost).toBeCloseTo(100 * 2.5, 9);
+  });
+
+  it('applies the documented 2x multiplier to fast GPT-5.4', () => {
+    const card: RateCard = { ...rateCard, models: { 'gpt-5.4': rate(50, 5, 250, 250) }, fallback_model: 'gpt-5.4' };
+    const result = tokensCost(totals(1_000_000, 0, 0, 0), 'gpt-5.4', card, 'fast', 'codex', card.models);
+    expect(result.cost).toBeCloseTo(50 * 2, 9);
+  });
+
+  it('never applies a fast multiplier to a model without a documented fast rate', () => {
+    const card: RateCard = { ...rateCard, models: { 'claude-sonnet-5': rate(3, 0.3, 15, 15) }, fallback_model: 'claude-sonnet-5' };
+    const result = tokensCost(totals(1_000_000, 0, 0, 0), 'claude-sonnet-5', card, 'fast', 'claude_code', card.models);
+    expect(result.cost).toBeCloseTo(3, 9);
   });
 });

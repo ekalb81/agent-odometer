@@ -344,14 +344,19 @@ fn price_tokens(
 }
 
 fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f64 {
+    // Cached-read and cache-creation are both disjoint subsets of
+    // input_tokens; both must be subtracted before pricing the remainder at
+    // the plain input rate, and neither subset may be priced twice.
     let non_cached_input = tokens
         .input_tokens
-        .saturating_sub(tokens.cached_input_tokens);
+        .saturating_sub(tokens.cached_input_tokens)
+        .saturating_sub(tokens.cache_creation_input_tokens);
     let non_reasoning_output = tokens
         .output_tokens
         .saturating_sub(tokens.reasoning_output_tokens);
     ((non_cached_input as f64 * rate.input)
         + (tokens.cached_input_tokens as f64 * rate.cached_input)
+        + (tokens.cache_creation_input_tokens as f64 * rate.cache_creation_input)
         + (non_reasoning_output as f64 * rate.output)
         + (tokens.reasoning_output_tokens as f64 * rate.reasoning))
         / 1_000_000.0
@@ -632,6 +637,7 @@ mod tests {
         ModelRate {
             input: value,
             cached_input: value,
+            cache_creation_input: value,
             output: value,
             reasoning: value,
         }
@@ -643,6 +649,7 @@ mod tests {
         let tokens = TokenTotals {
             input_tokens: 100_000,
             cached_input_tokens: 80_000,
+            cache_creation_input_tokens: 0,
             output_tokens: 20_000,
             reasoning_output_tokens: 10_000,
             total_tokens: 120_000,
@@ -733,6 +740,7 @@ mod tests {
             api_models: HashMap::from([("gpt-test".into(), rate(3.5))]),
             unpriced_models: Vec::new(),
             pricing_catalog: Default::default(),
+            ..Default::default()
         };
         (session, rates)
     }

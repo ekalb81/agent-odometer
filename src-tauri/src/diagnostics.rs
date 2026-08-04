@@ -641,6 +641,7 @@ mod tests {
                         crate::rates::ModelRate {
                             input: 1.0,
                             cached_input: 0.1,
+                            cache_creation_input: 0.125,
                             output: 2.0,
                             reasoning: 2.0,
                         },
@@ -653,6 +654,11 @@ mod tests {
             api_models: Default::default(),
             unpriced_models: unpriced.iter().map(|m| m.to_string()).collect(),
             pricing_catalog: Default::default(),
+            model_aliases: Default::default(),
+            free_local_models: Default::default(),
+            subscription_plans: Default::default(),
+            display_currency: None,
+            refresh: Default::default(),
         }
     }
 

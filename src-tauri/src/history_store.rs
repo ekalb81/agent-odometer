@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -392,7 +392,7 @@ impl HistoryStore {
 
         let mut token_rollup_query = connection.prepare(
             "SELECT hour_bucket, model, service_tier, input_tokens, cached_input_tokens,
-                    output_tokens, reasoning_output_tokens, total_tokens
+                    output_tokens, reasoning_output_tokens, total_tokens, cache_creation_input_tokens
              FROM rollup_token_totals WHERE session_key = ?1",
         )?;
         let mut tool_rollup_query = connection.prepare(
@@ -414,7 +414,8 @@ impl HistoryStore {
                 connection.prepare(&format!(
                     "SELECT timestamp_ms, model, service_tier, request_input_tokens,
                             cumulative_total_tokens, input_tokens, cached_input_tokens,
-                            output_tokens, reasoning_output_tokens, total_tokens
+                            output_tokens, reasoning_output_tokens, total_tokens,
+                            cache_creation_input_tokens
                      FROM durable_token_events WHERE session_key = ?1 AND ({edge_predicate})
                      ORDER BY timestamp_ms, event_index"
                 ))
@@ -443,6 +444,7 @@ impl HistoryStore {
                             output_tokens: row.get::<_, i64>(5)? as u64,
                             reasoning_output_tokens: row.get::<_, i64>(6)? as u64,
                             total_tokens: row.get::<_, i64>(7)? as u64,
+                            cache_creation_input_tokens: row.get::<_, i64>(8)? as u64,
                         },
                     ))
                 })?
@@ -514,6 +516,7 @@ impl HistoryStore {
                                     output_tokens: row.get::<_, i64>(7)? as u64,
                                     reasoning_output_tokens: row.get::<_, i64>(8)? as u64,
                                     total_tokens: row.get::<_, i64>(9)? as u64,
+                                    cache_creation_input_tokens: row.get::<_, i64>(10)? as u64,
                                 },
                             })
                         })?
@@ -937,6 +940,19 @@ fn compute_range_totals(
     }
 }
 
+/// True when `table` already has a column named `column`. Used to guard an
+/// `ALTER TABLE ... ADD COLUMN` in a migration step that may run against a
+/// table whose exact history (freshly created this call vs. pre-existing)
+/// cannot be inferred reliably from the schema-version transition alone.
+fn table_has_column(connection: &Transaction<'_>, table: &str, column: &str) -> Result<bool> {
+    let count: i64 = connection.query_row(
+        &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"),
+        [column],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn migrate(connection: &mut Connection) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
@@ -997,6 +1013,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                cumulative_total_tokens INTEGER NOT NULL,
                input_tokens INTEGER NOT NULL,
                cached_input_tokens INTEGER NOT NULL,
+               cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
                output_tokens INTEGER NOT NULL,
                reasoning_output_tokens INTEGER NOT NULL,
                total_tokens INTEGER NOT NULL,
@@ -1129,6 +1146,11 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         // helper the write path and read path both use, and `COALESCE(...,
         // '')` matches `key_sentinel`'s empty-string stand-in for a missing
         // model/tier/turn/target so grouping here and later upserts agree.
+        // `durable_token_events` does not have `cache_creation_input_tokens`
+        // yet at this point in a fresh v3->v4 upgrade (the v4->v5 step below
+        // adds it), so this backfill cannot and does not reference it;
+        // `rollup_token_totals.cache_creation_input_tokens` keeps its schema
+        // default of 0 here and is reconciled by the v4->v5 step instead.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(ROLLUP_SCHEMA_SQL)?;
         transaction.execute_batch(
@@ -1172,6 +1194,70 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )?;
         transaction.commit()?;
     }
+    let version_before_cache_creation: i64 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version_before_cache_creation == 4 {
+        // Cache-creation ("cache write") tokens are a normalized price
+        // dimension distinct from cache reads (issue #42), layered on top of
+        // the #107 rollup schema. Each `ALTER TABLE` is guarded by a direct
+        // `pragma_table_info` check rather than inferred from *how* this
+        // migrate() call reached version 4: `rollup_token_totals` already
+        // carries the column when the v3->v4 step above just created it
+        // fresh in this same call (`ROLLUP_SCHEMA_SQL` declares it), but a
+        // real pre-#42 database that was already sitting at version 4 does
+        // not have it on either table, and re-running `ALTER TABLE ADD
+        // COLUMN` on a column that already exists is a hard SQLite error —
+        // an inferred-from-path guard would be correct for every real
+        // upgrade sequence but wrong the moment a database's tables don't
+        // precisely match what that inference assumes.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !table_has_column(&transaction, "durable_token_events", "cache_creation_input_tokens")? {
+            transaction.execute_batch(
+                "ALTER TABLE durable_token_events
+                   ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !table_has_column(&transaction, "rollup_token_totals", "cache_creation_input_tokens")? {
+            transaction.execute_batch(
+                "ALTER TABLE rollup_token_totals
+                   ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        // Backfill via the same SQL `GROUP BY` shape the v3->v4 rollup
+        // migration above uses: one aggregate pass over
+        // `durable_token_events`, never by re-parsing transcripts or
+        // materializing a `Session` in Rust (the ledger can hold millions of
+        // token events). This always runs, unconditionally: it is a no-op
+        // (every source row is 0) for genuinely historical data that never
+        // recorded a cache-write count separately from ordinary input, but
+        // it is exactly what reconciles `rollup_token_totals` when
+        // `durable_token_events` already held real cache-creation data that
+        // an earlier, narrower backfill pass could not have copied forward
+        // (that column did not exist on either table at that point in the
+        // migration sequence) — a `rollup_token_totals` row must not
+        // silently keep serving a stale 0 in that case.
+        transaction.execute_batch(
+            "UPDATE rollup_token_totals
+             SET cache_creation_input_tokens = agg.total
+             FROM (
+               SELECT session_key, timestamp_ms / 3600000 AS hour_bucket,
+                      COALESCE(model, '') AS model, COALESCE(service_tier, '') AS service_tier,
+                      SUM(cache_creation_input_tokens) AS total
+               FROM durable_token_events
+               GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, '')
+             ) AS agg
+             WHERE rollup_token_totals.session_key = agg.session_key
+               AND rollup_token_totals.hour_bucket = agg.hour_bucket
+               AND rollup_token_totals.model = agg.model
+               AND rollup_token_totals.service_tier = agg.service_tier;",
+        )?;
+        transaction.execute_batch(
+            "INSERT INTO history_meta(key, value) VALUES('schema_version', '5')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 5;",
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -1186,6 +1272,7 @@ const ROLLUP_SCHEMA_SQL: &str = "
       service_tier TEXT NOT NULL DEFAULT '',
       input_tokens INTEGER NOT NULL DEFAULT 0,
       cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
       output_tokens INTEGER NOT NULL DEFAULT 0,
       reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
       total_tokens INTEGER NOT NULL DEFAULT 0
@@ -1472,8 +1559,8 @@ fn store_token_events(
         "INSERT INTO durable_token_events(
            session_key, event_key, event_index, timestamp_ms, model, service_tier, request_input_tokens,
            cumulative_total_tokens, input_tokens, cached_input_tokens, output_tokens,
-           reasoning_output_tokens, total_tokens)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+           reasoning_output_tokens, total_tokens, cache_creation_input_tokens)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
          ON CONFLICT(session_key, event_key) DO UPDATE SET
            request_input_tokens = COALESCE(excluded.request_input_tokens, durable_token_events.request_input_tokens)",
     )?;
@@ -1492,6 +1579,7 @@ fn store_token_events(
             to_i64(event.delta.output_tokens)?,
             to_i64(event.delta.reasoning_output_tokens)?,
             to_i64(event.delta.total_tokens)?,
+            to_i64(event.delta.cache_creation_input_tokens)?,
         ])?;
     }
 
@@ -1503,14 +1591,16 @@ fn store_token_events(
         let mut upsert = transaction.prepare(
             "INSERT INTO rollup_token_totals(
                session_key, hour_bucket, model, service_tier,
-               input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+               input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+               cache_creation_input_tokens)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(session_key, hour_bucket, model, service_tier) DO UPDATE SET
                input_tokens = input_tokens + excluded.input_tokens,
                cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
                output_tokens = output_tokens + excluded.output_tokens,
                reasoning_output_tokens = reasoning_output_tokens + excluded.reasoning_output_tokens,
-               total_tokens = total_tokens + excluded.total_tokens",
+               total_tokens = total_tokens + excluded.total_tokens,
+               cache_creation_input_tokens = cache_creation_input_tokens + excluded.cache_creation_input_tokens",
         )?;
         for event in events.iter().skip(next_event_index) {
             upsert.execute(params![
@@ -1523,6 +1613,7 @@ fn store_token_events(
                 to_i64(event.delta.output_tokens)?,
                 to_i64(event.delta.reasoning_output_tokens)?,
                 to_i64(event.delta.total_tokens)?,
+                to_i64(event.delta.cache_creation_input_tokens)?,
             ])?;
         }
     }
@@ -1932,6 +2023,7 @@ mod tests {
         TokenTotals {
             input_tokens: input,
             cached_input_tokens: input / 4,
+            cache_creation_input_tokens: input / 16,
             output_tokens: input / 2,
             reasoning_output_tokens: input / 8,
             total_tokens: input + input / 2,
@@ -2322,9 +2414,10 @@ mod tests {
                 )
                 .unwrap();
         }
-        // Rewind to schema v2: drop the fact and rollup tables and the
-        // version marker, exactly what a store written by a release before
-        // #107 looks like (a genuine v2 database predates all of them).
+        // Rewind to schema v2: drop the fact and rollup tables, the ledger
+        // flag, and the cache-creation column, and the version marker —
+        // exactly what a store written by a release before #107 and #42
+        // looks like (a genuine v2 database predates all of them).
         {
             let connection = Connection::open(&path).unwrap();
             connection
@@ -2335,6 +2428,7 @@ mod tests {
                      DROP TABLE rollup_tool_metrics;
                      DROP TABLE rollup_mutation_chains;
                      ALTER TABLE durable_sessions DROP COLUMN ledger_dirty;
+                     ALTER TABLE durable_token_events DROP COLUMN cache_creation_input_tokens;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '2')
                        ON CONFLICT(key) DO UPDATE SET value = '2';
                      PRAGMA user_version = 2;",
@@ -2632,6 +2726,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(request_column_count, 1);
+        let cache_creation_column_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('durable_token_events') WHERE name = 'cache_creation_input_tokens'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_creation_column_count, 1);
+    }
+
+    #[test]
+    fn cache_creation_tokens_round_trip_through_durable_store() {
+        // New rows written to a normal (not migrated-from-legacy) store must
+        // actually round-trip the cache-creation dimension end to end, not
+        // just carry the column.
+        let (_directory, store) = store();
+        let fixture = rich_session("cache-creation-roundtrip");
+        let expected_cache_creation: u64 = fixture
+            .tokens_history
+            .iter()
+            .map(|event| event.delta.cache_creation_input_tokens)
+            .sum();
+        assert!(
+            expected_cache_creation > 0,
+            "fixture must exercise the cache-creation dimension"
+        );
+        let generation = store.begin_scan().unwrap().max(1);
+        let observed = store
+            .observe(
+                Path::new("cache-creation-roundtrip.jsonl"),
+                &fixture,
+                generation,
+            )
+            .unwrap();
+        let windows: Vec<RangeWindow> = vec![(None, None)];
+        let totals = store
+            .range_totals_multi(std::slice::from_ref(&observed.key), &windows)
+            .unwrap();
+        assert_eq!(
+            totals[0][&observed.key].tokens.cache_creation_input_tokens,
+            expected_cache_creation
+        );
     }
 
     fn append_event(session: &mut Session, input: u64, at: &str) {

@@ -467,6 +467,7 @@
     name: string;
     input: string;
     cached_input: string;
+    cache_creation_input: string;
     output: string;
     reasoning: string;
   }
@@ -487,11 +488,26 @@
   // Catalog rules have their own provenance and validation contract. The
   // editor does not modify them yet, so preserve the complete object verbatim.
   let pricingCatalog = $state<PricingCatalog>({ rate_periods: [], conditional_modifiers: [], notes: [] });
+  // Alias table, free/local declarations, subscription plans, display
+  // currency, and refresh bookkeeping are not editable in the base rate
+  // editor yet (#42 ships the data model and offline plumbing first); carry
+  // them through unchanged so saving the rate table never silently drops them.
+  let ratesModelAliases = $state<RateCard['model_aliases']>({});
+  let ratesFreeLocalModels = $state<string[]>([]);
+  let ratesSubscriptionPlans = $state<RateCard['subscription_plans']>({});
+  let ratesDisplayCurrency = $state<RateCard['display_currency']>(null);
+  let ratesRefresh = $state<RateCard['refresh']>({
+    last_success_at: null,
+    last_attempt_at: null,
+    last_failure_reason: null,
+    max_cache_age_secs: 604_800,
+  });
 
   // New-model form.
   let newName = $state('');
   let newInput = $state('');
   let newCachedInput = $state('');
+  let newCacheCreationInput = $state('');
   let newOutput = $state('');
   let newReasoning = $state('');
 
@@ -510,6 +526,7 @@
       name,
       input: String(rate.input),
       cached_input: String(rate.cached_input),
+      cache_creation_input: String(rate.cache_creation_input),
       output: String(rate.output),
       reasoning: String(rate.reasoning),
     }));
@@ -524,6 +541,16 @@
     ratesApiModels = { ...(r.api_models ?? {}) };
     ratesUnpricedModels = [...(r.unpriced_models ?? [])];
     pricingCatalog = r.pricing_catalog;
+    ratesModelAliases = { ...(r.model_aliases ?? {}) };
+    ratesFreeLocalModels = [...(r.free_local_models ?? [])];
+    ratesSubscriptionPlans = { ...(r.subscription_plans ?? {}) };
+    ratesDisplayCurrency = r.display_currency ?? null;
+    ratesRefresh = r.refresh ?? {
+      last_success_at: null,
+      last_attempt_at: null,
+      last_failure_reason: null,
+      max_cache_age_secs: 604_800,
+    };
     dirty = false;
   });
 
@@ -568,13 +595,17 @@
       }
       const input = parseRate(row.input);
       const cached_input = parseRate(row.cached_input);
+      const cache_creation_input = parseRate(row.cache_creation_input);
       const output = parseRate(row.output);
       const reasoning = parseRate(row.reasoning);
-      if (input === null || cached_input === null || output === null || reasoning === null) {
+      if (
+        input === null || cached_input === null || cache_creation_input === null
+        || output === null || reasoning === null
+      ) {
         validationError = `Rates for "${row.name}" must be non-negative numbers.`;
         return null;
       }
-      models[row.name.trim()] = { input, cached_input, output, reasoning };
+      models[row.name.trim()] = { input, cached_input, cache_creation_input, output, reasoning };
     }
     if (!models[fallbackModel]) {
       validationError = `Fallback model "${fallbackModel}" is not in the model list.`;
@@ -594,6 +625,11 @@
       api_models: ratesApiModels,
       unpriced_models: ratesUnpricedModels,
       pricing_catalog: pricingCatalog,
+      model_aliases: ratesModelAliases,
+      free_local_models: ratesFreeLocalModels,
+      subscription_plans: ratesSubscriptionPlans,
+      display_currency: ratesDisplayCurrency,
+      refresh: ratesRefresh,
     };
   }
 
@@ -650,9 +686,13 @@
     }
     const input = parseRate(newInput);
     const cached_input = parseRate(newCachedInput);
+    const cache_creation_input = parseRate(newCacheCreationInput);
     const output = parseRate(newOutput);
     const reasoning = parseRate(newReasoning);
-    if (input === null || cached_input === null || output === null || reasoning === null) {
+    if (
+      input === null || cached_input === null || cache_creation_input === null
+      || output === null || reasoning === null
+    ) {
       validationError = 'All rate fields must be non-negative numbers.';
       return;
     }
@@ -660,12 +700,14 @@
       name,
       input: String(input),
       cached_input: String(cached_input),
+      cache_creation_input: String(cache_creation_input),
       output: String(output),
       reasoning: String(reasoning),
     }];
     newName = '';
     newInput = '';
     newCachedInput = '';
+    newCacheCreationInput = '';
     newOutput = '';
     newReasoning = '';
     validationError = null;
@@ -1326,6 +1368,7 @@
               <th class="text-left px-3 py-2 text-ink-muted font-medium">Model</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Input $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Cached $/1M</th>
+              <th class="text-right px-3 py-2 text-ink-muted font-medium" title="Cache-creation (write) rate — a distinct dimension from Cached (read), never double-counted with it.">Cache write $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Output $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Reasoning $/1M</th>
               <th class="px-3 py-2"></th>
@@ -1351,6 +1394,16 @@
                     min="0"
                     step="0.001"
                     bind:value={row.cached_input}
+                    oninput={markDirty}
+                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
+                  />
+                </td>
+                <td class="px-3 py-1.5">
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.001"
+                    bind:value={row.cache_creation_input}
                     oninput={markDirty}
                     class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                   />
@@ -1419,6 +1472,16 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newCachedInput}
+                  class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
+                />
+              </td>
+              <td class="px-3 py-1.5">
+                <input
+                  type="number"
+                  min="0"
+                  step="0.001"
+                  placeholder="0"
+                  bind:value={newCacheCreationInput}
                   class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                 />
               </td>
