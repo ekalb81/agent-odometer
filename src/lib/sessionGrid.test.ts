@@ -33,7 +33,7 @@ describe('session grid formatting', () => {
     expect(modelProviderVisual({ harness: 'codex', model_provider: 'local-provider' })).toMatchObject({ key: 'other', label: 'local-provider' });
   });
 
-  it('derives a privacy-safe repository label without exposing the path', () => {
+  it('derives the fallback label from the final path segment', () => {
     expect(repositoryLabel({ working_directory: 'C:\\workspace\\sample-repository' })).toBe('sample-repository');
     expect(repositoryLabel({ working_directory: '/home/demo/work/repository' })).toBe('repository');
     expect(repositoryLabel({ working_directory: null })).toBeNull();

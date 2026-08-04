@@ -60,7 +60,7 @@
           {/if}
         </div>
       {/each}
-      <p class="pt-1 text-[10px] text-ink-faint">Shown repository names use only the recorded project-folder label; full paths stay out of the grid.</p>
+      <p class="pt-1 text-[10px] text-ink-faint">Directories inside a git repository show the repository name and the path within it. Everything else shows a shortened path, with your home folder as <code>~</code>.</p>
     </div>
   </details>
 </div>

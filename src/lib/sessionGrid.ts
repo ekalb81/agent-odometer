@@ -96,9 +96,9 @@ export function groupSessionsByRepository<T extends Pick<
     const workingDirectory = anchor.working_directory;
     const normalized = workingDirectory?.replace(/\\/g, '/').replace(/\/+$/, '') ?? '';
     const windowsStyle = Boolean(workingDirectory && (/\\/.test(workingDirectory) || /^[A-Za-z]:[\\/]/.test(workingDirectory)));
-    // The full normalized path is an internal identity only; display remains
-    // the privacy-safe final segment. Prefix missing paths to avoid collisions
-    // with a real directory whose name happens to match the fallback label.
+    // The normalized path is the grouping identity; the label is derived
+    // separately. Prefix missing paths to avoid collisions with a real
+    // directory whose name happens to match the fallback label.
     const key = workingDirectory
       ? `path:${windowsStyle ? normalized.toLowerCase() : normalized}`
       : 'missing:';

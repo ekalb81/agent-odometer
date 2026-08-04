@@ -127,9 +127,13 @@ export function sessionName(session: Pick<
   return session.id.slice(0, 8);
 }
 
-/** A privacy-preserving project label for list views. Session summaries retain
- * the working directory for local actions, but the grid never needs to expose
- * the full path: its final segment is stable for display and grouping. */
+/** The working directory's final path segment.
+ *
+ * This is a fallback, not the grid's label. A directory is only a repository
+ * if it is actually inside a working tree, and its final segment is often a
+ * fragment that identifies nothing — the grid resolves the repository through
+ * `resolve_working_directories` and falls back here only until that resolves,
+ * or if it fails. Kept because the segment is stable and allocation-free. */
 export function repositoryLabel(session: Pick<SessionSummary, 'working_directory'>): string | null {
   if (!session.working_directory) return null;
   const parts = session.working_directory.replace(/\\/g, '/').split('/').filter(Boolean);
