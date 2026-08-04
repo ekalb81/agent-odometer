@@ -2,6 +2,7 @@ use crate::config::Config;
 use crate::model::{
     Harness, RateLimitSnapshotPoint, RateLimitWindow, Session, TokenTotals, TurnInfo,
 };
+use crate::provider::{claude_code_provider_id, codex_provider_id};
 use crate::rates::{ModelRate, RateCard};
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
@@ -42,8 +43,8 @@ pub fn try_run_cli() -> bool {
         return false;
     }
     let harness = match args.next().as_deref() {
-        Some("codex") => Harness::Codex,
-        Some("claude") | Some("claude_code") => Harness::ClaudeCode,
+        Some("codex") => codex_provider_id(),
+        Some("claude") | Some("claude_code") => claude_code_provider_id(),
         _ => {
             print_hook_output(None);
             return true;
@@ -51,9 +52,14 @@ pub fn try_run_cli() -> bool {
     };
 
     let config = Config::load().unwrap_or_default();
-    let provider_enabled = match harness {
-        Harness::Codex => config.turn_receipts_codex,
-        Harness::ClaudeCode => config.turn_receipts_claude,
+    let provider_enabled = if harness == codex_provider_id() {
+        config.turn_receipts_codex
+    } else if harness == claude_code_provider_id() {
+        config.turn_receipts_claude
+    } else {
+        // Fail safe: turn receipts have no configuration toggle for a
+        // provider outside the two builtins, so treat it as disabled.
+        false
     };
     // A stale hook after the feature is disabled must be nearly free: do not
     // read stdin, touch the transcript, or write health data.
@@ -62,7 +68,7 @@ pub fn try_run_cli() -> bool {
         return true;
     }
 
-    let result = run_hook(harness, &config);
+    let result = run_hook(harness.clone(), &config);
     match result {
         Ok(receipt) => {
             save_run_record(
@@ -129,11 +135,15 @@ fn run_hook(harness: Harness, config: &Config) -> anyhow::Result<String> {
         .as_deref()
         .map(expand_home_path)
         .ok_or_else(|| anyhow!("the harness did not provide a transcript"))?;
-    validate_transcript_path(&transcript, harness, config)?;
+    validate_transcript_path(&transcript, &harness, config)?;
 
-    let session = match harness {
-        Harness::Codex => crate::parser::parse_file(&transcript, false),
-        Harness::ClaudeCode => crate::claude_parser::parse_file(&transcript),
+    let session = if harness == codex_provider_id() {
+        crate::parser::parse_file(&transcript, false)
+    } else if harness == claude_code_provider_id() {
+        crate::claude_parser::parse_file(&transcript)
+    } else {
+        // Fail safe: parsing dispatch has no route for an unknown provider.
+        Err(anyhow!("unsupported provider for turn receipts"))
     }
     .context("the transcript could not be parsed")?
     .ok_or_else(|| anyhow!("the transcript did not contain a session"))?;
@@ -173,7 +183,7 @@ fn expand_home_path(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn validate_transcript_path(path: &Path, harness: Harness, config: &Config) -> anyhow::Result<()> {
+fn validate_transcript_path(path: &Path, harness: &Harness, config: &Config) -> anyhow::Result<()> {
     if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
         return Err(anyhow!("the transcript was not a JSONL file"));
     }
@@ -183,13 +193,18 @@ fn validate_transcript_path(path: &Path, harness: Harness, config: &Config) -> a
     if !canonical.is_file() {
         return Err(anyhow!("the transcript path was not a file"));
     }
-    let allowed_roots: Vec<&PathBuf> = match harness {
-        Harness::Codex => config
+    let allowed_roots: Vec<&PathBuf> = if *harness == codex_provider_id() {
+        config
             .session_roots
             .iter()
             .chain(config.archive_roots.iter())
-            .collect(),
-        Harness::ClaudeCode => config.claude_session_roots.iter().collect(),
+            .collect()
+    } else if *harness == claude_code_provider_id() {
+        config.claude_session_roots.iter().collect()
+    } else {
+        // Fail safe: no roots are trusted for a provider without dedicated
+        // hook wiring, so the path check below rejects the transcript.
+        Vec::new()
     };
     let allowed = allowed_roots.iter().any(|root| {
         root.canonicalize()
@@ -207,7 +222,7 @@ pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> St
         &turn.tokens,
         turn_model,
         turn.service_tier.as_deref(),
-        session.harness,
+        &session.harness,
         rates,
         false,
     );
@@ -215,7 +230,7 @@ pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> St
         &turn.tokens,
         turn_model,
         turn.service_tier.as_deref(),
-        session.harness,
+        &session.harness,
         rates,
         true,
     );
@@ -227,32 +242,38 @@ pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> St
         turn.index,
         format_tokens(turn.tokens.total_tokens)
     );
-    match session.harness {
-        Harness::Codex => {
-            first.push_str(&format_optional_amount(turn_plan, "credits", false));
-            first.push_str(&format_optional_amount(turn_api, "API", true));
-        }
-        Harness::ClaudeCode => {
-            first.push_str(&format_optional_amount(turn_plan, "API", true));
-        }
+    if session.harness == codex_provider_id() {
+        first.push_str(&format_optional_amount(turn_plan, "credits", false));
+        first.push_str(&format_optional_amount(turn_api, "API", true));
+    } else if session.harness == claude_code_provider_id() {
+        first.push_str(&format_optional_amount(turn_plan, "API", true));
+    } else {
+        // Neutral fallback: no plan/credits pricing concept exists outside
+        // Codex, so treat an unknown provider the same as Claude Code.
+        first.push_str(&format_optional_amount(turn_plan, "API", true));
     }
 
     let mut lines = vec![first];
     if let Some(quota) = quota_receipt(session, turn) {
         lines.push(format!("Quota · {quota}"));
     }
-    let session_line = match session.harness {
-        Harness::Codex => format!(
+    let session_line = if session.harness == codex_provider_id() {
+        format!(
             "Session{}{}",
             format_session_amount(&session_plan, "credits", false),
             format_session_amount(&session_api, "API", true)
-        ),
-        Harness::ClaudeCode => {
-            format!(
-                "Session{}",
-                format_session_amount(&session_plan, "API", true)
-            )
-        }
+        )
+    } else if session.harness == claude_code_provider_id() {
+        format!(
+            "Session{}",
+            format_session_amount(&session_plan, "API", true)
+        )
+    } else {
+        // Neutral fallback: same generic "API"-only shape as Claude Code.
+        format!(
+            "Session{}",
+            format_session_amount(&session_plan, "API", true)
+        )
     };
     lines.push(session_line);
     lines.join("\n")
@@ -273,7 +294,7 @@ fn price_session(session: &Session, rates: &RateCard, api_table: bool) -> Sessio
             &bucket.tokens,
             Some(&bucket.model),
             bucket.service_tier.as_deref(),
-            session.harness,
+            &session.harness,
             rates,
             api_table,
         ) {
@@ -293,7 +314,7 @@ fn price_tokens(
     tokens: &TokenTotals,
     model: Option<&str>,
     service_tier: Option<&str>,
-    harness: Harness,
+    harness: &Harness,
     rates: &RateCard,
     api_table: bool,
 ) -> Option<f64> {
@@ -301,7 +322,7 @@ fn price_tokens(
         return None;
     }
     let table = if api_table {
-        if harness != Harness::Codex || rates.api_models.is_empty() {
+        if *harness != codex_provider_id() || rates.api_models.is_empty() {
             return None;
         }
         &rates.api_models
@@ -310,7 +331,7 @@ fn price_tokens(
     };
     let fallback = rates
         .fallback_models
-        .get(harness_key(harness))
+        .get(harness.as_str())
         .unwrap_or(&rates.fallback_model);
     let rate = model
         .and_then(|model| table.get(model))
@@ -323,14 +344,19 @@ fn price_tokens(
 }
 
 fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f64 {
+    // Cached-read and cache-creation are both disjoint subsets of
+    // input_tokens; both must be subtracted before pricing the remainder at
+    // the plain input rate, and neither subset may be priced twice.
     let non_cached_input = tokens
         .input_tokens
-        .saturating_sub(tokens.cached_input_tokens);
+        .saturating_sub(tokens.cached_input_tokens)
+        .saturating_sub(tokens.cache_creation_input_tokens);
     let non_reasoning_output = tokens
         .output_tokens
         .saturating_sub(tokens.reasoning_output_tokens);
     ((non_cached_input as f64 * rate.input)
         + (tokens.cached_input_tokens as f64 * rate.cached_input)
+        + (tokens.cache_creation_input_tokens as f64 * rate.cache_creation_rate())
         + (non_reasoning_output as f64 * rate.output)
         + (tokens.reasoning_output_tokens as f64 * rate.reasoning))
         / 1_000_000.0
@@ -345,13 +371,6 @@ fn service_tier_multiplier(model: Option<&str>, service_tier: Option<&str>) -> f
         Some("gpt-5.5") => 2.5,
         Some("gpt-5.4") => 2.0,
         _ => 1.0,
-    }
-}
-
-fn harness_key(harness: Harness) -> &'static str {
-    match harness {
-        Harness::Codex => "codex",
-        Harness::ClaudeCode => "claude_code",
     }
 }
 
@@ -538,12 +557,16 @@ fn run_status_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|dir| dir.join("agent-odometer"))
 }
 
-fn run_status_path(dir: &Path, harness: Harness) -> PathBuf {
-    let name = match harness {
-        Harness::Codex => "turn-receipt-status-codex.json",
-        Harness::ClaudeCode => "turn-receipt-status-claude-code.json",
-    };
-    dir.join(name)
+fn run_status_path(dir: &Path, harness: &Harness) -> PathBuf {
+    if *harness == codex_provider_id() {
+        dir.join("turn-receipt-status-codex.json")
+    } else if *harness == claude_code_provider_id() {
+        dir.join("turn-receipt-status-claude-code.json")
+    } else {
+        // Neutral fallback: derive a per-provider file name from its id so a
+        // future provider gets an independent, collision-free status file.
+        dir.join(format!("turn-receipt-status-{}.json", harness.as_str()))
+    }
 }
 
 fn save_run_record(harness: Harness, record: HookRunRecord) {
@@ -554,7 +577,7 @@ fn save_run_record(harness: Harness, record: HookRunRecord) {
 }
 
 fn save_run_record_in_dir(dir: &Path, harness: Harness, record: &HookRunRecord) {
-    let path = run_status_path(dir, harness);
+    let path = run_status_path(dir, &harness);
     let Ok(bytes) = serde_json::to_vec_pretty(record) else {
         return;
     };
@@ -580,7 +603,7 @@ pub fn load_run_record(harness: Harness) -> HookRunRecord {
 }
 
 fn load_run_record_in_dir(dir: &Path, harness: Harness) -> HookRunRecord {
-    let current = std::fs::read(run_status_path(dir, harness))
+    let current = std::fs::read(run_status_path(dir, &harness))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<HookRunRecord>(&bytes).ok());
     if let Some(record) = current {
@@ -593,9 +616,14 @@ fn load_run_record_in_dir(dir: &Path, harness: Harness) -> HookRunRecord {
         .ok()
         .and_then(|bytes| serde_json::from_slice::<HookRunStatusFile>(&bytes).ok())
         .unwrap_or_default();
-    match harness {
-        Harness::Codex => legacy.codex,
-        Harness::ClaudeCode => legacy.claude_code,
+    if harness == codex_provider_id() {
+        legacy.codex
+    } else if harness == claude_code_provider_id() {
+        legacy.claude_code
+    } else {
+        // Neutral fallback: no legacy (pre-v0.6.0) status file entry existed
+        // for a provider beyond the two builtins.
+        HookRunRecord::default()
     }
 }
 
@@ -609,6 +637,7 @@ mod tests {
         ModelRate {
             input: value,
             cached_input: value,
+            cache_creation_input: Some(value),
             output: value,
             reasoning: value,
         }
@@ -620,6 +649,7 @@ mod tests {
         let tokens = TokenTotals {
             input_tokens: 100_000,
             cached_input_tokens: 80_000,
+            cache_creation_input_tokens: 0,
             output_tokens: 20_000,
             reasoning_output_tokens: 10_000,
             total_tokens: 120_000,
@@ -643,7 +673,7 @@ mod tests {
         let session = Session {
             id: "session".into(),
             storage_id: "codex:thread:session".into(),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -696,6 +726,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         };
         let rates = RateCard {
             version: 1,
@@ -710,6 +743,7 @@ mod tests {
             api_models: HashMap::from([("gpt-test".into(), rate(3.5))]),
             unpriced_models: Vec::new(),
             pricing_catalog: Default::default(),
+            ..Default::default()
         };
         (session, rates)
     }
@@ -790,11 +824,136 @@ mod tests {
                 &tokens,
                 Some("gpt-5.5"),
                 Some("fast"),
-                Harness::Codex,
+                &codex_provider_id(),
                 &rates,
                 false,
             ),
             Some(2.5)
+        );
+    }
+
+    #[test]
+    fn cache_creation_tokens_price_at_input_rate_when_no_premium_is_published() {
+        // Regression guard: a model whose ModelRate never states a
+        // cache-write premium (cache_creation_input: None) must price
+        // cache-creation tokens at the ordinary input rate, exactly as they
+        // were priced before the cache-creation dimension existed (when
+        // those tokens were still folded into plain input). Pricing them at
+        // 0 would silently bill real usage as free.
+        let mut rate_without_premium = rate(2.0);
+        rate_without_premium.cache_creation_input = None;
+        let tokens = TokenTotals {
+            input_tokens: 100_000,
+            cached_input_tokens: 10_000,
+            cache_creation_input_tokens: 20_000,
+            output_tokens: 5_000,
+            reasoning_output_tokens: 0,
+            total_tokens: 105_000,
+        };
+
+        let cost = token_cost(&tokens, &rate_without_premium, 1.0);
+
+        // Pre-#42 accounting: cache-creation tokens were indistinguishable
+        // from plain input, so the whole non-cached-read remainder
+        // (input_tokens - cached_input_tokens, which includes what is now
+        // cache_creation_input_tokens) priced at the ordinary input rate.
+        let pre_cache_creation_dimension_cost = (((tokens.input_tokens - tokens.cached_input_tokens)
+            as f64
+            * rate_without_premium.input)
+            + (tokens.cached_input_tokens as f64 * rate_without_premium.cached_input)
+            + (tokens.output_tokens as f64 * rate_without_premium.output))
+            / 1_000_000.0;
+        assert_eq!(cost, pre_cache_creation_dimension_cost);
+        assert!(rate_without_premium.cache_creation_rate_is_fallback());
+    }
+
+    /// Guard against the *next* dimension being added the same wrong way
+    /// `cache_creation_input` originally was: silently priced at zero
+    /// instead of falling back to the ordinary rate of the bucket it is a
+    /// subset of. Runs against every model actually shipped in
+    /// `src-tauri/rates.json` (not one synthetic rate), so it fails the
+    /// instant a real catalog entry regresses.
+    ///
+    /// The invariant: distinguishing a premium-or-fallback dimension
+    /// (cache-creation is a subset of input, reasoning is a subset of
+    /// output) from its parent bucket may raise a session's price (a
+    /// genuine published premium) or leave it unchanged (falls back to the
+    /// parent rate), but must never lower it. A dimension defaulting to a
+    /// zero rate is exactly the shape of that bug, because it makes the
+    /// "distinguished" total cheaper than folding it back into the parent
+    /// bucket would have priced the same tokens.
+    ///
+    /// `cached_input_tokens` (cache *reads*) is deliberately excluded from
+    /// the fold: unlike cache-creation and reasoning, a cache read is a
+    /// genuine, intentional discount below the input rate, not a
+    /// premium-or-fallback dimension, so it is not part of this invariant.
+    /// It stays distinguished — and identical — in both totals below, so it
+    /// cannot affect the comparison's direction.
+    #[test]
+    fn every_bundled_model_prices_added_dimensions_at_or_above_their_folded_cost() {
+        let rates = RateCard::load_bundled().expect("bundled rates.json must load");
+        let mut checked = 0;
+        for (model, rate) in rates.models.iter().chain(rates.api_models.iter()) {
+            let full = TokenTotals {
+                input_tokens: 1_000_000,
+                cached_input_tokens: 200_000,
+                cache_creation_input_tokens: 150_000,
+                output_tokens: 500_000,
+                reasoning_output_tokens: 100_000,
+                total_tokens: 1_500_000,
+            };
+            // Fold cache-creation and reasoning back into their parent
+            // ordinary bucket, exactly as sessions were priced before those
+            // dimensions existed. cached_input_tokens (and input_tokens /
+            // output_tokens themselves) are left untouched.
+            let folded = TokenTotals {
+                cache_creation_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                ..full.clone()
+            };
+
+            let full_cost = token_cost(&full, rate, 1.0);
+            let folded_cost = token_cost(&folded, rate, 1.0);
+            assert!(
+                full_cost >= folded_cost - 1e-9,
+                "model {model:?} prices its distinguished dimensions below folding them into \
+                 ordinary input/output ({full_cost} < {folded_cost}) — a subset dimension is \
+                 defaulting toward zero instead of falling back to its parent rate"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "rates.json produced no models to check");
+    }
+
+    /// Companion to the monotonicity guard above: for every bundled model
+    /// that has not published a cache-creation premium, cache-creation
+    /// tokens must price at exactly the ordinary input rate rather than at
+    /// zero. `cache_creation_input` is currently the only `Option<f64>`
+    /// rate field, so it is the only one this can check directly today, but
+    /// the assertion is written against the accessor
+    /// (`ModelRate::cache_creation_rate`) and real catalog data rather than
+    /// a single hard-coded rate, so it stays meaningful if more of the
+    /// catalog's fields become optional in the same way.
+    #[test]
+    fn bundled_models_without_a_published_premium_fall_back_to_the_input_rate() {
+        let rates = RateCard::load_bundled().expect("bundled rates.json must load");
+        let mut unpublished_found = false;
+        for (model, rate) in rates.models.iter().chain(rates.api_models.iter()) {
+            if rate.cache_creation_input.is_none() {
+                unpublished_found = true;
+                assert_eq!(
+                    rate.cache_creation_rate(),
+                    rate.input,
+                    "model {model:?} has no published cache-creation premium and must fall back \
+                     to its input rate, not zero"
+                );
+                assert!(rate.cache_creation_rate_is_fallback());
+            }
+        }
+        assert!(
+            unpublished_found,
+            "expected at least one bundled model without a published cache-creation premium; \
+             update this test if rates.json now publishes one for every model"
         );
     }
 
@@ -816,20 +975,20 @@ mod tests {
 
         std::thread::scope(|scope| {
             scope.spawn(|| {
-                save_run_record_in_dir(dir.path(), Harness::Codex, &codex_record);
+                save_run_record_in_dir(dir.path(), codex_provider_id(), &codex_record);
             });
             scope.spawn(|| {
-                save_run_record_in_dir(dir.path(), Harness::ClaudeCode, &claude_record);
+                save_run_record_in_dir(dir.path(), claude_code_provider_id(), &claude_record);
             });
         });
 
-        let codex = load_run_record_in_dir(dir.path(), Harness::Codex);
-        let claude = load_run_record_in_dir(dir.path(), Harness::ClaudeCode);
+        let codex = load_run_record_in_dir(dir.path(), codex_provider_id());
+        let claude = load_run_record_in_dir(dir.path(), claude_code_provider_id());
         assert_eq!(codex.last_receipt.as_deref(), Some("codex receipt"));
         assert_eq!(claude.detail.as_deref(), Some("claude detail"));
         assert_ne!(
-            run_status_path(dir.path(), Harness::Codex),
-            run_status_path(dir.path(), Harness::ClaudeCode)
+            run_status_path(dir.path(), &codex_provider_id()),
+            run_status_path(dir.path(), &claude_code_provider_id())
         );
     }
 
@@ -855,13 +1014,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            load_run_record_in_dir(dir.path(), Harness::Codex)
+            load_run_record_in_dir(dir.path(), codex_provider_id())
                 .last_receipt
                 .as_deref(),
             Some("legacy codex")
         );
         assert_eq!(
-            load_run_record_in_dir(dir.path(), Harness::ClaudeCode)
+            load_run_record_in_dir(dir.path(), claude_code_provider_id())
                 .detail
                 .as_deref(),
             Some("legacy claude")

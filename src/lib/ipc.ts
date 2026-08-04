@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, TurnReceiptIntegrationStatus } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -29,6 +29,12 @@ export function sessionsInRanges(
     ranges,
     sessionIds: sessionIds ?? null,
   });
+}
+
+/** Most-recent provider-reported subscription-usage snapshot per harness.
+ *  Omits harnesses with no rate-limit history (Claude Code transcripts, today). */
+export function getSubscriptionUsage(): Promise<SubscriptionUsageEntry[]> {
+  return invoke<SubscriptionUsageEntry[]>('get_subscription_usage');
 }
 
 export function listToolImpactTargets(
@@ -65,12 +71,64 @@ export function getScanStatus(): Promise<ScanStatus> {
 }
 
 /** Windows only: opens the UAC flow to exclude session folders from Defender scanning. */
-export function addDefenderExclusions(): Promise<void> {
-  return invoke<void>('add_defender_exclusions');
+export function addDefenderExclusions(): Promise<DefenderExclusionReceipt> {
+  return invoke<DefenderExclusionReceipt>('add_defender_exclusions');
 }
 
 export function getConfig(): Promise<Config> {
   return invoke<Config>('get_config');
+}
+
+/** Registered providers with display names and capability flags. */
+export function listProviders(): Promise<ProviderDescriptor[]> {
+  return invoke<ProviderDescriptor[]>('list_providers');
+}
+
+/** On-demand provider-registry diagnostics report (issue #39): capability
+ *  flags, roots, discovery/parse/cache counters, ledger health, pricing
+ *  coverage, retention risk, and quota status, per provider. Local paths are
+ *  included for on-screen display; redact before exporting (see
+ *  lib/diagnosticsExport.ts). Not fetched automatically on startup. */
+export function getProviderDiagnostics(): Promise<DiagnosticsReport> {
+  return invoke<DiagnosticsReport>('get_provider_diagnostics');
+}
+
+export function resolveWorkingDirectories(): Promise<WorkingDirectoryInfo[]> {
+  return invoke<WorkingDirectoryInfo[]>('resolve_working_directories');
+}
+
+/** Every resolved project (#41), after local alias/merge/split overrides —
+ *  the one map every project-scoped surface (grid label/grouping, cards,
+ *  export) joins a session's `project_key` against. Fetch-once-until-refreshed,
+ *  like `resolveWorkingDirectories`: overrides change rarely. */
+export function resolveProjects(): Promise<ProjectInfo[]> {
+  return invoke<ProjectInfo[]>('resolve_projects');
+}
+
+/** Sets (`label`) or clears (`null`) a local display-label alias for a project. */
+export function setProjectAlias(projectKey: string, displayLabel: string | null): Promise<void> {
+  return invoke<void>('set_project_alias', { projectKey, displayLabel });
+}
+
+/** Merges `sourceProjectKey` to display under `canonicalProjectKey`. Rejects a self-merge or a cycle. */
+export function mergeProjects(sourceProjectKey: string, canonicalProjectKey: string): Promise<void> {
+  return invoke<void>('merge_projects', { sourceProjectKey, canonicalProjectKey });
+}
+
+/** Reverses a previous `mergeProjects` call for `projectKey`. */
+export function unmergeProject(projectKey: string): Promise<void> {
+  return invoke<void>('unmerge_project', { projectKey });
+}
+
+/** Manually reassigns one session to `projectKey` (or, when `null`, splits it into a fresh
+ *  standalone project). Returns the effective project key applied. */
+export function reassignSessionProject(sessionKey: string, projectKey: string | null): Promise<string> {
+  return invoke<string>('reassign_session_project', { sessionKey, projectKey });
+}
+
+/** Reverses a previous `reassignSessionProject` call for `sessionKey`. */
+export function clearSessionProjectOverride(sessionKey: string): Promise<void> {
+  return invoke<void>('clear_session_project_override', { sessionKey });
 }
 
 export function setConfig(config: Config): Promise<void> {
@@ -194,6 +252,18 @@ export function onInstructionScanProgress(
   cb: (status: InstructionScanProgress) => void,
 ): Promise<UnlistenFn> {
   return listen<InstructionScanProgress>('instruction-scan-progress', (event) => cb(event.payload));
+}
+
+/** Fresh inventory from a background rescan behind a stale-while-revalidate read. */
+export function onInstructionInventoryUpdated(
+  cb: (inventory: InstructionInventory) => void,
+): Promise<UnlistenFn> {
+  return listen<InstructionInventory>('instruction-inventory-updated', (event) => cb(event.payload));
+}
+
+/** Terminal failure of a background rescan (never emitted for cancellations). */
+export function onInstructionInventoryError(cb: (error: string) => void): Promise<UnlistenFn> {
+  return listen<string>('instruction-inventory-error', (event) => cb(event.payload));
 }
 
 export function onRatesUpdated(cb: (rates: RateCard) => void): Promise<UnlistenFn> {

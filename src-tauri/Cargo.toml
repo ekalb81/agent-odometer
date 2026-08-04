@@ -1,6 +1,6 @@
 [package]
 name = "agent-odometer"
-version = "0.7.1"
+version = "0.8.5"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
@@ -20,7 +20,9 @@ tauri-build = { version = "2", features = [] }
 tauri          = { version = "2", features = ["tray-icon"] }
 serde          = { version = "1", features = ["derive"] }
 serde_json     = "1"
+toml_edit      = "0.25"
 chrono         = { version = "0.4", features = ["serde"] }
+base64         = "0.22"
 notify         = "8"
 notify-debouncer-full = "0.7"   # pairs with notify 8.x
 dashmap        = "6"
@@ -33,12 +35,19 @@ rayon          = "1"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
-gix = { version = "0.63", default-features = false }
+gix = { version = "0.86", default-features = false, features = ["sha1"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 tauri-plugin-opener = "2"
-
-[dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+xattr = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
 
 [profile.dev]
 incremental = true
@@ -49,3 +58,6 @@ lto           = true
 opt-level     = "s"
 panic         = "abort"
 strip         = true
+
+[dev-dependencies]
+chacha20poly1305 = "0.11.0"

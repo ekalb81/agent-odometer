@@ -1,15 +1,18 @@
 <script lang="ts">
   import { config } from '../lib/stores/config';
+  import { defenderActionStore } from '../lib/stores/defender.svelte';
   import { rates } from '../lib/stores/rates';
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
-  import { setConfig, setRates, getBundledRates, addDefenderExclusions, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations } from '../lib/ipc';
+  import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations } from '../lib/ipc';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
-  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, TurnReceiptIntegrationStatus, PricingCatalog } from '../lib/types';
+  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, HarnessIntegrationStatus, TurnReceiptIntegrationStatus, PricingCatalog } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
+  import { defenderReceiptStatus, isWindowsDefenderSurface } from '../lib/defenderStatus';
 
   const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
 
@@ -133,22 +136,22 @@
   // ---------------------------------------------------------------------------
   // Performance: Windows Defender exclusions (Windows only).
   // ---------------------------------------------------------------------------
-  const isWindows = navigator.userAgent.includes('Windows');
-  let defenderState = $state<'idle' | 'pending' | 'done'>('idle');
-  let defenderError = $state<string | null>(null);
+  const isWindows = isWindowsDefenderSurface();
+  const defenderStatus = $derived(defenderReceiptStatus($config));
+  const defenderReceipt = $derived($config.defender_exclusion_receipt);
+  const defenderVerifiedAt = $derived.by(() => {
+    if (!defenderReceipt) return null;
+    const parsed = new Date(defenderReceipt.verified_at);
+    return Number.isNaN(parsed.getTime()) ? 'an unknown time' : parsed.toLocaleString();
+  });
+  const defenderConfiguredCount = $derived(defenderReceipt?.configured_roots.length ?? 0);
+  const defenderVerifiedCount = $derived(defenderReceipt?.verified_roots.length ?? 0);
+  const defenderUnverifiedCount = $derived(
+    Math.max(0, defenderConfiguredCount - defenderVerifiedCount),
+  );
 
-  async function handleDefenderExclusions() {
-    defenderError = null;
-    defenderState = 'pending';
-    try {
-      // Resolves only after the elevated process finishes, so success here
-      // means the exclusions really were added.
-      await addDefenderExclusions();
-      defenderState = 'done';
-    } catch (e) {
-      defenderState = 'idle';
-      defenderError = String(e);
-    }
+  function handleDefenderExclusions() {
+    void defenderActionStore.request('settings').catch(() => {});
   }
 
   async function saveRoots() {
@@ -334,6 +337,47 @@
     return Number.isNaN(date.getTime()) ? value : `Last observed ${date.toLocaleString()}`;
   }
 
+  const receiptAttentionCodes = new Set([
+    'hook_cleanup_needed',
+    'hooks_disabled',
+    'hook_stale',
+    'hook_missing',
+    'hook_duplicate',
+    'receipt_failed',
+    'configuration_invalid',
+  ]);
+
+  function receiptNeedsAttention(value: HarnessIntegrationStatus): boolean {
+    return receiptAttentionCodes.has(value.diagnostic_code);
+  }
+
+  function receiptStatusLabel(value: HarnessIntegrationStatus): string {
+    if (value.receipt_observed) return 'Receipt observed';
+    if (receiptNeedsAttention(value)) return 'Needs attention';
+    if (value.configured) return 'Configured';
+    return value.requested ? 'Not configured' : 'Off';
+  }
+
+  function receiptSourceLabel(source: string): string {
+    switch (source) {
+      case 'codex_inline_toml': return 'Inline Codex config.toml';
+      case 'codex_hooks_json': return 'Codex hooks.json';
+      case 'claude_settings_json': return 'Claude Code user settings.json';
+      default: return 'Harness configuration';
+    }
+  }
+
+  function receiptNextStep(value: HarnessIntegrationStatus, harness: string): string | null {
+    const steps: string[] = [];
+    if (value.trust_review_recommended) steps.push('Review and trust the command in /hooks.');
+    if (value.restart_recommended) {
+      steps.push(harness === 'claude'
+        ? 'Start a fresh CLI or local Desktop Code task to load and verify it.'
+        : 'Start a fresh Codex task to load and verify it.');
+    }
+    return steps.length > 0 ? steps.join(' ') : null;
+  }
+
   // ---------------------------------------------------------------------------
   // Opt-in local performance measurements.
   // ---------------------------------------------------------------------------
@@ -423,6 +467,7 @@
     name: string;
     input: string;
     cached_input: string;
+    cache_creation_input: string;
     output: string;
     reasoning: string;
   }
@@ -443,11 +488,26 @@
   // Catalog rules have their own provenance and validation contract. The
   // editor does not modify them yet, so preserve the complete object verbatim.
   let pricingCatalog = $state<PricingCatalog>({ rate_periods: [], conditional_modifiers: [], notes: [] });
+  // Alias table, free/local declarations, subscription plans, display
+  // currency, and refresh bookkeeping are not editable in the base rate
+  // editor yet (#42 ships the data model and offline plumbing first); carry
+  // them through unchanged so saving the rate table never silently drops them.
+  let ratesModelAliases = $state<RateCard['model_aliases']>({});
+  let ratesFreeLocalModels = $state<string[]>([]);
+  let ratesSubscriptionPlans = $state<RateCard['subscription_plans']>({});
+  let ratesDisplayCurrency = $state<RateCard['display_currency']>(null);
+  let ratesRefresh = $state<RateCard['refresh']>({
+    last_success_at: null,
+    last_attempt_at: null,
+    last_failure_reason: null,
+    max_cache_age_secs: 604_800,
+  });
 
   // New-model form.
   let newName = $state('');
   let newInput = $state('');
   let newCachedInput = $state('');
+  let newCacheCreationInput = $state('');
   let newOutput = $state('');
   let newReasoning = $state('');
 
@@ -466,6 +526,9 @@
       name,
       input: String(rate.input),
       cached_input: String(rate.cached_input),
+      cache_creation_input: rate.cache_creation_input === null || rate.cache_creation_input === undefined
+        ? ''
+        : String(rate.cache_creation_input),
       output: String(rate.output),
       reasoning: String(rate.reasoning),
     }));
@@ -480,6 +543,16 @@
     ratesApiModels = { ...(r.api_models ?? {}) };
     ratesUnpricedModels = [...(r.unpriced_models ?? [])];
     pricingCatalog = r.pricing_catalog;
+    ratesModelAliases = { ...(r.model_aliases ?? {}) };
+    ratesFreeLocalModels = [...(r.free_local_models ?? [])];
+    ratesSubscriptionPlans = { ...(r.subscription_plans ?? {}) };
+    ratesDisplayCurrency = r.display_currency ?? null;
+    ratesRefresh = r.refresh ?? {
+      last_success_at: null,
+      last_attempt_at: null,
+      last_failure_reason: null,
+      max_cache_age_secs: 604_800,
+    };
     dirty = false;
   });
 
@@ -493,6 +566,20 @@
   function parseRate(s: string): number | null {
     const n = parseFloat(s);
     if (isNaN(n) || n < 0) return null;
+    return n;
+  }
+
+  /** The cache-write rate is the one field where blank is a valid, distinct
+   * value: it means "no published premium for this model", which prices
+   * cache-creation tokens at the ordinary input rate rather than at zero
+   * (see credits.ts cacheCreationRate). Typing `0` is a different, explicit
+   * "this is free" claim. Returns the sentinel string 'invalid' for
+   * anything else that doesn't parse as a non-negative number. */
+  function parseCacheCreationRate(s: string): number | null | 'invalid' {
+    const trimmed = s.trim();
+    if (trimmed === '') return null;
+    const n = parseFloat(trimmed);
+    if (isNaN(n) || n < 0) return 'invalid';
     return n;
   }
 
@@ -530,7 +617,18 @@
         validationError = `Rates for "${row.name}" must be non-negative numbers.`;
         return null;
       }
-      models[row.name.trim()] = { input, cached_input, output, reasoning };
+      const cacheCreationParsed = parseCacheCreationRate(row.cache_creation_input);
+      if (cacheCreationParsed === 'invalid') {
+        validationError = `Cache-write rate for "${row.name}" must be blank (unknown) or a non-negative number.`;
+        return null;
+      }
+      models[row.name.trim()] = {
+        input,
+        cached_input,
+        cache_creation_input: cacheCreationParsed,
+        output,
+        reasoning,
+      };
     }
     if (!models[fallbackModel]) {
       validationError = `Fallback model "${fallbackModel}" is not in the model list.`;
@@ -550,6 +648,11 @@
       api_models: ratesApiModels,
       unpriced_models: ratesUnpricedModels,
       pricing_catalog: pricingCatalog,
+      model_aliases: ratesModelAliases,
+      free_local_models: ratesFreeLocalModels,
+      subscription_plans: ratesSubscriptionPlans,
+      display_currency: ratesDisplayCurrency,
+      refresh: ratesRefresh,
     };
   }
 
@@ -609,19 +712,26 @@
     const output = parseRate(newOutput);
     const reasoning = parseRate(newReasoning);
     if (input === null || cached_input === null || output === null || reasoning === null) {
-      validationError = 'All rate fields must be non-negative numbers.';
+      validationError = 'Input, cached, output, and reasoning rates must be non-negative numbers.';
+      return;
+    }
+    const cacheCreationParsed = parseCacheCreationRate(newCacheCreationInput);
+    if (cacheCreationParsed === 'invalid') {
+      validationError = 'Cache-write rate must be blank (unknown) or a non-negative number.';
       return;
     }
     rows = [...rows, {
       name,
       input: String(input),
       cached_input: String(cached_input),
+      cache_creation_input: cacheCreationParsed === null ? '' : String(cacheCreationParsed),
       output: String(output),
       reasoning: String(reasoning),
     }];
     newName = '';
     newInput = '';
     newCachedInput = '';
+    newCacheCreationInput = '';
     newOutput = '';
     newReasoning = '';
     validationError = null;
@@ -998,9 +1108,13 @@
             onchange={markTurnReceiptsDirty}
             disabled={!turnReceiptsEnabled}
           />
-          Claude Code
+          Claude Code (CLI + local Desktop Code)
         </label>
       </div>
+      <p class="text-[11px] text-ink-faint pl-5">
+        Local Desktop Code sessions share Claude Code user settings. Direct setup requires Claude
+        Code 2.1.139 or later. Remote and SSH sessions use the settings on that host.
+      </p>
 
       <div class="flex items-center gap-3 flex-wrap">
         <button
@@ -1030,42 +1144,48 @@
       {#if turnReceiptStatus}
         <div class="grid grid-cols-1 md:grid-cols-2 gap-2 pt-1">
           {#each [
-            { label: 'Codex', value: turnReceiptStatus.codex },
-            { label: 'Claude Code', value: turnReceiptStatus.claude_code },
+            { label: 'Codex', harness: 'codex', value: turnReceiptStatus.codex },
+            { label: 'Claude Code', harness: 'claude', value: turnReceiptStatus.claude_code },
           ] as item}
             <div class="bg-app border border-edgerow rounded-md px-3 py-2 min-w-0">
               <div class="flex items-center justify-between gap-2">
                 <span class="text-xs font-medium text-ink">{item.label}</span>
-                <span class:text-pos={item.value.installed && item.value.requested}
-                  class:text-ink-faint={!item.value.installed || !item.value.requested}
+                <span class:text-pos={item.value.receipt_observed}
+                  class:text-red-500={receiptNeedsAttention(item.value)}
+                  class:text-amber-500={item.value.requested && item.value.configured && !item.value.receipt_observed && !receiptNeedsAttention(item.value)}
+                  class:text-ink-faint={!item.value.receipt_observed && !receiptNeedsAttention(item.value) && (!item.value.requested || !item.value.configured)}
                   class="text-[11px]">
-                  {item.value.installed ? 'Hook installed' : 'No hook installed'}
+                  {receiptStatusLabel(item.value)}
                 </span>
               </div>
               <p class="text-[11px] text-ink-faint mt-1">{item.value.detail}</p>
-              <p class="text-[11px] text-ink-faint mt-1 font-mono break-all">{item.value.config_path}</p>
+              <p class="text-[11px] text-ink-muted mt-1">{receiptSourceLabel(item.value.config_source)}</p>
+              <p class="text-[11px] text-ink-faint font-mono break-all">{item.value.config_path}</p>
+              {#if receiptNextStep(item.value, item.harness)}
+                <p class="text-[11px] text-amber-500 mt-1">{receiptNextStep(item.value, item.harness)}</p>
+              {/if}
               <p class="text-[11px] mt-2"
-                class:text-pos={item.value.last_run_success === true}
-                class:text-red-500={item.value.last_run_success === false}
-                class:text-ink-faint={item.value.last_run_success === null}>
+                class:text-pos={item.value.receipt_observed}
+                class:text-red-500={item.value.diagnostic_code === 'receipt_failed'}
+                class:text-ink-faint={!item.value.receipt_observed && item.value.diagnostic_code !== 'receipt_failed'}>
                 {formatHookRun(item.value.last_run_at)}
               </p>
               {#if item.value.last_run_detail}
-                <p class="text-[11px] text-red-500 mt-1">{item.value.last_run_detail}</p>
+                <p class="text-[11px] mt-1"
+                  class:text-red-500={item.value.diagnostic_code === 'receipt_failed'}
+                  class:text-ink-faint={item.value.diagnostic_code !== 'receipt_failed'}>
+                  {item.value.last_run_detail}
+                </p>
               {/if}
               {#if item.value.last_receipt}
+                <p class="text-[10px] uppercase tracking-wide text-ink-faint mt-1">
+                  {item.value.receipt_observed ? 'Latest observed receipt' : 'Previous stored receipt'}
+                </p>
                 <pre class="text-[11px] text-ink-2 whitespace-pre-wrap mt-1 font-mono">{item.value.last_receipt}</pre>
               {/if}
             </div>
           {/each}
         </div>
-        {#if turnReceiptStatus.enabled && turnReceiptStatus.codex.requested}
-          <p class="text-[11px] text-ink-faint">
-            Codex requires explicit trust for new or changed command hooks. Open
-            <span class="font-mono">/hooks</span> in Codex after setup. Start a new task if the
-            current harness session does not reload configuration automatically.
-          </p>
-        {/if}
       {:else}
          <p class="text-[11px] text-ink-faint">Status is available in the installed desktop app.</p>
        {/if}
@@ -1157,23 +1277,44 @@
         load of a large history. You can exclude the watched session folders above from Defender's
         real-time scanning. Trade-off: files in those folders are no longer scanned for threats —
         they normally contain only text session logs written by Codex and Claude Code. Windows will
-        ask for administrator approval.
+        ask for administrator approval. Odometer verifies the effective exclusion immediately after
+        the change; Windows or device policy can change it later.
       </p>
       <div class="flex items-center gap-3 flex-wrap">
         <button
           onclick={handleDefenderExclusions}
-          disabled={defenderState === 'pending'}
+          disabled={defenderActionStore.phase === 'pending'}
           class="px-3 py-1.5 text-xs font-medium rounded-sm bg-card border border-edge hover:bg-(--row-hover) text-ink transition-colors disabled:opacity-50"
         >
-          Exclude session folders from Defender…
+          {defenderStatus === 'never_requested'
+            ? 'Exclude session folders from Defender…'
+            : defenderStatus === 'stale'
+              ? 'Update Defender exclusions…'
+              : 'Reapply Defender exclusions…'}
         </button>
-        {#if defenderState === 'pending'}
-          <span class="text-xs text-ink-muted">Waiting for approval in the Windows security prompt…</span>
-        {:else if defenderState === 'done'}
-          <span class="text-xs text-pos">Done — the session folders are excluded from real-time scanning.</span>
+        {#if defenderActionStore.phase === 'pending'}
+          <span class="text-xs text-ink-muted" role="status" aria-live="polite">
+            Waiting for approval and Windows Defender verification…
+          </span>
+        {:else if defenderStatus === 'current' && defenderVerifiedAt}
+          <span class="text-xs text-pos" role="status">
+            Last verified {defenderVerifiedAt} for {defenderVerifiedCount}
+            {defenderVerifiedCount === 1 ? 'session folder' : 'session folders'}.
+          </span>
+        {:else if defenderStatus === 'partial' && defenderVerifiedAt}
+          <span class="text-xs text-amber-500" role="status">
+            Verified {defenderVerifiedCount} existing
+            {defenderVerifiedCount === 1 ? 'folder' : 'folders'} {defenderVerifiedAt};
+            {defenderUnverifiedCount} configured
+            {defenderUnverifiedCount === 1 ? 'folder was' : 'folders were'} not present and could not be verified.
+          </span>
+        {:else if defenderStatus === 'stale' && defenderVerifiedAt}
+          <span class="text-xs text-amber-500" role="status">
+            Session folders changed since the last verification at {defenderVerifiedAt}. Reapply to verify the current folders.
+          </span>
         {/if}
-        {#if defenderError}
-          <span class="text-xs text-red-500">{defenderError}</span>
+        {#if defenderActionStore.phase === 'error'}
+          <span class="text-xs text-red-500" role="alert">{defenderActionStore.error}</span>
         {/if}
       </div>
     </section>
@@ -1251,6 +1392,7 @@
               <th class="text-left px-3 py-2 text-ink-muted font-medium">Model</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Input $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Cached $/1M</th>
+              <th class="text-right px-3 py-2 text-ink-muted font-medium" title="Cache-creation (write) rate — a distinct dimension from Cached (read), never double-counted with it. Leave blank if no premium is published: cache-write tokens then price at the Input rate, not free. Enter 0 only if this model's cache writes are genuinely free.">Cache write $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Output $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Reasoning $/1M</th>
               <th class="px-3 py-2"></th>
@@ -1278,6 +1420,17 @@
                     bind:value={row.cached_input}
                     oninput={markDirty}
                     class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
+                  />
+                </td>
+                <td class="px-3 py-1.5">
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.001"
+                    placeholder="unknown"
+                    bind:value={row.cache_creation_input}
+                    oninput={markDirty}
+                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -1344,6 +1497,16 @@
                   step="0.001"
                   placeholder="0"
                   bind:value={newCachedInput}
+                  class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
+                />
+              </td>
+              <td class="px-3 py-1.5">
+                <input
+                  type="number"
+                  min="0"
+                  step="0.001"
+                  placeholder="unknown"
+                  bind:value={newCacheCreationInput}
                   class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                 />
               </td>
@@ -1430,5 +1593,7 @@
       <p class="text-xs text-ink-faint italic">Loading…</p>
     </section>
   {/if}
+
+  <DiagnosticsPanel />
 
 </div>

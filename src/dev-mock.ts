@@ -5,12 +5,17 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } from './dev-mock/visualScenario';
 import type {
+  DiagnosticsReport,
+  Harness,
+  ProviderDiagnostic,
   RangeTotals,
   RateCard,
   Session,
   SessionSummary,
+  SubscriptionUsageEntry,
   TierBucket,
   TokenTotals,
+  TurnReceiptIntegrationStatus,
   TurnInfo,
   ToolMetrics,
 } from './lib/types';
@@ -28,14 +33,24 @@ if (visualScenarioSelection.warning) console.warn(visualScenarioSelection.warnin
 // allowing query parameters to change native application behaviour.
 document.documentElement.dataset.visualScenario = visualScenario;
 
-function tok(total: number): TokenTotals {
+// Codex does not report a cache-creation ("cache write") token category at
+// all (see the bundled rates.json _note) — the parser can never produce a
+// nonzero cache_creation_input_tokens for a codex session. A shared
+// generator that gave every session cache-creation tokens regardless of
+// harness was asserting something the real parser cannot produce, and it is
+// exactly what let a Codex pricing regression hide inside what looked like
+// "the new Claude cache-write premium" in a visual diff. Every caller must
+// pass the session's harness explicitly — there is no default.
+function tok(total: number, harness: Harness): TokenTotals {
   const input = Math.round(total * 0.62);
   const cached = Math.round(total * 0.24);
+  const cacheCreation = harness === 'codex' ? 0 : Math.round(total * 0.08);
   const output = total - input;
   const reasoning = Math.round(output * 0.3);
   return {
     input_tokens: input,
     cached_input_tokens: cached,
+    cache_creation_input_tokens: cacheCreation,
     output_tokens: output,
     reasoning_output_tokens: reasoning,
     total_tokens: total,
@@ -46,6 +61,7 @@ function scaleTok(t: TokenTotals, f: number): TokenTotals {
   return {
     input_tokens: Math.round(t.input_tokens * f),
     cached_input_tokens: Math.round(t.cached_input_tokens * f),
+    cache_creation_input_tokens: Math.round(t.cache_creation_input_tokens * f),
     output_tokens: Math.round(t.output_tokens * f),
     reasoning_output_tokens: Math.round(t.reasoning_output_tokens * f),
     total_tokens: Math.round(t.total_tokens * f),
@@ -147,7 +163,7 @@ function fixtureModel(f: Fixture): string {
 }
 
 function buckets(f: Fixture): TierBucket[] {
-  return [{ model: fixtureModel(f), service_tier: null, tokens: tok(f.total) }];
+  return [{ model: fixtureModel(f), service_tier: null, tokens: tok(f.total, f.harness) }];
 }
 
 function summary(f: Fixture): SessionSummary {
@@ -167,6 +183,11 @@ function summary(f: Fixture): SessionSummary {
     started_at: f.started,
     last_event_at: new Date(new Date(f.started).getTime() + f.hoursActive * 3_600_000).toISOString(),
     working_directory: '/home/dev/projects/demo',
+    // Every fixture shares one working directory, so they resolve to one
+    // project — matches the 'resolve_projects' mock handler below.
+    project_key: 'repo:demo-fixture',
+    project_label: 'demo',
+    project_provenance: 'repository_root',
     originator: f.harness === 'codex' ? 'chatgpt' : 'cli',
     source: f.parent ? 'subagent' : null,
     cli_version: '1.4.2',
@@ -179,11 +200,11 @@ function summary(f: Fixture): SessionSummary {
     context_window: f.harness === 'codex' ? 272_000 : 200_000,
     total_turns: f.turns,
     first_user_message: `${f.name} — please take a look.`,
-    tokens_total: tok(f.total),
+    tokens_total: tok(f.total, f.harness),
     buckets: buckets(f),
     tool_metrics: toolMetrics(f.turns * 3),
     tool_metrics_by_model: { [model]: toolMetrics(f.turns * 3) },
-    category_totals: { coding: { turns: f.turns, tokens: tok(f.total), tool_calls: f.turns * 3, buckets: buckets(f) } },
+    category_totals: { coding: { turns: f.turns, tokens: tok(f.total, f.harness), tool_calls: f.turns * 3, buckets: buckets(f) } },
     optimization_findings_count: 0,
     optimization_summary: { findings: 0, warnings: 0, likely_avoidable_calls: 0, by_rule: {} },
   };
@@ -221,7 +242,7 @@ function details(f: Fixture): Session {
       time_to_first_token_ms: 1800,
       user_message: TURN_PROMPTS[i % TURN_PROMPTS.length],
       last_agent_message: 'Done — summarized in the diff above.',
-      tokens: tok(Math.round(perTurn * jitter)),
+      tokens: tok(Math.round(perTurn * jitter), f.harness),
       tool_metrics: toolMetrics(3),
       classification: { version: 1, category: 'coding', confidence: 0.8, signals: ['fixture'] },
     };
@@ -245,7 +266,7 @@ function details(f: Fixture): Session {
     memory_mode: null,
     model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
     latest_context_tokens: Math.round((s.context_window ?? 200_000) * 0.54),
-    tokens_by_model: { [model]: tok(f.total) },
+    tokens_by_model: { [model]: tok(f.total, f.harness) },
     tokens_history: history,
     rate_limits_history: [],
     turns,
@@ -261,27 +282,58 @@ const RATES: RateCard = {
   source_url: 'https://example.invalid/rates',
   fetched_at: new Date(now - 2 * DAY).toISOString(),
   models: {
-    'gpt-5.6-sol': { input: 1.1, cached_input: 0.11, output: 8.8, reasoning: 8.8 },
-    'gpt-5.6-terra': { input: 0.5, cached_input: 0.05, output: 4, reasoning: 4 },
-    'gpt-5.6-luna': { input: 0.15, cached_input: 0.015, output: 1.2, reasoning: 1.2 },
-    'gpt-5.5': { input: 0.8, cached_input: 0.08, output: 6.4, reasoning: 6.4 },
-    'claude-opus-4-8': { input: 3.2, cached_input: 0.32, output: 16, reasoning: 16 },
-    'claude-fable-5': { input: 2.4, cached_input: 0.24, output: 12, reasoning: 12 },
-    'claude-sonnet-5': { input: 1.2, cached_input: 0.12, output: 6, reasoning: 6 },
-    'claude-haiku-4-5': { input: 0.35, cached_input: 0.035, output: 1.75, reasoning: 1.75 },
+    // Codex has no published cache-write premium (it never reports the
+    // dimension at all) -- cache_creation_input stays null (absent), not 0.
+    // null means "price at the ordinary input rate", not "free"; see
+    // credits.ts cacheCreationRate.
+    'gpt-5.6-sol': { input: 1.1, cached_input: 0.11, cache_creation_input: null, output: 8.8, reasoning: 8.8 },
+    'gpt-5.6-terra': { input: 0.5, cached_input: 0.05, cache_creation_input: null, output: 4, reasoning: 4 },
+    'gpt-5.6-luna': { input: 0.15, cached_input: 0.015, cache_creation_input: null, output: 1.2, reasoning: 1.2 },
+    'gpt-5.5': { input: 0.8, cached_input: 0.08, cache_creation_input: null, output: 6.4, reasoning: 6.4 },
+    'claude-opus-4-8': { input: 3.2, cached_input: 0.32, cache_creation_input: 4, output: 16, reasoning: 16 },
+    'claude-fable-5': { input: 2.4, cached_input: 0.24, cache_creation_input: 3, output: 12, reasoning: 12 },
+    'claude-sonnet-5': { input: 1.2, cached_input: 0.12, cache_creation_input: 1.5, output: 6, reasoning: 6 },
+    'claude-haiku-4-5': { input: 0.35, cached_input: 0.035, cache_creation_input: 0.4375, output: 1.75, reasoning: 1.75 },
   },
   fallback_model: 'gpt-5.6-sol',
   currencies: { codex: 'credits', claude_code: 'USD' },
   fallback_models: { codex: 'gpt-5.6-sol', claude_code: 'claude-sonnet-5' },
   api_models: {
-    'gpt-5.6-sol': { input: 1.25, cached_input: 0.125, output: 10, reasoning: 10 },
-    'gpt-5.6-terra': { input: 0.6, cached_input: 0.06, output: 4.8, reasoning: 4.8 },
-    'gpt-5.6-luna': { input: 0.18, cached_input: 0.018, output: 1.44, reasoning: 1.44 },
-    'gpt-5.5': { input: 1, cached_input: 0.1, output: 8, reasoning: 8 },
+    'gpt-5.6-sol': { input: 1.25, cached_input: 0.125, cache_creation_input: null, output: 10, reasoning: 10 },
+    'gpt-5.6-terra': { input: 0.6, cached_input: 0.06, cache_creation_input: null, output: 4.8, reasoning: 4.8 },
+    'gpt-5.6-luna': { input: 0.18, cached_input: 0.018, cache_creation_input: null, output: 1.44, reasoning: 1.44 },
+    'gpt-5.5': { input: 1, cached_input: 0.1, cache_creation_input: null, output: 8, reasoning: 8 },
   },
   unpriced_models: ['gpt-5.3-codex-spark'],
   pricing_catalog: { rate_periods: [], conditional_modifiers: [], notes: [] },
+  model_aliases: {},
+  free_local_models: [],
+  subscription_plans: {},
+  display_currency: null,
+  refresh: { last_success_at: null, last_attempt_at: null, last_failure_reason: null, max_cache_age_secs: 604_800 },
 };
+
+function subscriptionUsage(): SubscriptionUsageEntry[] {
+  return [
+    {
+      harness: 'codex',
+      captured_at: new Date(now - 3 * 60_000).toISOString(),
+      plan_type: 'pro',
+      credits_unlimited: null,
+      credits_balance: null,
+      primary: {
+        used_percent: 63,
+        window_minutes: 300,
+        resets_at: new Date(now + 2 * 3_600_000 + 12 * 60_000).toISOString(),
+      },
+      secondary: {
+        used_percent: 22,
+        window_minutes: 10_080,
+        resets_at: new Date(now + 4 * DAY).toISOString(),
+      },
+    },
+  ];
+}
 
 function rangeTotals(
   from: string | null,
@@ -302,7 +354,7 @@ function rangeTotals(
     const overlap = Math.min(sEnd, toMs) - Math.max(sStart, fromMs);
     const fraction = Math.max(0, Math.min(1, overlap / Math.max(1, sEnd - sStart)));
     out[s.storage_id] = {
-      tokens: scaleTok(tok(f.total), fraction),
+      tokens: scaleTok(tok(f.total, f.harness), fraction),
       buckets: buckets(f).map((b) => ({ ...b, tokens: scaleTok(b.tokens, fraction) })),
       tool_metrics: toolMetrics(Math.round(f.turns * 3 * fraction)),
       tool_metrics_by_model: { [fixtureModel(f)]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
@@ -321,13 +373,104 @@ function visibleFixtures(): Fixture[] {
 
 function scanStatus() {
   if (visualScenario === 'sessions-scanning') {
-    return { done: 3, total: 12, complete: false, elapsed_ms: null };
+    return { done: 3, total: 12, complete: false, elapsed_ms: null, cold_reason: null };
   }
   if (visualScenario === 'defender-slow' || visualScenario === 'defender-error') {
-    return { done: FIXTURES.length, total: FIXTURES.length, complete: true, elapsed_ms: 31_000 };
+    return {
+      done: FIXTURES.length,
+      total: FIXTURES.length,
+      complete: true,
+      elapsed_ms: 31_000,
+      cold_reason: null,
+    };
   }
   const sessions = visibleFixtures();
-  return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240 };
+  return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240, cold_reason: null };
+}
+
+function turnReceiptStatus(): TurnReceiptIntegrationStatus {
+  return {
+    enabled: false,
+    executable_path: '/opt/odometer/odometer',
+    codex: {
+      requested: false,
+      configured: false,
+      receipt_observed: false,
+      config_source: 'codex_hooks_json',
+      config_path: '/home/dev/.codex/hooks.json',
+      diagnostic_code: 'hook_not_requested',
+      detail: 'Off. Harness configuration is unchanged.',
+      restart_recommended: false,
+      trust_review_recommended: false,
+      last_run_at: null,
+      last_run_success: null,
+      last_receipt: null,
+      last_run_detail: null,
+    },
+    claude_code: {
+      requested: false,
+      configured: false,
+      receipt_observed: false,
+      config_source: 'claude_settings_json',
+      config_path: '/home/dev/.claude/settings.json',
+      diagnostic_code: 'hook_not_requested',
+      detail: 'Off. Harness configuration is unchanged.',
+      restart_recommended: false,
+      trust_review_recommended: false,
+      last_run_at: null,
+      last_run_success: null,
+      last_receipt: null,
+      last_run_detail: null,
+    },
+  };
+}
+
+function providerDiagnostics(): DiagnosticsReport {
+  const generatedAt = new Date(now).toISOString();
+  const healthy: ProviderDiagnostic = {
+    id: 'codex',
+    display_name: 'Codex',
+    registered: true,
+    state: 'ready',
+    reasons: [],
+    notices: [{ code: 'healthy', message: 'No issues detected for this provider.' }],
+    capabilities: { archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true },
+    roots: [
+      { kind: 'live', path: '/home/dev/.codex/sessions', exists: true, is_default: true },
+      { kind: 'archive', path: '/home/dev/.codex/archived_sessions', exists: true, is_default: true },
+      { kind: 'session_index', path: '/home/dev/.codex/session_index.jsonl', exists: true, is_default: true },
+    ],
+    discovery: { discovered_files: 42, parsed_files: 42, skipped_files: 0, parse_failures: 0, cache_hits: 39, cache_misses: 3 },
+    ledger: { history_store_available: true, durable_sessions: 42, available_sessions: 42, collision_sessions: 0 },
+    pricing: { models_observed: 3, models_priced: 3, unpriced_models_used: [], fallback_models_used: [], fallback_used: false, rates_fetched_at: generatedAt, rates_stale: false },
+    retention: { level: 'none', supports_archive: true, archive_roots_configured: 1 },
+    quota: { status: 'not_available', reason_code: 'quota_source_not_implemented', message: 'Odometer does not read a live quota or rate-limit API for this provider yet.' },
+  };
+  const degraded: ProviderDiagnostic = {
+    id: 'claude_code',
+    display_name: 'Claude Code',
+    registered: true,
+    state: 'degraded',
+    reasons: [
+      { code: 'parse_failures_detected', message: 'The most recent scan could not parse one or more files for this provider.' },
+      { code: 'pricing_fallback_used', message: 'One or more models used by this provider have no published rate and are estimated with the configured fallback rate.' },
+    ],
+    notices: [],
+    capabilities: { archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false },
+    roots: [{ kind: 'live', path: '/home/dev/.claude/projects', exists: true, is_default: true }],
+    discovery: { discovered_files: 18, parsed_files: 18, skipped_files: 1, parse_failures: 2, cache_hits: 16, cache_misses: 2 },
+    ledger: { history_store_available: true, durable_sessions: 16, available_sessions: 16, collision_sessions: 0 },
+    pricing: { models_observed: 2, models_priced: 1, unpriced_models_used: [], fallback_models_used: ['claude-preview'], fallback_used: true, rates_fetched_at: generatedAt, rates_stale: false },
+    retention: { level: 'moderate', supports_archive: false, archive_roots_configured: 0 },
+    quota: { status: 'not_available', reason_code: 'quota_source_not_implemented', message: 'Odometer does not read a live quota or rate-limit API for this provider yet.' },
+  };
+  return {
+    generated_at: generatedAt,
+    source_configuration_valid: true,
+    cache_cold_reason: null,
+    last_scan_at: generatedAt,
+    providers: [healthy, degraded],
+  };
 }
 
 function emptyInstructionInventory() {
@@ -339,6 +482,7 @@ function emptyInstructionInventory() {
     entries_visited: 0,
     elapsed_ms: 0,
     scanned_at: new Date(now).toISOString(),
+    stale: false,
   };
 }
 
@@ -376,6 +520,52 @@ mockIPC((cmd, payload) => {
       const f = visibleFixtures().find((x) => summary(x).storage_id === sessionId);
       return f ? details(f) : null;
     }
+    case 'get_subscription_usage':
+      return subscriptionUsage();
+    case 'resolve_working_directories':
+      // Matches the fixture sessions' working directory, so the grid renders
+      // the resolved repository rather than its unresolved path fallback.
+      return [
+        {
+          directory: '/home/dev/projects/demo',
+          repository_name: 'demo',
+          relative_path: '',
+          display_path: '~/projects/demo',
+        },
+        {
+          directory: '/home/dev/Documents/Codex/2026-08-04/ser',
+          repository_name: null,
+          relative_path: null,
+          display_path: '…/Codex/2026-08-04/ser',
+        },
+      ];
+    case 'resolve_projects':
+      return [
+        {
+          project_key: 'repo:demo-fixture',
+          label: 'demo',
+          provenance: 'repository_root',
+          member_keys: ['repo:demo-fixture'],
+          session_count: visibleFixtures().length,
+        },
+      ];
+    case 'set_project_alias':
+    case 'merge_projects':
+    case 'unmerge_project':
+    case 'clear_session_project_override':
+      return null;
+    case 'reassign_session_project':
+      return 'repo:demo-fixture';
+    case 'list_providers':
+      // Kept to the two shipped-and-visually-baselined providers; Gemini CLI
+      // is registered but intentionally left out of this dev fixture so it
+      // does not shift tab counts in the Playwright visual suite.
+      return [
+        { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true },
+        { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false },
+      ];
+    case 'get_provider_diagnostics':
+      return providerDiagnostics();
     case 'sessions_in_ranges': {
       const { ranges, sessionIds } = payload as {
         ranges: { from: string | null; to: string | null }[];
@@ -403,7 +593,11 @@ mockIPC((cmd, payload) => {
         total_duration_ms: duration * turns,
         ttft_sample_count: 0,
         total_ttft_ms: 0,
-        tokens: tok(tokens * turns),
+        // Synthetic cohort data, not tied to a specific session/model
+        // (buckets stays empty below), so cache-creation harness-awareness
+        // doesn't matter for pricing here — 'claude_code' is an arbitrary
+        // but harmless choice.
+        tokens: tok(tokens * turns, 'claude_code'),
         buckets: [],
         tool_metrics: toolMetrics(calls * turns),
       });
@@ -422,12 +616,31 @@ mockIPC((cmd, payload) => {
       return scanStatus();
     case 'get_performance_status':
       return { enabled: false, max_log_mb: 64, stored_bytes: 0, recorded_this_run: 0, dropped_this_run: 0 };
+    case 'get_turn_receipt_status':
+    case 'repair_turn_receipt_integrations':
+      return turnReceiptStatus();
     case 'get_config':
+      // Mirrors the backend's normalized shape: versioned provider map with
+      // the legacy flat fields as its builtin mirror.
       return {
+        config_version: 1,
+        providers: {
+          codex: {
+            live_roots: ['/home/dev/.codex/sessions'],
+            archive_roots: ['/home/dev/.codex/archived_sessions'],
+            session_index_path: '/home/dev/.codex/session_index.jsonl',
+          },
+          claude_code: {
+            live_roots: ['/home/dev/.claude/projects'],
+            archive_roots: [],
+            session_index_path: null,
+          },
+        },
         session_roots: ['/home/dev/.codex/sessions'],
         archive_roots: ['/home/dev/.codex/archived_sessions'],
         session_index_path: '/home/dev/.codex/session_index.jsonl',
         claude_session_roots: ['/home/dev/.claude/projects'],
+        defender_exclusion_receipt: null,
         performance_tracking_enabled: false,
         performance_log_max_mb: 64,
         instructions_enabled: true,
@@ -479,6 +692,7 @@ mockIPC((cmd, payload) => {
         entries_visited: 24,
         elapsed_ms: 120,
         scanned_at: new Date(now).toISOString(),
+        stale: false,
       };
     }
     case 'read_instruction_file': {
@@ -508,7 +722,20 @@ mockIPC((cmd, payload) => {
       if (visualScenario === 'defender-error') {
         return Promise.reject(new Error('Fixture Defender exclusion request failed.'));
       }
-      return undefined;
+      return {
+        version: 1,
+        configured_roots: [
+          '/home/dev/.codex/sessions',
+          '/home/dev/.codex/archived_sessions',
+          '/home/dev/.claude/projects',
+        ],
+        verified_roots: [
+          '/home/dev/.codex/sessions',
+          '/home/dev/.codex/archived_sessions',
+          '/home/dev/.claude/projects',
+        ],
+        verified_at: new Date(now).toISOString(),
+      };
     case 'reveal_in_file_manager':
     case 'open_instruction_file':
     case 'open_task_in_chatgpt':

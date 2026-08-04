@@ -24,6 +24,17 @@
     />
     Color by model provider
   </label>
+  <label
+    class="flex items-center gap-1.5 text-ink-muted"
+    title="Rank subagent runs against every other thread instead of nesting them under their parent"
+  >
+    <input
+      type="checkbox"
+      checked={sessionGridStore.flattenSubagents}
+      onchange={(event) => sessionGridStore.setFlattenSubagents(event.currentTarget.checked)}
+    />
+    Flat list
+  </label>
   <details class="relative">
     <summary class="cursor-pointer rounded-md border border-edge bg-card px-2 py-1 text-ink-muted hover:text-ink">Columns</summary>
     <div class="absolute z-20 right-0 mt-1 w-64 rounded-lg border border-edge bg-card shadow-lg p-2 space-y-1">
@@ -49,7 +60,7 @@
           {/if}
         </div>
       {/each}
-      <p class="pt-1 text-[10px] text-ink-faint">Shown repository names use only the recorded project-folder label; full paths stay out of the grid.</p>
+      <p class="pt-1 text-[10px] text-ink-faint">Directories inside a git repository show the repository name and the path within it. Everything else shows a shortened path, with your home folder as <code>~</code>.</p>
     </div>
   </details>
 </div>

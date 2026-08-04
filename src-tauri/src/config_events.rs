@@ -63,14 +63,7 @@ fn stable_hash(bytes: &[u8]) -> String {
 }
 
 fn project_scope(path: &Path) -> PathBuf {
-    gix::discover(path)
-        .ok()
-        .map(|repo| {
-            repo.work_dir()
-                .unwrap_or_else(|| repo.git_dir())
-                .to_path_buf()
-        })
-        .unwrap_or_else(|| path.to_path_buf())
+    crate::git_outcomes::discover_repository_root(path).unwrap_or_else(|| path.to_path_buf())
 }
 
 fn project_roots(working_directories: impl IntoIterator<Item = PathBuf>) -> Vec<ConfigRoot> {

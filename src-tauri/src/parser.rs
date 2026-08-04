@@ -2,6 +2,7 @@ use crate::model::{
     storage_id_for_session, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
     TokenHistoryPoint, TokenTotals, TurnStatus,
 };
+use crate::provider::codex_provider_id;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -190,7 +191,7 @@ impl SessionParser {
                         crate::telemetry::ToolCallInput {
                             call_id: call_id.to_owned(),
                             turn_id: self.current_turn_id.clone(),
-                            harness: crate::model::Harness::Codex,
+                            harness: codex_provider_id(),
                             model: self.current_model.clone(),
                             timestamp,
                             name: name.to_owned(),
@@ -340,9 +341,9 @@ impl SessionParser {
             .map(str::to_owned);
 
         self.session = Some(Session {
-            storage_id: storage_id_for_session(crate::model::Harness::Codex, &id),
+            storage_id: storage_id_for_session(&codex_provider_id(), &id),
             id,
-            harness: crate::model::Harness::Codex,
+            harness: codex_provider_id(),
             thread_name,
             forked_from_id,
             parent_thread_id,
@@ -380,6 +381,9 @@ impl SessionParser {
             tool_metrics_by_model: Default::default(),
             category_totals: Default::default(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         });
 
         Ok(())
@@ -905,6 +909,8 @@ fn parse_token_totals(v: &Value) -> TokenTotals {
             .get("cached_input_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        // Codex does not report a separate cache-write dimension.
+        cache_creation_input_tokens: 0,
         output_tokens: v.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
         reasoning_output_tokens: v
             .get("reasoning_output_tokens")
@@ -947,11 +953,7 @@ fn parse_rate_limit_reset(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn add_token_totals(dst: &mut TokenTotals, src: &TokenTotals) {
-    dst.input_tokens += src.input_tokens;
-    dst.cached_input_tokens += src.cached_input_tokens;
-    dst.output_tokens += src.output_tokens;
-    dst.reasoning_output_tokens += src.reasoning_output_tokens;
-    dst.total_tokens += src.total_tokens;
+    *dst += src;
 }
 
 fn sum_bucket_totals(buckets: &HashMap<String, TokenTotals>) -> TokenTotals {
@@ -966,6 +968,9 @@ fn subtract_totals_saturating(a: &TokenTotals, b: &TokenTotals) -> TokenTotals {
     TokenTotals {
         input_tokens: a.input_tokens.saturating_sub(b.input_tokens),
         cached_input_tokens: a.cached_input_tokens.saturating_sub(b.cached_input_tokens),
+        cache_creation_input_tokens: a
+            .cache_creation_input_tokens
+            .saturating_sub(b.cache_creation_input_tokens),
         output_tokens: a.output_tokens.saturating_sub(b.output_tokens),
         reasoning_output_tokens: a
             .reasoning_output_tokens

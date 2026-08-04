@@ -3,10 +3,13 @@ import type { Config } from '../types';
 
 // Holds the current app config, loaded on startup in Phase 3.
 export const config = writable<Config>({
+  config_version: 0,
+  providers: {},
   session_roots: [],
   archive_roots: [],
   session_index_path: '',
   claude_session_roots: [],
+  defender_exclusion_receipt: null,
   performance_tracking_enabled: false,
   performance_log_max_mb: 64,
   instructions_enabled: false,
