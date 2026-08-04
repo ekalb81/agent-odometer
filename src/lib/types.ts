@@ -781,7 +781,10 @@ export interface RetentionHealth {
   archive_roots_configured: number;
 }
 
-export type QuotaStatus = 'not_available';
+/** 'transcript_derived' means at least one quota window has been observed
+ *  from this provider's own transcripts (see QuotaSnapshot below) — never a
+ *  live-polled API; no provider has one implemented. */
+export type QuotaStatus = 'not_available' | 'transcript_derived';
 
 export interface QuotaHealth {
   status: QuotaStatus;
@@ -816,4 +819,122 @@ export interface DiagnosticsReport {
   cache_cold_reason: ColdReason | null;
   last_scan_at: string | null;
   providers: ProviderDiagnostic[];
+}
+
+// ---------------------------------------------------------------------------
+// Quota windows, budgets, and alerts (issue #43). One backend service
+// (src-tauri/src/quota.rs) computes every number here — pace, projected
+// exhaustion, reserve/deficit, and budget-crossing decisions. The frontend
+// only formats and renders (see lib/subscriptionUsage.ts).
+// ---------------------------------------------------------------------------
+
+export type QuotaWindowKind = 'burst' | 'daily' | 'weekly' | 'monthly' | 'credit_balance' | 'other';
+
+export type QuotaUnit = 'percent' | 'credits';
+
+/** Never coerced together: a snapshot always says whether its numbers came
+ *  from transcripts or a (currently unimplemented) live-polled source. */
+export type QuotaProvenance = 'transcript_derived' | 'live_provider';
+
+export type QuotaConfidence = 'high' | 'medium' | 'low';
+
+/** `no_quota_source` and `no_observation` are the only reasons the current
+ *  (transcript-only) backend ever produces. The rest are reserved for a
+ *  future, reviewed live-polling source — see quota.rs's module docs. */
+export type QuotaUnavailableReason =
+  | 'no_quota_source'
+  | 'no_observation'
+  | 'clock_skew'
+  | 'provider_outage'
+  | 'auth_expired'
+  | 'rate_limited'
+  | 'offline';
+
+export interface QuotaForecast {
+  /** Percentage points of the window consumed per hour. */
+  pace_per_hour: number;
+  /** Only set when the projection lands before the window's own reset. */
+  projected_exhaustion_at: string | null;
+  /** Positive = burning faster than an even pace to reset (deficit/at risk);
+   *  negative = a reserve/cushion. */
+  reserve_deficit_percent: number;
+  evidence_points: number;
+}
+
+export interface QuotaWindow {
+  kind: QuotaWindowKind;
+  unit: QuotaUnit;
+  window_minutes: number | null;
+  /** `null` exactly when `unavailable` is set, or (for `credits`) the plan
+   *  is unlimited — never a fabricated zero. */
+  used: number | null;
+  remaining: number | null;
+  limit: number | null;
+  /** A known state ("unlimited"), not a number — `used`/`remaining` stay
+   *  `null` when this is true. */
+  unlimited: boolean;
+  resets_at: string | null;
+  window_started_at: string | null;
+  /** True when `window_started_at` was inferred (resets_at - window_minutes)
+   *  rather than observed as an actual used-percent rollover in the data. */
+  window_started_at_estimated: boolean;
+  observed_at: string;
+  confidence: QuotaConfidence;
+  /** Numbers are still populated when stale — see QuotaSnapshot's honesty
+   *  contract in quota.rs: stale is a different, more honest fact than
+   *  "no reading at all". */
+  stale: boolean;
+  unavailable: QuotaUnavailableReason | null;
+  forecast: QuotaForecast | null;
+}
+
+export interface QuotaSnapshot {
+  provider: Harness;
+  provenance: QuotaProvenance;
+  windows: QuotaWindow[];
+  /** Set only when `windows` is empty. */
+  unavailable: QuotaUnavailableReason | null;
+}
+
+export type BudgetUnit = 'percent_of_window' | 'tokens';
+
+export interface QuotaBudget {
+  id: string;
+  provider: Harness;
+  /** `null` = provider-wide; only valid combined with `unit: 'tokens'`. */
+  project_key: string | null;
+  unit: BudgetUnit;
+  /** Matches `QuotaWindowKind` ("burst"/"daily"/"weekly"/"monthly").
+   *  Required for `percent_of_window`; ignored for `tokens`. */
+  window_kind: string | null;
+  /** Rolling period for a `tokens` budget; ignored for `percent_of_window`. */
+  period_hours: number | null;
+  /** Percent-used (0-100) for `percent_of_window`, or a raw token count for `tokens`. */
+  threshold: number;
+  enabled: boolean;
+}
+
+export interface NotificationSettings {
+  /** Opt-in: no alert is ever surfaced while this is false. */
+  enabled: boolean;
+  /** Local-hour [start, end) range during which alerts are tracked but not shown. */
+  quiet_hours: [number, number] | null;
+}
+
+/** get_quota_config / set_quota_config payload. Never includes the backend's
+ *  internal notification dedup log. */
+export interface QuotaConfigWire {
+  budgets: QuotaBudget[];
+  notifications: NotificationSettings;
+  max_cache_age_secs: number;
+}
+
+export interface QuotaAlert {
+  budget_id: string;
+  provider: Harness;
+  project_key: string | null;
+  message: string;
+  current_value: number;
+  threshold: number;
+  fired_at: string;
 }

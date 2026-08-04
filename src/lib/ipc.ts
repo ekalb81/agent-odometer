@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -95,6 +95,30 @@ export function getProviderDiagnostics(): Promise<DiagnosticsReport> {
 
 export function resolveWorkingDirectories(): Promise<WorkingDirectoryInfo[]> {
   return invoke<WorkingDirectoryInfo[]>('resolve_working_directories');
+}
+
+/** Every registered provider's current quota snapshot (issue #43),
+ *  transcript-derived. Always one entry per provider — "no data" is always
+ *  an explicit `unavailable` reason, never an absent row. */
+export function getQuotaSnapshots(): Promise<QuotaSnapshot[]> {
+  return invoke<QuotaSnapshot[]>('get_quota_snapshots');
+}
+
+/** Current soft-budget/notification configuration. */
+export function getQuotaConfig(): Promise<QuotaConfigWire> {
+  return invoke<QuotaConfigWire>('get_quota_config');
+}
+
+/** Replaces the whole soft-budget/notification configuration. */
+export function setQuotaConfig(config: QuotaConfigWire): Promise<QuotaConfigWire> {
+  return invoke<QuotaConfigWire>('set_quota_config', { config });
+}
+
+/** Recomputes quota against configured soft budgets and returns any newly
+ *  crossed thresholds (already deduplicated/reset-aware/quiet-hours-gated
+ *  server-side — see quota.rs::evaluate_alerts). Safe to poll. */
+export function checkQuotaAlerts(): Promise<QuotaAlert[]> {
+  return invoke<QuotaAlert[]>('check_quota_alerts');
 }
 
 /** Every resolved project (#41), after local alias/merge/split overrides —

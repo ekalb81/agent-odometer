@@ -99,4 +99,17 @@ describe('computeTrayTotals', () => {
     );
     expect(totals.codex_api_usd).toBe('unavailable · missing direct rate');
   });
+
+  it('carries a quota label through unmodified, or an empty string when none is available', () => {
+    const withQuota = computeTrayTotals(
+      [session('c1', 'codex')],
+      { c1: range('m', 1, 0) },
+      rateCard,
+      'codex 5h 37% left',
+    );
+    expect(withQuota.quota).toBe('codex 5h 37% left');
+
+    const withoutQuota = computeTrayTotals([session('c1', 'codex')], { c1: range('m', 1, 0) }, rateCard);
+    expect(withoutQuota.quota).toBe('');
+  });
 });

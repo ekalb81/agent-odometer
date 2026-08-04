@@ -133,7 +133,18 @@ pub struct RetentionHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaStatus {
+    /// No quota source at all: the provider does not expose account-wide
+    /// quota in its transcripts (`ProviderCapabilities::quota_source` is
+    /// false), or it does but nothing has been observed yet.
     NotAvailable,
+    /// At least one quota window has been observed from this provider's own
+    /// transcripts (see `crate::quota`). This is never a live-polled API —
+    /// no provider has one implemented yet, and `AGENTS.md` forbids adding
+    /// outbound network access without an explicit requirement and a
+    /// security review that has not happened (see `crate::quota`'s module
+    /// docs for the reserved network seam). `message` says so explicitly so
+    /// this is never mistaken for a live/authoritative subscription source.
+    TranscriptDerived,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -143,17 +154,38 @@ pub struct QuotaHealth {
     pub message: String,
 }
 
-/// There is no quota/rate-limit API implementation yet for any provider.
-/// Always reports `not_available` with a fixed reason rather than inventing
-/// one from transcript rate-limit snapshots (those already power the
-/// separate subscription-usage view and turn receipts).
-fn quota_health() -> QuotaHealth {
+/// Reports this provider's real quota status: whether it has a
+/// transcript-derived quota source at all, and whether anything has been
+/// observed from it yet. Never reports a live/polled API — none exists for
+/// any provider — and the message says so explicitly rather than letting
+/// `transcript_derived` be mistaken for an authoritative subscription
+/// source. See `crate::quota` for the snapshot/forecast/budget service this
+/// reflects.
+fn quota_health(quota_source_capability: bool, has_quota_observation: bool) -> QuotaHealth {
+    if !quota_source_capability {
+        return QuotaHealth {
+            status: QuotaStatus::NotAvailable,
+            reason_code: "quota_source_not_available".to_string(),
+            message: "This provider's transcripts do not report account-wide quota, and Odometer \
+                      does not poll a live quota API for any provider yet."
+                .to_string(),
+        };
+    }
+    if !has_quota_observation {
+        return QuotaHealth {
+            status: QuotaStatus::NotAvailable,
+            reason_code: "quota_no_observation_yet".to_string(),
+            message: "This provider can report quota, but no rate-limit or credit snapshot has \
+                      been observed in its transcripts yet."
+                .to_string(),
+        };
+    }
     QuotaHealth {
-        status: QuotaStatus::NotAvailable,
-        reason_code: "quota_source_not_implemented".to_string(),
-        message: "Odometer does not read a live quota or rate-limit API for this provider yet. \
-                  Quota values shown elsewhere (Codex rate-limit snapshots) come only from \
-                  transcript observations, not this diagnostic."
+        status: QuotaStatus::TranscriptDerived,
+        reason_code: "quota_transcript_derived".to_string(),
+        message: "Quota values come from this provider's own transcript snapshots, not a live \
+                  polled API — Odometer does not poll any provider's quota API yet. See the \
+                  Subscription Usage panel for provenance and staleness on each window."
             .to_string(),
     }
 }
@@ -200,6 +232,10 @@ pub struct ProviderDiagnosticInput {
     pub ledger: LedgerHealth,
     pub pricing: PricingHealth,
     pub archive_roots_configured: usize,
+    /// True when at least one session for this provider has a rate-limit
+    /// snapshot or a credits field set — i.e. `crate::quota` has something
+    /// to report beyond "no observation yet". See `quota_health`.
+    pub has_quota_observation: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -355,6 +391,7 @@ fn retention_health(input: &ProviderDiagnosticInput) -> RetentionHealth {
 pub fn build_provider_diagnostic(input: ProviderDiagnosticInput) -> ProviderDiagnostic {
     let (state, reasons, notices) = evaluate_state(&input);
     let retention = retention_health(&input);
+    let quota = quota_health(input.capabilities.quota_source, input.has_quota_observation);
     ProviderDiagnostic {
         id: input.id,
         display_name: input.display_name,
@@ -368,7 +405,7 @@ pub fn build_provider_diagnostic(input: ProviderDiagnosticInput) -> ProviderDiag
         ledger: input.ledger,
         pricing: input.pricing,
         retention,
-        quota: quota_health(),
+        quota,
     }
 }
 
@@ -385,6 +422,7 @@ struct ProviderSessionStats {
     available_sessions: u64,
     collision_sessions: u64,
     models_used: HashSet<String>,
+    has_quota_observation: bool,
 }
 
 /// One pass over the already-loaded in-memory session projection (no new
@@ -402,6 +440,12 @@ fn collect_session_stats(state: &AppState) -> HashMap<ProviderId, ProviderSessio
         }
         if session.storage_id.contains(":collision:") {
             per_provider.collision_sessions += 1;
+        }
+        if !session.rate_limits_history.is_empty()
+            || session.credits_unlimited.is_some()
+            || session.credits_balance.is_some()
+        {
+            per_provider.has_quota_observation = true;
         }
         // Generous cap well above the final wire sample size (MAX_MODEL_SAMPLE)
         // so a pathological corpus with many distinct model strings cannot
@@ -591,6 +635,7 @@ pub fn generate_report(state: &AppState, config: &Config, rates: &RateCard) -> D
             ledger,
             pricing,
             archive_roots_configured: provider_config.archive_roots.len(),
+            has_quota_observation: stats.has_quota_observation,
         }));
     }
 
@@ -618,6 +663,7 @@ pub fn generate_report(state: &AppState, config: &Config, rates: &RateCard) -> D
             },
             pricing: pricing_health(&HashSet::new(), rates),
             archive_roots_configured: provider_config.archive_roots.len(),
+            has_quota_observation: false,
         }));
     }
 
@@ -734,6 +780,7 @@ mod tests {
             },
             pricing: PricingHealth::default(),
             archive_roots_configured: 0,
+            has_quota_observation: false,
         };
         assert_eq!(retention_health(&base).level, RetentionRiskLevel::None);
 
@@ -766,10 +813,43 @@ mod tests {
     }
 
     #[test]
-    fn quota_is_always_reported_not_available_with_a_fixed_reason() {
-        let quota = quota_health();
+    fn quota_reports_not_available_when_the_provider_has_no_quota_source() {
+        let quota = quota_health(false, false);
         assert_eq!(quota.status, QuotaStatus::NotAvailable);
-        assert_eq!(quota.reason_code, "quota_source_not_implemented");
+        assert_eq!(quota.reason_code, "quota_source_not_available");
         assert!(!quota.message.is_empty());
+    }
+
+    #[test]
+    fn quota_reports_not_available_when_capable_but_nothing_observed_yet() {
+        let quota = quota_health(true, false);
+        assert_eq!(quota.status, QuotaStatus::NotAvailable);
+        assert_eq!(quota.reason_code, "quota_no_observation_yet");
+    }
+
+    #[test]
+    fn quota_reports_transcript_derived_once_something_is_observed() {
+        let quota = quota_health(true, true);
+        assert_eq!(quota.status, QuotaStatus::TranscriptDerived);
+        assert_eq!(quota.reason_code, "quota_transcript_derived");
+        assert!(
+            quota.message.to_lowercase().contains("not") || quota.message.contains("does not poll"),
+            "the transcript-derived message must still disclaim a live polled API"
+        );
+    }
+
+    #[test]
+    fn never_reports_a_live_quota_status_no_provider_implements_one() {
+        // `QuotaStatus` has exactly two variants; this is a compile-time
+        // reminder as much as a runtime check — if a `Live` variant is ever
+        // added, this test (and the honest-message assertion above) must be
+        // revisited alongside the actual polling implementation.
+        for quota in [
+            quota_health(false, false),
+            quota_health(true, false),
+            quota_health(true, true),
+        ] {
+            assert_ne!(format!("{:?}", quota.status), "Live");
+        }
     }
 }

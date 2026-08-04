@@ -15,6 +15,8 @@ pub mod paths;
 pub mod performance;
 pub mod project_identity;
 pub mod provider;
+pub mod quota;
+pub mod quota_store;
 pub mod rates;
 pub mod scan_cache;
 pub mod scanner;
@@ -27,15 +29,16 @@ pub mod turn_receipts;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, cancel_instruction_scan, clear_session_project_override,
-    compare_tool_impact, correlate_events, export_performance_data, get_bundled_rates, get_config,
-    get_performance_status, get_provider_diagnostics, get_rates, get_scan_status,
-    get_session_details, get_subscription_usage, get_turn_receipt_status, list_external_events,
-    list_instruction_files, list_providers, list_sessions, list_tool_impact_targets,
-    merge_projects, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
-    reassign_session_project, record_frontend_performance, repair_turn_receipt_integrations,
-    resolve_projects, resolve_working_directories, reveal_in_file_manager, scan_git_outcomes,
-    sessions_in_ranges, set_config, set_project_alias, set_rates, set_tray_totals, unmerge_project,
+    add_defender_exclusions, cancel_instruction_scan, check_quota_alerts,
+    clear_session_project_override, compare_tool_impact, correlate_events, export_performance_data,
+    get_bundled_rates, get_config, get_performance_status, get_provider_diagnostics,
+    get_quota_config, get_quota_snapshots, get_rates, get_scan_status, get_session_details,
+    get_subscription_usage, get_turn_receipt_status, list_external_events, list_instruction_files,
+    list_providers, list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
+    open_task_in_chatgpt, read_instruction_file, reassign_session_project,
+    record_frontend_performance, repair_turn_receipt_integrations, resolve_projects,
+    resolve_working_directories, reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges,
+    set_config, set_project_alias, set_quota_config, set_rates, set_tray_totals, unmerge_project,
     write_export,
 };
 use config::Config;
@@ -99,6 +102,10 @@ pub fn run() {
             record_frontend_performance,
             export_performance_data,
             get_provider_diagnostics,
+            get_quota_snapshots,
+            get_quota_config,
+            set_quota_config,
+            check_quota_alerts,
         ])
         .setup(move |app| {
             let setup_started = Instant::now();

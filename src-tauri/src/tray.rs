@@ -10,6 +10,7 @@ pub struct TrayState {
     pub codex_credits: MenuItem<tauri::Wry>,
     pub codex_api: MenuItem<tauri::Wry>,
     pub claude_usd: MenuItem<tauri::Wry>,
+    pub quota: MenuItem<tauri::Wry>,
     _tray: tauri::tray::TrayIcon<tauri::Wry>,
 }
 
@@ -19,6 +20,13 @@ pub struct TrayTotals {
     pub codex_credits: String,
     pub codex_api_usd: String,
     pub claude_usd: String,
+    /// Live-quota headroom label (issue #43), e.g. "codex 5h 37% left".
+    /// Empty when nothing is available — the menu item then falls back to
+    /// its placeholder text rather than rendering blank. Formatted
+    /// frontend-side by `quotaTrayLabel` from numbers `crate::quota`
+    /// already computed; this module only displays the string.
+    #[serde(default)]
+    pub quota: String,
 }
 
 pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()> {
@@ -50,12 +58,13 @@ pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()>
         false,
         None::<&str>,
     )?;
+    let quota = MenuItem::with_id(app, "quota", "Quota · —", false, None::<&str>)?;
     let show_hide =
         MenuItem::with_id(app, "show_hide", "Show / Hide Odometer", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = MenuBuilder::new(app)
-        .items(&[&tokens, &codex_credits, &codex_api, &claude_usd])
+        .items(&[&tokens, &codex_credits, &codex_api, &claude_usd, &quota])
         .separator()
         .items(&[&show_hide, &settings, &quit])
         .build()?;
@@ -97,6 +106,7 @@ pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()>
         codex_credits,
         codex_api,
         claude_usd,
+        quota,
         _tray: tray,
     });
     state
@@ -121,6 +131,14 @@ pub fn update(state: &Arc<AppState>, totals: TrayTotals) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     tray.claude_usd
         .set_text(format!("Claude estimate · {}", totals.claude_usd))
+        .map_err(|error| error.to_string())?;
+    let quota_text = if totals.quota.is_empty() {
+        "Quota · —".to_string()
+    } else {
+        format!("Quota · {}", totals.quota)
+    };
+    tray.quota
+        .set_text(quota_text)
         .map_err(|error| error.to_string())?;
     Ok(())
 }

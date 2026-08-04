@@ -8,6 +8,9 @@ import type {
   DiagnosticsReport,
   Harness,
   ProviderDiagnostic,
+  QuotaAlert,
+  QuotaConfigWire,
+  QuotaSnapshot,
   RangeTotals,
   RateCard,
   Session,
@@ -313,6 +316,77 @@ const RATES: RateCard = {
   refresh: { last_success_at: null, last_attempt_at: null, last_failure_reason: null, max_cache_age_secs: 604_800 },
 };
 
+// Issue #43: quota windows/budgets, mirroring subscriptionUsage()'s figures
+// so the two panels agree in the browser dev fixture. `quotaConfigMock` is
+// mutable so set_quota_config round-trips within one dev session, matching
+// the real backend's persist-then-return contract.
+function quotaSnapshots(): QuotaSnapshot[] {
+  return [
+    {
+      provider: 'codex',
+      provenance: 'transcript_derived',
+      unavailable: null,
+      windows: [
+        {
+          kind: 'burst',
+          unit: 'percent',
+          window_minutes: 300,
+          used: 63,
+          remaining: 37,
+          limit: 100,
+          unlimited: false,
+          resets_at: new Date(now + 2 * 3_600_000 + 12 * 60_000).toISOString(),
+          window_started_at: new Date(now - 2 * 3_600_000 - 48 * 60_000).toISOString(),
+          window_started_at_estimated: true,
+          observed_at: new Date(now - 3 * 60_000).toISOString(),
+          confidence: 'medium',
+          stale: false,
+          unavailable: null,
+          forecast: {
+            pace_per_hour: 8.2,
+            projected_exhaustion_at: null,
+            reserve_deficit_percent: 4.5,
+            evidence_points: 9,
+          },
+        },
+        {
+          kind: 'weekly',
+          unit: 'percent',
+          window_minutes: 10_080,
+          used: 22,
+          remaining: 78,
+          limit: 100,
+          unlimited: false,
+          resets_at: new Date(now + 4 * DAY).toISOString(),
+          window_started_at: null,
+          window_started_at_estimated: false,
+          observed_at: new Date(now - 3 * 60_000).toISOString(),
+          confidence: 'medium',
+          stale: false,
+          unavailable: null,
+          forecast: null,
+        },
+      ],
+    },
+    {
+      provider: 'claude_code',
+      provenance: 'transcript_derived',
+      unavailable: 'no_quota_source',
+      windows: [],
+    },
+  ];
+}
+
+let quotaConfigMock: QuotaConfigWire = {
+  budgets: [],
+  notifications: { enabled: false, quiet_hours: null },
+  max_cache_age_secs: 21_600,
+};
+
+function checkQuotaAlerts(): QuotaAlert[] {
+  return [];
+}
+
 function subscriptionUsage(): SubscriptionUsageEntry[] {
   return [
     {
@@ -522,6 +596,15 @@ mockIPC((cmd, payload) => {
     }
     case 'get_subscription_usage':
       return subscriptionUsage();
+    case 'get_quota_snapshots':
+      return quotaSnapshots();
+    case 'get_quota_config':
+      return quotaConfigMock;
+    case 'set_quota_config':
+      quotaConfigMock = (payload as { config: QuotaConfigWire }).config;
+      return quotaConfigMock;
+    case 'check_quota_alerts':
+      return checkQuotaAlerts();
     case 'resolve_working_directories':
       // Matches the fixture sessions' working directory, so the grid renders
       // the resolved repository rather than its unresolved path fallback.
