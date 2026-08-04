@@ -13,9 +13,13 @@
 //! - Anthropic usage reports `input_tokens` EXCLUDING cache reads/writes,
 //!   while the viewer's `TokenTotals` convention (from Codex) treats cached
 //!   input as a subset of input. We therefore map:
-//!   input = input + cache_read + cache_creation, cached = cache_read.
-//!   Cache-creation tokens are priced at the ordinary input rate, a slight
-//!   undercount of Anthropic's 1.25x cache-write premium.
+//!   input = input + cache_read + cache_creation, cached = cache_read,
+//!   cache_creation = cache_creation. `cache_creation_input_tokens` is a
+//!   second, disjoint subset of `input_tokens` (distinct from
+//!   `cached_input_tokens`) so credit math (`src/lib/credits.ts`) can price
+//!   cache-write tokens at their own rate — typically Anthropic's 1.25x
+//!   cache-write premium over ordinary input — instead of folding the write
+//!   premium into the plain input rate.
 //!
 //! Subagent transcripts (`.../<session>/subagents/agent-<id>.jsonl`) carry
 //! the PARENT session's `sessionId` on every record and mark everything
@@ -669,6 +673,9 @@ fn usage_to_totals(usage: &Value) -> TokenTotals {
     TokenTotals {
         input_tokens: input,
         cached_input_tokens: cache_read,
+        // A distinct subset of input_tokens from cached_input_tokens: never
+        // add both a second time when pricing (see credits.ts eventCost).
+        cache_creation_input_tokens: cache_creation,
         output_tokens: output,
         // Anthropic bills thinking as output and does not break it out.
         reasoning_output_tokens: 0,
@@ -683,6 +690,7 @@ fn add_token_totals(dst: &mut TokenTotals, src: &TokenTotals) {
 fn totals_any_positive(t: &TokenTotals) -> bool {
     t.input_tokens > 0
         || t.cached_input_tokens > 0
+        || t.cache_creation_input_tokens > 0
         || t.output_tokens > 0
         || t.reasoning_output_tokens > 0
         || t.total_tokens > 0

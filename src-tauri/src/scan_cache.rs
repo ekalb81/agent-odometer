@@ -30,7 +30,7 @@ const LEGACY_CACHE_NAME: &str = "scan-cache.json";
 /// invalidate the cache — that was the old `APP_VERSION`-keyed behavior,
 /// and it turned every release into a full cold re-parse of every
 /// transcript.
-const PARSE_VERSION: u32 = 1;
+const PARSE_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
@@ -737,11 +737,13 @@ agent_path
 archived
 category_totals.coding.buckets.[].model
 category_totals.coding.buckets.[].service_tier
+category_totals.coding.buckets.[].tokens.cache_creation_input_tokens
 category_totals.coding.buckets.[].tokens.cached_input_tokens
 category_totals.coding.buckets.[].tokens.input_tokens
 category_totals.coding.buckets.[].tokens.output_tokens
 category_totals.coding.buckets.[].tokens.reasoning_output_tokens
 category_totals.coding.buckets.[].tokens.total_tokens
+category_totals.coding.tokens.cache_creation_input_tokens
 category_totals.coding.tokens.cached_input_tokens
 category_totals.coding.tokens.input_tokens
 category_totals.coding.tokens.output_tokens
@@ -792,11 +794,13 @@ started_at
 storage_id
 subagent_id_is_path_fallback
 thread_name
+tokens_by_model.m.cache_creation_input_tokens
 tokens_by_model.m.cached_input_tokens
 tokens_by_model.m.input_tokens
 tokens_by_model.m.output_tokens
 tokens_by_model.m.reasoning_output_tokens
 tokens_by_model.m.total_tokens
+tokens_history.[].delta.cache_creation_input_tokens
 tokens_history.[].delta.cached_input_tokens
 tokens_history.[].delta.input_tokens
 tokens_history.[].delta.output_tokens
@@ -807,6 +811,7 @@ tokens_history.[].request_input_tokens
 tokens_history.[].service_tier
 tokens_history.[].timestamp
 tokens_history.[].total_tokens
+tokens_total.cache_creation_input_tokens
 tokens_total.cached_input_tokens
 tokens_total.input_tokens
 tokens_total.output_tokens
@@ -871,6 +876,7 @@ turns.[].service_tier
 turns.[].started_at
 turns.[].status
 turns.[].time_to_first_token_ms
+turns.[].tokens.cache_creation_input_tokens
 turns.[].tokens.cached_input_tokens
 turns.[].tokens.input_tokens
 turns.[].tokens.output_tokens
@@ -945,6 +951,7 @@ working_directory"#;
         let totals = TokenTotals {
             input_tokens: 1,
             cached_input_tokens: 1,
+            cache_creation_input_tokens: 1,
             output_tokens: 1,
             reasoning_output_tokens: 1,
             total_tokens: 2,

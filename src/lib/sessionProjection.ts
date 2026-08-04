@@ -6,6 +6,7 @@ import {
 } from './credits';
 import type {
   Harness,
+  PricingBasis,
   RangeTotals,
   RateCard,
   SessionSummary,
@@ -58,6 +59,8 @@ export interface ModelMetric {
   currency: string;
   fallbackUsed: boolean;
   unpriced: boolean;
+  /** Provenance for `cost` — see rates.rs PricingBasis. */
+  basis: PricingBasis;
   tools: ToolMetrics;
 }
 
@@ -77,6 +80,7 @@ export function zeroTotals(): TokenTotals {
   return {
     input_tokens: 0,
     cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
     output_tokens: 0,
     reasoning_output_tokens: 0,
     total_tokens: 0,
@@ -86,6 +90,7 @@ export function zeroTotals(): TokenTotals {
 export function addTotals(target: TokenTotals, value: TokenTotals): void {
   target.input_tokens += value.input_tokens;
   target.cached_input_tokens += value.cached_input_tokens;
+  target.cache_creation_input_tokens += value.cache_creation_input_tokens;
   target.output_tokens += value.output_tokens;
   target.reasoning_output_tokens += value.reasoning_output_tokens;
   target.total_tokens += value.total_tokens;
@@ -268,6 +273,7 @@ function priceBucket(bucket: TierBucket, harness: Harness, rates: RateCard): {
   currency: string;
   fallbackUsed: boolean;
   unpriced: boolean;
+  basis: PricingBasis;
 } {
   const useApi = harness === 'codex' && Object.keys(rates.api_models ?? {}).length > 0;
   const priced = useApi
@@ -278,6 +284,7 @@ function priceBucket(bucket: TierBucket, harness: Harness, rates: RateCard): {
     currency: useApi ? 'USD' : harnessCurrency(rates, harness),
     fallbackUsed: (priced?.missingModels.length ?? 0) > 0,
     unpriced: (priced?.unpricedModels.length ?? 0) > 0,
+    basis: priced?.byModel.find((mc) => mc.model === bucket.model)?.basis ?? 'unavailable',
   };
 }
 
@@ -305,6 +312,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
           currency: priced.currency,
           fallbackUsed: false,
           unpriced: false,
+          basis: priced.basis,
           tools: zeroToolMetrics(),
         };
         grouped.set(key, metric);
@@ -313,6 +321,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
       metric.cost += priced.cost;
       metric.fallbackUsed ||= priced.fallbackUsed;
       metric.unpriced ||= priced.unpriced;
+      metric.basis = priced.basis;
     }
     for (const [model, tools] of Object.entries(range.tool_metrics_by_model ?? {})) {
       const key = `${session.harness}\0${model}`;
@@ -320,7 +329,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
       if (!metric) {
         metric = { harness: session.harness, model, tokens: zeroTotals(), cost: 0,
           currency: displayCurrency(session, rates), fallbackUsed: false, unpriced: false,
-          tools: zeroToolMetrics() };
+          basis: 'unavailable', tools: zeroToolMetrics() };
         grouped.set(key, metric);
       }
       addToolMetrics(metric.tools, tools);
@@ -367,6 +376,7 @@ export function exportRows<T extends SessionSummary>(
       turns: session.total_turns,
       input_tokens: tokens.input_tokens,
       cached_input_tokens: tokens.cached_input_tokens,
+      cache_creation_input_tokens: tokens.cache_creation_input_tokens,
       output_tokens: tokens.output_tokens,
       reasoning_output_tokens: tokens.reasoning_output_tokens,
       total_tokens: tokens.total_tokens,

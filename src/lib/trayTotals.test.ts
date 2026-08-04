@@ -3,7 +3,7 @@ import { computeTrayTotals, type TraySessionLike } from './trayTotals';
 import type { RangeTotals, RateCard, TokenTotals } from './types';
 
 const zero: TokenTotals = {
-  input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
+  input_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0,
   reasoning_output_tokens: 0, total_tokens: 0,
 };
 
@@ -31,13 +31,18 @@ const rateCard: RateCard = {
   unit: 'per_1m_tokens',
   source_url: 'https://example.test/rates',
   fetched_at: null,
-  models: { m: { input: 1_000_000, cached_input: 0, output: 2_000_000, reasoning: 2_000_000 } },
+  models: { m: { input: 1_000_000, cached_input: 0, cache_creation_input: 0, output: 2_000_000, reasoning: 2_000_000 } },
   fallback_model: 'm',
   currencies: { codex: 'credits', claude_code: 'USD' },
   fallback_models: { codex: 'm', claude_code: 'm' },
-  api_models: { m: { input: 500_000, cached_input: 0, output: 1_000_000, reasoning: 1_000_000 } },
+  api_models: { m: { input: 500_000, cached_input: 0, cache_creation_input: 0, output: 1_000_000, reasoning: 1_000_000 } },
   unpriced_models: [],
   pricing_catalog: { notes: [], rate_periods: [], conditional_modifiers: [] },
+  model_aliases: {},
+  free_local_models: [],
+  subscription_plans: {},
+  display_currency: null,
+  refresh: { last_success_at: null, last_attempt_at: null, last_failure_reason: null, max_cache_age_secs: 604_800 },
 };
 
 function session(id: string, harness: TraySessionLike['harness'], unlimited: boolean | null = null): TraySessionLike {

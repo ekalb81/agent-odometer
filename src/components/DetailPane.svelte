@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Session } from '../lib/types';
+  import type { PricingBasis, Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
   import { computeSessionApiCostScenarios, computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
@@ -181,7 +181,7 @@
   // api_models when the pane is in API-USD mode, plan credits otherwise —
   // so per-turn amounts reconcile with the displayed total.
   const turnCostById = $derived((() => {
-    const m = new Map<string, { cost: number; fallbackUsed: boolean; unpriced: boolean }>();
+    const m = new Map<string, { cost: number; fallbackUsed: boolean; unpriced: boolean; basis: PricingBasis }>();
     if (!session || !$rates) return m;
     const table =
       session.harness === 'codex' && sessionApiCost
@@ -199,7 +199,7 @@
   );
   const maxTurnCost = $derived(turnCosts.reduce((m, t) => Math.max(m, t.cost), 0));
 
-  function turnCost(turnId: string): { cost: number; fallbackUsed: boolean; unpriced: boolean } | null {
+  function turnCost(turnId: string): { cost: number; fallbackUsed: boolean; unpriced: boolean; basis: PricingBasis } | null {
     return turnCostById.get(turnId) ?? null;
   }
 
@@ -441,6 +441,10 @@
                         <span class="font-mono text-pos">{fmtMoney(credit.cost)}</span>
                         {#if credit.unpriced && turn.tokens.total_tokens > 0}
                           <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
+                        {:else if credit.basis === 'aliased' && turn.tokens.total_tokens > 0}
+                          <span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match">↝</span>
+                        {:else if credit.basis === 'estimated' && turn.tokens.total_tokens > 0}
+                          <span class="text-sky-500" title="Includes cache-write tokens priced at the ordinary input rate — no published cache-write premium for this model">≈</span>
                         {:else if credit.fallbackUsed && turn.tokens.total_tokens > 0}
                           <span class="text-amber-500" title="Fallback rate used (model not in rate card)">⚠</span>
                         {/if}
@@ -541,6 +545,10 @@
                       {modelName}
                       {#if modelCredit?.unpriced}
                         <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
+                      {:else if modelCredit?.basis === 'aliased'}
+                        <span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match">↝</span>
+                      {:else if modelCredit?.basis === 'estimated'}
+                        <span class="text-sky-500" title="Includes cache-write tokens priced at the ordinary input rate — no published cache-write premium for this model">≈</span>
                       {:else if modelCredit?.fallbackUsed}
                         <span class="text-amber-500" title="Fallback rate used ({$rates ? fallbackModelName($rates, session.harness) : '—'})">⚠</span>
                       {/if}

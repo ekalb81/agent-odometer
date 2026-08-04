@@ -40,8 +40,8 @@ describe('session grid formatting', () => {
   });
 
   it('uses range token categories when the grid is date scoped', () => {
-    const allTime: TokenTotals = { input_tokens: 100, cached_input_tokens: 40, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 120 };
-    const scoped: TokenTotals = { input_tokens: 12, cached_input_tokens: 4, output_tokens: 3, reasoning_output_tokens: 1, total_tokens: 15 };
+    const allTime: TokenTotals = { input_tokens: 100, cached_input_tokens: 40, cache_creation_input_tokens: 0, output_tokens: 20, reasoning_output_tokens: 5, total_tokens: 120 };
+    const scoped: TokenTotals = { input_tokens: 12, cached_input_tokens: 4, cache_creation_input_tokens: 0, output_tokens: 3, reasoning_output_tokens: 1, total_tokens: 15 };
     const session: SessionSummary = {
       id: 'session', storage_id: 'codex:thread:session', harness: 'codex', thread_name: null, forked_from_id: null,
       parent_thread_id: null, agent_path: null, agent_nickname: null, file_path: 'fixture.jsonl', source_availability: 'present',
