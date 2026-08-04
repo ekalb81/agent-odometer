@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::provider::{
-    claude_code_provider_id, codex_provider_id, ProviderId, ProviderRegistry, ProviderSource,
-    ProviderSourceKind, ProviderSourceSet,
+    claude_code_provider_id, codex_provider_id, gemini_cli_provider_id, ProviderId,
+    ProviderRegistry, ProviderSource, ProviderSourceKind, ProviderSourceSet,
 };
 
 pub const DEFENDER_EXCLUSION_RECEIPT_VERSION: u32 = 1;
@@ -142,6 +142,17 @@ fn resolve_codex_home(configured: Option<PathBuf>, home: Option<PathBuf>) -> Pat
     configured.unwrap_or_else(|| home.unwrap_or_else(|| PathBuf::from(".")).join(".codex"))
 }
 
+/// Gemini CLI's per-project session logs live under `~/.gemini/tmp`. Unlike
+/// `$CODEX_HOME`/`$CLAUDE_CONFIG_DIR`, no environment-variable override for
+/// this root is documented by the tool, so none is honored here rather than
+/// inventing one.
+pub(crate) fn gemini_cli_tmp_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".gemini")
+        .join("tmp")
+}
+
 impl Default for Config {
     fn default() -> Self {
         let codex_home = codex_home_dir();
@@ -214,6 +225,20 @@ impl Config {
                 .map(|c| c.live_roots.clone())
                 .unwrap_or_default();
         }
+
+        // Gemini CLI has no legacy flat-field mirror to migrate from (it
+        // never existed before this map became authoritative), so it is
+        // seeded directly the first time this config has no entry for it at
+        // all. `.entry().or_insert_with()` only fires when the key is
+        // entirely absent, so a user who has already saved settings once
+        // (which persists one entry per registered provider, even an empty
+        // one to disable it) is never overridden here.
+        self.providers
+            .entry(gemini_cli_provider_id())
+            .or_insert_with(|| ProviderSourceConfig {
+                live_roots: vec![gemini_cli_tmp_dir()],
+                ..Default::default()
+            });
         self
     }
 
@@ -472,7 +497,8 @@ mod tests {
         );
         let sources = cfg.provider_sources().unwrap();
         assert!(sources.iter().all(|s| s.provider_id() != &cursor));
-        assert_eq!(sources.len(), 3);
+        // codex-live, codex-archive, claude-live, plus the seeded Gemini CLI default.
+        assert_eq!(sources.len(), 4);
     }
 
     #[test]
@@ -559,6 +585,7 @@ mod tests {
                 dir.path().join("claude-live"),
                 ProviderSourceKind::Live,
             ),
+            ("gemini_cli", gemini_cli_tmp_dir(), ProviderSourceKind::Live),
         ];
         expected.sort();
         assert_eq!(projected, expected);

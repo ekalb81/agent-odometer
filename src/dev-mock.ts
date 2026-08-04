@@ -429,7 +429,7 @@ function providerDiagnostics(): DiagnosticsReport {
     state: 'ready',
     reasons: [],
     notices: [{ code: 'healthy', message: 'No issues detected for this provider.' }],
-    capabilities: { archived_sources: true, session_index: true },
+    capabilities: { archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true },
     roots: [
       { kind: 'live', path: '/home/dev/.codex/sessions', exists: true, is_default: true },
       { kind: 'archive', path: '/home/dev/.codex/archived_sessions', exists: true, is_default: true },
@@ -451,7 +451,7 @@ function providerDiagnostics(): DiagnosticsReport {
       { code: 'pricing_fallback_used', message: 'One or more models used by this provider have no published rate and are estimated with the configured fallback rate.' },
     ],
     notices: [],
-    capabilities: { archived_sources: false, session_index: false },
+    capabilities: { archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false },
     roots: [{ kind: 'live', path: '/home/dev/.claude/projects', exists: true, is_default: true }],
     discovery: { discovered_files: 18, parsed_files: 18, skipped_files: 1, parse_failures: 2, cache_hits: 16, cache_misses: 2 },
     ledger: { history_store_available: true, durable_sessions: 16, available_sessions: 16, collision_sessions: 0 },
@@ -535,9 +535,12 @@ mockIPC((cmd, payload) => {
         },
       ];
     case 'list_providers':
+      // Kept to the two shipped-and-visually-baselined providers; Gemini CLI
+      // is registered but intentionally left out of this dev fixture so it
+      // does not shift tab counts in the Playwright visual suite.
       return [
-        { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true },
-        { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false },
+        { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true },
+        { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false },
       ];
     case 'get_provider_diagnostics':
       return providerDiagnostics();

@@ -411,6 +411,16 @@ export interface ProviderDescriptor {
   display_name: string;
   archived_sources: boolean;
   session_index: boolean;
+  /** Rate-card currency key this provider prices into (see `harnessCurrency`
+   *  in `credits.ts`). Codex uses "credits"; every other current provider
+   *  prices in "USD". */
+  currency: string;
+  /** Whether Odometer can open this provider's session via a native deep
+   *  link (`open_task_in_chatgpt`). Only Codex has one today. */
+  deep_link: boolean;
+  /** Whether this provider's local transcripts carry account-wide
+   *  rate-limit/quota snapshots usable by the Subscription Usage view. */
+  quota_source: boolean;
 }
 
 export interface HarnessIntegrationStatus {
@@ -699,6 +709,9 @@ export interface DiagnosticRoot {
 export interface DiagnosticsCapabilities {
   archived_sources: boolean;
   session_index: boolean;
+  currency: string;
+  deep_link: boolean;
+  quota_source: boolean;
 }
 
 export interface DiscoveryHealth {

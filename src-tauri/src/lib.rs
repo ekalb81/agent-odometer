@@ -4,6 +4,7 @@ pub mod config;
 pub mod config_events;
 pub mod correlation;
 pub mod diagnostics;
+pub mod gemini_parser;
 pub mod git_outcomes;
 pub mod harness_integration;
 pub mod history_store;

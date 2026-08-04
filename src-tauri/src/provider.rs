@@ -8,6 +8,7 @@ use std::sync::{Arc, LazyLock};
 
 const CODEX_PROVIDER_ID: &str = "codex";
 const CLAUDE_CODE_PROVIDER_ID: &str = "claude_code";
+const GEMINI_CLI_PROVIDER_ID: &str = "gemini_cli";
 
 /// Stable, provider-owned identifier. This intentionally remains separate
 /// from `Harness` while persisted sessions and the frontend still use that
@@ -88,10 +89,36 @@ pub fn claude_code_provider_id() -> ProviderId {
     ProviderId::new(CLAUDE_CODE_PROVIDER_ID).expect("built-in provider id is valid")
 }
 
+pub fn gemini_cli_provider_id() -> ProviderId {
+    ProviderId::new(GEMINI_CLI_PROVIDER_ID).expect("built-in provider id is valid")
+}
+
+/// Capability flags that let generic UI/pricing surfaces branch on what a
+/// provider actually supports instead of comparing provider ids directly
+/// (issue #40 entry condition: quota source, currency, and deep-link support
+/// were "blessed" `harness == "codex"` / `"claude_code"` comparisons scattered
+/// through the pricing/quota paths and `SessionsView`/`SubscriptionUsage`,
+/// left in place by #102 because a two-provider world gave no signal about
+/// the right shape. A third provider forces the question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderCapabilities {
     pub archived_sources: bool,
     pub session_index: bool,
+    /// The rate-card currency key this provider's usage prices into (see
+    /// `RateCard::currencies` in `rates.rs` / `harnessCurrency` in
+    /// `credits.ts`). Codex uses its own plan-credit unit ("credits");
+    /// every other current provider prices directly in "USD". This is a
+    /// capability rather than a fixed enum so a future provider with its own
+    /// native unit does not require another closed match arm.
+    pub currency: &'static str,
+    /// Whether Odometer can open this provider's session in its native app
+    /// via a deep link (`open_task_in_chatgpt`). Only Codex has one today.
+    pub deep_link: bool,
+    /// Whether this provider's local transcripts carry account-wide
+    /// rate-limit/quota snapshots usable by the Subscription Usage view.
+    /// Distinct from `diagnostics::QuotaHealth`, which reports on a live
+    /// polled quota API that no provider implements yet.
+    pub quota_source: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +295,16 @@ impl IncrementalProviderParser for crate::claude_parser::ClaudeSessionParser {
     }
 }
 
+impl IncrementalProviderParser for crate::gemini_parser::GeminiSessionParser {
+    fn parse_to_end(&mut self) -> anyhow::Result<bool> {
+        crate::gemini_parser::GeminiSessionParser::parse_to_end(self)
+    }
+
+    fn session(&self) -> Option<&Session> {
+        self.session.as_ref()
+    }
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn descriptor(&self) -> &'static ProviderDescriptor;
 
@@ -291,6 +328,7 @@ pub trait ProviderAdapter: Send + Sync {
 
 struct CodexAdapter;
 struct ClaudeCodeAdapter;
+struct GeminiCliAdapter;
 
 static CODEX_DESCRIPTOR: LazyLock<ProviderDescriptor> = LazyLock::new(|| ProviderDescriptor {
     id: codex_provider_id(),
@@ -298,6 +336,9 @@ static CODEX_DESCRIPTOR: LazyLock<ProviderDescriptor> = LazyLock::new(|| Provide
     capabilities: ProviderCapabilities {
         archived_sources: true,
         session_index: true,
+        currency: "credits",
+        deep_link: true,
+        quota_source: true,
     },
 });
 
@@ -308,8 +349,33 @@ static CLAUDE_CODE_DESCRIPTOR: LazyLock<ProviderDescriptor> =
         capabilities: ProviderCapabilities {
             archived_sources: false,
             session_index: false,
+            currency: "USD",
+            deep_link: false,
+            quota_source: false,
         },
     });
+
+/// Gemini CLI (`google-gemini/gemini-cli`) session logs. Evidence for this
+/// shape comes from the tool's own session-management docs and from two
+/// independent third-party local-usage parsers (`ccusage`, `codeburn`) that
+/// read real installs; see the issue #40 PR body for citations. Only the
+/// JSONL session format (Gemini CLI >= 0.39) is supported: it is the one
+/// shape that fits Odometer's append-only, byte-offset incremental model.
+/// The earlier single-JSON-document-per-session format (<= 0.38) cannot be
+/// parsed incrementally without risking a partial/invalid JSON read while the
+/// CLI is still writing it, so it is deliberately left unsupported rather
+/// than guessed at.
+static GEMINI_CLI_DESCRIPTOR: LazyLock<ProviderDescriptor> = LazyLock::new(|| ProviderDescriptor {
+    id: gemini_cli_provider_id(),
+    display_name: "Gemini CLI",
+    capabilities: ProviderCapabilities {
+        archived_sources: false,
+        session_index: false,
+        currency: "USD",
+        deep_link: false,
+        quota_source: false,
+    },
+});
 
 impl ProviderAdapter for CodexAdapter {
     fn descriptor(&self) -> &'static ProviderDescriptor {
@@ -370,6 +436,36 @@ impl ProviderAdapter for ClaudeCodeAdapter {
     }
 }
 
+impl ProviderAdapter for GeminiCliAdapter {
+    fn descriptor(&self) -> &'static ProviderDescriptor {
+        &GEMINI_CLI_DESCRIPTOR
+    }
+
+    fn accepts_path(&self, path: &Path) -> bool {
+        is_gemini_session_jsonl(path)
+    }
+
+    fn accepts_cached_session(&self, session: &Session, kind: ProviderSourceKind) -> bool {
+        session.harness == gemini_cli_provider_id() && !kind.is_archived() && !session.archived
+    }
+
+    fn parse_file(&self, path: &Path, kind: ProviderSourceKind) -> anyhow::Result<Option<Session>> {
+        ensure_live_only(self.descriptor(), kind)?;
+        crate::gemini_parser::parse_file(path)
+    }
+
+    fn incremental_parser(
+        &self,
+        path: PathBuf,
+        kind: ProviderSourceKind,
+    ) -> anyhow::Result<Box<dyn IncrementalProviderParser>> {
+        ensure_live_only(self.descriptor(), kind)?;
+        Ok(Box::new(crate::gemini_parser::GeminiSessionParser::new(
+            path,
+        )))
+    }
+}
+
 fn ensure_live_only(
     descriptor: &ProviderDescriptor,
     kind: ProviderSourceKind,
@@ -385,7 +481,9 @@ fn ensure_live_only(
 
 static CODEX_ADAPTER: CodexAdapter = CodexAdapter;
 static CLAUDE_CODE_ADAPTER: ClaudeCodeAdapter = ClaudeCodeAdapter;
-static BUILTIN_ADAPTERS: [&'static dyn ProviderAdapter; 2] = [&CODEX_ADAPTER, &CLAUDE_CODE_ADAPTER];
+static GEMINI_CLI_ADAPTER: GeminiCliAdapter = GeminiCliAdapter;
+static BUILTIN_ADAPTERS: [&'static dyn ProviderAdapter; 3] =
+    [&CODEX_ADAPTER, &CLAUDE_CODE_ADAPTER, &GEMINI_CLI_ADAPTER];
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProviderRegistry;
@@ -427,6 +525,28 @@ fn root_contains(parent: &Path, child: &Path) -> bool {
 
 fn is_jsonl(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+}
+
+/// Gemini CLI's `~/.gemini/tmp/<project-hash>/` directory also holds
+/// unrelated `.json` checkpoint files under a sibling `checkpoints/`
+/// directory (see module docs on `GEMINI_CLI_DESCRIPTOR`). Restricting
+/// acceptance to `.jsonl` files named `session-*` under a `chats` directory
+/// keeps a broad configured root (the tool's whole `tmp` directory) from
+/// picking up files that are not session transcripts.
+fn is_gemini_session_jsonl(path: &Path) -> bool {
+    if !is_jsonl(path) {
+        return false;
+    }
+    let file_stem_matches = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.starts_with("session-"));
+    let under_chats_dir = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        == Some("chats");
+    file_stem_matches && under_chats_dir
 }
 
 #[cfg(test)]

@@ -1023,6 +1023,9 @@ pub struct ProviderDescriptorWire {
     pub display_name: String,
     pub archived_sources: bool,
     pub session_index: bool,
+    pub currency: String,
+    pub deep_link: bool,
+    pub quota_source: bool,
 }
 
 #[tauri::command]
@@ -1034,6 +1037,9 @@ pub fn list_providers() -> Vec<ProviderDescriptorWire> {
             display_name: descriptor.display_name.to_string(),
             archived_sources: descriptor.capabilities.archived_sources,
             session_index: descriptor.capabilities.session_index,
+            currency: descriptor.capabilities.currency.to_string(),
+            deep_link: descriptor.capabilities.deep_link,
+            quota_source: descriptor.capabilities.quota_source,
         })
         .collect()
 }

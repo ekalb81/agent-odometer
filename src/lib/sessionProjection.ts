@@ -210,7 +210,11 @@ export function projectSession<T extends SessionSummary>(
       planCost: 0,
       apiCost: null,
       displayCost: 0,
-      currency: session.harness === 'claude_code' ? 'USD' : 'credits',
+      // Rates have not loaded yet, so `harnessCurrency` (which reads
+      // `rates.currencies`) is not available. Codex is the only provider
+      // priced in its own plan-credit unit; every other registered provider
+      // prices directly in USD (see `ProviderCapabilities.currency`).
+      currency: session.harness === 'codex' ? 'credits' : 'USD',
       missingModels: [],
       unpricedModels: [],
       timeAwareApiStatus: null,
