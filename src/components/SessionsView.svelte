@@ -2,6 +2,7 @@
   import { onDestroy, onMount, untrack } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
+  import { workingDirectoryStore } from '../lib/stores/workingDirectories.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
@@ -353,6 +354,18 @@
     return d.displayCost;
   }
 
+  /// The grid's label for a session's working directory: the repository name
+  /// when it is inside a working tree, otherwise a shortened path. Falls back
+  /// to the leaf segment only until the resolve completes.
+  function repositoryDisplay(session: TrackedSession): string {
+    if (!session.working_directory) return '';
+    const info = workingDirectoryStore.info(session.working_directory);
+    if (info?.repository_name) {
+      return info.relative_path ? `${info.repository_name}/${info.relative_path}` : info.repository_name;
+    }
+    return info?.display_path ?? repositoryLabel(session) ?? '';
+  }
+
   // Wall-clock span of the run. Subagents are typically short-lived under a
   // parent that stays open for days, so this is the column that separates them.
   function durationMs(session: TrackedSession): number {
@@ -400,7 +413,7 @@
         cmp = a.startedMs - b.startedMs;
         break;
       case 'repository':
-        cmp = (repositoryLabel(a) ?? '').localeCompare(repositoryLabel(b) ?? '');
+        cmp = repositoryDisplay(a).localeCompare(repositoryDisplay(b));
         break;
       case 'model':
         cmp = (a.model ?? '').localeCompare(b.model ?? '');
@@ -618,7 +631,7 @@
         : 'missing:';
       const group = groups.get(key);
       if (group) group.sessions.push(session);
-      else groups.set(key, { label: repositoryLabel(anchor) ?? 'No repository recorded', sessions: [session] });
+      else groups.set(key, { label: repositoryDisplay(anchor) || 'No working directory recorded', sessions: [session] });
     }
     return [...groups.values()];
   }
@@ -713,6 +726,8 @@
       listViewportHeight = entry.contentRect.height;
     });
     if (listViewport) resize.observe(listViewport);
+    // Fetch-once and shared across tabs; the store dedupes concurrent calls.
+    void workingDirectoryStore.load();
     return () => resize.disconnect();
   });
 
@@ -1921,7 +1936,16 @@
                   {:else if column.id === 'tools'}
                     <span class="text-right font-mono text-xs text-ink" title={session.tool_metrics ? `${session.tool_metrics.reads} read · ${session.tool_metrics.searches} search · ${session.tool_metrics.mutations} mutation · ${session.tool_metrics.commands} command` : undefined}>{fmt.format(session.tool_metrics?.calls ?? 0)}</span>
                   {:else if column.id === 'repository'}
-                    <span class="text-ink-muted text-xs truncate" title={session.working_directory ? 'Recorded project folder' : 'No repository recorded for this session'}>{repositoryLabel(session) ?? 'No repository recorded'}</span>
+                    {@const wd = workingDirectoryStore.info(session.working_directory)}
+                    {#if !session.working_directory}
+                      <span class="text-ink-faint text-xs truncate" title="No working directory recorded for this session">—</span>
+                    {:else if wd?.repository_name}
+                      <span class="flex items-center min-w-0 whitespace-nowrap text-xs" title={`${wd.repository_name} · ${wd.display_path}`}>
+                        <span class="text-emerald-500 font-medium truncate">{wd.repository_name}</span>{#if wd.relative_path}<span class="text-ink-faint truncate">/{wd.relative_path}</span>{/if}
+                      </span>
+                    {:else}
+                      <span class="text-ink-muted text-xs truncate" title={wd ? `${session.working_directory} · not a git repository` : session.working_directory}>{wd?.display_path ?? repositoryLabel(session) ?? '—'}</span>
+                    {/if}
                   {:else if column.id === 'model'}
                     <span class="text-ink-muted font-mono text-xs truncate flex items-center gap-1.5" title={`${session.model ?? 'Unknown model'} · ${providerVisual.label}`}>
                       {#if sessionGridStore.colorByModelProvider}<span class="inline-block size-2 rounded-full shrink-0" style:background-color={providerVisual.tint} aria-hidden="true"></span>{/if}

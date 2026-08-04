@@ -575,3 +575,15 @@ export interface GitOutcome {
   commit_ids: string[];
   evidence: string;
 }
+
+/** How one session working directory should be labelled in the grid.
+ *  A working directory is not necessarily a repository — scratch directories
+ *  have none, and their final path segment identifies nothing. */
+export interface WorkingDirectoryInfo {
+  directory: string;
+  repository_name: string | null;
+  /** Location within the repository; empty string at the root itself. */
+  relative_path: string | null;
+  /** Shortened absolute path, home collapsed to `~`. */
+  display_path: string;
+}

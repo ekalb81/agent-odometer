@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 #[cfg(any(windows, test))]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -1790,16 +1791,112 @@ mod tests {
         configured_defender_roots, defender_elevation_script, defender_root_is_scoped,
         defender_verification_script, newest_subscription_usage_by_harness,
         powershell_encoded_command, powershell_encoded_path, preserve_backend_owned_config,
-        range_has_data, valid_session_id, write_export_file,
+        range_has_data, shorten_display_path, valid_session_id, working_directory_info,
+        write_export_file,
     };
     use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
     use crate::model::{
         Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
         TokenTotals, ToolMetrics,
     };
+    use std::path::{Path, PathBuf};
+
+    /// Path literals in these tests use the platform separator, since the
+    /// display form deliberately keeps it.
+    fn sep(value: &str) -> String {
+        if cfg!(windows) {
+            value.replace('/', "\\")
+        } else {
+            value.to_string()
+        }
+    }
+
+    /// Creates a minimal but real repository `gix::discover` will accept.
+    fn init_repository(root: &Path) {
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::create_dir_all(git.join("refs")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn display_path_collapses_home_and_keeps_the_trailing_segments() {
+        let home = PathBuf::from(sep("/users/dev"));
+
+        assert_eq!(
+            shorten_display_path(
+                Path::new(&sep("/users/dev/projects/odometer")),
+                Some(&home),
+                3
+            ),
+            sep("~/projects/odometer")
+        );
+        // Home itself stays addressable rather than rendering as empty.
+        assert_eq!(shorten_display_path(&home, Some(&home), 3), "~");
+        // Deeper than the segment budget: keep the tail, mark the elision.
+        assert_eq!(
+            shorten_display_path(
+                Path::new(&sep("/users/dev/documents/codex/2026-08-04/ser")),
+                Some(&home),
+                3
+            ),
+            sep("…/codex/2026-08-04/ser")
+        );
+    }
+
+    #[test]
+    fn display_path_outside_home_stays_absolute() {
+        let home = PathBuf::from(sep("/users/dev"));
+
+        assert_eq!(
+            shorten_display_path(Path::new(&sep("/data/work")), Some(&home), 3),
+            sep("/data/work")
+        );
+        assert_eq!(
+            shorten_display_path(Path::new(&sep("/data/work")), None, 3),
+            sep("/data/work")
+        );
+    }
+
+    /// The case that motivated this: a scratch directory whose final segment
+    /// identifies nothing must not be presented as a repository name.
+    #[test]
+    fn a_directory_outside_any_repository_reports_no_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = directory.path().join("2026-08-04").join("ser");
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let info = working_directory_info(&scratch.to_string_lossy(), None);
+
+        assert_eq!(info.repository_name, None);
+        assert_eq!(info.relative_path, None);
+        assert!(info.display_path.ends_with("ser"), "{}", info.display_path);
+    }
+
+    #[test]
+    fn a_directory_inside_a_repository_reports_its_root_and_relative_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("my-repo");
+        let nested = root.join("src").join("lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        init_repository(&root);
+
+        let at_root = working_directory_info(&root.to_string_lossy(), None);
+        assert_eq!(at_root.repository_name.as_deref(), Some("my-repo"));
+        // Empty, not absent: the directory *is* the repository root.
+        assert_eq!(at_root.relative_path.as_deref(), Some(""));
+
+        let inside = working_directory_info(&nested.to_string_lossy(), None);
+        assert_eq!(inside.repository_name.as_deref(), Some("my-repo"));
+        assert_eq!(inside.relative_path.as_deref(), Some("src/lib"));
+    }
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use chrono::{DateTime, Utc};
-    use std::path::PathBuf;
 
     #[test]
     fn validates_deep_link_session_ids() {
@@ -2098,4 +2195,117 @@ mod tests {
             Some(10_080)
         );
     }
+}
+
+/// How one session working directory should be labelled in the grid.
+///
+/// A working directory is not necessarily a repository: scratch directories
+/// (for example the dated folders a web client creates) have no repo at all,
+/// and their final path segment is frequently a one- or two-character
+/// fragment that identifies nothing. Rather than present those as repository
+/// names, the grid shows a shortened path for every directory and marks the
+/// ones that are genuinely inside a working tree.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WorkingDirectoryInfo {
+    /// The session's working directory, verbatim — the map key the frontend
+    /// looks up.
+    pub directory: String,
+    /// Working-tree root name when inside a repository.
+    pub repository_name: Option<String>,
+    /// Directory location relative to the repository root. Empty at the root
+    /// itself. Only meaningful alongside `repository_name`.
+    pub relative_path: Option<String>,
+    /// Shortened absolute path, home collapsed to `~`. Shown when there is no
+    /// repository, and as the hover title when there is.
+    pub display_path: String,
+}
+
+/// Collapses the home prefix to `~` and keeps only the trailing segments, so a
+/// deep path stays identifiable without carrying the whole ancestry into the
+/// grid.
+fn shorten_display_path(path: &Path, home: Option<&Path>, max_segments: usize) -> String {
+    let separator = if cfg!(windows) { '\\' } else { '/' };
+    let (mut rendered, prefixed) = match home.and_then(|home| path.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => (String::from("~"), true),
+        Some(rest) => (format!("~{separator}{}", rest.display()), true),
+        None => (path.display().to_string(), false),
+    };
+    let segments: Vec<&str> = rendered
+        .split(['/', '\\'])
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.len() > max_segments {
+        let kept = segments[segments.len() - max_segments..].join(&separator.to_string());
+        rendered = format!("…{separator}{kept}");
+    } else if !prefixed && rendered.is_empty() {
+        rendered = path.display().to_string();
+    }
+    rendered
+}
+
+fn working_directory_info(directory: &str, home: Option<&Path>) -> WorkingDirectoryInfo {
+    let path = Path::new(directory);
+    let display_path = shorten_display_path(path, home, 3);
+    match crate::git_outcomes::discover_repository_root(path) {
+        Some(root) => {
+            let repository_name = root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                // A repository at a filesystem root has no final segment.
+                .unwrap_or_else(|| root.display().to_string());
+            let relative_path = path
+                .strip_prefix(&root)
+                .ok()
+                .map(|rest| rest.to_string_lossy().replace('\\', "/"));
+            WorkingDirectoryInfo {
+                directory: directory.to_string(),
+                repository_name: Some(repository_name),
+                relative_path,
+                display_path,
+            }
+        }
+        None => WorkingDirectoryInfo {
+            directory: directory.to_string(),
+            repository_name: None,
+            relative_path: None,
+            display_path,
+        },
+    }
+}
+
+/// Resolves every distinct session working directory to its repository, if any.
+///
+/// Distinct directories are far fewer than sessions (roughly 30× fewer in
+/// practice), so this walks the filesystem once per directory rather than once
+/// per session. Deliberately uncached: a directory that becomes a repository
+/// after `git init` should be reflected without restarting the app.
+#[tauri::command]
+pub fn resolve_working_directories(state: State<'_, Arc<AppState>>) -> Vec<WorkingDirectoryInfo> {
+    let started = Instant::now();
+    let home = dirs::home_dir();
+    let mut directories: Vec<String> = state
+        .sessions
+        .iter()
+        .filter_map(|entry| entry.working_directory.clone())
+        .collect();
+    directories.sort_unstable();
+    directories.dedup();
+    let resolved: Vec<WorkingDirectoryInfo> = directories
+        .iter()
+        .map(|directory| working_directory_info(directory, home.as_deref()))
+        .collect();
+    let mut metadata = BTreeMap::new();
+    metadata.insert("directories".into(), resolved.len().to_string());
+    metadata.insert(
+        "repositories".into(),
+        resolved
+            .iter()
+            .filter(|info| info.repository_name.is_some())
+            .count()
+            .to_string(),
+    );
+    state
+        .performance
+        .record_backend("ipc.resolve_working_directories", started, true, metadata);
+    resolved
 }

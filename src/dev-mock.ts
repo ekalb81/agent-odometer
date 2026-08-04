@@ -446,6 +446,23 @@ mockIPC((cmd, payload) => {
     }
     case 'get_subscription_usage':
       return subscriptionUsage();
+    case 'resolve_working_directories':
+      // Matches the fixture sessions' working directory, so the grid renders
+      // the resolved repository rather than its unresolved path fallback.
+      return [
+        {
+          directory: '/home/dev/projects/demo',
+          repository_name: 'demo',
+          relative_path: '',
+          display_path: '~/projects/demo',
+        },
+        {
+          directory: '/home/dev/Documents/Codex/2026-08-04/ser',
+          repository_name: null,
+          relative_path: null,
+          display_path: '…/Codex/2026-08-04/ser',
+        },
+      ];
     case 'list_providers':
       return [
         { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true },

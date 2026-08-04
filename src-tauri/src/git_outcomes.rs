@@ -40,6 +40,14 @@ fn repository_scope(repo: &gix::Repository) -> PathBuf {
         .to_path_buf()
 }
 
+/// The working tree root of the repository containing `path`, if any.
+///
+/// Three call sites previously each open-coded `gix::discover` followed by the
+/// same workdir/git-dir fallback; they now share this one.
+pub(crate) fn discover_repository_root(path: &Path) -> Option<PathBuf> {
+    gix::discover(path).ok().map(|repo| repository_scope(&repo))
+}
+
 fn load_commits(repo: &gix::Repository) -> anyhow::Result<Vec<CommitInfo>> {
     let head = repo.head_commit()?;
     let mut commits = Vec::new();

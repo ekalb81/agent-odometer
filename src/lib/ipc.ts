@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -82,6 +82,10 @@ export function getConfig(): Promise<Config> {
 /** Registered providers with display names and capability flags. */
 export function listProviders(): Promise<ProviderDescriptor[]> {
   return invoke<ProviderDescriptor[]>('list_providers');
+}
+
+export function resolveWorkingDirectories(): Promise<WorkingDirectoryInfo[]> {
+  return invoke<WorkingDirectoryInfo[]>('resolve_working_directories');
 }
 
 export function setConfig(config: Config): Promise<void> {

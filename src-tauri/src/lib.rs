@@ -28,8 +28,9 @@ use commands::{
     get_scan_status, get_session_details, get_subscription_usage, get_turn_receipt_status,
     list_external_events, list_instruction_files, list_providers, list_sessions,
     list_tool_impact_targets, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
-    record_frontend_performance, repair_turn_receipt_integrations, reveal_in_file_manager,
-    scan_git_outcomes, sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
+    record_frontend_performance, repair_turn_receipt_integrations, resolve_working_directories,
+    reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges, set_config, set_rates,
+    set_tray_totals, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -63,6 +64,7 @@ pub fn run() {
             get_scan_status,
             get_config,
             list_providers,
+            resolve_working_directories,
             set_config,
             get_turn_receipt_status,
             repair_turn_receipt_integrations,
