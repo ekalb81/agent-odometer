@@ -6,7 +6,7 @@
   import Filters from './components/Filters.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, onInstructionScanProgress, sessionsInRanges, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
   import { instructionScanStore } from './lib/stores/instructionScan.svelte';
@@ -20,6 +20,7 @@
   import type { InstructionScanProgress, RateCard, SessionSummary } from './lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { computeTrayTotals } from './lib/trayTotals';
+  import { quotaTrayLabel } from './lib/subscriptionUsage';
   import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
   import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
@@ -119,7 +120,17 @@
         results = trayCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
       }
       if (!results) return;
-      await setTrayTotals(computeTrayTotals(sessionsStore.map.values(), results[0], rateCard));
+      // Best-effort: a quota-fetch failure must never block the existing
+      // token/credit tray update, so it's fetched and formatted (via the
+      // same helper the dashboard panel uses) outside the cache/plan path
+      // above and defaults to no label on failure.
+      let quotaLabel: string | null = null;
+      try {
+        quotaLabel = quotaTrayLabel(await getQuotaSnapshots());
+      } catch (error) {
+        console.error('quota tray label refresh failed:', error);
+      }
+      await setTrayTotals(computeTrayTotals(sessionsStore.map.values(), results[0], rateCard, quotaLabel));
     } catch (error) {
       trayCache.invalidate();
       console.error('tray totals refresh failed:', error);

@@ -65,6 +65,7 @@ fn healthy_input() -> ProviderDiagnosticInput {
             rates_stale: false,
         },
         archive_roots_configured: 1,
+        has_quota_observation: false,
     }
 }
 
@@ -76,7 +77,30 @@ fn healthy_operation_resolves_ready_with_a_healthy_notice_and_no_reasons() {
     assert_eq!(diagnostic.notices.len(), 1);
     assert_eq!(diagnostic.notices[0].code, "healthy");
     assert_eq!(diagnostic.retention.level, RetentionRiskLevel::None);
-    assert_eq!(diagnostic.quota.reason_code, "quota_source_not_implemented");
+    // `healthy_input()`'s capabilities declare `quota_source: false`, so
+    // even a fully healthy provider honestly reports no quota source here
+    // rather than a fabricated observation.
+    assert_eq!(diagnostic.quota.reason_code, "quota_source_not_available");
+}
+
+#[test]
+fn a_provider_with_quota_capability_and_an_observation_reports_transcript_derived() {
+    let mut input = healthy_input();
+    input.capabilities.quota_source = true;
+    input.has_quota_observation = true;
+
+    let diagnostic = build_provider_diagnostic(input);
+    assert_eq!(diagnostic.quota.reason_code, "quota_transcript_derived");
+}
+
+#[test]
+fn a_provider_with_quota_capability_but_no_observation_yet_stays_not_available() {
+    let mut input = healthy_input();
+    input.capabilities.quota_source = true;
+    input.has_quota_observation = false;
+
+    let diagnostic = build_provider_diagnostic(input);
+    assert_eq!(diagnostic.quota.reason_code, "quota_no_observation_yet");
 }
 
 #[test]

@@ -9,7 +9,7 @@ use crate::scan_cache;
 use crate::store::AppState;
 #[cfg(any(windows, test))]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 #[cfg(any(windows, test))]
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
@@ -2684,4 +2684,165 @@ pub fn clear_session_project_override(
     history
         .clear_session_project_override(&session_key)
         .map_err(|error| error.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Quota (issue #43): live-window snapshots, soft budgets, and alerts.
+// `crate::quota` is the single service computing pace/forecast/alert math;
+// these commands only assemble its inputs from `AppState`/`quota_store` and
+// return its output. See `crate::quota`'s module docs for the honesty
+// contract and the network seam this deliberately does not implement.
+// ---------------------------------------------------------------------------
+
+/// Every registered provider's current quota snapshot, transcript-derived.
+/// Always returns one entry per provider (never omits one), so "no data"
+/// is always an explicit, honest state rather than an absent row.
+#[tauri::command]
+pub fn get_quota_snapshots(state: State<'_, Arc<AppState>>) -> Vec<crate::quota::QuotaSnapshot> {
+    let started = Instant::now();
+    let store = crate::quota_store::QuotaStoreFile::load();
+    let now = Utc::now();
+    let max_cache_age = chrono::Duration::seconds(store.max_cache_age_secs);
+    let sessions: Vec<Arc<Session>> = state.sessions.iter().map(|e| e.value().clone()).collect();
+    let result = crate::quota::quota_snapshots_from_sessions(
+        sessions.iter().map(Arc::as_ref),
+        now,
+        max_cache_age,
+    );
+    state.performance.record_backend(
+        "ipc.get_quota_snapshots",
+        started,
+        true,
+        BTreeMap::from([("providers".into(), result.len().to_string())]),
+    );
+    result
+}
+
+/// Current soft-budget/notification configuration (never includes the
+/// internal dedup log — see `QuotaConfigWire`).
+#[tauri::command]
+pub fn get_quota_config() -> crate::quota_store::QuotaConfigWire {
+    let store = crate::quota_store::QuotaStoreFile::load();
+    crate::quota_store::QuotaConfigWire::from(&store)
+}
+
+/// Replaces the whole soft-budget/notification configuration, mirroring
+/// `set_rates`'s whole-object-replace shape. Validates before persisting
+/// (fail-closed) and preserves the existing notification dedup log, which
+/// is internal bookkeeping the caller never sees or supplies.
+#[tauri::command]
+pub fn set_quota_config(
+    config: crate::quota_store::QuotaConfigWire,
+) -> Result<crate::quota_store::QuotaConfigWire, String> {
+    crate::quota_store::validate_quota_config(&config)?;
+    let mut store = crate::quota_store::QuotaStoreFile::load();
+    store.budgets = config.budgets;
+    store.notifications = config.notifications;
+    store.max_cache_age_secs = config.max_cache_age_secs;
+    store.save().map_err(|error| error.to_string())?;
+    Ok(crate::quota_store::QuotaConfigWire::from(&store))
+}
+
+/// Token usage for one budget's provider/project scope over its rolling
+/// period, from the in-memory session projection. Only ever called for
+/// `Tokens`-unit budgets; `PercentOfWindow` budgets read their current
+/// value directly off the matching `QuotaWindow` instead.
+fn token_budget_current_value(
+    state: &AppState,
+    budget: &crate::quota_store::QuotaBudget,
+    now: DateTime<Utc>,
+) -> f64 {
+    let period_hours = budget.period_hours.unwrap_or(24).max(1) as i64;
+    let since = now - chrono::Duration::hours(period_hours);
+    state
+        .sessions
+        .iter()
+        .filter(|entry| entry.value().harness == budget.provider)
+        .filter(|entry| {
+            budget.project_key.is_none()
+                || entry.value().project_key.as_deref() == budget.project_key.as_deref()
+        })
+        .map(|entry| {
+            entry
+                .value()
+                .range_totals(Some(since), None)
+                .tokens
+                .total_tokens as f64
+        })
+        .sum()
+}
+
+/// Recomputes quota snapshots against configured soft budgets and returns
+/// any newly crossed thresholds, persisting the updated dedup log. Cheap
+/// enough to poll on the same interval as `get_subscription_usage`; a
+/// caller uninterested in alerts (or with no budgets/opted out) pays only
+/// the cost of loading the small quota config file.
+#[tauri::command]
+pub fn check_quota_alerts(state: State<'_, Arc<AppState>>) -> Vec<crate::quota::QuotaAlert> {
+    let started = Instant::now();
+    let mut store = crate::quota_store::QuotaStoreFile::load();
+    if store.budgets.is_empty() {
+        return Vec::new();
+    }
+    let now = Utc::now();
+    let max_cache_age = chrono::Duration::seconds(store.max_cache_age_secs);
+    let sessions: Vec<Arc<Session>> = state.sessions.iter().map(|e| e.value().clone()).collect();
+    let snapshots = crate::quota::quota_snapshots_from_sessions(
+        sessions.iter().map(Arc::as_ref),
+        now,
+        max_cache_age,
+    );
+    let snapshot_by_provider: HashMap<&str, &crate::quota::QuotaSnapshot> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.provider.as_str(), snapshot))
+        .collect();
+
+    let evaluations: Vec<crate::quota::BudgetEvaluation> = store
+        .budgets
+        .iter()
+        .map(|budget| {
+            let current_value = match budget.unit {
+                crate::quota_store::BudgetUnit::PercentOfWindow => snapshot_by_provider
+                    .get(budget.provider.as_str())
+                    .and_then(|snapshot| {
+                        snapshot.windows.iter().find(|window| {
+                            window.unavailable.is_none()
+                                && budget.window_kind.as_deref() == Some(window.kind.as_str())
+                        })
+                    })
+                    .and_then(|window| window.used),
+                crate::quota_store::BudgetUnit::Tokens => {
+                    Some(token_budget_current_value(&state, budget, now))
+                }
+            };
+            crate::quota::BudgetEvaluation {
+                budget,
+                current_value,
+            }
+        })
+        .collect();
+
+    let local_hour = Local::now().hour() as u8;
+    let (alerts, updated_log) = crate::quota::evaluate_alerts(
+        &evaluations,
+        &store.notifications,
+        &store.notification_log,
+        now,
+        local_hour,
+    );
+    store.notification_log = updated_log;
+    store.prune_log(now, chrono::Duration::days(30));
+    if let Err(error) = store.save() {
+        tracing::warn!("could not persist quota notification log: {}", error);
+    }
+    state.performance.record_backend(
+        "ipc.check_quota_alerts",
+        started,
+        true,
+        BTreeMap::from([
+            ("budgets".into(), store.budgets.len().to_string()),
+            ("alerts".into(), alerts.len().to_string()),
+        ]),
+    );
+    alerts
 }
