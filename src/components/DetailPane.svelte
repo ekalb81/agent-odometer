@@ -443,6 +443,8 @@
                           <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
                         {:else if credit.basis === 'aliased' && turn.tokens.total_tokens > 0}
                           <span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match">↝</span>
+                        {:else if credit.basis === 'estimated' && turn.tokens.total_tokens > 0}
+                          <span class="text-sky-500" title="Includes cache-write tokens priced at the ordinary input rate — no published cache-write premium for this model">≈</span>
                         {:else if credit.fallbackUsed && turn.tokens.total_tokens > 0}
                           <span class="text-amber-500" title="Fallback rate used (model not in rate card)">⚠</span>
                         {/if}
@@ -545,6 +547,8 @@
                         <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
                       {:else if modelCredit?.basis === 'aliased'}
                         <span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match">↝</span>
+                      {:else if modelCredit?.basis === 'estimated'}
+                        <span class="text-sky-500" title="Includes cache-write tokens priced at the ordinary input rate — no published cache-write premium for this model">≈</span>
                       {:else if modelCredit?.fallbackUsed}
                         <span class="text-amber-500" title="Fallback rate used ({$rates ? fallbackModelName($rates, session.harness) : '—'})">⚠</span>
                       {/if}

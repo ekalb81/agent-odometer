@@ -526,7 +526,9 @@
       name,
       input: String(rate.input),
       cached_input: String(rate.cached_input),
-      cache_creation_input: String(rate.cache_creation_input),
+      cache_creation_input: rate.cache_creation_input === null || rate.cache_creation_input === undefined
+        ? ''
+        : String(rate.cache_creation_input),
       output: String(rate.output),
       reasoning: String(rate.reasoning),
     }));
@@ -567,6 +569,20 @@
     return n;
   }
 
+  /** The cache-write rate is the one field where blank is a valid, distinct
+   * value: it means "no published premium for this model", which prices
+   * cache-creation tokens at the ordinary input rate rather than at zero
+   * (see credits.ts cacheCreationRate). Typing `0` is a different, explicit
+   * "this is free" claim. Returns the sentinel string 'invalid' for
+   * anything else that doesn't parse as a non-negative number. */
+  function parseCacheCreationRate(s: string): number | null | 'invalid' {
+    const trimmed = s.trim();
+    if (trimmed === '') return null;
+    const n = parseFloat(trimmed);
+    if (isNaN(n) || n < 0) return 'invalid';
+    return n;
+  }
+
   /** Catalog intervals are intentionally shown as UTC half-open windows so a
    * temporary price does not look like a current default. */
   function fmtPricingWindow(from: string, to: string | null): string {
@@ -595,17 +611,24 @@
       }
       const input = parseRate(row.input);
       const cached_input = parseRate(row.cached_input);
-      const cache_creation_input = parseRate(row.cache_creation_input);
       const output = parseRate(row.output);
       const reasoning = parseRate(row.reasoning);
-      if (
-        input === null || cached_input === null || cache_creation_input === null
-        || output === null || reasoning === null
-      ) {
+      if (input === null || cached_input === null || output === null || reasoning === null) {
         validationError = `Rates for "${row.name}" must be non-negative numbers.`;
         return null;
       }
-      models[row.name.trim()] = { input, cached_input, cache_creation_input, output, reasoning };
+      const cacheCreationParsed = parseCacheCreationRate(row.cache_creation_input);
+      if (cacheCreationParsed === 'invalid') {
+        validationError = `Cache-write rate for "${row.name}" must be blank (unknown) or a non-negative number.`;
+        return null;
+      }
+      models[row.name.trim()] = {
+        input,
+        cached_input,
+        cache_creation_input: cacheCreationParsed,
+        output,
+        reasoning,
+      };
     }
     if (!models[fallbackModel]) {
       validationError = `Fallback model "${fallbackModel}" is not in the model list.`;
@@ -686,21 +709,22 @@
     }
     const input = parseRate(newInput);
     const cached_input = parseRate(newCachedInput);
-    const cache_creation_input = parseRate(newCacheCreationInput);
     const output = parseRate(newOutput);
     const reasoning = parseRate(newReasoning);
-    if (
-      input === null || cached_input === null || cache_creation_input === null
-      || output === null || reasoning === null
-    ) {
-      validationError = 'All rate fields must be non-negative numbers.';
+    if (input === null || cached_input === null || output === null || reasoning === null) {
+      validationError = 'Input, cached, output, and reasoning rates must be non-negative numbers.';
+      return;
+    }
+    const cacheCreationParsed = parseCacheCreationRate(newCacheCreationInput);
+    if (cacheCreationParsed === 'invalid') {
+      validationError = 'Cache-write rate must be blank (unknown) or a non-negative number.';
       return;
     }
     rows = [...rows, {
       name,
       input: String(input),
       cached_input: String(cached_input),
-      cache_creation_input: String(cache_creation_input),
+      cache_creation_input: cacheCreationParsed === null ? '' : String(cacheCreationParsed),
       output: String(output),
       reasoning: String(reasoning),
     }];
@@ -1368,7 +1392,7 @@
               <th class="text-left px-3 py-2 text-ink-muted font-medium">Model</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Input $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Cached $/1M</th>
-              <th class="text-right px-3 py-2 text-ink-muted font-medium" title="Cache-creation (write) rate — a distinct dimension from Cached (read), never double-counted with it.">Cache write $/1M</th>
+              <th class="text-right px-3 py-2 text-ink-muted font-medium" title="Cache-creation (write) rate — a distinct dimension from Cached (read), never double-counted with it. Leave blank if no premium is published: cache-write tokens then price at the Input rate, not free. Enter 0 only if this model's cache writes are genuinely free.">Cache write $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Output $/1M</th>
               <th class="text-right px-3 py-2 text-ink-muted font-medium">Reasoning $/1M</th>
               <th class="px-3 py-2"></th>
@@ -1403,9 +1427,10 @@
                     type="number"
                     min="0"
                     step="0.001"
+                    placeholder="unknown"
                     bind:value={row.cache_creation_input}
                     oninput={markDirty}
-                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
+                    class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                   />
                 </td>
                 <td class="px-3 py-1.5">
@@ -1480,7 +1505,7 @@
                   type="number"
                   min="0"
                   step="0.001"
-                  placeholder="0"
+                  placeholder="unknown"
                   bind:value={newCacheCreationInput}
                   class="w-24 text-right bg-app border border-edge rounded-sm px-2 py-0.5 text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) tabular-nums"
                 />

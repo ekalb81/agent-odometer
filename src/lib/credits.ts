@@ -79,6 +79,45 @@ function serviceTierMultiplier(model: string | null, serviceTier: string | null)
   return 1;
 }
 
+/** Resolves the effective cache-creation rate: the published premium when
+ * stated, otherwise the ordinary `input` rate — exactly today's pre-#42
+ * accounting for a model with no published cache-write premium. Never zero
+ * by default; `rate.cache_creation_input` must stay `null`/absent, never
+ * default to `0`, or "unknown" silently becomes "free". Mirrors
+ * `ModelRate::cache_creation_rate` in rates.rs — keep both in sync. */
+export function cacheCreationRate(rate: ModelRate): number {
+  return rate.cache_creation_input ?? rate.input;
+}
+
+/** True when `cacheCreationRate` is falling back to the ordinary input rate
+ * rather than pricing at a directly published cache-write premium. Mirrors
+ * `ModelRate::cache_creation_rate_is_fallback` in rates.rs. */
+export function cacheCreationRateIsFallback(rate: ModelRate): boolean {
+  return rate.cache_creation_input === null || rate.cache_creation_input === undefined;
+}
+
+/** A `direct`/`aliased` model resolution is only as authoritative as its
+ * least-authoritative dimension. When the priced usage actually carries
+ * cache-creation tokens and this model's rate has no published cache-write
+ * premium, the resulting charge is partly a fallback-priced estimate, not a
+ * direct price — downgrade so the UI doesn't render it as one. Other bases
+ * (`fallback`, `unavailable`, `free_local`, `stale`, ...) already carry
+ * their own, more specific provenance and are left untouched. */
+function downgradeForCacheCreationFallback(
+  basis: PricingBasis,
+  rate: ModelRate,
+  cacheCreationTokens: number,
+): PricingBasis {
+  if (
+    (basis === 'direct' || basis === 'aliased')
+    && cacheCreationTokens > 0
+    && cacheCreationRateIsFallback(rate)
+  ) {
+    return 'estimated';
+  }
+  return basis;
+}
+
 /** Cost of one event's token delta under a given rate. Cached-read and
  * cache-creation are both disjoint subsets of input_tokens (never the same
  * tokens counted twice), and reasoning is a subset of output_tokens. */
@@ -91,7 +130,7 @@ function eventCost(delta: TokenTotals, rate: ModelRate, multiplier = 1): number 
   return (
     (nonCachedInput * rate.input +
       delta.cached_input_tokens * rate.cached_input +
-      delta.cache_creation_input_tokens * rate.cache_creation_input +
+      delta.cache_creation_input_tokens * cacheCreationRate(rate) +
       nonReasoningOutput * rate.output +
       delta.reasoning_output_tokens * rate.reasoning) /
     1_000_000
@@ -258,15 +297,27 @@ function bucketsCost(
 
   for (const b of buckets) {
     const { resolvedModel, basis } = resolveModelPricing(rates, b.model, harness, table);
-    basisByModel.set(b.model, basis);
     if (basis === 'unavailable' && isUnpricedModel(rates, b.model)) {
+      basisByModel.set(b.model, basis);
       unpricedModels.add(b.model);
       byModelMap.set(b.model, byModelMap.get(b.model) ?? 0);
       continue;
     }
     if (basis === 'fallback' || basis === 'unavailable') missingModels.add(b.model);
     const rate = table[resolvedModel];
-    if (!rate) continue;
+    if (!rate) {
+      if (basisByModel.get(b.model) !== 'estimated') basisByModel.set(b.model, basis);
+      continue;
+    }
+    // A model can appear in multiple buckets (one per service tier); once
+    // any bucket downgrades to `estimated`, a later, cleaner bucket for the
+    // same model must not paper back over it.
+    if (basisByModel.get(b.model) !== 'estimated') {
+      basisByModel.set(
+        b.model,
+        downgradeForCacheCreationFallback(basis, rate, b.tokens.cache_creation_input_tokens),
+      );
+    }
 
     const cost = eventCost(b.tokens, rate, serviceTierMultiplier(b.model, b.service_tier));
     total += cost;
@@ -417,13 +468,26 @@ export function computeSessionApiCostScenarios(
     const cost = (
       (nonCachedInput * period.rate.input * inputMultiplier)
       + (event.delta.cached_input_tokens * period.rate.cached_input * inputMultiplier)
-      + (event.delta.cache_creation_input_tokens * period.rate.cache_creation_input * inputMultiplier)
+      + (event.delta.cache_creation_input_tokens * cacheCreationRate(period.rate) * inputMultiplier)
       + (nonReasoningOutput * period.rate.output * outputMultiplier)
       + (event.delta.reasoning_output_tokens * period.rate.reasoning * outputMultiplier)
     ) / 1_000_000 * serviceTierMultiplier(event.model, event.service_tier);
     total += cost;
     byModelMap.set(event.model, (byModelMap.get(event.model) ?? 0) + cost);
-    basisByModel.set(event.model, 'direct');
+    // A period with a direct catalog match is normally `direct`, but when
+    // its cache-creation rate is itself falling back to the ordinary input
+    // rate (no published premium) and this event actually carries
+    // cache-creation tokens, that charge is not a directly published price
+    // — downgrade to `estimated` so the UI doesn't render it as one. Once a
+    // model is marked `estimated` a later, cleaner event must not paper
+    // over it.
+    const eventBasis: PricingBasis =
+      cacheCreationRateIsFallback(period.rate) && event.delta.cache_creation_input_tokens > 0
+        ? 'estimated'
+        : 'direct';
+    if (basisByModel.get(event.model) !== 'estimated') {
+      basisByModel.set(event.model, eventBasis);
+    }
     periodIds.add(period.id);
     if (period.cache_write_input_multiplier !== null && period.cache_write_input_multiplier !== undefined) {
       cacheWriteMultipliers.add(period.cache_write_input_multiplier);
@@ -489,11 +553,16 @@ export function computeSessionCredits(session: Session, rates: RateCard): Sessio
       byModel.push({ model, cost: 0, fallbackUsed, unpriced: false, basis });
       continue;
     }
+    const resolvedBasis = downgradeForCacheCreationFallback(
+      basis,
+      rate,
+      totals.cache_creation_input_tokens,
+    );
 
     const cost = eventCost(totals, rate);
 
     total += cost;
-    byModel.push({ model, cost, fallbackUsed, unpriced: false, basis });
+    byModel.push({ model, cost, fallbackUsed, unpriced: false, basis: resolvedBasis });
   }
 
   return { total, byModel, missingModels, unpricedModels };
@@ -513,15 +582,27 @@ function historyCost(
   for (const ev of session.tokens_history) {
     if (!ev.model) continue;
     const { resolvedModel, basis } = resolveModelPricing(rates, ev.model, session.harness, table);
-    basisByModel.set(ev.model, basis);
     if (basis === 'unavailable' && isUnpricedModel(rates, ev.model)) {
+      basisByModel.set(ev.model, basis);
       unpricedModels.add(ev.model);
       byModelMap.set(ev.model, byModelMap.get(ev.model) ?? 0);
       continue;
     }
     if (basis === 'fallback' || basis === 'unavailable') missingModels.add(ev.model);
     const rate = table[resolvedModel];
-    if (!rate) continue;
+    if (!rate) {
+      if (basisByModel.get(ev.model) !== 'estimated') basisByModel.set(ev.model, basis);
+      continue;
+    }
+    // Multiple events can share a model across a session's history; once any
+    // one of them downgrades to `estimated` a later, cleaner event must not
+    // paper back over it.
+    if (basisByModel.get(ev.model) !== 'estimated') {
+      basisByModel.set(
+        ev.model,
+        downgradeForCacheCreationFallback(basis, rate, ev.delta.cache_creation_input_tokens),
+      );
+    }
 
     const cost = eventCost(
       ev.delta,

@@ -641,7 +641,7 @@ mod tests {
                         crate::rates::ModelRate {
                             input: 1.0,
                             cached_input: 0.1,
-                            cache_creation_input: 0.125,
+                            cache_creation_input: Some(0.125),
                             output: 2.0,
                             reasoning: 2.0,
                         },

@@ -10,14 +10,43 @@ pub struct ModelRate {
     /// Cache-creation ("cache write") rate — a normalized dimension distinct
     /// from both `input` and `cached_input`. Historically Claude cache
     /// writes were folded into `input`, which missed Anthropic's ~1.25x
-    /// write premium. Defaults to 0.0 for rate-card entries written before
-    /// this field existed; `merge_older_override` backfills it from the
-    /// bundled card for models a user has otherwise customized (see there).
+    /// write premium.
+    ///
+    /// Deliberately nullable, and the null/absent case is not "free": it
+    /// means the publisher has not stated a cache-write premium for this
+    /// model, and cache-creation tokens must be priced at the ordinary
+    /// `input` rate (exactly today's pre-#42 accounting) rather than at
+    /// zero. `Some(0.0)` is a real, deliberate "this is free" claim,
+    /// distinct from "unknown". See `cache_creation_rate()` — every pricing
+    /// call site must resolve through it rather than reading this field
+    /// directly, or the absent/free distinction gets silently lost again.
+    /// Absent for rate-card entries written before this field existed;
+    /// `merge_older_override` backfills it from the bundled card for models
+    /// a user has otherwise customized (see there).
     #[serde(default)]
-    pub cache_creation_input: f64,
+    pub cache_creation_input: Option<f64>,
     pub output: f64,
     /// Typically the same as output for reasoning models.
     pub reasoning: f64,
+}
+
+impl ModelRate {
+    /// Resolves the effective cache-creation rate: the published premium
+    /// when stated, otherwise the ordinary `input` rate. Never zero by
+    /// default — see `cache_creation_input`'s docs. Every cache-creation
+    /// pricing call site must go through this rather than reading
+    /// `cache_creation_input` directly.
+    pub fn cache_creation_rate(&self) -> f64 {
+        self.cache_creation_input.unwrap_or(self.input)
+    }
+
+    /// True when `cache_creation_rate()` is falling back to the ordinary
+    /// input rate rather than pricing at a directly published cache-write
+    /// premium. Callers use this to keep a fallback cache-write charge from
+    /// rendering as an authoritative direct price.
+    pub fn cache_creation_rate_is_fallback(&self) -> bool {
+        self.cache_creation_input.is_none()
+    }
 }
 
 /// The billing surface a catalog rule applies to.  A model can carry different
@@ -717,6 +746,30 @@ impl RateCard {
     }
 }
 
+/// A `Direct`/`Aliased` model resolution is only as authoritative as its
+/// least-authoritative dimension. When the priced usage actually carries
+/// cache-creation tokens and the resolved rate has no published cache-write
+/// premium (`ModelRate::cache_creation_rate_is_fallback`), the resulting
+/// charge is partly a fallback-priced estimate, not a direct price —
+/// downgrade so the UI doesn't render it as one. Other bases (`Fallback`,
+/// `Unavailable`, `FreeLocal`, `Stale`, ...) already carry their own, more
+/// specific provenance and are left untouched. Mirrors
+/// `downgradeForCacheCreationFallback` in credits.ts — keep both in sync.
+pub fn downgrade_for_cache_creation_fallback(
+    basis: PricingBasis,
+    rate: &ModelRate,
+    cache_creation_tokens: u64,
+) -> PricingBasis {
+    if matches!(basis, PricingBasis::Direct | PricingBasis::Aliased)
+        && cache_creation_tokens > 0
+        && rate.cache_creation_rate_is_fallback()
+    {
+        PricingBasis::Estimated
+    } else {
+        basis
+    }
+}
+
 /// Add models introduced by a newer bundled card without overwriting any
 /// user-edited model, currency, unit, or fallback choices.
 fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
@@ -725,21 +778,29 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     }
     // Backfill the newly split cache-creation dimension onto models the user
     // already customized, before bundled entries below fill in models the
-    // user never touched. A disk entry's `cache_creation_input` is
-    // indistinguishable between "user explicitly priced it at 0" and
-    // "written before this field existed" (both deserialize to 0.0); this
-    // upgrades the latter, common, case for a rate-card override written by
-    // an earlier release, while never touching an already-nonzero user value.
+    // user never touched. A disk entry's `cache_creation_input` being
+    // `None` is unambiguous now (Option, not a 0.0 default that could also
+    // mean "explicitly free"): it means a rate-card override written before
+    // this field existed, or before the bundled card published a premium
+    // for that model. Absent already prices correctly (falls back to the
+    // ordinary input rate — see `ModelRate::cache_creation_rate`), so this
+    // is purely an upgrade to a more precise, directly published rate when
+    // one becomes available; it never touches a user's own `Some(_)` value,
+    // including an explicit `Some(0.0)` "this is free" claim.
     for (model, bundled_rate) in &bundled.models {
         if let Some(existing) = disk.models.get_mut(model) {
-            if existing.cache_creation_input == 0.0 && bundled_rate.cache_creation_input != 0.0 {
+            if existing.cache_creation_input.is_none()
+                && bundled_rate.cache_creation_input.is_some()
+            {
                 existing.cache_creation_input = bundled_rate.cache_creation_input;
             }
         }
     }
     for (model, bundled_rate) in &bundled.api_models {
         if let Some(existing) = disk.api_models.get_mut(model) {
-            if existing.cache_creation_input == 0.0 && bundled_rate.cache_creation_input != 0.0 {
+            if existing.cache_creation_input.is_none()
+                && bundled_rate.cache_creation_input.is_some()
+            {
                 existing.cache_creation_input = bundled_rate.cache_creation_input;
             }
         }
@@ -833,7 +894,7 @@ mod tests {
         ModelRate {
             input: value,
             cached_input: value,
-            cache_creation_input: value,
+            cache_creation_input: Some(value),
             output: value,
             reasoning: value,
         }
@@ -913,26 +974,28 @@ mod tests {
     #[test]
     fn older_override_backfills_cache_creation_rate_for_customized_models() {
         // A model the user customized before `cache_creation_input` existed
-        // deserializes with the field defaulted to 0.0 (see `ModelRate`).
-        // Merging in a newer bundled card must upgrade that 0.0 to the
-        // bundled cache-write rate rather than leaving cache-creation tokens
-        // silently priced at zero forever, while never touching a value the
-        // user actually set.
-        let mut user_priced_at_zero = rate(50.0);
-        user_priced_at_zero.cache_creation_input = 0.0;
-        let mut user_explicitly_zero = rate(60.0);
-        user_explicitly_zero.cache_creation_input = 0.0;
+        // deserializes with the field absent (`None`; see `ModelRate`).
+        // Merging in a newer bundled card must upgrade that `None` to the
+        // bundled cache-write rate, while never touching an already-edited
+        // `Some(_)` value.
+        let mut user_priced_without_premium = rate(50.0);
+        user_priced_without_premium.cache_creation_input = None;
+        let mut user_priced_api_without_premium = rate(60.0);
+        user_priced_api_without_premium.cache_creation_input = None;
 
         let disk = RateCard {
             version: 1,
-            models: HashMap::from([("legacy-model".into(), user_priced_at_zero)]),
-            api_models: HashMap::from([("legacy-api-model".into(), user_explicitly_zero)]),
+            models: HashMap::from([("legacy-model".into(), user_priced_without_premium)]),
+            api_models: HashMap::from([(
+                "legacy-api-model".into(),
+                user_priced_api_without_premium,
+            )]),
             ..Default::default()
         };
         let mut bundled_legacy = rate(50.0);
-        bundled_legacy.cache_creation_input = 62.5;
+        bundled_legacy.cache_creation_input = Some(62.5);
         let mut bundled_legacy_api = rate(60.0);
-        bundled_legacy_api.cache_creation_input = 75.0;
+        bundled_legacy_api.cache_creation_input = Some(75.0);
         let bundled = RateCard {
             version: 2,
             models: HashMap::from([("legacy-model".into(), bundled_legacy)]),
@@ -942,10 +1005,41 @@ mod tests {
 
         let merged = merge_older_override(disk, bundled);
         assert_eq!(merged.models["legacy-model"].input, 50.0);
-        assert_eq!(merged.models["legacy-model"].cache_creation_input, 62.5);
+        assert_eq!(
+            merged.models["legacy-model"].cache_creation_input,
+            Some(62.5)
+        );
         assert_eq!(
             merged.api_models["legacy-api-model"].cache_creation_input,
-            75.0
+            Some(75.0)
+        );
+    }
+
+    #[test]
+    fn older_override_never_overwrites_an_explicit_free_cache_creation_claim() {
+        // Some(0.0) is a deliberate "this model's cache writes are free"
+        // claim, not an unset field — it must survive a merge exactly like
+        // any other user-edited rate, never being "corrected" back to the
+        // bundled card's premium.
+        let mut user_explicitly_free = rate(50.0);
+        user_explicitly_free.cache_creation_input = Some(0.0);
+        let disk = RateCard {
+            version: 1,
+            models: HashMap::from([("legacy-model".into(), user_explicitly_free)]),
+            ..Default::default()
+        };
+        let mut bundled_legacy = rate(50.0);
+        bundled_legacy.cache_creation_input = Some(62.5);
+        let bundled = RateCard {
+            version: 2,
+            models: HashMap::from([("legacy-model".into(), bundled_legacy)]),
+            ..Default::default()
+        };
+
+        let merged = merge_older_override(disk, bundled);
+        assert_eq!(
+            merged.models["legacy-model"].cache_creation_input,
+            Some(0.0)
         );
     }
 
@@ -1320,6 +1414,27 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn cache_creation_rate_falls_back_to_input_when_absent() {
+        let mut absent = rate(3.0);
+        absent.cache_creation_input = None;
+        assert_eq!(absent.cache_creation_rate(), 3.0);
+        assert!(absent.cache_creation_rate_is_fallback());
+    }
+
+    #[test]
+    fn cache_creation_rate_uses_an_explicit_value_including_zero() {
+        let mut free = rate(3.0);
+        free.cache_creation_input = Some(0.0);
+        assert_eq!(free.cache_creation_rate(), 0.0);
+        assert!(!free.cache_creation_rate_is_fallback());
+
+        let mut premium = rate(3.0);
+        premium.cache_creation_input = Some(3.75);
+        assert_eq!(premium.cache_creation_rate(), 3.75);
+        assert!(!premium.cache_creation_rate_is_fallback());
+    }
+
     fn card_with(models: HashMap<String, ModelRate>, aliases: HashMap<String, String>) -> RateCard {
         RateCard {
             version: 1,
@@ -1328,6 +1443,57 @@ mod tests {
             model_aliases: aliases,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn downgrade_for_cache_creation_fallback_only_applies_to_authoritative_bases() {
+        let mut rate_without_premium = rate(3.0);
+        rate_without_premium.cache_creation_input = None;
+
+        // Direct/Aliased with nonzero cache-creation usage and no published
+        // premium downgrades to Estimated.
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(PricingBasis::Direct, &rate_without_premium, 100),
+            PricingBasis::Estimated
+        );
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(
+                PricingBasis::Aliased,
+                &rate_without_premium,
+                100
+            ),
+            PricingBasis::Estimated
+        );
+        // No cache-creation usage: nothing to downgrade for.
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(PricingBasis::Direct, &rate_without_premium, 0),
+            PricingBasis::Direct
+        );
+        // A published premium (even Some(0.0), a deliberate "free" claim) is
+        // authoritative — no downgrade.
+        let mut rate_with_premium = rate(3.0);
+        rate_with_premium.cache_creation_input = Some(0.0);
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(PricingBasis::Direct, &rate_with_premium, 100),
+            PricingBasis::Direct
+        );
+        // Already-non-authoritative bases keep their own provenance.
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(
+                PricingBasis::Fallback,
+                &rate_without_premium,
+                100
+            ),
+            PricingBasis::Fallback
+        );
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(
+                PricingBasis::Unavailable,
+                &rate_without_premium,
+                100
+            ),
+            PricingBasis::Unavailable
+        );
     }
 
     #[test]

@@ -34,7 +34,13 @@ function totals(
   };
 }
 
-function rate(input: number, cached: number, output: number, reasoning: number, cacheCreation = 0): ModelRate {
+function rate(
+  input: number,
+  cached: number,
+  output: number,
+  reasoning: number,
+  cacheCreation: number | null = 0,
+): ModelRate {
   return { input, cached_input: cached, cache_creation_input: cacheCreation, output, reasoning };
 }
 
@@ -229,6 +235,51 @@ describe('cache dimensions', () => {
     }, 'claude_code');
     expect(result.total).toBeCloseTo(1.25, 9);
     expect(result.total).not.toBeCloseTo(1.0, 9); // would be the plain-input (undercounted) price
+  });
+
+  it('prices cache-creation tokens at the ordinary input rate — never free — when no cache-write premium is published', () => {
+    // A model whose ModelRate never states a cache-write premium
+    // (cache_creation_input: null) must price cache-creation tokens at the
+    // ordinary input rate, producing the exact same total this usage would
+    // have priced at before the cache-creation dimension existed (when
+    // those tokens were still indistinguishable from plain input). Pricing
+    // them at 0 would silently bill real usage as free — the regression
+    // this test guards against.
+    const noPublishedPremium = rate(4, 0.4, 2, 2, null);
+    const delta = totals(100_000, 10_000, 5_000, 0, 20_000);
+    const buckets = [{ model: 'gpt-5.6-sol', service_tier: null, tokens: delta }];
+
+    const result = creditsFromBuckets(buckets, {
+      ...rateCard, models: { 'gpt-5.6-sol': noPublishedPremium }, fallback_model: 'gpt-5.6-sol',
+    }, 'codex');
+
+    // Pre-#42 accounting: cache-creation tokens were folded into plain
+    // input, so the whole non-cached-read remainder (which now includes
+    // what is separately tracked as cache_creation_input_tokens) priced at
+    // the ordinary input rate.
+    const preCacheCreationDimensionTotal = (
+      (delta.input_tokens - delta.cached_input_tokens) * noPublishedPremium.input
+      + delta.cached_input_tokens * noPublishedPremium.cached_input
+      + delta.output_tokens * noPublishedPremium.output
+    ) / 1_000_000;
+    expect(result.total).toBeCloseTo(preCacheCreationDimensionTotal, 9);
+    expect(result.total).not.toBe(0);
+    expect(result.byModel[0].basis).toBe('estimated');
+  });
+
+  it('treats an explicit zero cache-write rate as a deliberate free claim, distinct from an absent rate', () => {
+    const explicitlyFree = rate(4, 0.4, 2, 2, 0);
+    const buckets = [{
+      model: 'local-model', service_tier: null,
+      tokens: totals(0, 0, 0, 0, 50_000),
+    }];
+    const result = creditsFromBuckets(buckets, {
+      ...rateCard, models: { 'local-model': explicitlyFree }, fallback_model: 'local-model',
+    }, 'claude_code');
+    expect(result.total).toBe(0);
+    // A direct, explicit 0 rate is still an authoritative direct price, not
+    // an estimate — only an *absent* rate downgrades the basis.
+    expect(result.byModel[0].basis).toBe('direct');
   });
 });
 

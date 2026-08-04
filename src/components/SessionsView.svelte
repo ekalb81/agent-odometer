@@ -1717,7 +1717,7 @@
             <tbody>
               {#each modelComparison as metric (`${metric.harness}:${metric.model}`)}
                 <tr class="border-t border-edgerow">
-                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{providersStore.displayName(metric.harness)}</span> · {metric.model}{#if metric.unpriced}<span class="text-amber-500" title="Excluded because no published rate is available"> ◇</span>{:else if metric.basis === 'aliased'}<span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match"> ↝</span>{:else if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
+                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{providersStore.displayName(metric.harness)}</span> · {metric.model}{#if metric.unpriced}<span class="text-amber-500" title="Excluded because no published rate is available"> ◇</span>{:else if metric.basis === 'aliased'}<span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match"> ↝</span>{:else if metric.basis === 'estimated'}<span class="text-sky-500" title="Includes cache-write tokens priced at the ordinary input rate — no published cache-write premium for this model"> ≈</span>{:else if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
                   <td class="text-right">{fmt.format(metric.tokens.input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.cached_input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.output_tokens)}</td>

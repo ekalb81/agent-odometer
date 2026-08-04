@@ -356,7 +356,7 @@ fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f64 {
         .saturating_sub(tokens.reasoning_output_tokens);
     ((non_cached_input as f64 * rate.input)
         + (tokens.cached_input_tokens as f64 * rate.cached_input)
-        + (tokens.cache_creation_input_tokens as f64 * rate.cache_creation_input)
+        + (tokens.cache_creation_input_tokens as f64 * rate.cache_creation_rate())
         + (non_reasoning_output as f64 * rate.output)
         + (tokens.reasoning_output_tokens as f64 * rate.reasoning))
         / 1_000_000.0
@@ -637,7 +637,7 @@ mod tests {
         ModelRate {
             input: value,
             cached_input: value,
-            cache_creation_input: value,
+            cache_creation_input: Some(value),
             output: value,
             reasoning: value,
         }
@@ -827,6 +827,41 @@ mod tests {
             ),
             Some(2.5)
         );
+    }
+
+    #[test]
+    fn cache_creation_tokens_price_at_input_rate_when_no_premium_is_published() {
+        // Regression guard: a model whose ModelRate never states a
+        // cache-write premium (cache_creation_input: None) must price
+        // cache-creation tokens at the ordinary input rate, exactly as they
+        // were priced before the cache-creation dimension existed (when
+        // those tokens were still folded into plain input). Pricing them at
+        // 0 would silently bill real usage as free.
+        let mut rate_without_premium = rate(2.0);
+        rate_without_premium.cache_creation_input = None;
+        let tokens = TokenTotals {
+            input_tokens: 100_000,
+            cached_input_tokens: 10_000,
+            cache_creation_input_tokens: 20_000,
+            output_tokens: 5_000,
+            reasoning_output_tokens: 0,
+            total_tokens: 105_000,
+        };
+
+        let cost = token_cost(&tokens, &rate_without_premium, 1.0);
+
+        // Pre-#42 accounting: cache-creation tokens were indistinguishable
+        // from plain input, so the whole non-cached-read remainder
+        // (input_tokens - cached_input_tokens, which includes what is now
+        // cache_creation_input_tokens) priced at the ordinary input rate.
+        let pre_cache_creation_dimension_cost = (((tokens.input_tokens - tokens.cached_input_tokens)
+            as f64
+            * rate_without_premium.input)
+            + (tokens.cached_input_tokens as f64 * rate_without_premium.cached_input)
+            + (tokens.output_tokens as f64 * rate_without_premium.output))
+            / 1_000_000.0;
+        assert_eq!(cost, pre_cache_creation_dimension_cost);
+        assert!(rate_without_premium.cache_creation_rate_is_fallback());
     }
 
     #[test]

@@ -6,6 +6,7 @@ import { mockIPC } from '@tauri-apps/api/mocks';
 import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } from './dev-mock/visualScenario';
 import type {
   DiagnosticsReport,
+  Harness,
   ProviderDiagnostic,
   RangeTotals,
   RateCard,
@@ -32,10 +33,18 @@ if (visualScenarioSelection.warning) console.warn(visualScenarioSelection.warnin
 // allowing query parameters to change native application behaviour.
 document.documentElement.dataset.visualScenario = visualScenario;
 
-function tok(total: number): TokenTotals {
+// Codex does not report a cache-creation ("cache write") token category at
+// all (see the bundled rates.json _note) — the parser can never produce a
+// nonzero cache_creation_input_tokens for a codex session. A shared
+// generator that gave every session cache-creation tokens regardless of
+// harness was asserting something the real parser cannot produce, and it is
+// exactly what let a Codex pricing regression hide inside what looked like
+// "the new Claude cache-write premium" in a visual diff. Every caller must
+// pass the session's harness explicitly — there is no default.
+function tok(total: number, harness: Harness): TokenTotals {
   const input = Math.round(total * 0.62);
   const cached = Math.round(total * 0.24);
-  const cacheCreation = Math.round(total * 0.08);
+  const cacheCreation = harness === 'codex' ? 0 : Math.round(total * 0.08);
   const output = total - input;
   const reasoning = Math.round(output * 0.3);
   return {
@@ -154,7 +163,7 @@ function fixtureModel(f: Fixture): string {
 }
 
 function buckets(f: Fixture): TierBucket[] {
-  return [{ model: fixtureModel(f), service_tier: null, tokens: tok(f.total) }];
+  return [{ model: fixtureModel(f), service_tier: null, tokens: tok(f.total, f.harness) }];
 }
 
 function summary(f: Fixture): SessionSummary {
@@ -186,11 +195,11 @@ function summary(f: Fixture): SessionSummary {
     context_window: f.harness === 'codex' ? 272_000 : 200_000,
     total_turns: f.turns,
     first_user_message: `${f.name} — please take a look.`,
-    tokens_total: tok(f.total),
+    tokens_total: tok(f.total, f.harness),
     buckets: buckets(f),
     tool_metrics: toolMetrics(f.turns * 3),
     tool_metrics_by_model: { [model]: toolMetrics(f.turns * 3) },
-    category_totals: { coding: { turns: f.turns, tokens: tok(f.total), tool_calls: f.turns * 3, buckets: buckets(f) } },
+    category_totals: { coding: { turns: f.turns, tokens: tok(f.total, f.harness), tool_calls: f.turns * 3, buckets: buckets(f) } },
     optimization_findings_count: 0,
     optimization_summary: { findings: 0, warnings: 0, likely_avoidable_calls: 0, by_rule: {} },
   };
@@ -228,7 +237,7 @@ function details(f: Fixture): Session {
       time_to_first_token_ms: 1800,
       user_message: TURN_PROMPTS[i % TURN_PROMPTS.length],
       last_agent_message: 'Done — summarized in the diff above.',
-      tokens: tok(Math.round(perTurn * jitter)),
+      tokens: tok(Math.round(perTurn * jitter), f.harness),
       tool_metrics: toolMetrics(3),
       classification: { version: 1, category: 'coding', confidence: 0.8, signals: ['fixture'] },
     };
@@ -252,7 +261,7 @@ function details(f: Fixture): Session {
     memory_mode: null,
     model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
     latest_context_tokens: Math.round((s.context_window ?? 200_000) * 0.54),
-    tokens_by_model: { [model]: tok(f.total) },
+    tokens_by_model: { [model]: tok(f.total, f.harness) },
     tokens_history: history,
     rate_limits_history: [],
     turns,
@@ -268,10 +277,14 @@ const RATES: RateCard = {
   source_url: 'https://example.invalid/rates',
   fetched_at: new Date(now - 2 * DAY).toISOString(),
   models: {
-    'gpt-5.6-sol': { input: 1.1, cached_input: 0.11, cache_creation_input: 0, output: 8.8, reasoning: 8.8 },
-    'gpt-5.6-terra': { input: 0.5, cached_input: 0.05, cache_creation_input: 0, output: 4, reasoning: 4 },
-    'gpt-5.6-luna': { input: 0.15, cached_input: 0.015, cache_creation_input: 0, output: 1.2, reasoning: 1.2 },
-    'gpt-5.5': { input: 0.8, cached_input: 0.08, cache_creation_input: 0, output: 6.4, reasoning: 6.4 },
+    // Codex has no published cache-write premium (it never reports the
+    // dimension at all) -- cache_creation_input stays null (absent), not 0.
+    // null means "price at the ordinary input rate", not "free"; see
+    // credits.ts cacheCreationRate.
+    'gpt-5.6-sol': { input: 1.1, cached_input: 0.11, cache_creation_input: null, output: 8.8, reasoning: 8.8 },
+    'gpt-5.6-terra': { input: 0.5, cached_input: 0.05, cache_creation_input: null, output: 4, reasoning: 4 },
+    'gpt-5.6-luna': { input: 0.15, cached_input: 0.015, cache_creation_input: null, output: 1.2, reasoning: 1.2 },
+    'gpt-5.5': { input: 0.8, cached_input: 0.08, cache_creation_input: null, output: 6.4, reasoning: 6.4 },
     'claude-opus-4-8': { input: 3.2, cached_input: 0.32, cache_creation_input: 4, output: 16, reasoning: 16 },
     'claude-fable-5': { input: 2.4, cached_input: 0.24, cache_creation_input: 3, output: 12, reasoning: 12 },
     'claude-sonnet-5': { input: 1.2, cached_input: 0.12, cache_creation_input: 1.5, output: 6, reasoning: 6 },
@@ -281,10 +294,10 @@ const RATES: RateCard = {
   currencies: { codex: 'credits', claude_code: 'USD' },
   fallback_models: { codex: 'gpt-5.6-sol', claude_code: 'claude-sonnet-5' },
   api_models: {
-    'gpt-5.6-sol': { input: 1.25, cached_input: 0.125, cache_creation_input: 0, output: 10, reasoning: 10 },
-    'gpt-5.6-terra': { input: 0.6, cached_input: 0.06, cache_creation_input: 0, output: 4.8, reasoning: 4.8 },
-    'gpt-5.6-luna': { input: 0.18, cached_input: 0.018, cache_creation_input: 0, output: 1.44, reasoning: 1.44 },
-    'gpt-5.5': { input: 1, cached_input: 0.1, cache_creation_input: 0, output: 8, reasoning: 8 },
+    'gpt-5.6-sol': { input: 1.25, cached_input: 0.125, cache_creation_input: null, output: 10, reasoning: 10 },
+    'gpt-5.6-terra': { input: 0.6, cached_input: 0.06, cache_creation_input: null, output: 4.8, reasoning: 4.8 },
+    'gpt-5.6-luna': { input: 0.18, cached_input: 0.018, cache_creation_input: null, output: 1.44, reasoning: 1.44 },
+    'gpt-5.5': { input: 1, cached_input: 0.1, cache_creation_input: null, output: 8, reasoning: 8 },
   },
   unpriced_models: ['gpt-5.3-codex-spark'],
   pricing_catalog: { rate_periods: [], conditional_modifiers: [], notes: [] },
@@ -336,7 +349,7 @@ function rangeTotals(
     const overlap = Math.min(sEnd, toMs) - Math.max(sStart, fromMs);
     const fraction = Math.max(0, Math.min(1, overlap / Math.max(1, sEnd - sStart)));
     out[s.storage_id] = {
-      tokens: scaleTok(tok(f.total), fraction),
+      tokens: scaleTok(tok(f.total, f.harness), fraction),
       buckets: buckets(f).map((b) => ({ ...b, tokens: scaleTok(b.tokens, fraction) })),
       tool_metrics: toolMetrics(Math.round(f.turns * 3 * fraction)),
       tool_metrics_by_model: { [fixtureModel(f)]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
@@ -555,7 +568,11 @@ mockIPC((cmd, payload) => {
         total_duration_ms: duration * turns,
         ttft_sample_count: 0,
         total_ttft_ms: 0,
-        tokens: tok(tokens * turns),
+        // Synthetic cohort data, not tied to a specific session/model
+        // (buckets stays empty below), so cache-creation harness-awareness
+        // doesn't matter for pricing here — 'claude_code' is an arbitrary
+        // but harmless choice.
+        tokens: tok(tokens * turns, 'claude_code'),
         buckets: [],
         tool_metrics: toolMetrics(calls * turns),
       });

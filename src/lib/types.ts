@@ -448,9 +448,16 @@ export interface ModelRate {
   input: number;
   cached_input: number;
   /** Cache-creation ("cache write") rate — a normalized dimension distinct
-   * from both `input` and `cached_input`. Defaults to 0 for rate-card
-   * entries written before this field existed (see rates.rs ModelRate). */
-  cache_creation_input: number;
+   * from both `input` and `cached_input`.
+   *
+   * Deliberately nullable, and `null`/absent is NOT "free": it means the
+   * publisher has not stated a cache-write premium for this model, and
+   * cache-creation tokens must be priced at the ordinary `input` rate
+   * (exactly today's pre-#42 accounting) rather than at zero. `0` is a
+   * real, deliberate "this is free" claim, distinct from "unknown". Always
+   * resolve through `cacheCreationRate()` in credits.ts rather than reading
+   * this field directly. */
+  cache_creation_input: number | null;
   output: number;
   reasoning: number;
 }
