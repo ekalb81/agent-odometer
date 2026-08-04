@@ -222,6 +222,16 @@ visualTest('sessions-subagents-collapsed', 'session subagents collapsed', async 
   await expectSessionRollup(page, 8);
 });
 
+visualTest('sessions-subagent-drilldown', 'session subagent drill-down with per-run detail', async (page) => {
+  await visit(page, { view: 'codex' });
+  // The subagent-count chip scopes the grid to one parent and its runs, which
+  // also flattens the ordering so a column sort ranks the runs against
+  // each other rather than nesting them under the parent.
+  await page.getByRole('button', { name: /Show only .* and its \d+ subagent runs?/ }).first().click();
+  await expect(page.getByRole('button', { name: 'Show all sessions' })).toBeVisible();
+  await expect(page.getByText('and its subagent runs')).toBeVisible();
+});
+
 visualTest('sessions-availability-fallback', 'session availability, fallback, and unpriced indicators', async (page) => {
   await visit(page, { scenario: 'sessions-availability-fallback', view: 'codex' });
   await expect(page.getByText(/unpriced model excluded/i)).toBeVisible();

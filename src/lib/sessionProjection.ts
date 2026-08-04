@@ -394,3 +394,94 @@ export function rowsToCsv(rows: Record<string, string | number | boolean | null>
   for (const row of rows) lines.push(headers.map((header) => csvCell(row[header])).join(','));
   return `${lines.join('\r\n')}\r\n`;
 }
+
+/** Minimum a row needs to be ordered: identity plus its day-group anchor. */
+export interface OrderableSession {
+  storage_id: string;
+  startedMs: number;
+}
+
+export interface OrderOptions<T extends OrderableSession> {
+  /** Storage id of the row's parent, or null when it is a top-level thread. */
+  parentOf: (session: T) => string | null;
+  /** Parents whose subagent rows are hidden. Ignored when flat. */
+  collapsed?: ReadonlySet<string>;
+  /**
+   * Flat drops the parent/child nesting so the caller's sort ranks every
+   * thread against every other. Tree keeps children directly beneath their
+   * parent, which means a child can never outrank its parent.
+   */
+  flat?: boolean;
+}
+
+/**
+ * Orders already-sorted rows for the session grid and reports which day group
+ * each row belongs to.
+ *
+ * In tree mode a child inherits its parent's anchor, so a nested row never
+ * splits a day section — but a subagent that ran today under a weeks-old
+ * parent is then filed under the parent's start day. Flat mode anchors every
+ * row to its own start time, which is what makes long-lived parents with many
+ * short subagent runs readable.
+ */
+export function orderSessionsForDisplay<T extends OrderableSession>(
+  sorted: readonly T[],
+  options: OrderOptions<T>,
+): { list: T[]; anchorMs: Map<string, number> } {
+  const anchorMs = new Map<string, number>();
+  if (options.flat) {
+    for (const session of sorted) anchorMs.set(session.storage_id, session.startedMs);
+    return { list: [...sorted], anchorMs };
+  }
+
+  const collapsed = options.collapsed ?? new Set<string>();
+  const ids = new Set(sorted.map((session) => session.storage_id));
+  const children = new Map<string, T[]>();
+  const roots: T[] = [];
+  for (const session of sorted) {
+    const parentId = options.parentOf(session);
+    // A child whose parent was filtered out becomes a root rather than
+    // disappearing with it.
+    if (parentId && ids.has(parentId)) {
+      const arr = children.get(parentId);
+      if (arr) arr.push(session);
+      else children.set(parentId, [session]);
+    } else {
+      roots.push(session);
+    }
+  }
+
+  const list: T[] = [];
+  const seen = new Set<string>();
+  // Descendants of a collapsed parent: withheld on purpose, so the
+  // unreachable sweep below must not resurrect them as top-level rows.
+  const withheld = new Set<string>();
+  const withhold = (id: string) => {
+    for (const child of children.get(id) ?? []) {
+      if (withheld.has(child.storage_id)) continue;
+      withheld.add(child.storage_id);
+      withhold(child.storage_id);
+    }
+  };
+  const append = (session: T, anchor: number) => {
+    // Guards against a cyclic parent chain from corrupt lineage metadata.
+    if (seen.has(session.storage_id)) return;
+    seen.add(session.storage_id);
+    list.push(session);
+    anchorMs.set(session.storage_id, anchor);
+    if (collapsed.has(session.storage_id)) {
+      withhold(session.storage_id);
+      return;
+    }
+    for (const child of children.get(session.storage_id) ?? []) append(child, anchor);
+  };
+  for (const root of roots) append(root, root.startedMs);
+  // A parent cycle leaves its members unreachable from every root. Emit them
+  // at top level rather than dropping rows the caller filtered in.
+  for (const session of sorted) {
+    if (!seen.has(session.storage_id) && !withheld.has(session.storage_id)) {
+      append(session, session.startedMs);
+    }
+  }
+  return { list, anchorMs };
+}

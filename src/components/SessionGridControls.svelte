@@ -24,6 +24,17 @@
     />
     Color by model provider
   </label>
+  <label
+    class="flex items-center gap-1.5 text-ink-muted"
+    title="Rank subagent runs against every other thread instead of nesting them under their parent"
+  >
+    <input
+      type="checkbox"
+      checked={sessionGridStore.flattenSubagents}
+      onchange={(event) => sessionGridStore.setFlattenSubagents(event.currentTarget.checked)}
+    />
+    Flat list
+  </label>
   <details class="relative">
     <summary class="cursor-pointer rounded-md border border-edge bg-card px-2 py-1 text-ink-muted hover:text-ink">Columns</summary>
     <div class="absolute z-20 right-0 mt-1 w-64 rounded-lg border border-edge bg-card shadow-lg p-2 space-y-1">

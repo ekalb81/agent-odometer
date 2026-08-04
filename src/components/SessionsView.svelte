@@ -17,6 +17,7 @@
     exportRows,
     filterSessions,
     isSubagent,
+    orderSessionsForDisplay,
     projectSessions,
     repositoryLabel,
     rowsToCsv,
@@ -179,7 +180,41 @@
   // Datetime range — overlap semantics: include any session whose
   // [started_at, last_event_at] window intersects the filter range.
   // Comparison is lexical on UTC ISO strings, which sorts chronologically.
-  const filtered = $derived(filterSessions(filteredNoDate, harness, filters, true));
+  const dateFiltered = $derived(filterSessions(filteredNoDate, harness, filters, true));
+
+  // Drill-down: when set, the table shows one parent and its descendants only.
+  // Storage id, so it survives the provider-id indirection in parentStorageId.
+  let focusedParentId = $state<string | null>(null);
+  const focusedParent = $derived(
+    focusedParentId ? (dateFiltered.find((s) => s.storage_id === focusedParentId) ?? null) : null,
+  );
+  // Descendants at any depth: a subagent can itself spawn subagents, and
+  // scoping to direct children only would silently drop the deeper runs.
+  const filtered = $derived((() => {
+    if (!focusedParentId) return dateFiltered;
+    const childrenOf = new Map<string, TrackedSession[]>();
+    for (const session of dateFiltered) {
+      const parentId = parentStorageId(session);
+      if (!parentId) continue;
+      const arr = childrenOf.get(parentId);
+      if (arr) arr.push(session);
+      else childrenOf.set(parentId, [session]);
+    }
+    const out: TrackedSession[] = [];
+    const seen = new Set<string>();
+    const walk = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      for (const child of childrenOf.get(id) ?? []) {
+        out.push(child);
+        walk(child.storage_id);
+      }
+    };
+    const root = dateFiltered.find((s) => s.storage_id === focusedParentId);
+    if (root) out.unshift(root);
+    walk(focusedParentId);
+    return out;
+  })());
   const filteredIds = $derived(filtered.map((session) => session.storage_id));
   const analyticsSessionIds = $derived(filteredNoDate.map((session) => session.storage_id));
 
@@ -316,6 +351,39 @@
     return d.displayCost;
   }
 
+  // Wall-clock span of the run. Subagents are typically short-lived under a
+  // parent that stays open for days, so this is the column that separates them.
+  function durationMs(session: TrackedSession): number {
+    return Math.max(0, session.lastEventMs - session.startedMs);
+  }
+
+  function formatDuration(ms: number): string {
+    if (ms < 1000) return '—';
+    const seconds = Math.floor(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m`;
+    return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+  }
+
+  /// The agent identity of a subagent run: nickname when the harness recorded
+  /// one, else the agent path's last segment. Empty for main threads.
+  function agentLabel(session: TrackedSession): string {
+    if (session.agent_nickname) return session.agent_nickname;
+    if (!session.agent_path) return '';
+    const segments = session.agent_path.split(/[\\/]/).filter(Boolean);
+    return segments.at(-1) ?? session.agent_path;
+  }
+
+  function parentLabel(session: TrackedSession): string {
+    const parentId = parentStorageId(session);
+    if (!parentId) return '';
+    const parent = sessionsStore.map.get(parentId);
+    return parent ? sessionName(parent) : '';
+  }
+
   function compareSession(a: TrackedSession, b: TrackedSession): number {
     if (sortKey === null) {
       // Default: start time desc — matches the day-grouped presentation.
@@ -334,6 +402,21 @@
         break;
       case 'model':
         cmp = (a.model ?? '').localeCompare(b.model ?? '');
+        break;
+      case 'duration':
+        cmp = durationMs(a) - durationMs(b);
+        break;
+      case 'agent':
+        cmp = agentLabel(a).localeCompare(agentLabel(b));
+        break;
+      case 'parent':
+        cmp = parentLabel(a).localeCompare(parentLabel(b));
+        break;
+      case 'turns':
+        cmp = a.total_turns - b.total_turns;
+        break;
+      case 'tools':
+        cmp = (a.tool_metrics?.calls ?? 0) - (b.tool_metrics?.calls ?? 0);
         break;
       case 'input': {
         const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
@@ -366,40 +449,6 @@
     return sortDir === 'asc' ? cmp : -cmp;
   }
 
-  // Subagent rows tuck in directly beneath their parent (when the parent is
-  // in view) under every sort order: column sorts rank the parents, and each
-  // parent's children among themselves, so a child never floats above its
-  // parent. anchorMs records which day group a row belongs to — children
-  // inherit their parent's group so a nested row never splits a day section.
-  const displayedWithAnchors = $derived((() => {
-    const sorted = [...filtered].sort(compareSession);
-    const anchorMs = new Map<string, number>();
-    const ids = new Set(sorted.map((s) => s.storage_id));
-    const children = new Map<string, TrackedSession[]>();
-    const roots: TrackedSession[] = [];
-    for (const s of sorted) {
-      const parentId = parentStorageId(s);
-      if (parentId && ids.has(parentId)) {
-        const arr = children.get(parentId);
-        if (arr) arr.push(s);
-        else children.set(parentId, [s]);
-      } else {
-        roots.push(s);
-      }
-    }
-    const list: TrackedSession[] = [];
-    const append = (s: TrackedSession, anchor: number) => {
-      list.push(s);
-      anchorMs.set(s.storage_id, anchor);
-      if (collapsedParents.has(s.storage_id)) return;
-      for (const c of children.get(s.storage_id) ?? []) append(c, anchor);
-    };
-    for (const r of roots) append(r, r.startedMs);
-    return { list, anchorMs };
-  })());
-
-  const displayed = $derived(displayedWithAnchors.list);
-
   // Collapsed parents hide their nested subagent rows.
   let collapsedParents = $state<ReadonlySet<string>>(new Set());
   function toggleCollapsed(id: string) {
@@ -408,6 +457,26 @@
     else next.add(id);
     collapsedParents = next;
   }
+
+  // Tree mode keeps subagents tucked under their parent, which means a column
+  // sort can only rank parents (and each parent's children among themselves) —
+  // a child never outranks its parent. Flat mode drops the nesting so a sort
+  // ranks every thread against every other, which is the only way to ask
+  // "which subagent runs cost the most" across sessions. Each row then anchors
+  // to its own start time rather than inheriting its parent's day group.
+  // Drilling into one parent is inherently a flat question ("which of these
+  // runs cost the most"), so the scope implies the flattening.
+  const flatMode = $derived(sessionGridStore.flattenSubagents || focusedParentId !== null);
+  const displayedWithAnchors = $derived(
+    orderSessionsForDisplay([...filtered].sort(compareSession), {
+      parentOf: parentStorageId,
+      collapsed: collapsedParents,
+      flat: flatMode,
+    }),
+  );
+
+  const displayed = $derived(displayedWithAnchors.list);
+
 
   // Combined usage (session + all in-view descendant subagents) per row that
   // has in-view children. Primary cells stay per-thread; these feed the Σ lines.
@@ -1715,6 +1784,20 @@
           </button>
         </div>
       {:else}
+        {#if focusedParent}
+          <div class="px-5 py-1.5 border-b border-edge bg-card flex items-center gap-2 text-xs">
+            <span class="text-ink-muted">Showing</span>
+            <span class="text-ink font-medium truncate max-w-[28rem]">{sessionName(focusedParent)}</span>
+            <span class="text-ink-faint">and its subagent runs</span>
+            <button
+              type="button"
+              class="ml-auto text-accent-chipfg hover:underline underline-offset-2"
+              onclick={() => { focusedParentId = null; }}
+            >
+              Show all sessions
+            </button>
+          </div>
+        {/if}
         <div
           class="flex-1 overflow-y-auto min-h-0 relative"
           bind:this={listViewport}
@@ -1768,15 +1851,25 @@
               >
                 {#each visibleColumns as column (column.id)}
                   {#if column.id === 'name'}
-                    <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-(--row-name)'}" title={name}>
-                      {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.storage_id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
-                      {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
-                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap" title="The saved transcript source is currently unavailable">source missing</span>{/if}
-                      {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg) ml-1 whitespace-nowrap">archived</span>{/if}
-                      {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{providersStore.displayName(session.harness)}</span>{/if}
+                    <span class="flex items-center min-w-0 whitespace-nowrap {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-(--row-name)'}" title={name}>
+                      {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center shrink-0" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.storage_id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
+                      {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5 shrink-0" aria-hidden="true">↳</span>{/if}<span class="truncate">{truncate(name, 90)}</span>
+                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0">subagent</span>{:else if kids > 0}<button type="button" class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0 hover:ring-1 hover:ring-accent focus:outline-hidden focus:ring-1 focus:ring-accent" onclick={(e) => { e.stopPropagation(); focusedParentId = session.storage_id; }} title="Show only this session and its subagent runs" aria-label="Show only {name} and its {kids} subagent {kids === 1 ? 'run' : 'runs'}">{kids} {kids === 1 ? 'subagent' : 'subagents'}</button>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap shrink-0" title="The saved transcript source is currently unavailable">source missing</span>{/if}
+                      {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg) ml-1 whitespace-nowrap shrink-0">archived</span>{/if}
+                      {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap shrink-0">{providersStore.displayName(session.harness)}</span>{/if}
                     </span>
                   {:else if column.id === 'started'}
                     <span class="text-ink-muted font-mono text-xs" title={`UTC: ${session.started_at}`}>{formatStartedLocal(session.startedMs)}</span>
+                  {:else if column.id === 'duration'}
+                    <span class="text-right text-ink-muted font-mono text-xs" title={`Ended ${session.last_event_at}`}>{formatDuration(durationMs(session))}</span>
+                  {:else if column.id === 'agent'}
+                    <span class="text-ink-muted text-xs truncate" title={session.agent_path ?? (session.agent_nickname ?? 'Not a subagent run')}>{agentLabel(session) || '—'}</span>
+                  {:else if column.id === 'parent'}
+                    <span class="text-ink-muted text-xs truncate" title={parentLabel(session) || 'Top-level session'}>{parentLabel(session) || '—'}</span>
+                  {:else if column.id === 'turns'}
+                    <span class="text-right font-mono text-xs text-ink">{fmt.format(session.total_turns)}</span>
+                  {:else if column.id === 'tools'}
+                    <span class="text-right font-mono text-xs text-ink" title={session.tool_metrics ? `${session.tool_metrics.reads} read · ${session.tool_metrics.searches} search · ${session.tool_metrics.mutations} mutation · ${session.tool_metrics.commands} command` : undefined}>{fmt.format(session.tool_metrics?.calls ?? 0)}</span>
                   {:else if column.id === 'repository'}
                     <span class="text-ink-muted text-xs truncate" title={session.working_directory ? 'Recorded project folder' : 'No repository recorded for this session'}>{repositoryLabel(session) ?? 'No repository recorded'}</span>
                   {:else if column.id === 'model'}
