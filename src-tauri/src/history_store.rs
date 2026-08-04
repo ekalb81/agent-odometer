@@ -1499,6 +1499,24 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+/// First pass of `backfill_project_identities`: gathers only session keys,
+/// never a snapshot blob, so peak memory during this pass is bounded by
+/// session count and key length, not by how large any snapshot is. Named so
+/// `backfill_project_identity_selects_keys_before_any_snapshot_blob` can
+/// assert its shape directly rather than needing a true peak-RSS
+/// measurement, which is impractical in a unit test.
+const BACKFILL_PROJECT_IDENTITY_KEYS_SQL: &str = "SELECT session_key FROM durable_sessions";
+
+/// Per-session snapshot fetch used by the same backfill's loop body below:
+/// scoped to exactly one session per query (`WHERE d.session_key = ?1`), so
+/// at most one snapshot blob is resident at a time — never every session's
+/// `session_json` collected into memory at once.
+const BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL: &str = "SELECT s.session_json
+                 FROM durable_sessions d JOIN session_snapshots s
+                   ON s.session_key = d.session_key
+                  AND s.version = d.current_snapshot_version
+                 WHERE d.session_key = ?1";
+
 /// Resolves and stores project identity for every durable session whose
 /// current snapshot deserializes cleanly. A snapshot that fails to
 /// deserialize is skipped with a warning, exactly like the v1->v2 fact
@@ -1528,7 +1546,7 @@ fn backfill_project_identities(transaction: &Transaction<'_>) -> Result<()> {
     let home = dirs::home_dir();
 
     let keys: Vec<String> = {
-        let mut select = transaction.prepare("SELECT session_key FROM durable_sessions")?;
+        let mut select = transaction.prepare(BACKFILL_PROJECT_IDENTITY_KEYS_SQL)?;
         let rows = select.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -1539,11 +1557,7 @@ fn backfill_project_identities(transaction: &Transaction<'_>) -> Result<()> {
     for key in keys {
         let raw: Option<Vec<u8>> = transaction
             .query_row(
-                "SELECT s.session_json
-                 FROM durable_sessions d JOIN session_snapshots s
-                   ON s.session_key = d.session_key
-                  AND s.version = d.current_snapshot_version
-                 WHERE d.session_key = ?1",
+                BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL,
                 [key.as_str()],
                 |row| row.get(0),
             )
@@ -2506,7 +2520,7 @@ mod tests {
     };
     use crate::provider::codex_provider_id;
     use chrono::{DateTime, Utc};
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use tempfile::tempdir;
 
     fn timestamp(value: &str) -> DateTime<Utc> {
@@ -4179,5 +4193,770 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions.iter().filter(|item| item.available).count(), 1);
         assert_eq!(store.stats().unwrap().token_events, 2);
+    }
+
+    // -----------------------------------------------------------------
+    // Structural invariants (test/ledger-structural-invariants).
+    //
+    // These tests are deliberately derived from the Rust types and the
+    // schema itself rather than from a hand-maintained fixture list, so a
+    // newly added token/tool dimension, a colliding schema version, or an
+    // unbounded migration backfill fails loudly instead of quietly passing
+    // CI the way the defects described in AGENTS.md's rollup-dimension
+    // invariant did.
+    // -----------------------------------------------------------------
+
+    /// Every column name of `table`, read directly from SQLite rather than
+    /// from any Rust-side listing, so this can never itself drift from the
+    /// live schema.
+    fn table_columns(connection: &Connection, table: &str) -> BTreeSet<String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap();
+        names
+            .collect::<std::result::Result<BTreeSet<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn token_totals_fields_have_matching_rollup_columns() {
+        // Invariant 1 (highest value): every `TokenTotals` field must have a
+        // same-named column on `rollup_token_totals`, or `range_totals_multi`
+        // silently returns 0 for that dimension on every whole-hour bucket
+        // while still reporting it correctly at the sub-hour edges — exactly
+        // the `cache_creation_input_tokens` near-miss AGENTS.md documents.
+        let (_directory, store) = store();
+        let connection = store.connection().unwrap();
+
+        let fields: BTreeSet<String> = serde_json::to_value(TokenTotals::default())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+
+        let key_columns: BTreeSet<&str> = ["session_key", "hour_bucket", "model", "service_tier"]
+            .into_iter()
+            .collect();
+        let rollup_dimensions: BTreeSet<String> = table_columns(&connection, "rollup_token_totals")
+            .into_iter()
+            .filter(|column| !key_columns.contains(column.as_str()))
+            .collect();
+
+        assert_eq!(
+            fields, rollup_dimensions,
+            "TokenTotals fields and rollup_token_totals's non-key columns diverged; every \
+             token dimension needs a matching rollup column (AGENTS.md's ledger-rollup-\
+             dimension invariant) — extend the fact table, the rollup table, the migration \
+             backfill, and both the rollup write and read paths together"
+        );
+    }
+
+    #[test]
+    fn tool_metrics_fields_match_rollup_columns_or_documented_allowlist() {
+        // Invariant 1: same idea as `token_totals_fields_have_matching_rollup_columns`,
+        // but `ToolMetrics` has three fields — `mutation_targets`,
+        // `one_shot_mutations`, `retry_count` — that are *deliberately* not
+        // plain rollup columns. They are defined over distinct
+        // `(turn_id, target)` chains (see `telemetry::mutation_chain_fields`
+        // and `compute_range_totals` above); summing per-bucket values for
+        // these three would double-count or miscount a chain that straddles
+        // a rollup bucket boundary, so they are reconstructed at read time
+        // from `rollup_mutation_chains` instead. The allowlist below exists
+        // so a 15th field forces a deliberate choice — a rollup column or an
+        // explicit, justified addition here — instead of silently
+        // defaulting to an under-count.
+        let (_directory, store) = store();
+        let connection = store.connection().unwrap();
+
+        let fields: BTreeSet<String> = serde_json::to_value(ToolMetrics::default())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+
+        let key_columns: BTreeSet<&str> = ["session_key", "hour_bucket", "model"]
+            .into_iter()
+            .collect();
+        let rollup_columns: BTreeSet<String> = table_columns(&connection, "rollup_tool_metrics")
+            .into_iter()
+            .filter(|column| !key_columns.contains(column.as_str()))
+            .collect();
+
+        // Allowlist: fields reconstructed from `rollup_mutation_chains`
+        // rather than stored as plain rollup columns, and why each cannot be
+        // a plain summed column.
+        let derived_from_mutation_chains: BTreeSet<&str> = [
+            // Distinct-chain count: summing per-bucket counts would count a
+            // chain once per bucket it touches instead of once overall.
+            "mutation_targets",
+            // Depends on a chain's *total* count across every bucket it
+            // touches (a chain is "one-shot" only if it never repeats
+            // anywhere) — not decidable from any single bucket's partial
+            // count.
+            "one_shot_mutations",
+            // retries = total chain length minus one; the same
+            // straddling problem as `mutation_targets` applies to the
+            // per-chain lengths this is computed from.
+            "retry_count",
+        ]
+        .into_iter()
+        .collect();
+
+        let expected_plain_columns: BTreeSet<String> = fields
+            .iter()
+            .filter(|field| !derived_from_mutation_chains.contains(field.as_str()))
+            .cloned()
+            .collect();
+
+        assert_eq!(
+            expected_plain_columns, rollup_columns,
+            "ToolMetrics fields (minus the documented mutation-chain-derived allowlist) must \
+             match rollup_tool_metrics's non-key columns exactly; a newly added field needs \
+             either a rollup column or a deliberate, justified addition to the allowlist in \
+             this test"
+        );
+
+        // Guard the allowlist itself: every allowlisted name must still be a
+        // real ToolMetrics field (catches a stale/renamed entry), and must
+        // NOT also have a rollup column (catches "fixing" this test by both
+        // allowlisting a field and adding a column for it, which would
+        // silently resurrect the double-count/miscount bug the allowlist
+        // exists to prevent).
+        for name in &derived_from_mutation_chains {
+            assert!(
+                fields.contains(*name),
+                "allowlisted field {name} is not a ToolMetrics field"
+            );
+            assert!(
+                !rollup_columns.contains(*name),
+                "allowlisted field {name} unexpectedly also has a rollup_tool_metrics column; \
+                 pick one derivation, not both"
+            );
+        }
+    }
+
+    /// Normalized DDL fingerprint of every table and index in the schema.
+    /// Two migrations that both claim `SCHEMA_VERSION` but define different
+    /// table shapes look identical under `PRAGMA user_version` alone; this
+    /// only diverges in `sqlite_master`'s actual SQL text, which is exactly
+    /// what this fingerprints.
+    fn schema_fingerprint(connection: &Connection) -> String {
+        let mut statement = connection
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                 WHERE sql IS NOT NULL AND type IN ('table', 'index')
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        let mut lines: Vec<String> = statement
+            .query_map([], |row| {
+                let kind: String = row.get(0)?;
+                let name: String = row.get(1)?;
+                let sql: String = row.get(2)?;
+                // Whitespace-normalize so incidental formatting (added blank
+                // lines, re-indentation) never trips the fingerprint — only
+                // an actual change to a table/index's shape should.
+                let normalized_sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                Ok(format!("{kind}:{name}:{normalized_sql}"))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        lines.sort();
+        lines.join("\n")
+    }
+
+    /// Committed schema fingerprint for `SCHEMA_VERSION`. Changing this
+    /// value means the schema's actual shape changed — a new table, a
+    /// new/renamed/retyped column, or a new index — and that change must go
+    /// through a reviewed migration step (a new `if version == N` block in
+    /// `migrate()`) with `SCHEMA_VERSION` bumped, never a silent edit to an
+    /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
+    /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
+    /// `HistoryStore::open` and pasting the result below.
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
+
+    #[test]
+    fn schema_fingerprint_matches_committed_expected_value() {
+        // Invariant 2: this is what actually catches two branches that both
+        // bump to the same `SCHEMA_VERSION` with different table shapes —
+        // `PRAGMA user_version` alone cannot tell them apart, but their DDL
+        // text differs, and this fingerprints exactly that.
+        let (_directory, store) = store();
+        let connection = store.connection().unwrap();
+        let fingerprint = schema_fingerprint(&connection);
+        assert_eq!(
+            fingerprint, EXPECTED_SCHEMA_FINGERPRINT,
+            "the durable-ledger schema's actual shape changed without updating \
+             EXPECTED_SCHEMA_FINGERPRINT. If this is a deliberate, reviewed schema change, it \
+             must go through a new migration step with SCHEMA_VERSION bumped; then regenerate \
+             this constant from schema_fingerprint(&store.connection().unwrap())"
+        );
+    }
+
+    /// Order-insensitive structural shape of every table and index: each
+    /// table becomes its columns' (name, declared type, NOT NULL, default,
+    /// primary-key rank) tuples plus its foreign-key references, sorted by
+    /// column name; each index becomes its normalized `CREATE INDEX` text.
+    ///
+    /// Deliberately *not* `schema_fingerprint`, which is order-sensitive:
+    /// the fresh-database path (`migrate()`'s `version == 0` branch, whose
+    /// `CREATE TABLE` lists every column inline) and the fully-migrated
+    /// path (whose legacy columns arrive via `ALTER TABLE ... ADD COLUMN`
+    /// and land at the end) genuinely and harmlessly declare
+    /// `durable_token_events`'s columns in a different order — this
+    /// codebase always addresses columns by name, never positionally, so
+    /// that difference is not a real shape divergence. What *would* be a
+    /// real divergence — a missing, extra, retyped, or renamed column, a
+    /// changed constraint, or a missing index — still fails this check.
+    fn schema_shape(connection: &Connection) -> Vec<String> {
+        let mut tables: Vec<String> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND sql IS NOT NULL",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        tables.sort();
+
+        let mut lines = Vec::new();
+        for table in &tables {
+            let mut column_statement = connection
+                .prepare(&format!("PRAGMA table_info('{table}')"))
+                .unwrap();
+            let mut columns: Vec<String> = column_statement
+                .query_map([], |row| {
+                    let name: String = row.get(1)?;
+                    let declared_type: String = row.get(2)?;
+                    let not_null: i64 = row.get(3)?;
+                    let default_value: Option<String> = row.get(4)?;
+                    let primary_key_rank: i64 = row.get(5)?;
+                    Ok(format!(
+                        "{name}:{declared_type}:{not_null}:{}:{primary_key_rank}",
+                        default_value.unwrap_or_default()
+                    ))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            columns.sort();
+
+            let mut fk_statement = connection
+                .prepare(&format!("PRAGMA foreign_key_list('{table}')"))
+                .unwrap();
+            let mut foreign_keys: Vec<String> = fk_statement
+                .query_map([], |row| {
+                    let referenced_table: String = row.get(2)?;
+                    let from_column: String = row.get(3)?;
+                    let to_column: String = row.get(4)?;
+                    Ok(format!("{from_column}->{referenced_table}.{to_column}"))
+                })
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            foreign_keys.sort();
+
+            lines.push(format!(
+                "table:{table}:columns=[{}]:fks=[{}]",
+                columns.join(","),
+                foreign_keys.join(",")
+            ));
+        }
+
+        let mut index_statement = connection
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'index' AND sql IS NOT NULL",
+            )
+            .unwrap();
+        let indexes: Vec<String> = index_statement
+            .query_map([], |row| {
+                let name: String = row.get(0)?;
+                let sql: String = row.get(1)?;
+                let normalized_sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                Ok(format!("index:{name}:{normalized_sql}"))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        lines.extend(indexes);
+        lines.sort();
+        lines
+    }
+
+    #[test]
+    fn fresh_and_fully_migrated_databases_produce_identical_schema_shapes() {
+        // Invariant 2: the fresh-database path (`migrate()`'s `version == 0`
+        // branch) and the fully-migrated-from-oldest path are built
+        // separately in this file and have drifted before; this pins them to
+        // agree on every table's columns, constraints, foreign keys, and
+        // indexes (see `schema_shape` for why this is order-insensitive
+        // rather than reusing the strict `schema_fingerprint`).
+        let (_fresh_directory, fresh_store) = store();
+        let fresh_shape = schema_shape(&fresh_store.connection().unwrap());
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(V1_MINIMAL_SCHEMA_SQL).unwrap();
+        }
+        let migrated_store = HistoryStore::open(&path).unwrap();
+        let migrated_shape = schema_shape(&migrated_store.connection().unwrap());
+
+        assert_eq!(
+            fresh_shape, migrated_shape,
+            "the fresh-database schema and the fully-migrated-from-v1 schema must define the \
+             same tables, columns, constraints, foreign keys, and indexes; a drift here means \
+             the two paths built separately in this file have diverged"
+        );
+    }
+
+    /// Minimal genuine schema-v1 database, matching a real pre-#107/#42/#41
+    /// store. Used by `fresh_and_fully_migrated_databases_produce_identical_schema_shapes`.
+    ///
+    /// Matches the *original* `version == 0` shape from this file's first
+    /// commit (`9e74026`, "Add durable session history and time-aware
+    /// pricing") byte-for-byte in every column, foreign key, and index that
+    /// commit already had — including the `durable_sessions_identity_idx`
+    /// and `durable_token_events_session_timestamp_idx` indexes and the
+    /// `REFERENCES durable_sessions(session_key)` foreign keys on
+    /// `durable_token_events` and `session_snapshots` — so this genuinely
+    /// models a real legacy database rather than the narrower, hand-typed v1
+    /// stub used elsewhere in this file for column-presence-only checks
+    /// (`migrates_schema_v1_request_evidence_forward`), which was never
+    /// meant to be a byte-for-byte proxy for a real v1 schema and would
+    /// otherwise make `fresh_and_fully_migrated_databases_produce_identical_schema_shapes`
+    /// fail for a reason that isn't a real migration bug.
+    const V1_MINIMAL_SCHEMA_SQL: &str = "CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         INSERT INTO history_meta(key, value) VALUES('schema_version', '1');
+         CREATE TABLE durable_sessions (
+           session_key TEXT PRIMARY KEY,
+           identity_key TEXT NOT NULL,
+           first_event_fingerprint TEXT NOT NULL,
+           fingerprint_is_final INTEGER NOT NULL,
+           collision INTEGER NOT NULL DEFAULT 0,
+           current_snapshot_version INTEGER NOT NULL DEFAULT 0,
+           current_snapshot_hash TEXT,
+           created_at_ms INTEGER NOT NULL,
+           last_seen_at_ms INTEGER NOT NULL
+         );
+         CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key);
+         CREATE TABLE source_artifacts (
+           artifact_key TEXT PRIMARY KEY,
+           identity_key TEXT NOT NULL,
+           first_event_fingerprint TEXT NOT NULL,
+           session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+           created_at_ms INTEGER NOT NULL,
+           last_seen_at_ms INTEGER NOT NULL
+         );
+         CREATE TABLE source_locations (
+           path TEXT PRIMARY KEY,
+           artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key),
+           session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+           present INTEGER NOT NULL,
+           first_seen_at_ms INTEGER NOT NULL,
+           last_seen_at_ms INTEGER NOT NULL,
+           seen_generation INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE INDEX source_locations_session_idx ON source_locations(session_key, present);
+         CREATE TABLE session_snapshots (
+           session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+           version INTEGER NOT NULL,
+           format_version INTEGER NOT NULL,
+           snapshot_hash TEXT NOT NULL,
+           captured_at_ms INTEGER NOT NULL,
+           session_json BLOB NOT NULL,
+           PRIMARY KEY(session_key, version)
+         );
+         CREATE TABLE durable_token_events (
+           session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+           event_key TEXT NOT NULL,
+           event_index INTEGER NOT NULL,
+           timestamp_ms INTEGER NOT NULL,
+           model TEXT,
+           service_tier TEXT,
+           cumulative_total_tokens INTEGER NOT NULL,
+           input_tokens INTEGER NOT NULL,
+           cached_input_tokens INTEGER NOT NULL,
+           output_tokens INTEGER NOT NULL,
+           reasoning_output_tokens INTEGER NOT NULL,
+           total_tokens INTEGER NOT NULL,
+           PRIMARY KEY(session_key, event_key)
+         );
+         CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms);
+         PRAGMA user_version = 1;";
+
+    /// Rewinds a freshly-created (head-schema) database down to exactly
+    /// `target_version` by undoing each migration step above it in reverse —
+    /// the literal inverse of the real `migrate()` SQL, so the resulting
+    /// stub tracks the actual legacy shapes instead of a hand-maintained
+    /// parallel fixture that could silently drift from them.
+    fn rewind_database_to_version(path: &Path, target_version: i64) {
+        let connection = Connection::open(path).unwrap();
+        let mut version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "rewind_database_to_version expects a head-schema database to start from"
+        );
+        while version > target_version {
+            let sql = match version {
+                6 => {
+                    "DROP INDEX IF EXISTS durable_sessions_project_idx;
+                     ALTER TABLE durable_sessions DROP COLUMN project_key;
+                     ALTER TABLE durable_sessions DROP COLUMN project_label;
+                     ALTER TABLE durable_sessions DROP COLUMN project_provenance;
+                     ALTER TABLE durable_sessions DROP COLUMN project_source_directory;
+                     DROP TABLE project_overrides;
+                     DROP TABLE project_session_overrides;"
+                }
+                5 => {
+                    "ALTER TABLE durable_token_events DROP COLUMN cache_creation_input_tokens;
+                     ALTER TABLE rollup_token_totals DROP COLUMN cache_creation_input_tokens;"
+                }
+                4 => {
+                    "DROP TABLE rollup_token_totals;
+                     DROP TABLE rollup_tool_metrics;
+                     DROP TABLE rollup_mutation_chains;"
+                }
+                3 => {
+                    "DROP TABLE durable_tool_events;
+                     DROP TABLE durable_finding_events;
+                     ALTER TABLE durable_sessions DROP COLUMN ledger_dirty;"
+                }
+                2 => "ALTER TABLE durable_token_events DROP COLUMN request_input_tokens;",
+                other => unreachable!("no rewind step defined for version {other}"),
+            };
+            connection.execute_batch(sql).unwrap();
+            version -= 1;
+            connection
+                .execute_batch(&format!(
+                    "INSERT INTO history_meta(key, value) VALUES('schema_version', '{version}')
+                       ON CONFLICT(key) DO UPDATE SET value = '{version}';
+                     PRAGMA user_version = {version};"
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_from_every_prior_version_reaches_schema_version_with_no_gap_or_duplicate() {
+        // Invariant 2: proves migrate()'s version-by-version `if` chain has
+        // no gap (every version from 1 to SCHEMA_VERSION - 1 makes forward
+        // progress all the way to head) and no duplicated step (history_meta
+        // ends with exactly one schema_version row, matching PRAGMA
+        // user_version).
+        for target_version in 1..SCHEMA_VERSION {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("history.sqlite3");
+            {
+                let _ = HistoryStore::open(&path).unwrap();
+            }
+            rewind_database_to_version(&path, target_version);
+
+            let store = HistoryStore::open(&path).unwrap();
+            let connection = store.connection().unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                version, SCHEMA_VERSION,
+                "migrating from v{target_version} did not reach SCHEMA_VERSION (a gap in the \
+                 migration chain)"
+            );
+            let schema_version_rows: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM history_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                schema_version_rows, 1,
+                "migrating from v{target_version} left {schema_version_rows} 'schema_version' \
+                 rows in history_meta (expected exactly 1 — a duplicated migration step)"
+            );
+            let recorded_version: String = connection
+                .query_row(
+                    "SELECT value FROM history_meta WHERE key = 'schema_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(recorded_version, SCHEMA_VERSION.to_string());
+        }
+    }
+
+    /// Builds a `Session` whose every `TokenTotals` field and every
+    /// `ToolMetrics` counter is non-zero and pairwise distinct within its
+    /// struct, spread across three consecutive hour buckets on
+    /// 2026-01-01 (00:xx, 01:xx, 02:xx).
+    fn every_dimension_session(id: &str) -> Session {
+        use crate::model::ToolKind;
+        let mut fixture = session(id, 1);
+
+        // Token dimension: one event per bucket. Field values (grouped by
+        // dimension across all three events) are pairwise distinct: input=93,
+        // cached=103, cache_creation=115, output=127, reasoning=137,
+        // total=221.
+        let token_event = |at: &str,
+                           input: u64,
+                           cached: u64,
+                           cache_creation: u64,
+                           output: u64,
+                           reasoning: u64,
+                           total: u64| TokenHistoryPoint {
+            timestamp: timestamp(at),
+            model: Some("gpt-dimension".into()),
+            service_tier: None,
+            request_input_tokens: Some(input),
+            total_tokens: total,
+            delta: TokenTotals {
+                input_tokens: input,
+                cached_input_tokens: cached,
+                cache_creation_input_tokens: cache_creation,
+                output_tokens: output,
+                reasoning_output_tokens: reasoning,
+                total_tokens: total,
+            },
+        };
+        fixture.tokens_history = vec![
+            token_event("2026-01-01T00:30:00Z", 11, 13, 17, 19, 23, 101),
+            token_event("2026-01-01T01:15:00Z", 29, 31, 37, 41, 43, 47),
+            token_event("2026-01-01T02:45:00Z", 53, 59, 61, 67, 71, 73),
+        ];
+        let mut total = TokenTotals::default();
+        for point in &fixture.tokens_history {
+            total += &point.delta;
+        }
+        fixture.tokens_total = total;
+
+        // Tool dimension: 30 observations across the same three buckets.
+        // Kind counts: reads=4, searches=6, mutations=5, commands=7, other=8
+        // (calls=30). The 5 mutations are two (turn, target) chains: a
+        // one-shot chain (turn-a/target-a, bucket 1) and a four-call retry
+        // chain (turn-b/target-b) that straddles an edge bucket, the
+        // rollup-served bucket (twice), and the other edge bucket — giving
+        // mutation_targets=2, one_shot_mutations=1, retry_count=3. Outcome
+        // counts: successes=9, failures=10, unknown=11. duration_ms and
+        // output_bytes are concentrated on one call so their totals (555,
+        // 9999) stay distinct from every other counter.
+        struct Call {
+            at: String,
+            kind: ToolKind,
+            turn: Option<&'static str>,
+            target: Option<&'static str>,
+        }
+        let mut calls = vec![
+            Call {
+                at: "2026-01-01T01:05:00Z".into(),
+                kind: ToolKind::Mutation,
+                turn: Some("turn-a"),
+                target: Some("target-a"),
+            },
+            Call {
+                at: "2026-01-01T00:20:00Z".into(),
+                kind: ToolKind::Mutation,
+                turn: Some("turn-b"),
+                target: Some("target-b"),
+            },
+            Call {
+                at: "2026-01-01T01:10:00Z".into(),
+                kind: ToolKind::Mutation,
+                turn: Some("turn-b"),
+                target: Some("target-b"),
+            },
+            Call {
+                at: "2026-01-01T01:40:00Z".into(),
+                kind: ToolKind::Mutation,
+                turn: Some("turn-b"),
+                target: Some("target-b"),
+            },
+            Call {
+                at: "2026-01-01T02:10:00Z".into(),
+                kind: ToolKind::Mutation,
+                turn: Some("turn-b"),
+                target: Some("target-b"),
+            },
+        ];
+        let hours = ["00", "01", "02"];
+        let mut minute = [16usize, 16usize, 16usize];
+        let plain_kinds = [
+            ToolKind::Read,
+            ToolKind::Search,
+            ToolKind::Command,
+            ToolKind::Other,
+        ];
+        let plain_counts = [4usize, 6, 7, 8];
+        let mut plain_generated = 0usize;
+        for (kind, count) in plain_kinds.into_iter().zip(plain_counts) {
+            for _ in 0..count {
+                let bucket = plain_generated % 3;
+                let at = format!("2026-01-01T{}:{:02}:00Z", hours[bucket], minute[bucket]);
+                minute[bucket] += 1;
+                plain_generated += 1;
+                calls.push(Call {
+                    at,
+                    kind,
+                    turn: None,
+                    target: None,
+                });
+            }
+        }
+        assert_eq!(
+            calls.len(),
+            30,
+            "fixture sanity check: reads+searches+mutations+commands+other"
+        );
+
+        let outcomes: Vec<ToolOutcome> = std::iter::repeat_n(ToolOutcome::Success, 9)
+            .chain(std::iter::repeat_n(ToolOutcome::Failure, 10))
+            .chain(std::iter::repeat_n(ToolOutcome::Unknown, 11))
+            .collect();
+        assert_eq!(outcomes.len(), 30);
+
+        fixture.tool_observations = calls
+            .into_iter()
+            .zip(outcomes)
+            .enumerate()
+            .map(|(index, (call, outcome))| ToolObservation {
+                call_id: format!("dimension-call-{index}"),
+                turn_id: call.turn.map(Into::into),
+                harness: codex_provider_id(),
+                model: Some("gpt-dimension".into()),
+                timestamp: timestamp(&call.at),
+                kind: call.kind,
+                name: "tool".into(),
+                providers: Vec::new(),
+                effective_tools: Vec::new(),
+                target: call.target.map(Into::into),
+                resource_id: None,
+                outcome,
+                duration_ms: Some(if index == 0 { 555 } else { 0 }),
+                output_bytes: if index == 0 { 9999 } else { 0 },
+            })
+            .collect();
+
+        fixture.last_event_at = timestamp("2026-01-01T02:45:00Z");
+        fixture
+    }
+
+    /// Every field of the serialized value must be a non-negative integer
+    /// that is both non-zero and pairwise distinct from every other field —
+    /// reflection-based (`serde_json`), not a hand-maintained field list, so
+    /// a newly added dimension is included automatically without anyone
+    /// remembering to update this test.
+    fn assert_all_fields_nonzero_and_distinct(value: &serde_json::Value, label: &str) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{label} did not serialize to a JSON object"));
+        let mut seen = HashSet::new();
+        for (field, field_value) in object {
+            let n = field_value
+                .as_u64()
+                .unwrap_or_else(|| panic!("{label}.{field} is not a plain non-negative integer"));
+            assert_ne!(
+                n, 0,
+                "{label}.{field} is zero in the golden fixture; a field that silently defaults \
+                 to zero must fail this guard rather than pass vacuously"
+            );
+            assert!(
+                seen.insert(n),
+                "{label}.{field} = {n} collides with another field's value in this fixture; \
+                 dimensions must be pairwise distinct or a field swap would go undetected"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_range_totals_match_oracle_for_every_nonzero_distinct_dimension() {
+        // Invariant 3: strengthens the golden ledger-vs-oracle comparison so
+        // a newly added dimension is exercised without anyone extending a
+        // fixture by hand. `every_dimension_session` populates every
+        // TokenTotals field and every ToolMetrics counter with a distinct,
+        // non-zero value, and the window below straddles buckets so the
+        // rollup-served path and the sub-hour edge path are both exercised
+        // in the same call.
+        let (_directory, store) = store();
+        let fixture = every_dimension_session("every-dimension");
+        let generation = store.begin_scan().unwrap().max(1);
+        let key = store
+            .observe(Path::new("every-dimension.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        let windows: Vec<RangeWindow> = vec![(
+            Some(timestamp("2026-01-01T00:15:00Z")),
+            Some(timestamp("2026-01-01T02:50:00Z")),
+        )];
+        let expected = &fixture.range_totals_multi(&windows)[0];
+
+        assert_all_fields_nonzero_and_distinct(
+            &serde_json::to_value(&expected.tokens).unwrap(),
+            "tokens",
+        );
+        assert_all_fields_nonzero_and_distinct(
+            &serde_json::to_value(&expected.tool_metrics).unwrap(),
+            "tool_metrics",
+        );
+
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let actual = from_ledger[0]
+            .get(&key)
+            .expect("window has data for this session");
+        assert_eq!(&actual.tokens, &expected.tokens, "tokens");
+        assert_eq!(&actual.tool_metrics, &expected.tool_metrics, "tool_metrics");
+    }
+
+    #[test]
+    fn backfill_project_identity_selects_keys_before_any_snapshot_blob() {
+        // Invariant 4: structural proxy for the migration backfill's memory
+        // shape. A true peak-RSS measurement is impractical in a unit test,
+        // so this instead asserts the query shape `backfill_project_identities`
+        // actually issues: its first pass (`BACKFILL_PROJECT_IDENTITY_KEYS_SQL`)
+        // selects only session keys, never a snapshot blob, and its
+        // per-session fetch (`BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL`) is
+        // scoped to exactly one session at a time. A ledger can hold
+        // thousands of sessions with multi-megabyte snapshots each
+        // (AGENTS.md); a query that returned every `session_json` at once
+        // would exhaust memory well before that, the same class of defect
+        // the v1->v2 fact backfill earlier in this file was already written
+        // to avoid.
+        assert!(
+            !BACKFILL_PROJECT_IDENTITY_KEYS_SQL
+                .to_lowercase()
+                .contains("session_json"),
+            "the first-pass query must select only session keys, not snapshot blobs: {}",
+            BACKFILL_PROJECT_IDENTITY_KEYS_SQL
+        );
+        assert!(
+            BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL.contains("WHERE d.session_key = ?1"),
+            "the snapshot fetch must be scoped to exactly one session per query: {}",
+            BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL
+        );
+        assert!(
+            !BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL
+                .to_lowercase()
+                .contains(" in ("),
+            "the snapshot fetch must not batch multiple sessions' blobs into one query: {}",
+            BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL
+        );
     }
 }
