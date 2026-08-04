@@ -243,6 +243,50 @@ pub fn observe_result(
     }
 }
 
+/// Increments the 11 additive `ToolMetrics` counters for one observation.
+/// Shared with the durable-ledger rollup read path (`history_store.rs`,
+/// #107): both a live accumulation over in-memory observations and a
+/// reconstruction from pooled sub-hour edge events must count a call
+/// identically, or the two paths would silently diverge.
+pub(crate) fn accumulate_observation(counters: &mut ToolMetrics, item: &ToolObservation) {
+    counters.calls += 1;
+    counters.output_bytes += item.output_bytes;
+    counters.duration_ms += item.duration_ms.unwrap_or(0);
+    match item.kind {
+        ToolKind::Read => counters.reads += 1,
+        ToolKind::Search => counters.searches += 1,
+        ToolKind::Mutation => counters.mutations += 1,
+        ToolKind::Command => counters.commands += 1,
+        ToolKind::Other => counters.other += 1,
+    }
+    match item.outcome {
+        ToolOutcome::Success => counters.successes += 1,
+        ToolOutcome::Failure => counters.failures += 1,
+        ToolOutcome::Pending | ToolOutcome::Unknown => counters.unknown += 1,
+    }
+}
+
+/// Derives the three non-additive `ToolMetrics` fields — `mutation_targets`,
+/// `one_shot_mutations`, `retry_count` — from mutation-chain event counts
+/// keyed by `(turn_id, target)`. This is the one formula both the in-memory
+/// accumulator below and the durable-ledger rollup reconstruction
+/// (`history_store.rs::compute_range_totals`, #107) use, so a chain that
+/// straddles a rollup bucket or day boundary is still counted exactly once
+/// rather than approximated by summing per-bucket derived fields.
+pub fn mutation_chain_fields(counts: impl Iterator<Item = u64>) -> (u64, u64, u64) {
+    let mut mutation_targets = 0u64;
+    let mut one_shot_mutations = 0u64;
+    let mut retry_count = 0u64;
+    for count in counts {
+        mutation_targets += 1;
+        if count == 1 {
+            one_shot_mutations += 1;
+        }
+        retry_count += count.saturating_sub(1);
+    }
+    (mutation_targets, one_shot_mutations, retry_count)
+}
+
 #[derive(Default)]
 struct MetricsAccumulator<'a> {
     out: ToolMetrics,
@@ -251,38 +295,21 @@ struct MetricsAccumulator<'a> {
 
 impl<'a> MetricsAccumulator<'a> {
     fn push(&mut self, item: &'a ToolObservation) {
-        self.out.calls += 1;
-        self.out.output_bytes += item.output_bytes;
-        self.out.duration_ms += item.duration_ms.unwrap_or(0);
-        match item.kind {
-            ToolKind::Read => self.out.reads += 1,
-            ToolKind::Search => self.out.searches += 1,
-            ToolKind::Mutation => {
-                self.out.mutations += 1;
-                *self
-                    .mutations
-                    .entry((item.turn_id.as_deref(), item.target.as_deref()))
-                    .or_default() += 1;
-            }
-            ToolKind::Command => self.out.commands += 1,
-            ToolKind::Other => self.out.other += 1,
-        }
-        match item.outcome {
-            ToolOutcome::Success => self.out.successes += 1,
-            ToolOutcome::Failure => self.out.failures += 1,
-            ToolOutcome::Pending | ToolOutcome::Unknown => self.out.unknown += 1,
+        accumulate_observation(&mut self.out, item);
+        if item.kind == ToolKind::Mutation {
+            *self
+                .mutations
+                .entry((item.turn_id.as_deref(), item.target.as_deref()))
+                .or_default() += 1;
         }
     }
 
     fn finish(mut self) -> ToolMetrics {
-        self.out.mutation_targets = self.mutations.len() as u64;
-        self.out.one_shot_mutations =
-            self.mutations.values().filter(|count| **count == 1).count() as u64;
-        self.out.retry_count = self
-            .mutations
-            .values()
-            .map(|count| count.saturating_sub(1))
-            .sum();
+        let (mutation_targets, one_shot_mutations, retry_count) =
+            mutation_chain_fields(self.mutations.values().copied());
+        self.out.mutation_targets = mutation_targets;
+        self.out.one_shot_mutations = one_shot_mutations;
+        self.out.retry_count = retry_count;
         self.out
     }
 }

@@ -8,20 +8,25 @@
 //! session or token event during a scan.
 
 use crate::model::{
-    OptimizationFinding, RangeTotals, RangeWindow, Session, SourceAvailability, TokenHistoryPoint,
-    TokenTotals, ToolKind, ToolObservation, ToolOutcome,
+    OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session,
+    SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolKind, ToolMetrics,
+    ToolObservation, ToolOutcome,
 };
 use crate::provider::{claude_code_provider_id, codex_provider_id};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::TimeZone;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
+/// Rollup grain for the durable-ledger read path (#107): every hour bucket
+/// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
+/// migration's SQL use identically so the two never disagree on bucketing.
+const HOUR_MS: i64 = 3_600_000;
 
 /// One path at which an archived transcript has been observed. Paths are
 /// availability observations, not logical-session identities.
@@ -337,15 +342,19 @@ impl HistoryStore {
         self.load_one(&key)
     }
 
-    /// Window-scoped rollups computed from the normalized ledger. Each
-    /// session's in-span facts are fetched once on a dedicated read
-    /// connection (WAL keeps the writer unblocked), rebuilt into a minimal
-    /// session shell, and evaluated through the same
-    /// `Session::range_totals_multi` the in-memory path uses — the two paths
-    /// share one implementation and cannot diverge semantically. Timestamps
-    /// carry the ledger's millisecond storage granularity, which the oracle
-    /// also compares at. Returns one map per window containing only sessions
-    /// with data in that window (the `sessions_in_ranges` wire contract).
+    /// Window-scoped rollups computed from the normalized ledger (#107).
+    /// Whole hour buckets are served from the `rollup_*` tables — a few rows
+    /// per session, not a re-materialization of every event — and only the
+    /// (at most two) sub-hour edges of each window fall back to exact event
+    /// reads. The three non-additive `ToolMetrics` fields are never summed
+    /// across buckets: they are always derived, via the same
+    /// `telemetry::mutation_chain_fields` formula the in-memory path uses,
+    /// from merged `(turn_id, target)` chain counts, so they stay exact
+    /// regardless of how a window's buckets and edges are combined.
+    /// Timestamps carry the ledger's millisecond storage granularity, which
+    /// the oracle also compares at. Returns one map per window containing
+    /// only sessions with data in that window (the `sessions_in_ranges` wire
+    /// contract).
     pub fn range_totals_multi(
         &self,
         session_keys: &[String],
@@ -355,97 +364,202 @@ impl HistoryStore {
             .with_context(|| format!("could not open history reader {}", self.path.display()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); windows.len()];
-        // Events outside the union of all requested windows cannot affect any
-        // window, so each session's rows are fetched once over that span and
-        // every window is evaluated in Rust against the same rows.
-        let span_from = if windows.iter().any(|(from, _)| from.is_none()) {
-            i64::MIN
-        } else {
-            windows
-                .iter()
-                .filter_map(|(from, _)| from.map(|value| value.timestamp_millis()))
-                .min()
-                .unwrap_or(i64::MIN)
-        };
-        let span_to = if windows.iter().any(|(_, to)| to.is_none()) {
-            i64::MAX
-        } else {
-            windows
-                .iter()
-                .filter_map(|(_, to)| to.map(|value| value.timestamp_millis()))
-                .max()
-                .unwrap_or(i64::MAX)
-        };
-        let mut token_query = connection.prepare(
-            "SELECT timestamp_ms, model, service_tier, request_input_tokens,
-                    cumulative_total_tokens, input_tokens, cached_input_tokens,
+
+        let window_ms: Vec<(Option<i64>, Option<i64>)> = windows
+            .iter()
+            .map(|(from, to)| {
+                (
+                    from.map(|value| value.timestamp_millis()),
+                    to.map(|value| value.timestamp_millis()),
+                )
+            })
+            .collect();
+        let plans: Vec<WindowPlan> = window_ms
+            .iter()
+            .map(|(from_ms, to_ms)| plan_window(*from_ms, *to_ms))
+            .collect();
+        // The union of every window's sub-hour edges, deduplicated, so each
+        // session issues at most one edge query per fact table regardless of
+        // how many windows were requested.
+        let mut edge_ranges: Vec<(i64, i64)> = Vec::new();
+        for plan in &plans {
+            for edge in &plan.edges {
+                if !edge_ranges.contains(edge) {
+                    edge_ranges.push(*edge);
+                }
+            }
+        }
+
+        let mut token_rollup_query = connection.prepare(
+            "SELECT hour_bucket, model, service_tier, input_tokens, cached_input_tokens,
                     output_tokens, reasoning_output_tokens, total_tokens
-             FROM durable_token_events
-             WHERE session_key = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
-             ORDER BY timestamp_ms, event_index",
+             FROM rollup_token_totals WHERE session_key = ?1",
         )?;
-        let mut tool_query = connection.prepare(
-            "SELECT timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes
-             FROM durable_tool_events
-             WHERE session_key = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
-             ORDER BY timestamp_ms",
+        let mut tool_rollup_query = connection.prepare(
+            "SELECT hour_bucket, model, calls, reads, searches, mutations, commands, other,
+                    successes, failures, unknown, duration_ms, output_bytes
+             FROM rollup_tool_metrics WHERE session_key = ?1",
+        )?;
+        let mut chain_rollup_query = connection.prepare(
+            "SELECT hour_bucket, model, turn_id, target, mutation_count
+             FROM rollup_mutation_chains WHERE session_key = ?1",
         )?;
         let mut finding_query = connection.prepare(
             "SELECT timestamp_ms, rule_id, severity, avoidable_calls
              FROM durable_finding_events WHERE session_key = ?1",
         )?;
+        let edge_predicate = edge_predicate_sql(&edge_ranges);
+        let mut token_edge_query = (!edge_ranges.is_empty())
+            .then(|| {
+                connection.prepare(&format!(
+                    "SELECT timestamp_ms, model, service_tier, request_input_tokens,
+                            cumulative_total_tokens, input_tokens, cached_input_tokens,
+                            output_tokens, reasoning_output_tokens, total_tokens
+                     FROM durable_token_events WHERE session_key = ?1 AND ({edge_predicate})
+                     ORDER BY timestamp_ms, event_index"
+                ))
+            })
+            .transpose()?;
+        let mut tool_edge_query = (!edge_ranges.is_empty())
+            .then(|| {
+                connection.prepare(&format!(
+                    "SELECT timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes
+                     FROM durable_tool_events WHERE session_key = ?1 AND ({edge_predicate})
+                     ORDER BY timestamp_ms"
+                ))
+            })
+            .transpose()?;
+
         for key in session_keys {
-            let tokens_history: Vec<TokenHistoryPoint> = token_query
-                .query_map(params![key, span_from, span_to], |row| {
-                    Ok(TokenHistoryPoint {
-                        timestamp: chrono::Utc
-                            .timestamp_millis_opt(row.get::<_, i64>(0)?)
-                            .single()
-                            .unwrap_or_default(),
-                        model: row.get(1)?,
-                        service_tier: row.get(2)?,
-                        request_input_tokens: row
-                            .get::<_, Option<i64>>(3)?
-                            .map(|value| value as u64),
-                        total_tokens: row.get::<_, i64>(4)? as u64,
-                        delta: TokenTotals {
-                            input_tokens: row.get::<_, i64>(5)? as u64,
-                            cached_input_tokens: row.get::<_, i64>(6)? as u64,
-                            output_tokens: row.get::<_, i64>(7)? as u64,
-                            reasoning_output_tokens: row.get::<_, i64>(8)? as u64,
-                            total_tokens: row.get::<_, i64>(9)? as u64,
+            let token_rows: Vec<(i64, String, String, TokenTotals)> = token_rollup_query
+                .query_map([key.as_str()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        TokenTotals {
+                            input_tokens: row.get::<_, i64>(3)? as u64,
+                            cached_input_tokens: row.get::<_, i64>(4)? as u64,
+                            output_tokens: row.get::<_, i64>(5)? as u64,
+                            reasoning_output_tokens: row.get::<_, i64>(6)? as u64,
+                            total_tokens: row.get::<_, i64>(7)? as u64,
                         },
-                    })
+                    ))
                 })?
                 .collect::<std::result::Result<_, _>>()?;
-            let tool_observations: Vec<ToolObservation> = tool_query
-                .query_map(params![key, span_from, span_to], |row| {
-                    Ok(ToolObservation {
-                        call_id: String::new(),
-                        turn_id: row.get(4)?,
-                        // Not persisted: metric reconstruction reads only
-                        // kind/outcome/model/turn/target/duration/bytes. Any
-                        // future metric keyed on harness or name must extend
-                        // the fact schema first.
-                        harness: codex_provider_id(),
-                        model: row.get(1)?,
-                        timestamp: chrono::Utc
-                            .timestamp_millis_opt(row.get::<_, i64>(0)?)
-                            .single()
-                            .unwrap_or_default(),
-                        kind: tool_kind_from_str(&row.get::<_, String>(2)?),
-                        name: String::new(),
-                        providers: Vec::new(),
-                        effective_tools: Vec::new(),
-                        target: row.get(5)?,
-                        resource_id: None,
-                        outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
-                        duration_ms: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
-                        output_bytes: row.get::<_, i64>(7)? as u64,
-                    })
+            let tool_rows: Vec<(i64, String, ToolMetrics)> = tool_rollup_query
+                .query_map([key.as_str()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        ToolMetrics {
+                            calls: row.get::<_, i64>(2)? as u64,
+                            reads: row.get::<_, i64>(3)? as u64,
+                            searches: row.get::<_, i64>(4)? as u64,
+                            mutations: row.get::<_, i64>(5)? as u64,
+                            commands: row.get::<_, i64>(6)? as u64,
+                            other: row.get::<_, i64>(7)? as u64,
+                            successes: row.get::<_, i64>(8)? as u64,
+                            failures: row.get::<_, i64>(9)? as u64,
+                            unknown: row.get::<_, i64>(10)? as u64,
+                            duration_ms: row.get::<_, i64>(11)? as u64,
+                            output_bytes: row.get::<_, i64>(12)? as u64,
+                            ..Default::default()
+                        },
+                    ))
                 })?
                 .collect::<std::result::Result<_, _>>()?;
-            let optimization_findings: Vec<OptimizationFinding> = finding_query
+            let chain_rows: Vec<(i64, String, String, String, u64)> = chain_rollup_query
+                .query_map([key.as_str()], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)? as u64,
+                    ))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            let edge_params = |key: &str| -> Vec<Box<dyn rusqlite::ToSql>> {
+                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
+                    Vec::with_capacity(1 + edge_ranges.len() * 2);
+                params.push(Box::new(key.to_owned()));
+                for (a, b) in &edge_ranges {
+                    params.push(Box::new(*a));
+                    params.push(Box::new(*b));
+                }
+                params
+            };
+            let edge_tokens: Vec<TokenHistoryPoint> = match token_edge_query.as_mut() {
+                Some(query) => {
+                    let params = edge_params(key);
+                    let refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|value| value.as_ref()).collect();
+                    query
+                        .query_map(refs.as_slice(), |row| {
+                            Ok(TokenHistoryPoint {
+                                timestamp: chrono::Utc
+                                    .timestamp_millis_opt(row.get::<_, i64>(0)?)
+                                    .single()
+                                    .unwrap_or_default(),
+                                model: row.get(1)?,
+                                service_tier: row.get(2)?,
+                                request_input_tokens: row
+                                    .get::<_, Option<i64>>(3)?
+                                    .map(|value| value as u64),
+                                total_tokens: row.get::<_, i64>(4)? as u64,
+                                delta: TokenTotals {
+                                    input_tokens: row.get::<_, i64>(5)? as u64,
+                                    cached_input_tokens: row.get::<_, i64>(6)? as u64,
+                                    output_tokens: row.get::<_, i64>(7)? as u64,
+                                    reasoning_output_tokens: row.get::<_, i64>(8)? as u64,
+                                    total_tokens: row.get::<_, i64>(9)? as u64,
+                                },
+                            })
+                        })?
+                        .collect::<std::result::Result<_, _>>()?
+                }
+                None => Vec::new(),
+            };
+            let edge_tools: Vec<ToolObservation> = match tool_edge_query.as_mut() {
+                Some(query) => {
+                    let params = edge_params(key);
+                    let refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|value| value.as_ref()).collect();
+                    query
+                        .query_map(refs.as_slice(), |row| {
+                            Ok(ToolObservation {
+                                call_id: String::new(),
+                                turn_id: row.get(4)?,
+                                // Not persisted: metric reconstruction reads
+                                // only kind/outcome/model/turn/target/
+                                // duration/bytes. Any future metric keyed on
+                                // harness or name must extend the fact schema
+                                // first.
+                                harness: codex_provider_id(),
+                                model: row.get(1)?,
+                                timestamp: chrono::Utc
+                                    .timestamp_millis_opt(row.get::<_, i64>(0)?)
+                                    .single()
+                                    .unwrap_or_default(),
+                                kind: tool_kind_from_str(&row.get::<_, String>(2)?),
+                                name: String::new(),
+                                providers: Vec::new(),
+                                effective_tools: Vec::new(),
+                                target: row.get(5)?,
+                                resource_id: None,
+                                outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
+                                duration_ms: row
+                                    .get::<_, Option<i64>>(6)?
+                                    .map(|value| value as u64),
+                                output_bytes: row.get::<_, i64>(7)? as u64,
+                            })
+                        })?
+                        .collect::<std::result::Result<_, _>>()?
+                }
+                None => Vec::new(),
+            };
+            let findings: Vec<OptimizationFinding> = finding_query
                 .query_map([key.as_str()], |row| {
                     Ok(OptimizationFinding {
                         timestamp: row
@@ -459,9 +573,19 @@ impl HistoryStore {
                 })?
                 .collect::<std::result::Result<_, _>>()?;
 
-            let shell =
-                ledger_session_shell(tokens_history, tool_observations, optimization_findings);
-            for (window_index, range) in shell.range_totals_multi(windows).into_iter().enumerate() {
+            for (window_index, ((from_ms, to_ms), plan)) in window_ms.iter().zip(&plans).enumerate()
+            {
+                let range = compute_range_totals(
+                    *from_ms,
+                    *to_ms,
+                    plan,
+                    &token_rows,
+                    &tool_rows,
+                    &chain_rows,
+                    &edge_tokens,
+                    &edge_tools,
+                    &findings,
+                );
                 if crate::commands::range_has_data(&range) {
                     out[window_index].insert(key.clone(), range);
                 }
@@ -536,6 +660,281 @@ impl HistoryStore {
 /// a later remove always address the same durable record.
 fn source_path_key(path: &Path) -> String {
     crate::paths::normalized_path_key(path, false)
+}
+
+/// Hour-bucket grain shared by the write path (rollup maintenance), the v4
+/// migration's SQL backfill, and the read path's bucket-range math. Plain
+/// truncating division, matching SQLite's integer `/`; realistic timestamps
+/// are always non-negative so this never needs `div_euclid`.
+fn hour_bucket(timestamp_ms: i64) -> i64 {
+    timestamp_ms / HOUR_MS
+}
+
+/// Rollup grouping columns (model/tier/turn/target) use an empty string, not
+/// SQL NULL, as the "absent" sentinel: a `UNIQUE INDEX` treats every NULL as
+/// distinct, which would silently defeat upsert accumulation for the
+/// unattributed-event bucket. Real values are never empty (parsers only ever
+/// produce `None` or a genuine identifier), so the sentinel cannot collide.
+fn key_sentinel(value: Option<&str>) -> &str {
+    value.unwrap_or("")
+}
+
+fn sentinel_to_option(value: &str) -> Option<String> {
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
+/// One `[from, to]` window decomposed into a whole-hour range servable
+/// entirely from rollups, plus the (at most two) millisecond sub-ranges at
+/// its ends that still need exact per-event reads. A window that does not
+/// fully contain any hour bucket — a genuinely sub-hour query, or one that
+/// lands entirely between two hour starts — has no rollup-coverable range at
+/// all; its whole span becomes the sole edge.
+struct WindowPlan {
+    full_buckets: Option<(i64, i64)>,
+    edges: Vec<(i64, i64)>,
+}
+
+fn plan_window(from_ms: Option<i64>, to_ms: Option<i64>) -> WindowPlan {
+    if let (Some(from_ms), Some(to_ms)) = (from_ms, to_ms) {
+        if from_ms > to_ms {
+            return WindowPlan {
+                full_buckets: None,
+                edges: Vec::new(),
+            };
+        }
+    }
+    // The first bucket entirely at-or-after `from`, and the last bucket
+    // entirely at-or-before `to` (both inclusive bounds, matching
+    // `Session::range_totals_multi`'s own event comparisons).
+    let first_full = from_ms.map(|from_ms| {
+        if from_ms % HOUR_MS == 0 {
+            from_ms / HOUR_MS
+        } else {
+            from_ms / HOUR_MS + 1
+        }
+    });
+    let last_full = to_ms.map(|to_ms| {
+        if (to_ms + 1) % HOUR_MS == 0 {
+            to_ms / HOUR_MS
+        } else {
+            to_ms / HOUR_MS - 1
+        }
+    });
+    if let (Some(first), Some(last)) = (first_full, last_full) {
+        if first > last {
+            return WindowPlan {
+                full_buckets: None,
+                edges: vec![(from_ms.unwrap(), to_ms.unwrap())],
+            };
+        }
+    }
+    let mut edges = Vec::new();
+    if let (Some(from_ms), Some(first)) = (from_ms, first_full) {
+        let boundary = first * HOUR_MS;
+        if boundary > from_ms {
+            edges.push((from_ms, boundary - 1));
+        }
+    }
+    if let (Some(to_ms), Some(last)) = (to_ms, last_full) {
+        let boundary = (last + 1) * HOUR_MS;
+        if boundary <= to_ms {
+            edges.push((boundary, to_ms));
+        }
+    }
+    WindowPlan {
+        full_buckets: Some((
+            first_full.unwrap_or(i64::MIN),
+            last_full.unwrap_or(i64::MAX),
+        )),
+        edges,
+    }
+}
+
+/// Builds the `(timestamp_ms BETWEEN ?n AND ?n+1) OR ...` predicate for the
+/// union of edge ranges, with parameter placeholders starting at `?2` (`?1`
+/// is reserved for `session_key`).
+fn edge_predicate_sql(edge_ranges: &[(i64, i64)]) -> String {
+    (0..edge_ranges.len())
+        .map(|index| {
+            format!(
+                "(timestamp_ms BETWEEN ?{} AND ?{})",
+                index * 2 + 2,
+                index * 2 + 3
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Merges one session's hour-bucket rollup rows with its exact sub-hour edge
+/// events into the `RangeTotals` for one window. The additive fields are
+/// plain sums; `mutation_targets`/`one_shot_mutations`/`retry_count` are
+/// always derived from merged `(turn_id, target)` chain counts via
+/// `telemetry::mutation_chain_fields`, never summed across buckets, so a
+/// chain that straddles a bucket or day boundary is still counted exactly
+/// once. `token_rows`/`tool_rows`/`chain_rows` hold every rollup row for the
+/// session (a handful, cheap to filter in Rust); `edge_tokens`/`edge_tools`
+/// hold the pooled edge events for every window in the batch, so a row that
+/// belongs to a *different* window's edge but happens to fall inside *this*
+/// window's full-bucket range is excluded — it is already counted via that
+/// bucket's rollup row.
+#[allow(clippy::too_many_arguments)]
+fn compute_range_totals(
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+    plan: &WindowPlan,
+    token_rows: &[(i64, String, String, TokenTotals)],
+    tool_rows: &[(i64, String, ToolMetrics)],
+    chain_rows: &[(i64, String, String, String, u64)],
+    edge_tokens: &[TokenHistoryPoint],
+    edge_tools: &[ToolObservation],
+    findings: &[OptimizationFinding],
+) -> RangeTotals {
+    let in_bucket_range = |bucket: i64| {
+        plan.full_buckets
+            .is_some_and(|(first, last)| bucket >= first && bucket <= last)
+    };
+    let in_window =
+        |ms: i64| from_ms.is_none_or(|from| ms >= from) && to_ms.is_none_or(|to| ms <= to);
+
+    let mut tokens = TokenTotals::default();
+    let mut bucket_map: BTreeMap<(String, Option<String>), TokenTotals> = BTreeMap::new();
+    for (bucket, model, tier, delta) in token_rows {
+        if !in_bucket_range(*bucket) {
+            continue;
+        }
+        tokens += delta;
+        if !model.is_empty() {
+            *bucket_map
+                .entry((model.clone(), sentinel_to_option(tier)))
+                .or_default() += delta;
+        }
+    }
+    for point in edge_tokens {
+        let ms = point.timestamp.timestamp_millis();
+        if !in_window(ms) || in_bucket_range(hour_bucket(ms)) {
+            continue;
+        }
+        tokens += &point.delta;
+        if let Some(model) = &point.model {
+            *bucket_map
+                .entry((model.clone(), point.service_tier.clone()))
+                .or_default() += &point.delta;
+        }
+    }
+    let mut buckets: Vec<TierBucket> = bucket_map
+        .into_iter()
+        .map(|((model, service_tier), tokens)| TierBucket {
+            model,
+            service_tier,
+            tokens,
+        })
+        .collect();
+    buckets.sort_by(|a, b| {
+        a.model
+            .cmp(&b.model)
+            .then_with(|| a.service_tier.cmp(&b.service_tier))
+    });
+
+    let mut all_counters = ToolMetrics::default();
+    let mut by_model_counters: BTreeMap<String, ToolMetrics> = BTreeMap::new();
+    let mut all_chain: HashMap<(String, String), u64> = HashMap::new();
+    let mut by_model_chain: BTreeMap<String, HashMap<(String, String), u64>> = BTreeMap::new();
+
+    for (bucket, model, counters) in tool_rows {
+        if !in_bucket_range(*bucket) {
+            continue;
+        }
+        all_counters.add_assign(counters);
+        if !model.is_empty() {
+            by_model_counters
+                .entry(model.clone())
+                .or_default()
+                .add_assign(counters);
+        }
+    }
+    for (bucket, model, turn, target, count) in chain_rows {
+        if !in_bucket_range(*bucket) {
+            continue;
+        }
+        *all_chain.entry((turn.clone(), target.clone())).or_insert(0) += *count;
+        if !model.is_empty() {
+            *by_model_chain
+                .entry(model.clone())
+                .or_default()
+                .entry((turn.clone(), target.clone()))
+                .or_insert(0) += *count;
+        }
+    }
+    for item in edge_tools {
+        let ms = item.timestamp.timestamp_millis();
+        if !in_window(ms) || in_bucket_range(hour_bucket(ms)) {
+            continue;
+        }
+        crate::telemetry::accumulate_observation(&mut all_counters, item);
+        let is_mutation = item.kind == ToolKind::Mutation;
+        let chain_key = (
+            item.turn_id.clone().unwrap_or_default(),
+            item.target.clone().unwrap_or_default(),
+        );
+        if is_mutation {
+            *all_chain.entry(chain_key.clone()).or_insert(0) += 1;
+        }
+        if let Some(model) = &item.model {
+            let entry = by_model_counters.entry(model.clone()).or_default();
+            crate::telemetry::accumulate_observation(entry, item);
+            if is_mutation {
+                *by_model_chain
+                    .entry(model.clone())
+                    .or_default()
+                    .entry(chain_key)
+                    .or_insert(0) += 1;
+            }
+        }
+    }
+
+    let (mutation_targets, one_shot_mutations, retry_count) =
+        crate::telemetry::mutation_chain_fields(all_chain.values().copied());
+    all_counters.mutation_targets = mutation_targets;
+    all_counters.one_shot_mutations = one_shot_mutations;
+    all_counters.retry_count = retry_count;
+
+    let mut tool_metrics_by_model = BTreeMap::new();
+    for (model, mut counters) in by_model_counters {
+        let (targets, one_shot, retry) = crate::telemetry::mutation_chain_fields(
+            by_model_chain
+                .get(&model)
+                .into_iter()
+                .flat_map(|chains| chains.values().copied()),
+        );
+        counters.mutation_targets = targets;
+        counters.one_shot_mutations = one_shot;
+        counters.retry_count = retry;
+        tool_metrics_by_model.insert(model, counters);
+    }
+
+    let selected_findings: Vec<&OptimizationFinding> = findings
+        .iter()
+        .filter(|finding| match finding.timestamp {
+            Some(timestamp) => in_window(timestamp.timestamp_millis()),
+            None => from_ms.is_none() && to_ms.is_none(),
+        })
+        .collect();
+    let optimization_findings_count = selected_findings.len() as u64;
+    let optimization_summary = OptimizationSummary::from_findings(selected_findings);
+
+    RangeTotals {
+        tokens,
+        buckets,
+        tool_metrics: all_counters,
+        tool_metrics_by_model,
+        optimization_findings_count,
+        optimization_summary,
+    }
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
@@ -623,8 +1022,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                severity TEXT NOT NULL,
                avoidable_calls INTEGER NOT NULL
              );
-             CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key);",
+             CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key);"
         )?;
+        transaction.execute_batch(ROLLUP_SCHEMA_SQL)?;
         transaction.execute(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -687,7 +1087,11 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                 let raw: Vec<u8> = row.get(1)?;
                 match serde_json::from_slice::<Session>(&raw) {
                     Ok(session) => {
-                        store_tool_events(&transaction, &key, &session.tool_observations)?;
+                        // Facts only: the rollup tables (#107) do not exist
+                        // yet at this schema version, and the v3->v4 step
+                        // right after this one populates them from these
+                        // same facts via one SQL aggregate pass.
+                        store_tool_event_facts(&transaction, &key, &session.tool_observations)?;
                         store_finding_events(&transaction, &key, &session.optimization_findings)?;
                     }
                     Err(error) => {
@@ -711,8 +1115,112 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )?;
         transaction.commit()?;
     }
+    // Re-read rather than trust the initial `version` local: the two blocks
+    // above run only when the *original* version matched, so a database that
+    // started at 1 or 2 has already been brought to 3 by the time execution
+    // reaches here, in the same `migrate()` call.
+    let version_before_rollups: i64 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version_before_rollups == 3 {
+        // Adds the #107 hour-bucket rollups. Populated once here directly
+        // from the existing normalized fact tables via SQL aggregation —
+        // never by re-parsing transcripts or re-materializing full Session
+        // snapshots. `timestamp_ms / HOUR_MS` matches the Rust `hour_bucket`
+        // helper the write path and read path both use, and `COALESCE(...,
+        // '')` matches `key_sentinel`'s empty-string stand-in for a missing
+        // model/tier/turn/target so grouping here and later upserts agree.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(ROLLUP_SCHEMA_SQL)?;
+        transaction.execute_batch(
+            "INSERT INTO rollup_token_totals(
+               session_key, hour_bucket, model, service_tier,
+               input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens)
+             SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, ''),
+               SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
+               SUM(reasoning_output_tokens), SUM(total_tokens)
+             FROM durable_token_events
+             GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, '');
+
+             INSERT INTO rollup_tool_metrics(
+               session_key, hour_bucket, model, calls, reads, searches, mutations, commands, other,
+               successes, failures, unknown, duration_ms, output_bytes)
+             SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''),
+               COUNT(*),
+               SUM(CASE WHEN kind = 'read' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN kind = 'search' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN kind = 'mutation' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN kind = 'command' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN kind = 'other' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END),
+               SUM(CASE WHEN outcome NOT IN ('success', 'failure') THEN 1 ELSE 0 END),
+               SUM(COALESCE(duration_ms, 0)),
+               SUM(output_bytes)
+             FROM durable_tool_events
+             GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, '');
+
+             INSERT INTO rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target, mutation_count)
+             SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(turn_id, ''), COALESCE(target, ''), COUNT(*)
+             FROM durable_tool_events
+             WHERE kind = 'mutation'
+             GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(turn_id, ''), COALESCE(target, '');",
+        )?;
+        transaction.execute_batch(
+            "INSERT INTO history_meta(key, value) VALUES('schema_version', '4')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 4;",
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
+
+/// Shared by both the fresh-database path (`version == 0`, already at the
+/// latest schema) and the `version == 3` upgrade path, so the table shapes
+/// can never drift between them.
+const ROLLUP_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS rollup_token_totals (
+      session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+      hour_bucket INTEGER NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      service_tier TEXT NOT NULL DEFAULT '',
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS rollup_token_totals_key_idx
+      ON rollup_token_totals(session_key, hour_bucket, model, service_tier);
+    CREATE TABLE IF NOT EXISTS rollup_tool_metrics (
+      session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+      hour_bucket INTEGER NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      calls INTEGER NOT NULL DEFAULT 0,
+      reads INTEGER NOT NULL DEFAULT 0,
+      searches INTEGER NOT NULL DEFAULT 0,
+      mutations INTEGER NOT NULL DEFAULT 0,
+      commands INTEGER NOT NULL DEFAULT 0,
+      other INTEGER NOT NULL DEFAULT 0,
+      successes INTEGER NOT NULL DEFAULT 0,
+      failures INTEGER NOT NULL DEFAULT 0,
+      unknown INTEGER NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      output_bytes INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS rollup_tool_metrics_key_idx
+      ON rollup_tool_metrics(session_key, hour_bucket, model);
+    CREATE TABLE IF NOT EXISTS rollup_mutation_chains (
+      session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+      hour_bucket INTEGER NOT NULL,
+      model TEXT NOT NULL DEFAULT '',
+      turn_id TEXT NOT NULL DEFAULT '',
+      target TEXT NOT NULL DEFAULT '',
+      mutation_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS rollup_mutation_chains_key_idx
+      ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target);
+";
 
 fn reconcile_session(
     transaction: &Transaction<'_>,
@@ -986,6 +1494,38 @@ fn store_token_events(
             to_i64(event.delta.total_tokens)?,
         ])?;
     }
+
+    // Maintain the #107 hour-bucket token rollup incrementally: token events
+    // are append-only (the same new-suffix slice inserted above), so each
+    // event needs to contribute its delta exactly once, additively, to keep
+    // read-path reconstruction exact.
+    if next_event_index < events.len() {
+        let mut upsert = transaction.prepare(
+            "INSERT INTO rollup_token_totals(
+               session_key, hour_bucket, model, service_tier,
+               input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(session_key, hour_bucket, model, service_tier) DO UPDATE SET
+               input_tokens = input_tokens + excluded.input_tokens,
+               cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+               output_tokens = output_tokens + excluded.output_tokens,
+               reasoning_output_tokens = reasoning_output_tokens + excluded.reasoning_output_tokens,
+               total_tokens = total_tokens + excluded.total_tokens",
+        )?;
+        for event in events.iter().skip(next_event_index) {
+            upsert.execute(params![
+                key,
+                hour_bucket(event.timestamp.timestamp_millis()),
+                key_sentinel(event.model.as_deref()),
+                key_sentinel(event.service_tier.as_deref()),
+                to_i64(event.delta.input_tokens)?,
+                to_i64(event.delta.cached_input_tokens)?,
+                to_i64(event.delta.output_tokens)?,
+                to_i64(event.delta.reasoning_output_tokens)?,
+                to_i64(event.delta.total_tokens)?,
+            ])?;
+        }
+    }
     Ok(())
 }
 
@@ -1007,58 +1547,6 @@ fn tool_outcome_from_str(value: &str) -> ToolOutcome {
     }
 }
 
-/// Minimal session carrying only the fact-backed collections, so ledger
-/// aggregation can reuse `Session::range_totals_multi` verbatim. Every other
-/// field is display metadata the rollup math never reads.
-fn ledger_session_shell(
-    tokens_history: Vec<TokenHistoryPoint>,
-    tool_observations: Vec<ToolObservation>,
-    optimization_findings: Vec<OptimizationFinding>,
-) -> Session {
-    Session {
-        id: String::new(),
-        storage_id: String::new(),
-        harness: codex_provider_id(),
-        thread_name: None,
-        forked_from_id: None,
-        parent_thread_id: None,
-        agent_path: None,
-        agent_nickname: None,
-        file_path: String::new(),
-        source_availability: SourceAvailability::Present,
-        archived: false,
-        started_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
-        last_event_at: chrono::DateTime::<chrono::Utc>::MIN_UTC,
-        working_directory: None,
-        originator: None,
-        source: None,
-        subagent_id_is_path_fallback: false,
-        history_mode: None,
-        memory_mode: None,
-        cli_version: None,
-        model_provider: None,
-        model: None,
-        service_tier: None,
-        plan_type: None,
-        credits_unlimited: None,
-        credits_balance: None,
-        context_window: None,
-        latest_context_tokens: None,
-        total_turns: 0,
-        first_user_message: None,
-        tokens_total: TokenTotals::default(),
-        tokens_by_model: std::collections::HashMap::new(),
-        tokens_history,
-        rate_limits_history: Vec::new(),
-        turns: Vec::new(),
-        tool_observations,
-        tool_metrics: Default::default(),
-        tool_metrics_by_model: std::collections::BTreeMap::new(),
-        category_totals: std::collections::BTreeMap::new(),
-        optimization_findings,
-    }
-}
-
 fn tool_kind_from_str(value: &str) -> ToolKind {
     match value {
         "read" => ToolKind::Read,
@@ -1069,11 +1557,15 @@ fn tool_kind_from_str(value: &str) -> ToolKind {
     }
 }
 
-/// Replaceable per-session materialization of tool observations, carrying
-/// exactly the fields window-scoped `ToolMetrics` reconstruction needs.
-/// Unlike token events these are not append-only: the snapshot-hash gate at
-/// the call sites already limits rewrites to sessions that actually changed.
-fn store_tool_events(
+/// Replaces the `durable_tool_events` fact rows for one session, with no
+/// rollup side effects. Used by the normal write path (via
+/// [`store_tool_events`], which additionally rebuilds the rollups from the
+/// same observations) and — deliberately without rollup maintenance — by the
+/// legacy schema-v1/v2 fact backfill, which runs *before* the rollup tables
+/// exist; the later v3->v4 migration step populates rollups for every
+/// session from whatever `durable_tool_events` holds at that point, however
+/// it got there, so backfilling rollups here would double-insert.
+fn store_tool_event_facts(
     transaction: &Transaction<'_>,
     key: &str,
     observations: &[ToolObservation],
@@ -1098,6 +1590,83 @@ fn store_tool_events(
             item.duration_ms.map(|value| value as i64),
             to_i64(item.output_bytes)?,
         ])?;
+    }
+    Ok(())
+}
+
+/// Replaceable per-session materialization of tool observations, carrying
+/// exactly the fields window-scoped `ToolMetrics` reconstruction needs, plus
+/// the #107 hour-bucket rollups derived from the same observations. Unlike
+/// token events these are not append-only: the snapshot-hash gate at the
+/// call sites already limits rewrites to sessions that actually changed.
+fn store_tool_events(
+    transaction: &Transaction<'_>,
+    key: &str,
+    observations: &[ToolObservation],
+) -> Result<()> {
+    store_tool_event_facts(transaction, key, observations)?;
+    transaction.execute(
+        "DELETE FROM rollup_tool_metrics WHERE session_key = ?1",
+        [key],
+    )?;
+    transaction.execute(
+        "DELETE FROM rollup_mutation_chains WHERE session_key = ?1",
+        [key],
+    )?;
+    // Rebuilt wholesale from the same observations just written above (this
+    // path is a replace-all, not an append), so the rollups can never
+    // observe a durable_tool_events row they did not also account for.
+    let mut tool_metrics: HashMap<(i64, String), ToolMetrics> = HashMap::new();
+    let mut chain_counts: HashMap<(i64, String, String, String), u64> = HashMap::new();
+    for item in observations {
+        let bucket = hour_bucket(item.timestamp.timestamp_millis());
+        let model = key_sentinel(item.model.as_deref()).to_owned();
+        crate::telemetry::accumulate_observation(
+            tool_metrics.entry((bucket, model.clone())).or_default(),
+            item,
+        );
+        if item.kind == ToolKind::Mutation {
+            let turn = key_sentinel(item.turn_id.as_deref()).to_owned();
+            let target = key_sentinel(item.target.as_deref()).to_owned();
+            *chain_counts
+                .entry((bucket, model, turn, target))
+                .or_insert(0) += 1;
+        }
+    }
+    if !tool_metrics.is_empty() {
+        let mut insert_metrics = transaction.prepare(
+            "INSERT INTO rollup_tool_metrics(
+               session_key, hour_bucket, model, calls, reads, searches, mutations, commands, other,
+               successes, failures, unknown, duration_ms, output_bytes)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+        for ((bucket, model), metrics) in &tool_metrics {
+            insert_metrics.execute(params![
+                key,
+                bucket,
+                model,
+                to_i64(metrics.calls)?,
+                to_i64(metrics.reads)?,
+                to_i64(metrics.searches)?,
+                to_i64(metrics.mutations)?,
+                to_i64(metrics.commands)?,
+                to_i64(metrics.other)?,
+                to_i64(metrics.successes)?,
+                to_i64(metrics.failures)?,
+                to_i64(metrics.unknown)?,
+                to_i64(metrics.duration_ms)?,
+                to_i64(metrics.output_bytes)?,
+            ])?;
+        }
+    }
+    if !chain_counts.is_empty() {
+        let mut insert_chains = transaction.prepare(
+            "INSERT INTO rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target, mutation_count)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for ((bucket, model, turn, target), count) in &chain_counts {
+            insert_chains.execute(params![key, bucket, model, turn, target, to_i64(*count)?])?;
+        }
     }
     Ok(())
 }
@@ -1753,14 +2322,18 @@ mod tests {
                 )
                 .unwrap();
         }
-        // Rewind to schema v2: drop the fact tables and the version marker,
-        // exactly what a store written by the previous release looks like.
+        // Rewind to schema v2: drop the fact and rollup tables and the
+        // version marker, exactly what a store written by a release before
+        // #107 looks like (a genuine v2 database predates all of them).
         {
             let connection = Connection::open(&path).unwrap();
             connection
                 .execute_batch(
                     "DROP TABLE durable_tool_events;
                      DROP TABLE durable_finding_events;
+                     DROP TABLE rollup_token_totals;
+                     DROP TABLE rollup_tool_metrics;
+                     DROP TABLE rollup_mutation_chains;
                      ALTER TABLE durable_sessions DROP COLUMN ledger_dirty;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '2')
                        ON CONFLICT(key) DO UPDATE SET value = '2';
@@ -1783,6 +2356,213 @@ mod tests {
             expected.optimization_findings_count
         );
         assert_eq!(&actual.optimization_summary, &expected.optimization_summary);
+    }
+
+    /// Builds a session whose only activity is the same `(turn, target)`
+    /// mutation chain firing twice, at `first_at` and `second_at` — the
+    /// minimal fixture for proving the rollup read path never double-counts
+    /// or under-counts a chain that straddles a bucket boundary.
+    fn mutation_pair_session(id: &str, first_at: &str, second_at: &str) -> Session {
+        use crate::model::ToolKind;
+        let mut fixture = session(id, 10);
+        fixture.tool_observations = vec![
+            tool(
+                first_at,
+                ToolKind::Mutation,
+                ToolOutcome::Success,
+                Some("gpt-a"),
+                Some("t1"),
+                Some("hash-x"),
+            ),
+            tool(
+                second_at,
+                ToolKind::Mutation,
+                ToolOutcome::Success,
+                Some("gpt-a"),
+                Some("t1"),
+                Some("hash-x"),
+            ),
+        ];
+        fixture.last_event_at = timestamp(second_at);
+        fixture
+    }
+
+    /// Asserts the ledger matches the in-memory oracle for every window,
+    /// including windows with no data in range (the ledger must omit them).
+    fn assert_ledger_matches_oracle_tool_metrics(
+        store: &HistoryStore,
+        key: &str,
+        fixture: &Session,
+        windows: &[RangeWindow],
+    ) {
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key.to_owned()), windows)
+            .unwrap();
+        let expected = fixture.range_totals_multi(windows);
+        for (window_index, expected_range) in expected.iter().enumerate() {
+            let actual = from_ledger[window_index].get(key);
+            if crate::commands::range_has_data(expected_range) {
+                let actual = actual
+                    .unwrap_or_else(|| panic!("ledger omitted data for window {window_index}"));
+                assert_eq!(
+                    &actual.tool_metrics, &expected_range.tool_metrics,
+                    "tool_metrics window {window_index}"
+                );
+            } else {
+                assert!(
+                    actual.is_none(),
+                    "ledger had extra data for window {window_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mutation_chain_straddling_an_hour_bucket_matches_oracle() {
+        let (_directory, store) = store();
+        // The chain's two mutations land in adjacent hour buckets (00 and
+        // 01), thirty seconds either side of the boundary.
+        let fixture = mutation_pair_session(
+            "hour-straddle",
+            "2026-01-01T00:59:30Z",
+            "2026-01-01T01:00:30Z",
+        );
+        let generation = store.begin_scan().unwrap().max(1);
+        let key = store
+            .observe(Path::new("hour-straddle.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        let bound = |value: &str| Some(timestamp(value));
+        let windows: Vec<RangeWindow> = vec![
+            // Whole range: one chain, two events -> a retry, not two one-shots.
+            (None, None),
+            // Both hour buckets, hour-aligned: same expectation via rollups.
+            (bound("2026-01-01T00:00:00Z"), bound("2026-01-01T02:00:00Z")),
+            // Only the first bucket: a single one-shot mutation.
+            (
+                bound("2026-01-01T00:00:00Z"),
+                bound("2026-01-01T00:59:59.999Z"),
+            ),
+            // Only the second bucket: a single one-shot mutation.
+            (
+                bound("2026-01-01T01:00:00Z"),
+                bound("2026-01-01T01:59:59.999Z"),
+            ),
+            // Sub-hour window straddling the exact boundary (no full bucket
+            // at all — served entirely from an exact event read).
+            (bound("2026-01-01T00:59:00Z"), bound("2026-01-01T01:01:00Z")),
+        ];
+        assert_ledger_matches_oracle_tool_metrics(&store, &key, &fixture, &windows);
+    }
+
+    #[test]
+    fn mutation_chain_straddling_a_day_boundary_matches_oracle() {
+        let (_directory, store) = store();
+        // The chain's two mutations land on either side of midnight.
+        let fixture = mutation_pair_session(
+            "day-straddle",
+            "2026-01-01T23:59:30Z",
+            "2026-01-02T00:00:30Z",
+        );
+        let generation = store.begin_scan().unwrap().max(1);
+        let key = store
+            .observe(Path::new("day-straddle.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        let bound = |value: &str| Some(timestamp(value));
+        let windows: Vec<RangeWindow> = vec![
+            (None, None),
+            // Both days, day-aligned (also hour-aligned): one retried chain.
+            (bound("2026-01-01T00:00:00Z"), bound("2026-01-03T00:00:00Z")),
+            // Day one only: a single one-shot mutation.
+            (
+                bound("2026-01-01T00:00:00Z"),
+                bound("2026-01-01T23:59:59.999Z"),
+            ),
+            // Day two only: a single one-shot mutation.
+            (bound("2026-01-02T00:00:00Z"), None),
+        ];
+        assert_ledger_matches_oracle_tool_metrics(&store, &key, &fixture, &windows);
+    }
+
+    #[test]
+    fn v4_migration_rebuilds_rollups_from_existing_facts_without_reparsing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let fixture = rich_session("rollup-rebuild");
+        let key;
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            key = store
+                .observe(Path::new("rollup-rebuild.jsonl"), &fixture, generation)
+                .unwrap()
+                .key;
+        }
+        // Rewind to schema v3: drop only the rollup tables, keeping the
+        // normalized fact tables the migration must rebuild them from —
+        // exactly what an existing v0.8.4 store looks like.
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE rollup_token_totals;
+                     DROP TABLE rollup_tool_metrics;
+                     DROP TABLE rollup_mutation_chains;
+                     INSERT INTO history_meta(key, value) VALUES('schema_version', '3')
+                       ON CONFLICT(key) DO UPDATE SET value = '3';
+                     PRAGMA user_version = 3;",
+                )
+                .unwrap();
+        }
+        let store = HistoryStore::open(&path).unwrap();
+        let connection = store.connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let rollup_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM rollup_token_totals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(rollup_rows > 0, "migration should have populated rollups");
+        drop(connection);
+
+        let bound = |value: &str| Some(timestamp(value));
+        let windows: Vec<RangeWindow> = vec![
+            (None, None),
+            (bound("2026-01-01T00:00:00Z"), bound("2026-01-02T00:00:00Z")),
+            (bound("2026-01-02T00:00:01Z"), None),
+        ];
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let expected = fixture.range_totals_multi(&windows);
+        for (window_index, expected_range) in expected.iter().enumerate() {
+            let actual = from_ledger[window_index].get(&key);
+            if crate::commands::range_has_data(expected_range) {
+                let actual = actual.expect("rebuilt rollups should cover this window");
+                assert_eq!(
+                    &actual.tokens, &expected_range.tokens,
+                    "window {window_index}"
+                );
+                assert_eq!(
+                    &actual.buckets, &expected_range.buckets,
+                    "window {window_index}"
+                );
+                assert_eq!(
+                    &actual.tool_metrics, &expected_range.tool_metrics,
+                    "window {window_index}"
+                );
+            } else {
+                assert!(actual.is_none(), "window {window_index}");
+            }
+        }
     }
 
     #[test]
