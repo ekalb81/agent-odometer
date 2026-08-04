@@ -5,6 +5,7 @@
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations } from '../lib/ipc';
+  import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
@@ -1504,5 +1505,7 @@
       <p class="text-xs text-ink-faint italic">Loading…</p>
     </section>
   {/if}
+
+  <DiagnosticsPanel />
 
 </div>

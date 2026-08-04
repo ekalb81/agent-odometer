@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -82,6 +82,15 @@ export function getConfig(): Promise<Config> {
 /** Registered providers with display names and capability flags. */
 export function listProviders(): Promise<ProviderDescriptor[]> {
   return invoke<ProviderDescriptor[]>('list_providers');
+}
+
+/** On-demand provider-registry diagnostics report (issue #39): capability
+ *  flags, roots, discovery/parse/cache counters, ledger health, pricing
+ *  coverage, retention risk, and quota status, per provider. Local paths are
+ *  included for on-screen display; redact before exporting (see
+ *  lib/diagnosticsExport.ts). Not fetched automatically on startup. */
+export function getProviderDiagnostics(): Promise<DiagnosticsReport> {
+  return invoke<DiagnosticsReport>('get_provider_diagnostics');
 }
 
 export function resolveWorkingDirectories(): Promise<WorkingDirectoryInfo[]> {

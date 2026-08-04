@@ -13,10 +13,12 @@ export default defineConfig({
       reporter: ['json'],
       reportsDirectory: './coverage/frontend',
       include: [
+        'src/components/DiagnosticsPanel.svelte',
         'src/components/SessionContextMenu.svelte',
         'src/components/SessionGridControls.svelte',
         'src/lib/configTimeline.ts',
         'src/lib/defenderStatus.ts',
+        'src/lib/diagnosticsExport.ts',
         'src/lib/flushCadence.ts',
         'src/lib/rangeData.ts',
         'src/lib/sessionGrid.ts',
