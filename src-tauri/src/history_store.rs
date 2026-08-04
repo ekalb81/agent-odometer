@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -51,6 +51,18 @@ pub struct StoredSession {
     pub collision: bool,
     pub locations: Vec<SourceLocation>,
     pub session: Session,
+}
+
+/// A user-controlled project-identity overlay row (#41): an optional local
+/// display-label alias, and/or a merge redirect folding this project's
+/// sessions under another project. Both are reversible by deleting or
+/// clearing this row; neither ever touches the auto-computed
+/// `durable_sessions.project_*` columns or a source transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectOverrideRow {
+    pub project_key: String,
+    pub display_label: Option<String>,
+    pub canonical_project_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -179,6 +191,7 @@ impl HistoryStore {
         archived_session.storage_id = key.clone();
         archived_session.source_availability = SourceAvailability::Present;
         archived_session.file_path = path.clone();
+        apply_project_identity(&transaction, &key, &mut archived_session)?;
         let raw_snapshot =
             serde_json::to_vec(&archived_session).context("could not encode session snapshot")?;
         let snapshot_hash = stable_hash_bytes(&raw_snapshot);
@@ -277,9 +290,6 @@ impl HistoryStore {
         let key = session.effective_storage_id();
         let mut archived = session.clone();
         archived.storage_id = key.clone();
-        let raw_snapshot = serde_json::to_vec(&archived)
-            .context("could not encode metadata-only session snapshot")?;
-        let snapshot_hash = stable_hash_bytes(&raw_snapshot);
         let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -293,6 +303,10 @@ impl HistoryStore {
         if exists.is_none() {
             bail!("cannot update snapshot for unknown durable session {key}");
         }
+        apply_project_identity(&transaction, &key, &mut archived)?;
+        let raw_snapshot = serde_json::to_vec(&archived)
+            .context("could not encode metadata-only session snapshot")?;
+        let snapshot_hash = stable_hash_bytes(&raw_snapshot);
         // A metadata overlay may legitimately carry history that differs from
         // the durable snapshot (its caller's in-memory copy can be ahead when
         // an observe failed, or behind by design). Fact tables are only ever
@@ -340,6 +354,154 @@ impl HistoryStore {
         transaction.commit()?;
         drop(connection);
         self.load_one(&key)
+    }
+
+    /// Every project-identity override row (local aliases and/or merges,
+    /// #41). Both are reversible: deleting or clearing a row never touches
+    /// the auto-computed `durable_sessions.project_*` columns or a source
+    /// transcript.
+    pub fn list_project_overrides(&self) -> Result<Vec<ProjectOverrideRow>> {
+        let connection = self.connection()?;
+        load_project_overrides(&connection).map(|map| map.into_values().collect())
+    }
+
+    /// Sets (`Some`) or clears (`None`) a local display-label alias for
+    /// `project_key`. Never rewrites the auto-computed `project_label`.
+    pub fn set_project_alias(&self, project_key: &str, display_label: Option<&str>) -> Result<()> {
+        let connection = self.connection()?;
+        let now = now_ms();
+        connection.execute(
+            "INSERT INTO project_overrides(project_key, display_label, canonical_project_key, updated_at_ms)
+             VALUES(?1, ?2, NULL, ?3)
+             ON CONFLICT(project_key) DO UPDATE SET display_label = ?2, updated_at_ms = ?3",
+            params![project_key, display_label, now],
+        )?;
+        prune_empty_project_override(&connection, project_key)?;
+        Ok(())
+    }
+
+    /// Merges `source_key` to display under `canonical_key`: every session
+    /// auto-computed under `source_key` reports as `canonical_key` once
+    /// resolved via [`resolve_canonical_project_key`]. Rejects merging a key
+    /// into itself and rejects creating a cycle.
+    pub fn merge_project(&self, source_key: &str, canonical_key: &str) -> Result<()> {
+        if source_key == canonical_key {
+            bail!("cannot merge a project into itself");
+        }
+        let connection = self.connection()?;
+        let overrides = load_project_overrides(&connection)?;
+        // A merge of source -> canonical creates a cycle exactly when
+        // canonical can already (transitively, through existing overrides)
+        // reach source: the resulting chain would be
+        // `source -> canonical -> ... -> source`.
+        if project_key_reaches(&overrides, canonical_key, source_key) {
+            bail!("merging {source_key} into {canonical_key} would create a cycle");
+        }
+        let now = now_ms();
+        connection.execute(
+            "INSERT INTO project_overrides(project_key, display_label, canonical_project_key, updated_at_ms)
+             VALUES(?1, NULL, ?2, ?3)
+             ON CONFLICT(project_key) DO UPDATE SET canonical_project_key = ?2, updated_at_ms = ?3",
+            params![source_key, canonical_key, now],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a merge redirect for `project_key` (an existing alias is
+    /// preserved). The reversal for `merge_project`.
+    pub fn unmerge_project(&self, project_key: &str) -> Result<()> {
+        let connection = self.connection()?;
+        let now = now_ms();
+        connection.execute(
+            "INSERT INTO project_overrides(project_key, display_label, canonical_project_key, updated_at_ms)
+             VALUES(?1, NULL, NULL, ?2)
+             ON CONFLICT(project_key) DO UPDATE SET canonical_project_key = NULL, updated_at_ms = ?2",
+            params![project_key, now],
+        )?;
+        prune_empty_project_override(&connection, project_key)?;
+        Ok(())
+    }
+
+    /// Manually reassigns one session to `project_key` (or, when `None`, to
+    /// a freshly minted standalone project key), overriding whatever it
+    /// would otherwise be auto-grouped or merged into. This is the "split"
+    /// primitive: it pulls exactly one session out on its own. Reversible
+    /// via [`Self::clear_session_project_override`]. Never rewrites the
+    /// auto-computed `durable_sessions.project_*` columns or a source
+    /// transcript.
+    pub fn reassign_session_project(
+        &self,
+        session_key: &str,
+        project_key: Option<&str>,
+    ) -> Result<String> {
+        let connection = self.connection()?;
+        let exists: Option<i64> = connection
+            .query_row(
+                "SELECT 1 FROM durable_sessions WHERE session_key = ?1",
+                [session_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            bail!("cannot reassign unknown durable session {session_key}");
+        }
+        let now = now_ms();
+        let effective_key = match project_key.map(str::trim).filter(|key| !key.is_empty()) {
+            Some(key) => key.to_string(),
+            None => format!(
+                "manual:{}",
+                stable_hash(&format!("{session_key}\u{1f}{now}"))
+            ),
+        };
+        connection.execute(
+            "INSERT INTO project_session_overrides(session_key, project_key, updated_at_ms)
+             VALUES(?1, ?2, ?3)
+             ON CONFLICT(session_key) DO UPDATE SET project_key = excluded.project_key, updated_at_ms = excluded.updated_at_ms",
+            params![session_key, effective_key, now],
+        )?;
+        Ok(effective_key)
+    }
+
+    /// Reverts a manual session reassignment back to auto-computed grouping.
+    pub fn clear_session_project_override(&self, session_key: &str) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM project_session_overrides WHERE session_key = ?1",
+            [session_key],
+        )?;
+        Ok(())
+    }
+
+    /// Every session-level manual project reassignment (#41 "split"), keyed
+    /// by durable session key.
+    pub fn list_session_project_overrides(&self) -> Result<HashMap<String, String>> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare("SELECT session_key, project_key FROM project_session_overrides")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// Re-resolves project identity for every durable session from its
+    /// current snapshot, clearing any stale value from before a working
+    /// directory changed on disk in a way the cheap unchanged-directory skip
+    /// in `apply_project_identity` could not observe (for example, a
+    /// directory that became a Git repository after its sessions were first
+    /// recorded). Mirrors `resolve_working_directories`' explicit
+    /// `refresh()` — this app never re-probes the filesystem automatically
+    /// on every observation, only on request. Returns the number of durable
+    /// sessions re-resolved.
+    pub fn refresh_project_identities(&self) -> Result<usize> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count = count(&transaction, "SELECT COUNT(*) FROM durable_sessions")?;
+        backfill_project_identities(&transaction)?;
+        transaction.commit()?;
+        Ok(count)
     }
 
     /// Window-scoped rollups computed from the normalized ledger (#107).
@@ -972,9 +1134,25 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                current_snapshot_hash TEXT,
                created_at_ms INTEGER NOT NULL,
                last_seen_at_ms INTEGER NOT NULL,
-               ledger_dirty INTEGER NOT NULL DEFAULT 0
+               ledger_dirty INTEGER NOT NULL DEFAULT 0,
+               project_key TEXT,
+               project_label TEXT,
+               project_provenance TEXT,
+               project_source_directory TEXT
              );
              CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key);
+             CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key);
+             CREATE TABLE project_overrides (
+               project_key TEXT PRIMARY KEY,
+               display_label TEXT,
+               canonical_project_key TEXT,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE project_session_overrides (
+               session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key),
+               project_key TEXT NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );
              CREATE TABLE source_artifacts (
                artifact_key TEXT PRIMARY KEY,
                identity_key TEXT NOT NULL,
@@ -1266,6 +1444,110 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )?;
         transaction.commit()?;
     }
+    let version_before_project_identity: i64 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version_before_project_identity == 5 {
+        // Project identity (#41) is a *session*-level dimension: it lives on
+        // `durable_sessions`, never on a per-event fact/rollup table, so it
+        // deliberately does not touch `durable_token_events` or the
+        // `rollup_*` tables and is exempt from the two-table rollup-dimension
+        // invariant that governs those (see `AGENTS.md`). `project_overrides`
+        // and `project_session_overrides` are a separate user-controlled
+        // overlay (aliases/merges/splits) resolved at read time; they never
+        // rewrite the auto-computed columns added here or any source
+        // transcript, and are fully reversible by deleting the override row.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !table_has_column(&transaction, "durable_sessions", "project_key")? {
+            transaction.execute_batch(
+                "ALTER TABLE durable_sessions ADD COLUMN project_key TEXT;
+                 ALTER TABLE durable_sessions ADD COLUMN project_label TEXT;
+                 ALTER TABLE durable_sessions ADD COLUMN project_provenance TEXT;
+                 ALTER TABLE durable_sessions ADD COLUMN project_source_directory TEXT;
+                 CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key);",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_overrides (
+               project_key TEXT PRIMARY KEY,
+               display_label TEXT,
+               canonical_project_key TEXT,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS project_session_overrides (
+               session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key),
+               project_key TEXT NOT NULL,
+               updated_at_ms INTEGER NOT NULL
+             );",
+        )?;
+        // Backfill every existing session's project identity. Unlike the
+        // token/tool dimension backfills above, the source data
+        // (`working_directory`) exists only inside each session's snapshot
+        // JSON, not in a normalized per-event fact table — there is no SQL
+        // `GROUP BY` that could compute it. This streams one session
+        // snapshot at a time (mirroring the v1->v2 tool/finding-facts
+        // backfill earlier in this function), so at most one snapshot blob
+        // is resident at a time; it is bounded by session count, not event
+        // count, so it stays cheap even on a multi-GB ledger.
+        backfill_project_identities(&transaction)?;
+        transaction.execute_batch(
+            "INSERT INTO history_meta(key, value) VALUES('schema_version', '6')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 6;",
+        )?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+/// Resolves and stores project identity for every durable session whose
+/// current snapshot deserializes cleanly. A snapshot that fails to
+/// deserialize is skipped with a warning, exactly like the v1->v2 fact
+/// backfill: it heals the next time that session is observed.
+fn backfill_project_identities(transaction: &Transaction<'_>) -> Result<()> {
+    let home = dirs::home_dir();
+    let rows: Vec<(String, Vec<u8>)> = {
+        let mut select = transaction.prepare(
+            "SELECT d.session_key, s.session_json
+             FROM durable_sessions d JOIN session_snapshots s
+               ON s.session_key = d.session_key
+              AND s.version = d.current_snapshot_version",
+        )?;
+        let rows = select
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (key, raw) in rows {
+        match serde_json::from_slice::<Session>(&raw) {
+            Ok(session) => {
+                let identity = crate::project_identity::resolve_project_identity(
+                    session.working_directory.as_deref(),
+                    &session.harness,
+                    &session.file_path,
+                    home.as_deref(),
+                );
+                transaction.execute(
+                    "UPDATE durable_sessions
+                     SET project_key = ?2, project_label = ?3, project_provenance = ?4, project_source_directory = ?5
+                     WHERE session_key = ?1",
+                    params![
+                        key,
+                        identity.as_ref().map(|i| i.project_key.as_str()),
+                        identity.as_ref().map(|i| i.label.as_str()),
+                        identity.as_ref().map(|i| i.provenance.as_str()),
+                        session.working_directory,
+                    ],
+                )?;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not backfill project identity for {key}: snapshot did not deserialize: {error}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1316,6 +1598,63 @@ const ROLLUP_SCHEMA_SQL: &str = "
     CREATE UNIQUE INDEX IF NOT EXISTS rollup_mutation_chains_key_idx
       ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target);
 ";
+
+/// Resolves (or reuses) project identity onto `session` in place, and
+/// persists it onto `durable_sessions` for `key`, which must already exist.
+///
+/// The previous durable value is reused whenever `working_directory` is
+/// unchanged, so a filesystem/git probe does not run on every token-event
+/// append for an already-classified session — only on first observation and
+/// after a genuine working-directory change (a resumed session recorded
+/// under a different `cwd`, for example).
+fn apply_project_identity(
+    transaction: &Transaction<'_>,
+    key: &str,
+    session: &mut Session,
+) -> Result<()> {
+    let current_directory = session.working_directory.clone();
+    let (prev_key, prev_label, prev_provenance, prev_directory): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = transaction.query_row(
+        "SELECT project_key, project_label, project_provenance, project_source_directory
+         FROM durable_sessions WHERE session_key = ?1",
+        [key],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    if prev_key.is_some() && prev_directory == current_directory {
+        session.project_key = prev_key;
+        session.project_label = prev_label;
+        session.project_provenance = prev_provenance
+            .as_deref()
+            .and_then(crate::project_identity::ProjectProvenance::parse);
+        return Ok(());
+    }
+    let identity = crate::project_identity::resolve_project_identity(
+        current_directory.as_deref(),
+        &session.harness,
+        &session.file_path,
+        dirs::home_dir().as_deref(),
+    );
+    session.project_key = identity.as_ref().map(|i| i.project_key.clone());
+    session.project_label = identity.as_ref().map(|i| i.label.clone());
+    session.project_provenance = identity.as_ref().map(|i| i.provenance);
+    transaction.execute(
+        "UPDATE durable_sessions
+         SET project_key = ?2, project_label = ?3, project_provenance = ?4, project_source_directory = ?5
+         WHERE session_key = ?1",
+        params![
+            key,
+            session.project_key,
+            session.project_label,
+            session.project_provenance.map(|p| p.as_str()),
+            current_directory,
+        ],
+    )?;
+    Ok(())
+}
 
 fn reconcile_session(
     transaction: &Transaction<'_>,
@@ -1998,6 +2337,84 @@ fn stable_hash_bytes(bytes: &[u8]) -> String {
     format!("{hash:016x}")
 }
 
+fn load_project_overrides(connection: &Connection) -> Result<HashMap<String, ProjectOverrideRow>> {
+    let mut statement = connection.prepare(
+        "SELECT project_key, display_label, canonical_project_key FROM project_overrides",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ProjectOverrideRow {
+                project_key: row.get(0)?,
+                display_label: row.get(1)?,
+                canonical_project_key: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.project_key.clone(), row))
+        .collect())
+}
+
+/// Deletes an override row once it carries neither an alias nor a merge
+/// redirect, so a cleared alias or unmerge does not leave empty clutter.
+fn prune_empty_project_override(connection: &Connection, project_key: &str) -> Result<()> {
+    connection.execute(
+        "DELETE FROM project_overrides
+         WHERE project_key = ?1 AND display_label IS NULL AND canonical_project_key IS NULL",
+        [project_key],
+    )?;
+    Ok(())
+}
+
+/// Chases `canonical_project_key` redirects to the final, non-redirected
+/// project key. Cycle-safe: a chain that revisits a key it has already
+/// visited (which `merge_project`'s own validation prevents in the normal
+/// path, but a hand-edited database might not) stops at the repeated key
+/// rather than looping forever.
+pub fn resolve_canonical_project_key(
+    overrides: &HashMap<String, ProjectOverrideRow>,
+    start: &str,
+) -> String {
+    let mut current = start.to_string();
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current.clone()) {
+        match overrides
+            .get(&current)
+            .and_then(|row| row.canonical_project_key.clone())
+        {
+            Some(next) if next != current => current = next,
+            _ => break,
+        }
+    }
+    current
+}
+
+/// Whether following `canonical_project_key` redirects from `start` ever
+/// reaches `target`. Used by `merge_project` to reject a merge that would
+/// otherwise create a cycle.
+fn project_key_reaches(
+    overrides: &HashMap<String, ProjectOverrideRow>,
+    start: &str,
+    target: &str,
+) -> bool {
+    let mut current = start.to_string();
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(current.clone()) {
+        if current == target {
+            return true;
+        }
+        match overrides
+            .get(&current)
+            .and_then(|row| row.canonical_project_key.clone())
+        {
+            Some(next) if next != current => current = next,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
@@ -2088,6 +2505,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::<crate::model::TaskCategory, CategoryMetric>::new(),
             optimization_findings: Vec::<OptimizationFinding>::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -2858,6 +3278,260 @@ mod tests {
             totals[0][&observed.key].tokens.cache_creation_input_tokens,
             expected_cache_creation
         );
+    }
+
+    fn project_test_git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn project_test_repository() -> tempfile::TempDir {
+        let directory = tempdir().unwrap();
+        project_test_git(directory.path(), &["init", "--quiet"]);
+        project_test_git(directory.path(), &["config", "user.name", "Synthetic Test"]);
+        project_test_git(
+            directory.path(),
+            &["config", "user.email", "synthetic@example.invalid"],
+        );
+        project_test_git(directory.path(), &["config", "commit.gpgsign", "false"]);
+        directory
+    }
+
+    #[test]
+    fn observe_persists_project_identity_and_reuses_it_when_the_directory_is_unchanged() {
+        let repo = project_test_repository();
+        let (_directory, store) = store();
+        let mut fixture = session("project-thread", 10);
+        fixture.working_directory = Some(repo.path().to_str().unwrap().to_string());
+        let generation = store.begin_scan().unwrap();
+        let first = store
+            .observe(Path::new("project.jsonl"), &fixture, generation)
+            .unwrap();
+        assert_eq!(
+            first.session.project_provenance,
+            Some(crate::project_identity::ProjectProvenance::RepositoryRoot)
+        );
+        assert!(first.session.project_key.is_some());
+
+        // The repository is removed before the second observe: if identity
+        // were recomputed from disk it would fall back to a path identity
+        // (a different provenance). Getting `RepositoryRoot` back proves the
+        // durable value was reused rather than re-probed.
+        drop(repo);
+        append_event(&mut fixture, 5, "2026-01-01T00:00:02Z");
+        let second = store
+            .observe(Path::new("project.jsonl"), &fixture, generation)
+            .unwrap();
+        assert_eq!(second.session.project_key, first.session.project_key);
+        assert_eq!(
+            second.session.project_provenance,
+            Some(crate::project_identity::ProjectProvenance::RepositoryRoot)
+        );
+    }
+
+    #[test]
+    fn observe_recomputes_project_identity_after_a_working_directory_change() {
+        let repo_a = project_test_repository();
+        let repo_b = project_test_repository();
+        let (_directory, store) = store();
+        let mut fixture = session("project-move", 10);
+        fixture.working_directory = Some(repo_a.path().to_str().unwrap().to_string());
+        let generation = store.begin_scan().unwrap();
+        let first = store
+            .observe(Path::new("project-move.jsonl"), &fixture, generation)
+            .unwrap();
+
+        fixture.working_directory = Some(repo_b.path().to_str().unwrap().to_string());
+        append_event(&mut fixture, 5, "2026-01-01T00:00:02Z");
+        let second = store
+            .observe(Path::new("project-move.jsonl"), &fixture, generation)
+            .unwrap();
+        assert_ne!(second.session.project_key, first.session.project_key);
+    }
+
+    #[test]
+    fn sessions_without_a_working_directory_have_no_project_identity() {
+        let (_directory, store) = store();
+        let fixture = session("no-cwd", 10);
+        assert!(fixture.working_directory.is_none());
+        let generation = store.begin_scan().unwrap();
+        let observed = store
+            .observe(Path::new("no-cwd.jsonl"), &fixture, generation)
+            .unwrap();
+        assert!(observed.session.project_key.is_none());
+        assert!(observed.session.project_label.is_none());
+        assert!(observed.session.project_provenance.is_none());
+    }
+
+    #[test]
+    fn v5_migration_backfills_project_identity_from_existing_snapshots() {
+        let repo = project_test_repository();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let fixture = {
+            let mut fixture = session("project-backfill", 10);
+            fixture.working_directory = Some(repo.path().to_str().unwrap().to_string());
+            fixture
+        };
+        let key;
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            key = store
+                .observe(Path::new("project-backfill.jsonl"), &fixture, generation)
+                .unwrap()
+                .key;
+        }
+        // Rewind to schema v5: an existing pre-#41 store has no project
+        // identity backfilled yet and no override tables. Clearing the
+        // column *values* (rather than dropping and recreating the table,
+        // which would fight the other tables' foreign keys into it) models
+        // the same pre-migration state the real v5->v6 step must repair.
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE durable_sessions SET
+                       project_key = NULL, project_label = NULL,
+                       project_provenance = NULL, project_source_directory = NULL;
+                     DROP TABLE IF EXISTS project_overrides;
+                     DROP TABLE IF EXISTS project_session_overrides;
+                     INSERT INTO history_meta(key, value) VALUES('schema_version', '5')
+                       ON CONFLICT(key) DO UPDATE SET value = '5';
+                     PRAGMA user_version = 5;",
+                )
+                .unwrap();
+        }
+        let store = HistoryStore::open(&path).unwrap();
+        let connection = store.connection().unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let (project_key, project_label, provenance): (Option<String>, Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT project_key, project_label, project_provenance FROM durable_sessions WHERE session_key = ?1",
+                [key.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(project_key.is_some());
+        assert!(project_label.is_some());
+        assert_eq!(provenance.as_deref(), Some("repository_root"));
+        drop(connection);
+
+        let loaded = store.load_one(&key).unwrap();
+        assert_eq!(loaded.session.project_key, project_key);
+    }
+
+    #[test]
+    fn set_project_alias_overrides_the_label_and_is_reversible() {
+        let (_directory, store) = store();
+        store
+            .set_project_alias("repo:abc", Some("Renamed"))
+            .unwrap();
+        let overrides = store.list_project_overrides().unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].display_label.as_deref(), Some("Renamed"));
+        assert_eq!(overrides[0].canonical_project_key, None);
+
+        // Clearing the alias (None) removes the now-empty override row.
+        store.set_project_alias("repo:abc", None).unwrap();
+        assert!(store.list_project_overrides().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_project_redirects_and_rejects_cycles() {
+        let (_directory, store) = store();
+        store.merge_project("repo:a", "repo:b").unwrap();
+        let overrides: HashMap<_, _> = store
+            .list_project_overrides()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.project_key.clone(), row))
+            .collect();
+        assert_eq!(
+            resolve_canonical_project_key(&overrides, "repo:a"),
+            "repo:b"
+        );
+
+        // Merging b back into a would create a cycle and must be rejected.
+        assert!(store.merge_project("repo:b", "repo:a").is_err());
+        // Merging a key into itself is always rejected.
+        assert!(store.merge_project("repo:c", "repo:c").is_err());
+
+        // Unmerge reverses the redirect (the "split" undo for a merge).
+        store.unmerge_project("repo:a").unwrap();
+        assert!(store.list_project_overrides().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_preserves_an_existing_alias_and_alias_preserves_an_existing_merge() {
+        let (_directory, store) = store();
+        store.set_project_alias("repo:a", Some("Alpha")).unwrap();
+        store.merge_project("repo:a", "repo:b").unwrap();
+        let overrides = store.list_project_overrides().unwrap();
+        let row = overrides
+            .iter()
+            .find(|row| row.project_key == "repo:a")
+            .unwrap();
+        assert_eq!(row.display_label.as_deref(), Some("Alpha"));
+        assert_eq!(row.canonical_project_key.as_deref(), Some("repo:b"));
+
+        store.set_project_alias("repo:a", Some("Alpha 2")).unwrap();
+        let overrides = store.list_project_overrides().unwrap();
+        let row = overrides
+            .iter()
+            .find(|row| row.project_key == "repo:a")
+            .unwrap();
+        assert_eq!(row.display_label.as_deref(), Some("Alpha 2"));
+        assert_eq!(row.canonical_project_key.as_deref(), Some("repo:b"));
+    }
+
+    #[test]
+    fn reassign_session_project_splits_a_session_and_is_reversible() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let observed = store
+            .observe(Path::new("split.jsonl"), &session("split", 10), generation)
+            .unwrap();
+
+        let manual_key = store.reassign_session_project(&observed.key, None).unwrap();
+        assert!(manual_key.starts_with("manual:"));
+        let overrides = store.list_session_project_overrides().unwrap();
+        assert_eq!(overrides.get(&observed.key), Some(&manual_key));
+
+        store
+            .reassign_session_project(&observed.key, Some("repo:other"))
+            .unwrap();
+        let overrides = store.list_session_project_overrides().unwrap();
+        assert_eq!(
+            overrides.get(&observed.key),
+            Some(&"repo:other".to_string())
+        );
+
+        store.clear_session_project_override(&observed.key).unwrap();
+        assert!(store.list_session_project_overrides().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reassign_session_project_rejects_an_unknown_session() {
+        let (_directory, store) = store();
+        assert!(store
+            .reassign_session_project("does-not-exist", Some("repo:x"))
+            .is_err());
     }
 
     fn append_event(session: &mut Session, input: u64, at: &str) {

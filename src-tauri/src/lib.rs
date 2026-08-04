@@ -13,6 +13,7 @@ pub mod model;
 pub mod parser;
 pub mod paths;
 pub mod performance;
+pub mod project_identity;
 pub mod provider;
 pub mod rates;
 pub mod scan_cache;
@@ -26,14 +27,16 @@ pub mod turn_receipts;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, cancel_instruction_scan, compare_tool_impact, correlate_events,
-    export_performance_data, get_bundled_rates, get_config, get_performance_status,
-    get_provider_diagnostics, get_rates, get_scan_status, get_session_details,
-    get_subscription_usage, get_turn_receipt_status, list_external_events, list_instruction_files,
-    list_providers, list_sessions, list_tool_impact_targets, open_instruction_file,
-    open_task_in_chatgpt, read_instruction_file, record_frontend_performance,
-    repair_turn_receipt_integrations, resolve_working_directories, reveal_in_file_manager,
-    scan_git_outcomes, sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
+    add_defender_exclusions, cancel_instruction_scan, clear_session_project_override,
+    compare_tool_impact, correlate_events, export_performance_data, get_bundled_rates, get_config,
+    get_performance_status, get_provider_diagnostics, get_rates, get_scan_status,
+    get_session_details, get_subscription_usage, get_turn_receipt_status, list_external_events,
+    list_instruction_files, list_providers, list_sessions, list_tool_impact_targets,
+    merge_projects, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
+    reassign_session_project, record_frontend_performance, repair_turn_receipt_integrations,
+    resolve_projects, resolve_working_directories, reveal_in_file_manager, scan_git_outcomes,
+    sessions_in_ranges, set_config, set_project_alias, set_rates, set_tray_totals, unmerge_project,
+    write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -68,6 +71,12 @@ pub fn run() {
             get_config,
             list_providers,
             resolve_working_directories,
+            resolve_projects,
+            set_project_alias,
+            merge_projects,
+            unmerge_project,
+            reassign_session_project,
+            clear_session_project_override,
             set_config,
             get_turn_receipt_status,
             repair_turn_receipt_integrations,

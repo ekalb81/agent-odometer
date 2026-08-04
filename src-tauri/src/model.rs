@@ -410,6 +410,18 @@ pub struct Session {
     pub category_totals: BTreeMap<TaskCategory, CategoryMetric>,
     #[serde(default)]
     pub optimization_findings: Vec<OptimizationFinding>,
+    /// Stable project-identity key resolved from `working_directory` (#41).
+    /// `None` when the session has no working directory to resolve from.
+    /// This is the auto-computed identity; user aliases/merges/splits are a
+    /// separate overlay applied at read time and never mutate this field.
+    #[serde(default)]
+    pub project_key: Option<String>,
+    /// Local display label for `project_key`. Never redacted here — see
+    /// `crate::project_identity` for the redaction/aggregate-export contract.
+    #[serde(default)]
+    pub project_label: Option<String>,
+    #[serde(default)]
+    pub project_provenance: Option<crate::project_identity::ProjectProvenance>,
 }
 
 /// Token usage grouped by (model, service_tier). Credit math is linear per
@@ -493,6 +505,12 @@ pub struct SessionSummary {
     pub optimization_findings_count: u64,
     #[serde(default)]
     pub optimization_summary: OptimizationSummary,
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub project_label: Option<String>,
+    #[serde(default)]
+    pub project_provenance: Option<crate::project_identity::ProjectProvenance>,
 }
 
 impl SessionSummary {
@@ -532,6 +550,9 @@ impl SessionSummary {
             category_totals: s.category_totals.clone(),
             optimization_findings_count: s.optimization_findings.len() as u64,
             optimization_summary,
+            project_key: s.project_key.clone(),
+            project_label: s.project_label.clone(),
+            project_provenance: s.project_provenance,
         }
     }
 }
@@ -807,6 +828,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 

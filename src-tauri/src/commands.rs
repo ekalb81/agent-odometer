@@ -1829,14 +1829,15 @@ mod tests {
         configured_defender_roots, defender_elevation_script, defender_root_is_scoped,
         defender_verification_script, newest_subscription_usage_by_harness,
         powershell_encoded_command, powershell_encoded_path, preserve_backend_owned_config,
-        range_has_data, shorten_display_path, valid_session_id, working_directory_info,
-        write_export_file,
+        range_has_data, resolve_projects_from, shorten_display_path, valid_session_id,
+        working_directory_info, write_export_file,
     };
     use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
     use crate::model::{
         Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
         TokenTotals, ToolMetrics,
     };
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     /// Path literals in these tests use the platform separator, since the
@@ -2156,6 +2157,9 @@ mod tests {
             tool_metrics_by_model: Default::default(),
             category_totals: Default::default(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -2233,6 +2237,113 @@ mod tests {
             Some(10_080)
         );
     }
+
+    fn project_fixture_session(
+        id: &str,
+        project_key: Option<&str>,
+        project_label: Option<&str>,
+    ) -> Session {
+        let mut session = subscription_fixture_session(
+            id,
+            crate::provider::codex_provider_id(),
+            None,
+            None,
+            None,
+            Vec::new(),
+        );
+        session.storage_id = format!("codex:thread:{id}");
+        session.project_key = project_key.map(str::to_owned);
+        session.project_label = project_label.map(str::to_owned);
+        session.project_provenance = project_key
+            .is_some()
+            .then_some(crate::project_identity::ProjectProvenance::RepositoryRoot);
+        session
+    }
+
+    #[test]
+    fn resolve_projects_groups_sessions_and_omits_sessions_without_a_project() {
+        let sessions = [
+            project_fixture_session("a1", Some("repo:a"), Some("alpha")),
+            project_fixture_session("a2", Some("repo:a"), Some("alpha")),
+            project_fixture_session("b1", Some("repo:b"), Some("beta")),
+            project_fixture_session("no-project", None, None),
+        ];
+        let projects = resolve_projects_from(sessions.iter(), &HashMap::new(), &HashMap::new());
+        assert_eq!(projects.len(), 2);
+        let alpha = projects.iter().find(|p| p.project_key == "repo:a").unwrap();
+        assert_eq!(alpha.label, "alpha");
+        assert_eq!(alpha.session_count, 2);
+        assert_eq!(alpha.member_keys, vec!["repo:a".to_string()]);
+        let beta = projects.iter().find(|p| p.project_key == "repo:b").unwrap();
+        assert_eq!(beta.session_count, 1);
+
+        // Reconciliation: every session with a project is accounted for
+        // exactly once across the resolved projects, and the session with no
+        // project is neither silently dropped nor silently grouped in.
+        let total_grouped: usize = projects.iter().map(|p| p.session_count).sum();
+        let with_project = sessions.iter().filter(|s| s.project_key.is_some()).count();
+        assert_eq!(total_grouped, with_project);
+        assert_eq!(with_project, sessions.len() - 1);
+    }
+
+    #[test]
+    fn resolve_projects_applies_merge_and_alias_overrides_and_reconciles_session_counts() {
+        let sessions = [
+            project_fixture_session("a1", Some("repo:a"), Some("alpha")),
+            project_fixture_session("b1", Some("repo:b"), Some("beta")),
+            project_fixture_session("b2", Some("repo:b"), Some("beta")),
+        ];
+        let total_sessions = sessions.len();
+        let mut project_overrides = HashMap::new();
+        project_overrides.insert(
+            "repo:a".to_string(),
+            crate::history_store::ProjectOverrideRow {
+                project_key: "repo:a".into(),
+                display_label: None,
+                canonical_project_key: Some("repo:b".into()),
+            },
+        );
+        project_overrides.insert(
+            "repo:b".to_string(),
+            crate::history_store::ProjectOverrideRow {
+                project_key: "repo:b".into(),
+                display_label: Some("Beta (renamed)".into()),
+                canonical_project_key: None,
+            },
+        );
+        let projects = resolve_projects_from(sessions.iter(), &HashMap::new(), &project_overrides);
+        assert_eq!(projects.len(), 1, "a merged into b leaves one project");
+        let merged = &projects[0];
+        assert_eq!(merged.project_key, "repo:b");
+        assert_eq!(merged.label, "Beta (renamed)");
+        assert_eq!(merged.session_count, total_sessions);
+        assert_eq!(
+            merged.member_keys,
+            vec!["repo:a".to_string(), "repo:b".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_projects_honors_a_manual_session_split_override() {
+        let sessions = [
+            project_fixture_session("a1", Some("repo:a"), Some("alpha")),
+            project_fixture_session("a2", Some("repo:a"), Some("alpha")),
+        ];
+        let mut session_overrides = HashMap::new();
+        session_overrides.insert(
+            "codex:thread:a1".to_string(),
+            "manual:standalone".to_string(),
+        );
+        let projects = resolve_projects_from(sessions.iter(), &session_overrides, &HashMap::new());
+        assert_eq!(projects.len(), 2);
+        let standalone = projects
+            .iter()
+            .find(|p| p.project_key == "manual:standalone")
+            .unwrap();
+        assert_eq!(standalone.session_count, 1);
+        let remaining = projects.iter().find(|p| p.project_key == "repo:a").unwrap();
+        assert_eq!(remaining.session_count, 1);
+    }
 }
 
 /// How one session working directory should be labelled in the grid.
@@ -2261,7 +2372,11 @@ pub struct WorkingDirectoryInfo {
 /// Collapses the home prefix to `~` and keeps only the trailing segments, so a
 /// deep path stays identifiable without carrying the whole ancestry into the
 /// grid.
-fn shorten_display_path(path: &Path, home: Option<&Path>, max_segments: usize) -> String {
+pub(crate) fn shorten_display_path(
+    path: &Path,
+    home: Option<&Path>,
+    max_segments: usize,
+) -> String {
     let separator = if cfg!(windows) { '\\' } else { '/' };
     let (mut rendered, prefixed) = match home.and_then(|home| path.strip_prefix(home).ok()) {
         Some(rest) if rest.as_os_str().is_empty() => (String::from("~"), true),
@@ -2346,4 +2461,227 @@ pub fn resolve_working_directories(state: State<'_, Arc<AppState>>) -> Vec<Worki
         .performance
         .record_backend("ipc.resolve_working_directories", started, true, metadata);
     resolved
+}
+
+/// One resolved project (#41): the effective identity after local
+/// alias/merge overrides, the sessions it currently contains, and the
+/// auto-computed keys folded into it (more than one only when a user has
+/// merged projects together). This is the one backend aggregation path for
+/// the project dimension — cards, tables, exports, and any future tray/CLI
+/// consumer group sessions by `project_key` using this same map rather than
+/// recomputing grouping on the frontend.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ProjectInfo {
+    pub project_key: String,
+    pub label: String,
+    pub provenance: crate::project_identity::ProjectProvenance,
+    pub member_keys: Vec<String>,
+    pub session_count: usize,
+}
+
+/// Pure grouping logic behind [`resolve_projects`], separated out so it is
+/// testable without a Tauri `State`. `session_overrides` maps a durable
+/// session key to a manually reassigned raw project key ("split", #41);
+/// `project_overrides` is every alias/merge row keyed by raw project key.
+fn resolve_projects_from<'a>(
+    sessions: impl Iterator<Item = &'a Session>,
+    session_overrides: &HashMap<String, String>,
+    project_overrides: &HashMap<String, crate::history_store::ProjectOverrideRow>,
+) -> Vec<ProjectInfo> {
+    struct RawInfo {
+        label: String,
+        provenance: crate::project_identity::ProjectProvenance,
+        count: usize,
+    }
+    let mut raw: BTreeMap<String, RawInfo> = BTreeMap::new();
+    for session in sessions {
+        let effective_raw = session_overrides
+            .get(&session.effective_storage_id())
+            .cloned()
+            .or_else(|| session.project_key.clone());
+        let Some(raw_key) = effective_raw else {
+            continue;
+        };
+        let record = raw.entry(raw_key).or_insert_with(|| RawInfo {
+            label: session.project_label.clone().unwrap_or_default(),
+            provenance: session
+                .project_provenance
+                .unwrap_or(crate::project_identity::ProjectProvenance::FallbackPathIdentity),
+            count: 0,
+        });
+        record.count += 1;
+    }
+
+    let mut grouped: HashMap<String, ProjectInfo> = HashMap::new();
+    for (raw_key, info) in &raw {
+        let canonical =
+            crate::history_store::resolve_canonical_project_key(project_overrides, raw_key);
+        let target = grouped
+            .entry(canonical.clone())
+            .or_insert_with(|| ProjectInfo {
+                project_key: canonical.clone(),
+                label: String::new(),
+                provenance: info.provenance,
+                member_keys: Vec::new(),
+                session_count: 0,
+            });
+        target.member_keys.push(raw_key.clone());
+        target.session_count += info.count;
+        if *raw_key == canonical {
+            target.label = info.label.clone();
+            target.provenance = info.provenance;
+        }
+    }
+    for project in grouped.values_mut() {
+        if let Some(alias) = project_overrides
+            .get(&project.project_key)
+            .and_then(|row| row.display_label.clone())
+        {
+            project.label = alias;
+        } else if project.label.is_empty() {
+            // The canonical key was chosen as a merge target that no longer
+            // (or never did) label itself directly — fall back to the
+            // lexicographically-first member's auto label, so the row is
+            // never displayed with a raw key string.
+            if let Some(first) = project.member_keys.first() {
+                if let Some(info) = raw.get(first) {
+                    project.label = info.label.clone();
+                }
+            }
+        }
+    }
+    let mut result: Vec<ProjectInfo> = grouped.into_values().collect();
+    result.sort_by(|a, b| {
+        a.label
+            .cmp(&b.label)
+            .then_with(|| a.project_key.cmp(&b.project_key))
+    });
+    result
+}
+
+/// Every resolved project, after local alias/merge/split overrides. Reuses
+/// the same auto-computed `project_key`/`project_label`/`project_provenance`
+/// already carried on each in-memory session (populated durably by
+/// `history_store::apply_project_identity`) — this command never re-walks
+/// the filesystem itself, matching `resolve_working_directories`' pattern of
+/// a cheap, fetch-once-until-refreshed map the frontend joins against by key.
+#[tauri::command]
+pub fn resolve_projects(state: State<'_, Arc<AppState>>) -> Result<Vec<ProjectInfo>, String> {
+    let started = Instant::now();
+    let session_overrides = match state.history.as_ref() {
+        Some(history) => history
+            .list_session_project_overrides()
+            .map_err(|error| error.to_string())?,
+        None => HashMap::new(),
+    };
+    let project_overrides: HashMap<String, crate::history_store::ProjectOverrideRow> =
+        match state.history.as_ref() {
+            Some(history) => history
+                .list_project_overrides()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|row| (row.project_key.clone(), row))
+                .collect(),
+            None => HashMap::new(),
+        };
+    let sessions: Vec<Arc<Session>> = state
+        .sessions
+        .iter()
+        .map(|entry| entry.value().clone())
+        .collect();
+    let result = resolve_projects_from(
+        sessions.iter().map(|session| session.as_ref()),
+        &session_overrides,
+        &project_overrides,
+    );
+    let mut metadata = BTreeMap::new();
+    metadata.insert("projects".into(), result.len().to_string());
+    metadata.insert("sessions".into(), sessions.len().to_string());
+    state
+        .performance
+        .record_backend("ipc.resolve_projects", started, true, metadata);
+    Ok(result)
+}
+
+/// Sets (`Some`) or clears (`None`) a local display-label alias for a
+/// project. Never rewrites a source transcript or the auto-computed label;
+/// reversible by calling again with `None`.
+#[tauri::command]
+pub fn set_project_alias(
+    state: State<'_, Arc<AppState>>,
+    project_key: String,
+    display_label: Option<String>,
+) -> Result<(), String> {
+    let history = state
+        .history
+        .as_ref()
+        .ok_or("the history store is unavailable")?;
+    history
+        .set_project_alias(&project_key, display_label.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+/// Merges `source_project_key` to display under `canonical_project_key`.
+/// Rejects a self-merge or a merge that would create a cycle. Reversible via
+/// [`unmerge_project`].
+#[tauri::command]
+pub fn merge_projects(
+    state: State<'_, Arc<AppState>>,
+    source_project_key: String,
+    canonical_project_key: String,
+) -> Result<(), String> {
+    let history = state
+        .history
+        .as_ref()
+        .ok_or("the history store is unavailable")?;
+    history
+        .merge_project(&source_project_key, &canonical_project_key)
+        .map_err(|error| error.to_string())
+}
+
+/// Removes a project's merge redirect (its alias, if any, is preserved).
+#[tauri::command]
+pub fn unmerge_project(state: State<'_, Arc<AppState>>, project_key: String) -> Result<(), String> {
+    let history = state
+        .history
+        .as_ref()
+        .ok_or("the history store is unavailable")?;
+    history
+        .unmerge_project(&project_key)
+        .map_err(|error| error.to_string())
+}
+
+/// Manually reassigns one session to `project_key` (or, when `None`, splits
+/// it into a freshly minted standalone project), overriding whatever it
+/// would otherwise be auto-grouped or merged into. Returns the effective
+/// project key applied. Reversible via [`clear_session_project_override`].
+#[tauri::command]
+pub fn reassign_session_project(
+    state: State<'_, Arc<AppState>>,
+    session_key: String,
+    project_key: Option<String>,
+) -> Result<String, String> {
+    let history = state
+        .history
+        .as_ref()
+        .ok_or("the history store is unavailable")?;
+    history
+        .reassign_session_project(&session_key, project_key.as_deref())
+        .map_err(|error| error.to_string())
+}
+
+/// Reverts a manual session project reassignment back to auto-computed
+/// grouping.
+#[tauri::command]
+pub fn clear_session_project_override(
+    state: State<'_, Arc<AppState>>,
+    session_key: String,
+) -> Result<(), String> {
+    let history = state
+        .history
+        .as_ref()
+        .ok_or("the history store is unavailable")?;
+    history
+        .clear_session_project_override(&session_key)
+        .map_err(|error| error.to_string())
 }

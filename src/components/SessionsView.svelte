@@ -2,7 +2,7 @@
   import { onDestroy, onMount, untrack } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
-  import { workingDirectoryStore } from '../lib/stores/workingDirectories.svelte';
+  import { projectStore } from '../lib/stores/projects.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
@@ -22,7 +22,6 @@
     isSubagent,
     orderSessionsForDisplay,
     projectSessions,
-    repositoryLabel,
     rowsToCsv,
     sessionName,
     toUtcIso,
@@ -363,16 +362,22 @@
     return d.displayCost;
   }
 
-  /// The grid's label for a session's working directory: the repository name
-  /// when it is inside a working tree, otherwise a shortened path. Falls back
-  /// to the leaf segment only until the resolve completes.
+  /// The grid's label for a session's project (#41): the backend-owned
+  /// `project_label`, with any local alias/merge applied through
+  /// `projectStore`. Falls back to the session's own auto-computed label
+  /// only until that resolve completes.
   function repositoryDisplay(session: TrackedSession): string {
-    if (!session.working_directory) return '';
-    const info = workingDirectoryStore.info(session.working_directory);
-    if (info?.repository_name) {
-      return info.relative_path ? `${info.repository_name}/${info.relative_path}` : info.repository_name;
-    }
-    return info?.display_path ?? repositoryLabel(session) ?? '';
+    if (!session.project_key) return '';
+    return projectStore.info(session.project_key)?.label ?? session.project_label ?? '';
+  }
+
+  /// Splits a `repository_root` label at its first `/` so the repository
+  /// name segment can be highlighted distinctly from the relative path
+  /// beneath it, the way the grid has always rendered a repository hit.
+  function splitRepositoryLabel(label: string): { name: string; rest: string } | null {
+    if (!label) return null;
+    const slash = label.indexOf('/');
+    return slash === -1 ? { name: label, rest: '' } : { name: label.slice(0, slash), rest: label.slice(slash + 1) };
   }
 
   // Wall-clock span of the run. Subagents are typically short-lived under a
@@ -619,6 +624,12 @@
     return `${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
   }
 
+  /// Groups by project identity (#41). The backend already resolved and
+  /// persisted `project_key`/`project_label` from the working directory
+  /// (Git repository root, workspace marker, or normalized path) — grouping
+  /// here only joins that key through `projectStore` for any local
+  /// alias/merge; it never recomputes identity from `working_directory`
+  /// itself, so this can never disagree with the grid's sort/filter/label.
   function groupByRepository(sessions: TrackedSession[]): { label: string; sessions: TrackedSession[] }[] {
     const groups = new Map<string, { label: string; sessions: TrackedSession[] }>();
     const byStorageId = new Map(sessions.map((session) => [session.storage_id, session]));
@@ -632,15 +643,12 @@
         if (!parent) break;
         anchor = parent;
       }
-      const workingDirectory = anchor.working_directory;
-      const normalized = workingDirectory?.replace(/\\/g, '/').replace(/\/+$/, '') ?? '';
-      const windowsStyle = Boolean(workingDirectory && (/\\/.test(workingDirectory) || /^[A-Za-z]:[\\/]/.test(workingDirectory)));
-      const key = workingDirectory
-        ? `path:${windowsStyle ? normalized.toLowerCase() : normalized}`
-        : 'missing:';
+      const info = anchor.project_key ? projectStore.info(anchor.project_key) : undefined;
+      const key = info?.project_key ?? anchor.project_key ?? 'missing:';
+      const label = info?.label ?? anchor.project_label ?? 'No working directory recorded';
       const group = groups.get(key);
       if (group) group.sessions.push(session);
-      else groups.set(key, { label: repositoryDisplay(anchor) || 'No working directory recorded', sessions: [session] });
+      else groups.set(key, { label, sessions: [session] });
     }
     return [...groups.values()];
   }
@@ -736,7 +744,7 @@
     });
     if (listViewport) resize.observe(listViewport);
     // Fetch-once and shared across tabs; the store dedupes concurrent calls.
-    void workingDirectoryStore.load();
+    void projectStore.load();
     return () => resize.disconnect();
   });
 
@@ -1945,15 +1953,18 @@
                   {:else if column.id === 'tools'}
                     <span class="text-right font-mono text-xs text-ink" title={session.tool_metrics ? `${session.tool_metrics.reads} read · ${session.tool_metrics.searches} search · ${session.tool_metrics.mutations} mutation · ${session.tool_metrics.commands} command` : undefined}>{fmt.format(session.tool_metrics?.calls ?? 0)}</span>
                   {:else if column.id === 'repository'}
-                    {@const wd = workingDirectoryStore.info(session.working_directory)}
-                    {#if !session.working_directory}
+                    {@const project = session.project_key ? projectStore.info(session.project_key) : undefined}
+                    {@const label = project?.label ?? session.project_label ?? ''}
+                    {@const provenance = project?.provenance ?? session.project_provenance}
+                    {@const repoSplit = provenance === 'repository_root' ? splitRepositoryLabel(label) : null}
+                    {#if !session.project_key}
                       <span class="text-ink-faint text-xs truncate" title="No working directory recorded for this session">—</span>
-                    {:else if wd?.repository_name}
-                      <span class="flex items-center min-w-0 whitespace-nowrap text-xs" title={`${wd.repository_name} · ${wd.display_path}`}>
-                        <span class="text-emerald-500 font-medium truncate">{wd.repository_name}</span>{#if wd.relative_path}<span class="text-ink-faint truncate">/{wd.relative_path}</span>{/if}
+                    {:else if repoSplit}
+                      <span class="flex items-center min-w-0 whitespace-nowrap text-xs" title={`${label}${session.working_directory ? ` · ${session.working_directory}` : ''}`}>
+                        <span class="text-emerald-500 font-medium truncate">{repoSplit.name}</span>{#if repoSplit.rest}<span class="text-ink-faint truncate">/{repoSplit.rest}</span>{/if}
                       </span>
                     {:else}
-                      <span class="text-ink-muted text-xs truncate" title={wd ? `${session.working_directory} · not a git repository` : session.working_directory}>{wd?.display_path ?? repositoryLabel(session) ?? '—'}</span>
+                      <span class="text-ink-muted text-xs truncate" title={session.working_directory ?? label}>{label || '—'}</span>
                     {/if}
                   {:else if column.id === 'model'}
                     <span class="text-ink-muted font-mono text-xs truncate flex items-center gap-1.5" title={`${session.model ?? 'Unknown model'} · ${providerVisual.label}`}>
