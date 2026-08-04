@@ -1211,13 +1211,21 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         // upgrade sequence but wrong the moment a database's tables don't
         // precisely match what that inference assumes.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if !table_has_column(&transaction, "durable_token_events", "cache_creation_input_tokens")? {
+        if !table_has_column(
+            &transaction,
+            "durable_token_events",
+            "cache_creation_input_tokens",
+        )? {
             transaction.execute_batch(
                 "ALTER TABLE durable_token_events
                    ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;",
             )?;
         }
-        if !table_has_column(&transaction, "rollup_token_totals", "cache_creation_input_tokens")? {
+        if !table_has_column(
+            &transaction,
+            "rollup_token_totals",
+            "cache_creation_input_tokens",
+        )? {
             transaction.execute_batch(
                 "ALTER TABLE rollup_token_totals
                    ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;",
@@ -2286,6 +2294,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ledger_range_totals_include_cache_creation_tokens_across_rollup_and_edge_reads() {
+        // Regression guard for the AGENTS.md ledger-rollup-dimension
+        // invariant (#112): `rollup_token_totals` must carry
+        // `cache_creation_input_tokens`, or a window that spans a whole-hour
+        // rollup bucket plus sub-hour edges silently drops the
+        // cache-creation dimension for the rollup-served bucket while still
+        // reporting it correctly for the edge-served buckets — a partial,
+        // silent under-count rather than an obviously wrong total.
+        let (_directory, store) = store();
+        let mut fixture = session("cache-creation-golden", 0);
+        let event = |at: &str, cache_creation: u64| TokenHistoryPoint {
+            timestamp: timestamp(at),
+            model: Some("gpt-test".into()),
+            service_tier: None,
+            request_input_tokens: Some(100),
+            total_tokens: 0,
+            delta: TokenTotals {
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                cache_creation_input_tokens: cache_creation,
+                output_tokens: 20,
+                reasoning_output_tokens: 0,
+                total_tokens: 120,
+            },
+        };
+        // Bucket 0 (00:00-01:00) and bucket 2 (02:00-03:00) are edge-served
+        // by the window below; bucket 1 (01:00-02:00) is fully inside it and
+        // is rollup-served. Non-zero cache-creation tokens in at least two
+        // distinct hour buckets, including the rollup-served one, are
+        // exactly what a fact-table-only fix cannot get right.
+        fixture.tokens_history = vec![
+            event("2026-01-01T00:30:00Z", 40),
+            event("2026-01-01T01:15:00Z", 25),
+            event("2026-01-01T02:45:00Z", 10),
+        ];
+        let mut total = TokenTotals::default();
+        for point in &fixture.tokens_history {
+            total += &point.delta;
+        }
+        fixture.tokens_total = total;
+        fixture.last_event_at = timestamp("2026-01-01T02:45:00Z");
+
+        let generation = store.begin_scan().unwrap().max(1);
+        let key = store
+            .observe(
+                Path::new("cache-creation-golden.jsonl"),
+                &fixture,
+                generation,
+            )
+            .unwrap()
+            .key;
+
+        // Both bounds land inside a bucket (not on an hour boundary), so
+        // this single call exercises a whole-bucket rollup read (bucket 1)
+        // together with two partial-edge event reads (the tails of buckets
+        // 0 and 2) in one query — the exact combination the AGENTS.md
+        // invariant calls out.
+        let windows: Vec<RangeWindow> = vec![(
+            Some(timestamp("2026-01-01T00:15:00Z")),
+            Some(timestamp("2026-01-01T02:50:00Z")),
+        )];
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let expected = fixture.range_totals_multi(&windows);
+
+        assert_eq!(
+            expected[0].tokens.cache_creation_input_tokens, 75,
+            "fixture sanity check: 40 + 25 + 10"
+        );
+        let actual = from_ledger[0]
+            .get(&key)
+            .expect("window has data for this session");
+        assert_eq!(
+            actual.tokens.cache_creation_input_tokens,
+            expected[0].tokens.cache_creation_input_tokens,
+            "ledger cache-creation tokens must match the in-memory oracle across rollup and edge reads"
+        );
+        assert_eq!(&actual.tokens, &expected[0].tokens);
     }
 
     #[test]
