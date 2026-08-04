@@ -559,14 +559,7 @@ impl AppState {
 }
 
 fn path_key(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
-    let normalized = value.replace('\\', "/");
-    if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    }
+    crate::paths::normalized_path_key(path, false)
 }
 
 impl Default for AppState {

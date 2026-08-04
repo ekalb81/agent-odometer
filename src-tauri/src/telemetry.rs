@@ -597,11 +597,7 @@ pub fn category_totals(turns: &[crate::model::TurnInfo]) -> BTreeMap<TaskCategor
         let category = turn.classification.category;
         let entry: &mut CategoryMetric = out.entry(category).or_default();
         entry.turns += 1;
-        entry.tokens.input_tokens += turn.tokens.input_tokens;
-        entry.tokens.cached_input_tokens += turn.tokens.cached_input_tokens;
-        entry.tokens.output_tokens += turn.tokens.output_tokens;
-        entry.tokens.reasoning_output_tokens += turn.tokens.reasoning_output_tokens;
-        entry.tokens.total_tokens += turn.tokens.total_tokens;
+        entry.tokens += &turn.tokens;
         entry.tool_calls += turn.tool_metrics.calls;
         if let Some(model) = &turn.model {
             let bucket = entry
@@ -610,11 +606,7 @@ pub fn category_totals(turns: &[crate::model::TurnInfo]) -> BTreeMap<TaskCategor
                 .find(|bucket| bucket.model == *model && bucket.service_tier == turn.service_tier);
             match bucket {
                 Some(bucket) => {
-                    bucket.tokens.input_tokens += turn.tokens.input_tokens;
-                    bucket.tokens.cached_input_tokens += turn.tokens.cached_input_tokens;
-                    bucket.tokens.output_tokens += turn.tokens.output_tokens;
-                    bucket.tokens.reasoning_output_tokens += turn.tokens.reasoning_output_tokens;
-                    bucket.tokens.total_tokens += turn.tokens.total_tokens;
+                    bucket.tokens += &turn.tokens;
                 }
                 None => entry.buckets.push(crate::model::TierBucket {
                     model: model.clone(),

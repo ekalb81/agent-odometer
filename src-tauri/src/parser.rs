@@ -948,11 +948,7 @@ fn parse_rate_limit_reset(value: &Value) -> Option<DateTime<Utc>> {
 }
 
 fn add_token_totals(dst: &mut TokenTotals, src: &TokenTotals) {
-    dst.input_tokens += src.input_tokens;
-    dst.cached_input_tokens += src.cached_input_tokens;
-    dst.output_tokens += src.output_tokens;
-    dst.reasoning_output_tokens += src.reasoning_output_tokens;
-    dst.total_tokens += src.total_tokens;
+    *dst += src;
 }
 
 fn sum_bucket_totals(buckets: &HashMap<String, TokenTotals>) -> TokenTotals {

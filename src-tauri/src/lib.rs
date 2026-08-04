@@ -9,6 +9,7 @@ pub mod history_store;
 pub mod instructions;
 pub mod model;
 pub mod parser;
+pub mod paths;
 pub mod performance;
 pub mod provider;
 pub mod rates;

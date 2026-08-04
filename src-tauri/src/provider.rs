@@ -1,5 +1,6 @@
 use crate::model::Session;
-use std::borrow::{Borrow, Cow};
+use crate::paths::strip_verbatim_prefix;
+use std::borrow::Borrow;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -428,21 +429,10 @@ fn is_jsonl(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
 }
 
-fn strip_verbatim_prefix(path: &Path) -> Cow<'_, Path> {
-    if let Some(path) = path.to_str() {
-        if let Some(stripped) = path.strip_prefix(r"\\?\UNC\") {
-            return Cow::Owned(PathBuf::from(format!(r"\\{stripped}")));
-        }
-        if let Some(stripped) = path.strip_prefix(r"\\?\") {
-            return Cow::Borrowed(Path::new(stripped));
-        }
-    }
-    Cow::Borrowed(path)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{strip_verbatim_prefix, ProviderId};
+    use super::ProviderId;
+    use crate::paths::strip_verbatim_prefix;
     use std::path::Path;
 
     #[test]

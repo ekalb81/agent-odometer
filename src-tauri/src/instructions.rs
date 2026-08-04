@@ -286,14 +286,7 @@ pub fn validate_instruction_path(path: &Path) -> anyhow::Result<std::fs::Metadat
 }
 
 pub fn normalized_path_key(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
-    let normalized = value.replace('\\', "/").trim_end_matches('/').to_owned();
-    if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    }
+    crate::paths::normalized_path_key(path, true)
 }
 
 pub fn path_identity(path: &Path) -> String {
@@ -1016,8 +1009,9 @@ fn path_depth(path: &Path) -> usize {
 }
 
 fn display_path(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    value.strip_prefix(r"\\?\").unwrap_or(&value).to_owned()
+    crate::paths::strip_verbatim_prefix(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn stable_hash(bytes: &[u8]) -> String {

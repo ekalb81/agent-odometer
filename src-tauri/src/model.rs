@@ -240,6 +240,23 @@ pub struct TokenTotals {
     pub total_tokens: u64,
 }
 
+/// Field-wise accumulation, defined once.
+///
+/// This fold was previously written out per module — a new field had to be
+/// added to every copy, and any copy that was missed would have silently
+/// under-counted on whichever surface used it. For a tool whose entire output
+/// is token accounting, that is the wrong failure mode, so the operation lives
+/// with the type.
+impl std::ops::AddAssign<&TokenTotals> for TokenTotals {
+    fn add_assign(&mut self, other: &TokenTotals) {
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_output_tokens += other.reasoning_output_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenHistoryPoint {
     pub timestamp: chrono::DateTime<chrono::Utc>,
@@ -512,11 +529,7 @@ impl SessionSummary {
 }
 
 pub(crate) fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
-    dst.input_tokens += src.input_tokens;
-    dst.cached_input_tokens += src.cached_input_tokens;
-    dst.output_tokens += src.output_tokens;
-    dst.reasoning_output_tokens += src.reasoning_output_tokens;
-    dst.total_tokens += src.total_tokens;
+    *dst += src;
 }
 
 /// Groups history deltas by (model, tier), skipping events that had no model

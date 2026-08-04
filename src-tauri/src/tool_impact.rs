@@ -119,11 +119,7 @@ impl CohortAccumulator {
 }
 
 fn add_tokens(target: &mut TokenTotals, value: &TokenTotals) {
-    target.input_tokens += value.input_tokens;
-    target.cached_input_tokens += value.cached_input_tokens;
-    target.output_tokens += value.output_tokens;
-    target.reasoning_output_tokens += value.reasoning_output_tokens;
-    target.total_tokens += value.total_tokens;
+    *target += value;
 }
 
 fn turn_overlaps(

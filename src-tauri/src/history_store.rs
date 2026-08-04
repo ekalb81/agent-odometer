@@ -535,14 +535,7 @@ impl HistoryStore {
 /// (on Windows) casing. Persist the normalized location key so an observe and
 /// a later remove always address the same durable record.
 fn source_path_key(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
-    let normalized = value.replace('\\', "/");
-    if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    }
+    crate::paths::normalized_path_key(path, false)
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
@@ -1871,11 +1864,7 @@ mod tests {
             total_tokens: session.tokens_total.total_tokens + delta.total_tokens,
             delta: delta.clone(),
         };
-        session.tokens_total.input_tokens += delta.input_tokens;
-        session.tokens_total.cached_input_tokens += delta.cached_input_tokens;
-        session.tokens_total.output_tokens += delta.output_tokens;
-        session.tokens_total.reasoning_output_tokens += delta.reasoning_output_tokens;
-        session.tokens_total.total_tokens += delta.total_tokens;
+        session.tokens_total += &delta;
         session.last_event_at = point.timestamp;
         session.tokens_history.push(point);
     }
