@@ -1,14 +1,23 @@
 name: CI
 
-# Runs the fast validation path on every PR and on pushes to main. Verifies that:
+# Runs the full validation path on every PR and on pushes to main. Verifies that:
 #   - the frontend type-checks (svelte-check)
 #   - the frontend unit and component tests pass (Vitest)
 #   - the frontend builds (vite build)
 #   - the Rust crate is formatted and passes strict Clippy
 #   - all Rust tests pass (cargo test)
-# Main pushes and manual runs also verify the declared MSRV and measure Rust
-# test coverage. Coverage uploads to Codecov using GitHub OIDC and are only
-# functional while the repository is public.
+#   - the crate builds under the declared MSRV
+#   - Rust test coverage is measured
+# MSRV and Coverage run on pull requests too, not just main pushes, so a PR
+# cannot go green on a config that then turns main red once merged. Measured
+# job durations (see PR description) show both run comfortably inside the
+# wall-clock time the "Check + test" job already takes, since all jobs run
+# concurrently and reuse the same swatinem/rust-cache keys. Coverage uploads
+# to Codecov using GitHub OIDC and are only functional while the repository
+# is public; the upload step is intentionally non-blocking (continue-on-error,
+# fail_ci_if_error: false) so an authentication failure — e.g. from a fork PR
+# without OIDC access — never fails the job. The coverage *measurement*
+# (cargo llvm-cov) still gates.
 #
 # Runs on Linux only — these checks are platform-independent and Linux is
 # the fastest GitHub-hosted runner. The release workflow handles the
@@ -181,10 +190,11 @@ jobs:
 
   msrv:
     name: Minimum supported Rust
-    # PRs already exercise the same source with stable Rust. Keep the slower
-    # compatibility build on main and explicit runs, where it still catches
-    # accidental MSRV drift without charging every intermediate PR commit.
-    if: github.event_name != 'pull_request'
+    # Runs on pull requests too: a PR that only exercises stable Rust can
+    # still merge an MSRV-breaking change, which then fails on the next
+    # push to main. Measured at ~50-56s on recent pushes, well under the
+    # "Check + test" job it runs alongside, so it does not lengthen PR
+    # wall-clock time.
     runs-on: ubuntu-22.04
     timeout-minutes: 15
 
@@ -244,9 +254,12 @@ jobs:
 
   coverage:
     name: Coverage
-    # Coverage is informational (the upload is intentionally non-blocking), so
-    # publish it once changes land rather than rebuilding every PR revision.
-    if: github.event_name != 'pull_request'
+    # Runs on pull requests too, so a coverage regression is visible before
+    # merge rather than only after. The Codecov *upload* stays informational
+    # (continue-on-error, fail_ci_if_error: false below) since it depends on
+    # GitHub OIDC and only authenticates while the repo is public — a PR
+    # context where that fails must not fail this job. Measured at ~2m16s-2m22s
+    # on recent pushes, under the "Check + test" job it runs alongside.
     runs-on: ubuntu-22.04
     timeout-minutes: 15
 

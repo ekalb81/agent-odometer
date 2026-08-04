@@ -280,9 +280,41 @@ mod tests {
         }
     }
 
+    /// Path to a permanently empty config file, used to blank out
+    /// `GIT_CONFIG_GLOBAL` for every git invocation these tests make.
+    ///
+    /// These tests must not inherit the host's git configuration. A
+    /// developer's global `~/.gitconfig` can set `commit.gpgsign = true`
+    /// (this repo's own maintainer signs commits via a 1Password SSH
+    /// agent), and a non-interactive signer refuses to sign, so `git
+    /// commit` fails — even though the test has nothing to do with
+    /// signing. The same leak path applies to `core.hooksPath`,
+    /// `commit.template`, `gpg.format`, and any other global setting.
+    ///
+    /// Rather than chase each interfering key individually, every `git()`
+    /// call below points `GIT_CONFIG_GLOBAL` at this empty file and sets
+    /// `GIT_CONFIG_NOSYSTEM=1`, so the only configuration a test repo ever
+    /// sees is what these helpers write into its own `.git/config`. The
+    /// explicit `commit.gpgsign`/`tag.gpgsign` overrides in `repository()`
+    /// are kept too, as defense in depth in case a future helper runs git
+    /// against a repo without going through this `git()` function.
+    fn empty_global_config() -> &'static Path {
+        static PATH: std::sync::OnceLock<tempfile::TempPath> = std::sync::OnceLock::new();
+        let path: &'static tempfile::TempPath = PATH.get_or_init(|| {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            file.into_temp_path()
+        });
+        path.as_ref()
+    }
+
     fn git(repo: &Path, args: &[&str], timestamp: Option<&str>) -> String {
         let mut command = Command::new("git");
-        command.arg("-C").arg(repo).args(args);
+        command
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", empty_global_config())
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         if let Some(timestamp) = timestamp {
             command
                 .env("GIT_AUTHOR_DATE", timestamp)
@@ -320,6 +352,15 @@ mod tests {
             &["config", "user.email", "synthetic@example.invalid"],
             None,
         );
+        // Belt-and-suspenders: even with the global/system config blanked
+        // out above, pin signing off explicitly so this repo's behavior
+        // does not depend on git's compiled-in defaults either.
+        git(
+            directory.path(),
+            &["config", "commit.gpgsign", "false"],
+            None,
+        );
+        git(directory.path(), &["config", "tag.gpgsign", "false"], None);
         directory
     }
 
