@@ -22,10 +22,6 @@ export function configurePerformanceTracking(value: boolean): void {
   if (!enabled) pending.length = 0;
 }
 
-export function performanceTrackingEnabled(): boolean {
-  return enabled;
-}
-
 export async function measureAsync<T>(
   operation: string,
   task: () => Promise<T>,

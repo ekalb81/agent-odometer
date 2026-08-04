@@ -43,10 +43,6 @@ export function selectVisualScenario(search: string): VisualScenarioSelection {
   };
 }
 
-export function isDefenderVisualScenario(scenario: VisualScenario | undefined): boolean {
-  return scenario === 'defender-slow' || scenario === 'defender-error';
-}
-
 export function isUpdaterVisualScenario(scenario: VisualScenario): boolean {
   return scenario === 'updater-available' || scenario === 'updater-installing' || scenario === 'updater-error';
 }

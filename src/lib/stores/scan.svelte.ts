@@ -2,7 +2,13 @@ import type { ScanStatus } from '../types';
 
 /** Bulk-scan progress shared between App (which feeds it) and the views. */
 function createScanStore() {
-  let status = $state<ScanStatus>({ done: 0, total: 0, complete: false, elapsed_ms: null });
+  let status = $state<ScanStatus>({
+    done: 0,
+    total: 0,
+    complete: false,
+    elapsed_ms: null,
+    cold_reason: null,
+  });
 
   return {
     get status() {

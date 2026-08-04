@@ -19,6 +19,7 @@
     "sessions-true-empty",
     "sessions-scanning",
     "sessions-subagents-collapsed",
+    "sessions-subagent-drilldown",
     "sessions-availability-fallback",
     "session-narrow-detail-overlay",
     "instructions-preview",

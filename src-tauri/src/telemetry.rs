@@ -243,6 +243,50 @@ pub fn observe_result(
     }
 }
 
+/// Increments the 11 additive `ToolMetrics` counters for one observation.
+/// Shared with the durable-ledger rollup read path (`history_store.rs`,
+/// #107): both a live accumulation over in-memory observations and a
+/// reconstruction from pooled sub-hour edge events must count a call
+/// identically, or the two paths would silently diverge.
+pub(crate) fn accumulate_observation(counters: &mut ToolMetrics, item: &ToolObservation) {
+    counters.calls += 1;
+    counters.output_bytes += item.output_bytes;
+    counters.duration_ms += item.duration_ms.unwrap_or(0);
+    match item.kind {
+        ToolKind::Read => counters.reads += 1,
+        ToolKind::Search => counters.searches += 1,
+        ToolKind::Mutation => counters.mutations += 1,
+        ToolKind::Command => counters.commands += 1,
+        ToolKind::Other => counters.other += 1,
+    }
+    match item.outcome {
+        ToolOutcome::Success => counters.successes += 1,
+        ToolOutcome::Failure => counters.failures += 1,
+        ToolOutcome::Pending | ToolOutcome::Unknown => counters.unknown += 1,
+    }
+}
+
+/// Derives the three non-additive `ToolMetrics` fields — `mutation_targets`,
+/// `one_shot_mutations`, `retry_count` — from mutation-chain event counts
+/// keyed by `(turn_id, target)`. This is the one formula both the in-memory
+/// accumulator below and the durable-ledger rollup reconstruction
+/// (`history_store.rs::compute_range_totals`, #107) use, so a chain that
+/// straddles a rollup bucket or day boundary is still counted exactly once
+/// rather than approximated by summing per-bucket derived fields.
+pub fn mutation_chain_fields(counts: impl Iterator<Item = u64>) -> (u64, u64, u64) {
+    let mut mutation_targets = 0u64;
+    let mut one_shot_mutations = 0u64;
+    let mut retry_count = 0u64;
+    for count in counts {
+        mutation_targets += 1;
+        if count == 1 {
+            one_shot_mutations += 1;
+        }
+        retry_count += count.saturating_sub(1);
+    }
+    (mutation_targets, one_shot_mutations, retry_count)
+}
+
 #[derive(Default)]
 struct MetricsAccumulator<'a> {
     out: ToolMetrics,
@@ -251,38 +295,21 @@ struct MetricsAccumulator<'a> {
 
 impl<'a> MetricsAccumulator<'a> {
     fn push(&mut self, item: &'a ToolObservation) {
-        self.out.calls += 1;
-        self.out.output_bytes += item.output_bytes;
-        self.out.duration_ms += item.duration_ms.unwrap_or(0);
-        match item.kind {
-            ToolKind::Read => self.out.reads += 1,
-            ToolKind::Search => self.out.searches += 1,
-            ToolKind::Mutation => {
-                self.out.mutations += 1;
-                *self
-                    .mutations
-                    .entry((item.turn_id.as_deref(), item.target.as_deref()))
-                    .or_default() += 1;
-            }
-            ToolKind::Command => self.out.commands += 1,
-            ToolKind::Other => self.out.other += 1,
-        }
-        match item.outcome {
-            ToolOutcome::Success => self.out.successes += 1,
-            ToolOutcome::Failure => self.out.failures += 1,
-            ToolOutcome::Pending | ToolOutcome::Unknown => self.out.unknown += 1,
+        accumulate_observation(&mut self.out, item);
+        if item.kind == ToolKind::Mutation {
+            *self
+                .mutations
+                .entry((item.turn_id.as_deref(), item.target.as_deref()))
+                .or_default() += 1;
         }
     }
 
     fn finish(mut self) -> ToolMetrics {
-        self.out.mutation_targets = self.mutations.len() as u64;
-        self.out.one_shot_mutations =
-            self.mutations.values().filter(|count| **count == 1).count() as u64;
-        self.out.retry_count = self
-            .mutations
-            .values()
-            .map(|count| count.saturating_sub(1))
-            .sum();
+        let (mutation_targets, one_shot_mutations, retry_count) =
+            mutation_chain_fields(self.mutations.values().copied());
+        self.out.mutation_targets = mutation_targets;
+        self.out.one_shot_mutations = one_shot_mutations;
+        self.out.retry_count = retry_count;
         self.out
     }
 }
@@ -597,11 +624,7 @@ pub fn category_totals(turns: &[crate::model::TurnInfo]) -> BTreeMap<TaskCategor
         let category = turn.classification.category;
         let entry: &mut CategoryMetric = out.entry(category).or_default();
         entry.turns += 1;
-        entry.tokens.input_tokens += turn.tokens.input_tokens;
-        entry.tokens.cached_input_tokens += turn.tokens.cached_input_tokens;
-        entry.tokens.output_tokens += turn.tokens.output_tokens;
-        entry.tokens.reasoning_output_tokens += turn.tokens.reasoning_output_tokens;
-        entry.tokens.total_tokens += turn.tokens.total_tokens;
+        entry.tokens += &turn.tokens;
         entry.tool_calls += turn.tool_metrics.calls;
         if let Some(model) = &turn.model {
             let bucket = entry
@@ -610,11 +633,7 @@ pub fn category_totals(turns: &[crate::model::TurnInfo]) -> BTreeMap<TaskCategor
                 .find(|bucket| bucket.model == *model && bucket.service_tier == turn.service_tier);
             match bucket {
                 Some(bucket) => {
-                    bucket.tokens.input_tokens += turn.tokens.input_tokens;
-                    bucket.tokens.cached_input_tokens += turn.tokens.cached_input_tokens;
-                    bucket.tokens.output_tokens += turn.tokens.output_tokens;
-                    bucket.tokens.reasoning_output_tokens += turn.tokens.reasoning_output_tokens;
-                    bucket.tokens.total_tokens += turn.tokens.total_tokens;
+                    bucket.tokens += &turn.tokens;
                 }
                 None => entry.buckets.push(crate::model::TierBucket {
                     model: model.clone(),
@@ -673,6 +692,7 @@ pub fn refresh_session(session: &mut crate::model::Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::codex_provider_id;
 
     #[test]
     fn target_identity_is_stable_and_does_not_retain_arguments() {
@@ -701,7 +721,7 @@ mod tests {
         let make = |id: &str, target: &str| ToolObservation {
             call_id: id.into(),
             turn_id: Some("t".into()),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             model: Some("m".into()),
             timestamp: ts,
             kind: ToolKind::Mutation,
@@ -728,7 +748,7 @@ mod tests {
             .map(|i| ToolObservation {
                 call_id: i.to_string(),
                 turn_id: Some("t".into()),
-                harness: Harness::Codex,
+                harness: codex_provider_id(),
                 model: None,
                 timestamp: ts,
                 kind: ToolKind::Read,
@@ -809,7 +829,7 @@ mod tests {
         ToolObservation {
             call_id: id.to_string(),
             turn_id: Some("t".into()),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             model: Some("m".into()),
             timestamp: DateTime::from_timestamp(id as i64, 0).unwrap(),
             kind,

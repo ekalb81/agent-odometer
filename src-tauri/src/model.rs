@@ -2,18 +2,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-/// Which agent harness produced a session's transcript. Serialized as
-/// snake_case strings; defaults to Codex so previously-serialized sessions
-/// and frontends without the field keep working.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Harness {
-    #[default]
-    Codex,
-    ClaudeCode,
-}
+use crate::provider::{claude_code_provider_id, codex_provider_id, ProviderId};
+
+/// Open provider identity for a session's transcript. The name `Harness` is
+/// retained crate-wide during the migration off the closed two-variant enum;
+/// the wire form is unchanged (bare snake_case strings such as "codex" and
+/// "claude_code"), and sessions persisted without the field still default to
+/// codex via the serde defaults on the structs below.
+pub type Harness = ProviderId;
 
 /// Whether Odometer can currently read the transcript that supplied this
 /// session. Durable storage retains the parsed session even after a source is
@@ -28,10 +24,14 @@ pub enum SourceAvailability {
 
 /// Stable identity for a provider session. Unlike `Session::id`, this is
 /// namespaced by harness and is safe to use as a durable storage key.
-pub fn storage_id_for_session(harness: Harness, provider_session_id: &str) -> String {
-    match harness {
-        Harness::Codex => format!("codex:thread:{provider_session_id}"),
-        Harness::ClaudeCode => format!("claude_code:session:{provider_session_id}"),
+pub fn storage_id_for_session(provider: &ProviderId, provider_session_id: &str) -> String {
+    // Codex threads keep their historical "thread" segment; every other
+    // provider (including claude_code) uses the generic "session" segment,
+    // which preserves all previously persisted storage ids byte-for-byte.
+    if *provider == codex_provider_id() {
+        format!("codex:thread:{provider_session_id}")
+    } else {
+        format!("{provider}:session:{provider_session_id}")
     }
 }
 
@@ -76,10 +76,11 @@ pub enum ToolOutcome {
     Unknown,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolObservation {
     pub call_id: String,
     pub turn_id: Option<String>,
+    #[serde(default = "crate::provider::codex_provider_id")]
     pub harness: Harness,
     pub model: Option<String>,
     pub timestamp: DateTime<Utc>,
@@ -234,9 +235,34 @@ impl OptimizationSummary {
 pub struct TokenTotals {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Anthropic cache-creation ("cache write") tokens. A subset of
+    /// `input_tokens`, disjoint from `cached_input_tokens` (cache reads).
+    /// Always 0 for Codex, whose provider does not report this dimension.
+    /// Defaulted for backward compatibility with durable/cached data written
+    /// before this field existed.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
+}
+
+/// Field-wise accumulation, defined once.
+///
+/// This fold was previously written out per module — a new field had to be
+/// added to every copy, and any copy that was missed would have silently
+/// under-counted on whichever surface used it. For a tool whose entire output
+/// is token accounting, that is the wrong failure mode, so the operation lives
+/// with the type.
+impl std::ops::AddAssign<&TokenTotals> for TokenTotals {
+    fn add_assign(&mut self, other: &TokenTotals) {
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_output_tokens += other.reasoning_output_tokens;
+        self.total_tokens += other.total_tokens;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -324,7 +350,7 @@ pub struct Session {
     /// path, allowing a transcript to move or temporarily disappear.
     #[serde(default)]
     pub storage_id: String,
-    #[serde(default)]
+    #[serde(default = "crate::provider::codex_provider_id")]
     pub harness: Harness,
     pub thread_name: Option<String>,
     pub forked_from_id: Option<String>,
@@ -384,6 +410,18 @@ pub struct Session {
     pub category_totals: BTreeMap<TaskCategory, CategoryMetric>,
     #[serde(default)]
     pub optimization_findings: Vec<OptimizationFinding>,
+    /// Stable project-identity key resolved from `working_directory` (#41).
+    /// `None` when the session has no working directory to resolve from.
+    /// This is the auto-computed identity; user aliases/merges/splits are a
+    /// separate overlay applied at read time and never mutate this field.
+    #[serde(default)]
+    pub project_key: Option<String>,
+    /// Local display label for `project_key`. Never redacted here — see
+    /// `crate::project_identity` for the redaction/aggregate-export contract.
+    #[serde(default)]
+    pub project_label: Option<String>,
+    #[serde(default)]
+    pub project_provenance: Option<crate::project_identity::ProjectProvenance>,
 }
 
 /// Token usage grouped by (model, service_tier). Credit math is linear per
@@ -467,6 +505,12 @@ pub struct SessionSummary {
     pub optimization_findings_count: u64,
     #[serde(default)]
     pub optimization_summary: OptimizationSummary,
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub project_label: Option<String>,
+    #[serde(default)]
+    pub project_provenance: Option<crate::project_identity::ProjectProvenance>,
 }
 
 impl SessionSummary {
@@ -475,7 +519,7 @@ impl SessionSummary {
         Self {
             id: s.id.clone(),
             storage_id: s.effective_storage_id(),
-            harness: s.harness,
+            harness: s.harness.clone(),
             thread_name: s.thread_name.clone(),
             forked_from_id: s.forked_from_id.clone(),
             parent_thread_id: s.parent_thread_id.clone(),
@@ -506,16 +550,15 @@ impl SessionSummary {
             category_totals: s.category_totals.clone(),
             optimization_findings_count: s.optimization_findings.len() as u64,
             optimization_summary,
+            project_key: s.project_key.clone(),
+            project_label: s.project_label.clone(),
+            project_provenance: s.project_provenance,
         }
     }
 }
 
-fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
-    dst.input_tokens += src.input_tokens;
-    dst.cached_input_tokens += src.cached_input_tokens;
-    dst.output_tokens += src.output_tokens;
-    dst.reasoning_output_tokens += src.reasoning_output_tokens;
-    dst.total_tokens += src.total_tokens;
+pub(crate) fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
+    *dst += src;
 }
 
 /// Groups history deltas by (model, tier), skipping events that had no model
@@ -550,13 +593,13 @@ impl Session {
             return self.storage_id.clone();
         }
 
-        if self.harness == Harness::ClaudeCode && self.source.as_deref() == Some("subagent") {
+        if self.harness == claude_code_provider_id() && self.source.as_deref() == Some("subagent") {
             if let Some(parent_session_id) = self.parent_thread_id.as_deref() {
                 return storage_id_for_claude_subagent(parent_session_id, &self.id);
             }
         }
 
-        storage_id_for_session(self.harness, &self.id)
+        storage_id_for_session(&self.harness, &self.id)
     }
 
     /// All-time (model, tier) usage buckets. Derived from history when
@@ -628,12 +671,14 @@ impl Session {
             };
             if history_sorted {
                 let start = from.as_ref().map_or(0, |from| {
-                    self.tokens_history
-                        .partition_point(|event| event.timestamp < *from)
+                    self.tokens_history.partition_point(|event| {
+                        event.timestamp.timestamp_millis() < from.timestamp_millis()
+                    })
                 });
                 let end = to.as_ref().map_or(self.tokens_history.len(), |to| {
-                    self.tokens_history
-                        .partition_point(|event| event.timestamp <= *to)
+                    self.tokens_history.partition_point(|event| {
+                        event.timestamp.timestamp_millis() <= to.timestamp_millis()
+                    })
                 });
                 for event in &self.tokens_history[start.min(end)..end] {
                     add_event(event);
@@ -641,8 +686,13 @@ impl Session {
             } else {
                 for event in &self.tokens_history {
                     if (from.is_none()
-                        || from.as_ref().is_some_and(|start| event.timestamp >= *start))
-                        && (to.is_none() || to.as_ref().is_some_and(|end| event.timestamp <= *end))
+                        || from.as_ref().is_some_and(|start| {
+                            event.timestamp.timestamp_millis() >= start.timestamp_millis()
+                        }))
+                        && (to.is_none()
+                            || to.as_ref().is_some_and(|end| {
+                                event.timestamp.timestamp_millis() <= end.timestamp_millis()
+                            }))
                     {
                         add_event(event);
                     }
@@ -651,12 +701,14 @@ impl Session {
 
             let (tool_metrics, tool_metrics_by_model) = if observations_sorted {
                 let start = from.as_ref().map_or(0, |from| {
-                    self.tool_observations
-                        .partition_point(|item| item.timestamp < *from)
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() < from.timestamp_millis()
+                    })
                 });
                 let end = to.as_ref().map_or(self.tool_observations.len(), |to| {
-                    self.tool_observations
-                        .partition_point(|item| item.timestamp <= *to)
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() <= to.timestamp_millis()
+                    })
                 });
                 let selected = &self.tool_observations[start.min(end)..end];
                 crate::telemetry::metrics_with_models(selected.iter())
@@ -664,9 +716,13 @@ impl Session {
                 crate::telemetry::metrics_with_models(self.tool_observations.iter().filter(
                     |item| {
                         (from.is_none()
-                            || from.as_ref().is_some_and(|start| item.timestamp >= *start))
+                            || from.as_ref().is_some_and(|start| {
+                                item.timestamp.timestamp_millis() >= start.timestamp_millis()
+                            }))
                             && (to.is_none()
-                                || to.as_ref().is_some_and(|end| item.timestamp <= *end))
+                                || to.as_ref().is_some_and(|end| {
+                                    item.timestamp.timestamp_millis() <= end.timestamp_millis()
+                                }))
                     },
                 ))
             };
@@ -675,8 +731,10 @@ impl Session {
                 .iter()
                 .filter(|finding| match finding.timestamp {
                     Some(timestamp) => {
-                        from.is_none_or(|from| timestamp >= from)
-                            && to.is_none_or(|to| timestamp <= to)
+                        from.is_none_or(|from| {
+                            timestamp.timestamp_millis() >= from.timestamp_millis()
+                        }) && to
+                            .is_none_or(|to| timestamp.timestamp_millis() <= to.timestamp_millis())
                     }
                     None => from.is_none() && to.is_none(),
                 })
@@ -710,6 +768,7 @@ mod tests {
         TokenTotals {
             input_tokens: n,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             output_tokens: n / 2,
             reasoning_output_tokens: 0,
             total_tokens: n + n / 2,
@@ -730,8 +789,8 @@ mod tests {
     fn session_with_history(history: Vec<TokenHistoryPoint>) -> Session {
         Session {
             id: "s".into(),
-            storage_id: storage_id_for_session(Harness::Codex, "s"),
-            harness: Harness::Codex,
+            storage_id: storage_id_for_session(&codex_provider_id(), "s"),
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -769,6 +828,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -886,7 +948,7 @@ mod tests {
             .map(|second| ToolObservation {
                 call_id: second.to_string(),
                 turn_id: Some("turn".into()),
-                harness: Harness::Codex,
+                harness: codex_provider_id(),
                 model: Some("m".into()),
                 timestamp: format!("2026-01-01T00:00:0{second}Z").parse().unwrap(),
                 kind: ToolKind::Read,

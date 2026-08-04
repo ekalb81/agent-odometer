@@ -2,7 +2,9 @@ use crate::config_events::ConfigWatcherHandle;
 use crate::correlation::ExternalEvent;
 use crate::history_store::HistoryStore;
 use crate::model::{Session, SourceAvailability};
+use crate::scanner::ScanReport;
 use crate::watcher::WatcherHandle;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -10,6 +12,16 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 
 const MAX_EXTERNAL_EVENTS: usize = 10_000;
+
+/// The most recently completed bulk/incremental scan's per-provider counters,
+/// retained for the provider diagnostics report (issue #39). This is a plain
+/// cache of the last `ScanReport`; it is never a source of truth and is
+/// overwritten by the next scan.
+#[derive(Debug, Clone)]
+pub struct ScanSummary {
+    pub completed_at: DateTime<Utc>,
+    pub report: ScanReport,
+}
 
 #[derive(Debug)]
 struct PathSessionState {
@@ -82,6 +94,10 @@ pub struct AppState {
     pub scan_total: AtomicUsize,
     /// Duration of the last completed scan in ms (0 = none yet).
     pub scan_elapsed_ms: AtomicU64,
+    /// Why the current/last scan's cache could not be treated as fully warm;
+    /// None for an ordinary warm scan. Set once the cache is opened, before
+    /// the scan's progress events start firing.
+    pub cold_reason: Mutex<Option<crate::scan_cache::ColdReason>>,
     /// Identifies the configuration generation allowed to publish scan work.
     pub scan_generation: AtomicU64,
     /// Identifies the instruction-inventory scan allowed to publish results.
@@ -92,10 +108,19 @@ pub struct AppState {
     pub config_watcher: Mutex<Option<ConfigWatcherHandle>>,
     instruction_paths: Mutex<HashSet<String>>,
     session_paths: DashMap<String, PathSessionState>,
+    /// Storage ids whose most recent history-store persist failed: their
+    /// ledger rows may be stale or absent, so ledger-backed aggregation must
+    /// compute exactly these sessions from in-memory history instead.
+    /// Cleared per id on the next successful persist.
+    ledger_stale: DashMap<String, ()>,
     pub external_events: Mutex<ExternalEventStore>,
     pub performance: crate::performance::PerformanceRecorder,
     pub tray: Mutex<Option<crate::tray::TrayState>>,
     pub tray_available: AtomicBool,
+    /// Per-provider counters from the most recently completed scan, read by
+    /// the on-demand provider diagnostics report. Never populated eagerly
+    /// beyond the scan that already runs at startup/config-save.
+    last_scan_report: Mutex<Option<ScanSummary>>,
 }
 
 impl AppState {
@@ -115,6 +140,7 @@ impl AppState {
             scan_done: AtomicUsize::new(0),
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
+            cold_reason: Mutex::new(None),
             // Startup watcher events and the initial bulk scan share generation 1.
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
@@ -123,12 +149,14 @@ impl AppState {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            ledger_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(
                 crate::config_events::load_events(),
             )),
             performance: crate::performance::PerformanceRecorder::default(),
             tray: Mutex::new(None),
             tray_available: AtomicBool::new(false),
+            last_scan_report: Mutex::new(None),
         };
         state.hydrate_history();
         state
@@ -268,6 +296,7 @@ impl AppState {
         };
         match history.observe_with_displaced(path, &session, generation) {
             Ok((stored, displaced)) => {
+                self.ledger_stale.remove(&stored.key);
                 let displaced = displaced.map(|stored| {
                     self.sessions
                         .insert(stored.key, Arc::new(stored.session.clone()));
@@ -284,12 +313,19 @@ impl AppState {
                     path,
                     error
                 );
+                self.ledger_stale.insert(session.effective_storage_id(), ());
                 ReconciledSession {
                     session,
                     displaced: None,
                 }
             }
         }
+    }
+
+    /// True when this session's ledger rows cannot be trusted for
+    /// aggregation because its latest persist failed.
+    pub fn ledger_is_stale(&self, storage_id: &str) -> bool {
+        self.ledger_stale.contains_key(storage_id)
     }
 
     /// Completes an error-free current scan and rehydrates the archive so
@@ -319,6 +355,19 @@ impl AppState {
                 return Vec::new();
             }
         };
+        // Dirty markings survive restarts in the store itself; rebuild the
+        // in-process stale set so ledger-backed aggregation keeps routing
+        // these sessions through in-memory history.
+        match history.dirty_session_keys() {
+            Ok(keys) => {
+                for key in keys {
+                    self.ledger_stale.insert(key, ());
+                }
+            }
+            Err(error) => {
+                tracing::warn!("could not load ledger-dirty markings: {}", error);
+            }
+        }
         let mut changed = Vec::new();
         for stored in stored {
             let session = stored.session;
@@ -524,17 +573,24 @@ impl AppState {
     pub fn extend_external_events(&self, events: impl IntoIterator<Item = ExternalEvent>) {
         self.external_events.lock().unwrap().extend(events);
     }
+
+    /// Records the most recently completed scan's counters for the provider
+    /// diagnostics report. Overwrites any previous summary.
+    pub fn record_scan_report(&self, report: ScanReport) {
+        *self.last_scan_report.lock().unwrap() = Some(ScanSummary {
+            completed_at: Utc::now(),
+            report,
+        });
+    }
+
+    /// The last completed scan's counters, if any scan has finished yet.
+    pub fn last_scan_summary(&self) -> Option<ScanSummary> {
+        self.last_scan_report.lock().unwrap().clone()
+    }
 }
 
 fn path_key(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
-    let normalized = value.replace('\\', "/");
-    if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    }
+    crate::paths::normalized_path_key(path, false)
 }
 
 impl Default for AppState {
@@ -550,7 +606,8 @@ impl Default for AppState {
 #[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
-    use crate::model::{Harness, TokenTotals};
+    use crate::model::TokenTotals;
+    use crate::provider::codex_provider_id;
     use chrono::Utc;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -564,6 +621,7 @@ mod tests {
             scan_done: AtomicUsize::new(0),
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
+            cold_reason: Mutex::new(None),
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),
@@ -571,10 +629,12 @@ mod tests {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            ledger_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(Vec::new())),
             performance: crate::performance::PerformanceRecorder::default(),
             tray: Mutex::new(None),
             tray_available: AtomicBool::new(false),
+            last_scan_report: Mutex::new(None),
         }
     }
 
@@ -582,7 +642,7 @@ mod tests {
         Session {
             id: id.into(),
             storage_id: format!("codex:thread:{id}"),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -620,6 +680,9 @@ mod tests {
             tool_metrics_by_model: Default::default(),
             category_totals: Default::default(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 

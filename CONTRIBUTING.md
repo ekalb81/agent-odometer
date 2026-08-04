@@ -15,7 +15,7 @@ npm ci
 npm run tauri dev
 ```
 
-Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before touching the parsers or wire types — it documents the contracts and accounting invariants that are easy to break silently. [AGENTS.md](AGENTS.md) is the working agreement for changes (it's written for AI coding agents, but everything in it applies to humans too).
+Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) before touching the parsers or wire types — it documents the contracts and accounting invariants that are easy to break silently. [docs/ENGINEERING_GUIDELINES.md](docs/ENGINEERING_GUIDELINES.md) collects the broader engineering, privacy, performance, UI, validation, and release practices. [AGENTS.md](AGENTS.md) is the working agreement for changes (it's written for AI coding agents, but everything in it applies to humans too).
 
 ## Before opening a PR
 

@@ -64,12 +64,32 @@ Turn receipts are disabled by default. To enable them, open **Settings → Turn 
 Codex and/or Claude Code, and choose **Save setup**. Odometer adds one identifiable `Stop` hook to
 the selected user-level harness configuration while preserving unrelated settings and hooks.
 
+- For Codex, Odometer keeps an existing Odometer hook in its current source. For a new setup it
+  uses the `[[hooks.Stop]]` representation in `config.toml` when those inline hooks already exist;
+  otherwise it uses `hooks.json`. Repair removes duplicate Odometer-owned handlers instead of
+  leaving both representations active. Symlinked configs and other valid inline-array TOML shapes
+  fail closed with manual setup guidance rather than being replaced or creating a second source.
 - In Codex, open `/hooks` once after setup to inspect and trust the command. New or changed
   non-managed hooks do not run until Codex records that trust.
-- In Claude Code, use `/hooks` to inspect the installed command.
-- Start a new harness task if an existing session does not reload configuration automatically.
-- **Refresh status** shows the exact configuration file, whether the hook is present, its last run,
-  and the last receipt. **Repair setup** reconciles missing or stale Odometer-owned entries.
+- Claude Code user settings cover the CLI and local Desktop Code sessions. Use `/hooks` to inspect
+  the command. Odometer uses Claude's direct executable plus `args` form so paths with spaces do not
+  depend on shell quoting; this requires Claude Code 2.1.139 or later. Remote and SSH sessions use
+  the settings on their host and must be configured there.
+- A running AppImage records its absolute AppImage launcher only when the process is actually inside
+  the matching mounted `APPDIR`; other launches use the current executable path.
+- Start a fresh harness task when status recommends it; an existing session may not reload changed
+  configuration automatically.
+- **Refresh status** distinguishes a configured hook from a receipt observed after that user-level
+  configuration was written, and shows its source, last run, and last receipt. Managed or
+  project-level policy can subsequently block a user hook without changing that historical
+  observation. **Repair setup** reconciles missing, stale, or duplicate Odometer-owned entries.
+
+Setup rechecks each source immediately before a platform-atomic replacement. An edit visible at the
+configured path before replacement aborts setup. The prior file stays in a random recovery path
+until the settings transaction commits. Commit atomically detaches that recovery name before its
+final check; an already-open-handle edit visible in that check is preserved and reported. Writes
+racing the final verification or arriving afterward follow normal operating-system open-handle
+semantics.
 
 The helper receives the harness-provided transcript path, verifies that it is a JSONL file inside
 Odometer's configured roots, and parses that exact file. It exits successfully on every error and
@@ -170,7 +190,7 @@ git push origin vX.Y.Z                        # triggers the cross-platform buil
 
 All three version fields (`package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`) must already equal `X.Y.Z`; the release workflow rejects a mismatched `vX.Y.Z` tag before any platform builds start. The tagged commit must also have a successful CI run. `git tag -s` creates an annotated, cryptographically signed Git tag; this Git signature is separate from the updater artifact signature.
 
-The workflow creates or validates one mutable draft release during preflight, pins every platform build to its exact release ID, and uploads sequentially so `latest.json` updates cannot race or split across drafts. A final job validates the manifest's Tauri field types, release notes, complete signed platform map, asset names, sizes, SHA-256 digests, release ownership, tag, and exact commit. Do not create or publish the GitHub release manually before the workflow finishes: a published release is immutable and cannot accept corrected assets. Publish only after every release job succeeds. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets. The in-app updater follows the latest published release. OS code signing/notarization is not configured yet. A manual Actions run is build-only: it validates the three internal versions and bundles every platform, but never creates a tag or GitHub release.
+The workflow creates or validates one mutable draft release during preflight, then builds and signs macOS, Linux, and Windows bundles in parallel without allowing matrix jobs to write the GitHub release or `latest.json`. After all platform builds succeed, one publisher downloads the one-day workflow artifacts, validates and uploads the exact signed asset set, and assembles and uploads a single complete `latest.json`. A final job downloads the draft manifest and validates its Tauri field types, release notes, complete signed platform map, asset names, sizes, SHA-256 digests, release ownership, tag, and exact commit. Do not create or publish the GitHub release manually before the workflow finishes: a published release is immutable and cannot accept corrected assets. Publish only after every release job succeeds. Updater packages are minisign-signed — the workflow needs the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets. The in-app updater follows the latest published release. OS code signing/notarization is not configured yet. A manual Actions run is build-only: it validates the three internal versions and bundles every platform, but never creates a tag or GitHub release.
 
 ## Contributing
 

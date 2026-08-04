@@ -7,9 +7,46 @@ use std::path::PathBuf;
 pub struct ModelRate {
     pub input: f64,
     pub cached_input: f64,
+    /// Cache-creation ("cache write") rate — a normalized dimension distinct
+    /// from both `input` and `cached_input`. Historically Claude cache
+    /// writes were folded into `input`, which missed Anthropic's ~1.25x
+    /// write premium.
+    ///
+    /// Deliberately nullable, and the null/absent case is not "free": it
+    /// means the publisher has not stated a cache-write premium for this
+    /// model, and cache-creation tokens must be priced at the ordinary
+    /// `input` rate (exactly today's pre-#42 accounting) rather than at
+    /// zero. `Some(0.0)` is a real, deliberate "this is free" claim,
+    /// distinct from "unknown". See `cache_creation_rate()` — every pricing
+    /// call site must resolve through it rather than reading this field
+    /// directly, or the absent/free distinction gets silently lost again.
+    /// Absent for rate-card entries written before this field existed;
+    /// `merge_older_override` backfills it from the bundled card for models
+    /// a user has otherwise customized (see there).
+    #[serde(default)]
+    pub cache_creation_input: Option<f64>,
     pub output: f64,
     /// Typically the same as output for reasoning models.
     pub reasoning: f64,
+}
+
+impl ModelRate {
+    /// Resolves the effective cache-creation rate: the published premium
+    /// when stated, otherwise the ordinary `input` rate. Never zero by
+    /// default — see `cache_creation_input`'s docs. Every cache-creation
+    /// pricing call site must go through this rather than reading
+    /// `cache_creation_input` directly.
+    pub fn cache_creation_rate(&self) -> f64 {
+        self.cache_creation_input.unwrap_or(self.input)
+    }
+
+    /// True when `cache_creation_rate()` is falling back to the ordinary
+    /// input rate rather than pricing at a directly published cache-write
+    /// premium. Callers use this to keep a fallback cache-write charge from
+    /// rendering as an authoritative direct price.
+    pub fn cache_creation_rate_is_fallback(&self) -> bool {
+        self.cache_creation_input.is_none()
+    }
 }
 
 /// The billing surface a catalog rule applies to.  A model can carry different
@@ -272,8 +309,240 @@ fn validate_rule_scope(
     Ok(())
 }
 
+/// Provenance recorded for every priced amount, so the UI can render direct,
+/// approximate, and unpriced results as visually and structurally distinct
+/// states rather than collapsing them into one number (issue #42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingBasis {
+    /// The exact requested model id had a rate in the resolved table.
+    Direct,
+    /// The requested model id resolved to a different key via `model_aliases`
+    /// before a rate was found.
+    Aliased,
+    /// Neither the model nor an alias resolved; the harness's (or card's)
+    /// configured fallback model rate was used instead.
+    Fallback,
+    /// A rate was found but is marked as a non-authoritative estimate (not
+    /// produced by this build; reserved for a future estimation source, e.g.
+    /// interpolating an unpublished tier from a published one).
+    Estimated,
+    /// The model is explicitly configured as free or locally hosted — zero
+    /// cost by design, distinct from `Unavailable` (no pricing information
+    /// at all). See `RateCard::free_local_models`.
+    FreeLocal,
+    /// Priced against a user-declared subscription/custom plan rather than a
+    /// metered per-token rate. See `RateCard::subscription_plans`.
+    Subscription,
+    /// A rate was found, but the card's refresh bookkeeping considers it
+    /// older than `RateRefreshState::max_cache_age_secs`.
+    Stale,
+    /// No rate could be resolved for this model by any path, including the
+    /// fallback. Distinct from `unpriced_models`, whose members are known
+    /// models with a confirmed absence of published pricing.
+    Unavailable,
+}
+
+/// The resolved pricing-table key and provenance for one raw model id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PricedModelResolution {
+    /// The table key actually used to find a rate — equal to the requested
+    /// model for `Direct`/`FreeLocal`/`Unavailable`, the alias target for
+    /// `Aliased`, or the configured fallback model for `Fallback`.
+    pub resolved_model: String,
+    pub basis: PricingBasis,
+}
+
+/// Resolves a raw model id through `model_aliases` before any fallback path.
+/// Alias chains may be several hops deep, but a chain can never take more
+/// steps than the table has entries — if it does, a cycle exists. Cycle
+/// detection tracks visited keys and stops instead of looping forever,
+/// returning the last resolved key so the caller can still attempt a plain
+/// lookup (which will typically fail, correctly falling through to
+/// `Fallback`/`Unavailable`).
+fn resolve_alias<'a>(model: &'a str, aliases: &'a HashMap<String, String>) -> (&'a str, bool) {
+    let mut current = model;
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut hopped = false;
+    for _ in 0..=aliases.len() {
+        let Some(next) = aliases.get(current) else {
+            break;
+        };
+        if !seen.insert(current) {
+            break; // Cycle: `current` was already visited this resolution.
+        }
+        current = next.as_str();
+        hopped = true;
+    }
+    (current, hopped)
+}
+
+/// A user-declared subscription or custom plan for one harness. Odometer
+/// records exactly what the user tells it here — it never infers or claims a
+/// plan-equivalent token allowance, because no harness publishes one.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SubscriptionPlan {
+    pub name: String,
+    #[serde(default)]
+    pub monthly_price: Option<f64>,
+    #[serde(default)]
+    pub currency: Option<String>,
+    /// Free-text notes, e.g. plan tier or seat count.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// User-declared estimated monthly savings versus a metered API-equivalent
+    /// cost, from running a local model or a caching proxy instead of paying
+    /// per token. This is a value the user supplies or measures themselves,
+    /// never a figure Odometer derives from token counts.
+    #[serde(default)]
+    pub local_baseline_savings: Option<f64>,
+}
+
+/// A user-supplied display-currency conversion. Odometer performs no FX
+/// fetch: `rate` and `as_of` are exactly what the user entered (or absent).
+/// The original-currency amount and the `RateCard.currency`/harness currency
+/// it was computed in are always retained separately so a converted total
+/// never silently replaces or is combined with money in a different currency
+/// or with harness credits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurrencyConversion {
+    /// ISO 4217 code to convert into, e.g. "EUR".
+    pub target_currency: String,
+    /// Multiply an amount already in the card's original currency by this to
+    /// get `target_currency`.
+    pub rate: f64,
+    pub as_of: DateTime<Utc>,
+    /// Free-text provenance for the rate, e.g. "user-entered" or a cited
+    /// source name. Never a claim that Odometer fetched it.
+    pub source: String,
+}
+
+impl CurrencyConversion {
+    /// Converts one original-currency amount. Returns `None` for a
+    /// non-finite or non-positive rate rather than producing a nonsensical
+    /// total.
+    pub fn convert(&self, amount_in_original_currency: f64) -> Option<f64> {
+        if !self.rate.is_finite() || self.rate <= 0.0 {
+            return None;
+        }
+        Some(amount_in_original_currency * self.rate)
+    }
+}
+
+/// Coarse freshness classification for `RateRefreshState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateFreshness {
+    /// A refresh has succeeded within `max_cache_age_secs`.
+    Fresh,
+    /// The last successful refresh is older than `max_cache_age_secs`.
+    Stale,
+    /// No successful refresh has ever been recorded (e.g. a fresh bundled
+    /// card that has never gone through `apply_refresh_candidate`).
+    Unknown,
+}
+
+fn default_max_cache_age_secs() -> i64 {
+    7 * 24 * 60 * 60 // one week
+}
+
+/// Bounded-cache-age bookkeeping for the price-refresh/rollback flow. This is
+/// local bookkeeping about *when this build last validated a candidate card*,
+/// deliberately separate from `RateCard.fetched_at`, which is
+/// catalog-supplied provenance for the price data itself.
+///
+/// SEAM (deliberately unimplemented in this PR — see the PR description for
+/// #42's scope): nothing in this codebase currently produces a
+/// `RateRefreshState` from a network or updater-channel fetch. `AGENTS.md`
+/// forbids adding outbound network access without an explicit requirement
+/// and a security review, and no such review has happened yet. A future,
+/// reviewed price source would call `apply_refresh_candidate` after fetching
+/// and deserializing a candidate `RateCard`, exactly as the offline test
+/// coverage in this module exercises.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateRefreshState {
+    #[serde(default)]
+    pub last_success_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_attempt_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_failure_reason: Option<String>,
+    /// How long a successful refresh remains authoritative before
+    /// `freshness` reports `Stale`. Purely informational: nothing in this
+    /// build automatically re-fetches when a card goes stale.
+    #[serde(default = "default_max_cache_age_secs")]
+    pub max_cache_age_secs: i64,
+}
+
+impl Default for RateRefreshState {
+    /// A hand-written `Default` (rather than `#[derive(Default)]`) so both
+    /// this and a `refresh` field entirely missing from an older on-disk
+    /// card converge on the same one-week bound instead of the derive's
+    /// `i64::default()` of zero, which would make every dated card look
+    /// immediately stale.
+    fn default() -> Self {
+        Self {
+            last_success_at: None,
+            last_attempt_at: None,
+            last_failure_reason: None,
+            max_cache_age_secs: default_max_cache_age_secs(),
+        }
+    }
+}
+
+impl RateRefreshState {
+    pub fn freshness(&self, now: DateTime<Utc>) -> RateFreshness {
+        match self.last_success_at {
+            None => RateFreshness::Unknown,
+            Some(at) => {
+                let age_secs = now.signed_duration_since(at).num_seconds();
+                if age_secs <= self.max_cache_age_secs {
+                    RateFreshness::Fresh
+                } else {
+                    RateFreshness::Stale
+                }
+            }
+        }
+    }
+}
+
+/// Validates a refresh candidate and fails closed to `previous` (the last
+/// valid or bundled card) on any structural or partial-data problem, rather
+/// than ever partially applying an invalid candidate. See the SEAM note on
+/// `RateRefreshState` for why nothing calls this with a network-fetched
+/// candidate yet — today's only caller is the offline test suite and, when a
+/// reviewed transport exists, that transport.
+pub fn apply_refresh_candidate(
+    previous: &RateCard,
+    candidate: RateCard,
+    now: DateTime<Utc>,
+) -> RateCard {
+    let mut refreshed = candidate;
+    let structurally_valid = refreshed.pricing_catalog.validate().is_ok();
+    // A candidate that "successfully" parses to an empty or truncated price
+    // table is not a valid refresh — it would silently zero out coverage the
+    // previous card had. Refuse it exactly like a validation failure.
+    let dropped_models = !previous.models.is_empty() && refreshed.models.is_empty();
+    let dropped_api_models = !previous.api_models.is_empty() && refreshed.api_models.is_empty();
+    if structurally_valid && !dropped_models && !dropped_api_models {
+        refreshed.refresh.last_success_at = Some(now);
+        refreshed.refresh.last_attempt_at = Some(now);
+        refreshed.refresh.last_failure_reason = None;
+        refreshed
+    } else {
+        let mut rolled_back = previous.clone();
+        rolled_back.refresh.last_attempt_at = Some(now);
+        rolled_back.refresh.last_failure_reason = Some(if !structurally_valid {
+            "candidate pricing catalog failed validation".to_owned()
+        } else {
+            "candidate price tables were empty or partial".to_owned()
+        });
+        rolled_back
+    }
+}
+
 /// Rate card shipped with the binary or customized by the user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RateCard {
     pub version: u32,
     /// Three-letter currency code, e.g. "USD".
@@ -307,6 +576,29 @@ pub struct RateCard {
     /// Optional so rate-card overrides written by earlier releases still load.
     #[serde(default)]
     pub pricing_catalog: PricingCatalog,
+    /// Raw provider model id -> canonical rate-table key, resolved before any
+    /// fallback lookup. Chains are supported; cycles terminate (see
+    /// `resolve_alias`) instead of resolving or hanging.
+    #[serde(default)]
+    pub model_aliases: HashMap<String, String>,
+    /// Models that are explicitly zero-cost (free tier, local/self-hosted),
+    /// as distinct from `unpriced_models` (known models with no published
+    /// price) and from an ordinary missing-rate `Unavailable` resolution.
+    #[serde(default)]
+    pub free_local_models: Vec<String>,
+    /// Per-harness user-declared subscription/custom plan configuration. See
+    /// `SubscriptionPlan` — this never claims a plan-equivalent token
+    /// allowance, only what the user records.
+    #[serde(default)]
+    pub subscription_plans: HashMap<String, SubscriptionPlan>,
+    /// User-supplied display-currency conversion. `None` means the UI must
+    /// show the original currency; Odometer never invents or fetches a rate.
+    #[serde(default)]
+    pub display_currency: Option<CurrencyConversion>,
+    /// Bounded-cache-age bookkeeping for the (currently unimplemented)
+    /// refresh flow. See `RateRefreshState` and `apply_refresh_candidate`.
+    #[serde(default)]
+    pub refresh: RateRefreshState,
 }
 
 fn rates_path() -> Option<PathBuf> {
@@ -383,6 +675,99 @@ impl RateCard {
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
+
+    /// Resolves a raw model id against `table` (the legacy plan-credit
+    /// `models` map, `api_models`, or any other rate table sharing this
+    /// card's aliases/fallbacks) and records why the returned key was
+    /// chosen. This is the one place every surface should call instead of
+    /// re-implementing direct/alias/fallback lookup — see the module-level
+    /// "one rate-card contract" requirement in AGENTS.md.
+    ///
+    /// Order of resolution: explicit free/local declaration, explicit
+    /// known-unpriced declaration, direct match, alias match, harness (or
+    /// card-wide) fallback, else `Unavailable`. A resolution that would
+    /// otherwise be `Direct`/`Aliased`/`Fallback` downgrades to `Stale` when
+    /// `RateRefreshState::freshness` reports the card itself is stale as of
+    /// `now` — staleness is a property of the whole card's last refresh, not
+    /// of any one model.
+    pub fn resolve_model_pricing(
+        &self,
+        model: &str,
+        harness: &str,
+        table: &HashMap<String, ModelRate>,
+        now: DateTime<Utc>,
+    ) -> PricedModelResolution {
+        let basis = |direct_basis: PricingBasis| -> PricingBasis {
+            if self.refresh.freshness(now) == RateFreshness::Stale {
+                PricingBasis::Stale
+            } else {
+                direct_basis
+            }
+        };
+        if self.free_local_models.iter().any(|m| m == model) {
+            return PricedModelResolution {
+                resolved_model: model.to_owned(),
+                basis: PricingBasis::FreeLocal,
+            };
+        }
+        if self.unpriced_models.iter().any(|m| m == model) {
+            return PricedModelResolution {
+                resolved_model: model.to_owned(),
+                basis: PricingBasis::Unavailable,
+            };
+        }
+        if table.contains_key(model) {
+            return PricedModelResolution {
+                resolved_model: model.to_owned(),
+                basis: basis(PricingBasis::Direct),
+            };
+        }
+        let (resolved, hopped) = resolve_alias(model, &self.model_aliases);
+        if hopped && table.contains_key(resolved) {
+            return PricedModelResolution {
+                resolved_model: resolved.to_owned(),
+                basis: basis(PricingBasis::Aliased),
+            };
+        }
+        let fallback_model = self
+            .fallback_models
+            .get(harness)
+            .unwrap_or(&self.fallback_model);
+        if table.contains_key(fallback_model.as_str()) {
+            return PricedModelResolution {
+                resolved_model: fallback_model.clone(),
+                basis: basis(PricingBasis::Fallback),
+            };
+        }
+        PricedModelResolution {
+            resolved_model: model.to_owned(),
+            basis: PricingBasis::Unavailable,
+        }
+    }
+}
+
+/// A `Direct`/`Aliased` model resolution is only as authoritative as its
+/// least-authoritative dimension. When the priced usage actually carries
+/// cache-creation tokens and the resolved rate has no published cache-write
+/// premium (`ModelRate::cache_creation_rate_is_fallback`), the resulting
+/// charge is partly a fallback-priced estimate, not a direct price —
+/// downgrade so the UI doesn't render it as one. Other bases (`Fallback`,
+/// `Unavailable`, `FreeLocal`, `Stale`, ...) already carry their own, more
+/// specific provenance and are left untouched. Mirrors
+/// `downgradeForCacheCreationFallback` in credits.ts — keep both in sync.
+pub fn downgrade_for_cache_creation_fallback(
+    basis: PricingBasis,
+    rate: &ModelRate,
+    cache_creation_tokens: u64,
+) -> PricingBasis {
+    if matches!(basis, PricingBasis::Direct | PricingBasis::Aliased)
+        && cache_creation_tokens > 0
+        && rate.cache_creation_rate_is_fallback()
+    {
+        PricingBasis::Estimated
+    } else {
+        basis
+    }
 }
 
 /// Add models introduced by a newer bundled card without overwriting any
@@ -390,6 +775,35 @@ impl RateCard {
 fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     if disk.version >= bundled.version {
         return disk;
+    }
+    // Backfill the newly split cache-creation dimension onto models the user
+    // already customized, before bundled entries below fill in models the
+    // user never touched. A disk entry's `cache_creation_input` being
+    // `None` is unambiguous now (Option, not a 0.0 default that could also
+    // mean "explicitly free"): it means a rate-card override written before
+    // this field existed, or before the bundled card published a premium
+    // for that model. Absent already prices correctly (falls back to the
+    // ordinary input rate — see `ModelRate::cache_creation_rate`), so this
+    // is purely an upgrade to a more precise, directly published rate when
+    // one becomes available; it never touches a user's own `Some(_)` value,
+    // including an explicit `Some(0.0)` "this is free" claim.
+    for (model, bundled_rate) in &bundled.models {
+        if let Some(existing) = disk.models.get_mut(model) {
+            if existing.cache_creation_input.is_none()
+                && bundled_rate.cache_creation_input.is_some()
+            {
+                existing.cache_creation_input = bundled_rate.cache_creation_input;
+            }
+        }
+    }
+    for (model, bundled_rate) in &bundled.api_models {
+        if let Some(existing) = disk.api_models.get_mut(model) {
+            if existing.cache_creation_input.is_none()
+                && bundled_rate.cache_creation_input.is_some()
+            {
+                existing.cache_creation_input = bundled_rate.cache_creation_input;
+            }
+        }
     }
     for (model, rate) in bundled.models {
         disk.models.entry(model).or_insert(rate);
@@ -410,6 +824,21 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
             disk.unpriced_models.push(model);
         }
     }
+    // New models an earlier release couldn't have known about must inherit
+    // exactly as they do for `models`/`api_models`/`unpriced_models` above:
+    // a bundled alias, free/local declaration, or plan is added only when
+    // the user hasn't already recorded their own entry for that key.
+    for (raw_id, canonical) in bundled.model_aliases {
+        disk.model_aliases.entry(raw_id).or_insert(canonical);
+    }
+    for model in bundled.free_local_models {
+        if !disk.free_local_models.contains(&model) {
+            disk.free_local_models.push(model);
+        }
+    }
+    for (harness, plan) in bundled.subscription_plans {
+        disk.subscription_plans.entry(harness).or_insert(plan);
+    }
     // Reconcile managed catalog rules by durable ID. This refreshes corrected
     // bundled periods/modifiers and adds newly published rules while retaining
     // a user's separately identified custom rules and notes.
@@ -417,6 +846,8 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     disk.version = bundled.version;
     disk.source_url = bundled.source_url;
     disk.fetched_at = bundled.fetched_at;
+    // `refresh` and `display_currency` are local/user bookkeeping, not
+    // catalog content — a newer bundled card never overwrites them.
     disk
 }
 
@@ -463,6 +894,7 @@ mod tests {
         ModelRate {
             input: value,
             cached_input: value,
+            cache_creation_input: Some(value),
             output: value,
             reasoning: value,
         }
@@ -483,6 +915,8 @@ mod tests {
             api_models: HashMap::from([("preview-covered".into(), rate(7.0))]),
             unpriced_models: vec!["preview-old".into()],
             pricing_catalog: PricingCatalog::default(),
+            model_aliases: HashMap::from([("custom-alias".into(), "gpt-old".into())]),
+            ..Default::default()
         };
         let bundled = RateCard {
             version: 3,
@@ -500,6 +934,19 @@ mod tests {
                 notes: vec!["new scenario metadata".into()],
                 ..PricingCatalog::default()
             },
+            model_aliases: HashMap::from([
+                ("custom-alias".into(), "gpt-new".into()),
+                ("gpt-preview".into(), "gpt-new".into()),
+            ]),
+            free_local_models: vec!["local-llama".into()],
+            subscription_plans: HashMap::from([(
+                "codex".into(),
+                SubscriptionPlan {
+                    name: "Bundled Default".into(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
         };
 
         let merged = merge_older_override(disk, bundled);
@@ -516,6 +963,84 @@ mod tests {
         assert_eq!(merged.unpriced_models, ["preview-old", "preview-new"]);
         assert_eq!(merged.api_models["preview-covered"].input, 7.0);
         assert_eq!(merged.pricing_catalog.notes, ["new scenario metadata"]);
+        // A user-edited alias key survives even though the bundled card
+        // redefines the same key; a brand-new bundled alias is inherited.
+        assert_eq!(merged.model_aliases["custom-alias"], "gpt-old");
+        assert_eq!(merged.model_aliases["gpt-preview"], "gpt-new");
+        assert_eq!(merged.free_local_models, ["local-llama"]);
+        assert_eq!(merged.subscription_plans["codex"].name, "Bundled Default");
+    }
+
+    #[test]
+    fn older_override_backfills_cache_creation_rate_for_customized_models() {
+        // A model the user customized before `cache_creation_input` existed
+        // deserializes with the field absent (`None`; see `ModelRate`).
+        // Merging in a newer bundled card must upgrade that `None` to the
+        // bundled cache-write rate, while never touching an already-edited
+        // `Some(_)` value.
+        let mut user_priced_without_premium = rate(50.0);
+        user_priced_without_premium.cache_creation_input = None;
+        let mut user_priced_api_without_premium = rate(60.0);
+        user_priced_api_without_premium.cache_creation_input = None;
+
+        let disk = RateCard {
+            version: 1,
+            models: HashMap::from([("legacy-model".into(), user_priced_without_premium)]),
+            api_models: HashMap::from([(
+                "legacy-api-model".into(),
+                user_priced_api_without_premium,
+            )]),
+            ..Default::default()
+        };
+        let mut bundled_legacy = rate(50.0);
+        bundled_legacy.cache_creation_input = Some(62.5);
+        let mut bundled_legacy_api = rate(60.0);
+        bundled_legacy_api.cache_creation_input = Some(75.0);
+        let bundled = RateCard {
+            version: 2,
+            models: HashMap::from([("legacy-model".into(), bundled_legacy)]),
+            api_models: HashMap::from([("legacy-api-model".into(), bundled_legacy_api)]),
+            ..Default::default()
+        };
+
+        let merged = merge_older_override(disk, bundled);
+        assert_eq!(merged.models["legacy-model"].input, 50.0);
+        assert_eq!(
+            merged.models["legacy-model"].cache_creation_input,
+            Some(62.5)
+        );
+        assert_eq!(
+            merged.api_models["legacy-api-model"].cache_creation_input,
+            Some(75.0)
+        );
+    }
+
+    #[test]
+    fn older_override_never_overwrites_an_explicit_free_cache_creation_claim() {
+        // Some(0.0) is a deliberate "this model's cache writes are free"
+        // claim, not an unset field — it must survive a merge exactly like
+        // any other user-edited rate, never being "corrected" back to the
+        // bundled card's premium.
+        let mut user_explicitly_free = rate(50.0);
+        user_explicitly_free.cache_creation_input = Some(0.0);
+        let disk = RateCard {
+            version: 1,
+            models: HashMap::from([("legacy-model".into(), user_explicitly_free)]),
+            ..Default::default()
+        };
+        let mut bundled_legacy = rate(50.0);
+        bundled_legacy.cache_creation_input = Some(62.5);
+        let bundled = RateCard {
+            version: 2,
+            models: HashMap::from([("legacy-model".into(), bundled_legacy)]),
+            ..Default::default()
+        };
+
+        let merged = merge_older_override(disk, bundled);
+        assert_eq!(
+            merged.models["legacy-model"].cache_creation_input,
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -703,6 +1228,17 @@ mod tests {
         }))
         .expect("pre-catalog rate card should load");
         assert!(card.pricing_catalog.is_empty());
+        // New #42 fields must also default cleanly for a card written before
+        // they existed, including the hand-written RateRefreshState default
+        // (see its Default impl) rather than a derived zero-length window.
+        assert!(card.model_aliases.is_empty());
+        assert!(card.free_local_models.is_empty());
+        assert!(card.subscription_plans.is_empty());
+        assert!(card.display_currency.is_none());
+        assert_eq!(
+            card.refresh.max_cache_age_secs,
+            default_max_cache_age_secs()
+        );
     }
 
     #[test]
@@ -876,5 +1412,348 @@ mod tests {
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn cache_creation_rate_falls_back_to_input_when_absent() {
+        let mut absent = rate(3.0);
+        absent.cache_creation_input = None;
+        assert_eq!(absent.cache_creation_rate(), 3.0);
+        assert!(absent.cache_creation_rate_is_fallback());
+    }
+
+    #[test]
+    fn cache_creation_rate_uses_an_explicit_value_including_zero() {
+        let mut free = rate(3.0);
+        free.cache_creation_input = Some(0.0);
+        assert_eq!(free.cache_creation_rate(), 0.0);
+        assert!(!free.cache_creation_rate_is_fallback());
+
+        let mut premium = rate(3.0);
+        premium.cache_creation_input = Some(3.75);
+        assert_eq!(premium.cache_creation_rate(), 3.75);
+        assert!(!premium.cache_creation_rate_is_fallback());
+    }
+
+    fn card_with(models: HashMap<String, ModelRate>, aliases: HashMap<String, String>) -> RateCard {
+        RateCard {
+            version: 1,
+            models,
+            fallback_model: "fallback-model".into(),
+            model_aliases: aliases,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn downgrade_for_cache_creation_fallback_only_applies_to_authoritative_bases() {
+        let mut rate_without_premium = rate(3.0);
+        rate_without_premium.cache_creation_input = None;
+
+        // Direct/Aliased with nonzero cache-creation usage and no published
+        // premium downgrades to Estimated.
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(PricingBasis::Direct, &rate_without_premium, 100),
+            PricingBasis::Estimated
+        );
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(
+                PricingBasis::Aliased,
+                &rate_without_premium,
+                100
+            ),
+            PricingBasis::Estimated
+        );
+        // No cache-creation usage: nothing to downgrade for.
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(PricingBasis::Direct, &rate_without_premium, 0),
+            PricingBasis::Direct
+        );
+        // A published premium (even Some(0.0), a deliberate "free" claim) is
+        // authoritative — no downgrade.
+        let mut rate_with_premium = rate(3.0);
+        rate_with_premium.cache_creation_input = Some(0.0);
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(PricingBasis::Direct, &rate_with_premium, 100),
+            PricingBasis::Direct
+        );
+        // Already-non-authoritative bases keep their own provenance.
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(
+                PricingBasis::Fallback,
+                &rate_without_premium,
+                100
+            ),
+            PricingBasis::Fallback
+        );
+        assert_eq!(
+            downgrade_for_cache_creation_fallback(
+                PricingBasis::Unavailable,
+                &rate_without_premium,
+                100
+            ),
+            PricingBasis::Unavailable
+        );
+    }
+
+    #[test]
+    fn resolve_model_pricing_prefers_direct_over_alias_and_fallback() {
+        let card = card_with(
+            HashMap::from([
+                ("claude-sonnet-5".into(), rate(3.0)),
+                ("fallback-model".into(), rate(9.0)),
+            ]),
+            HashMap::from([("claude-sonnet-5-20260815".into(), "claude-sonnet-5".into())]),
+        );
+        let now = instant("2026-01-01T00:00:00Z");
+
+        let direct =
+            card.resolve_model_pricing("claude-sonnet-5", "claude_code", &card.models, now);
+        assert_eq!(direct.basis, PricingBasis::Direct);
+        assert_eq!(direct.resolved_model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn resolve_model_pricing_resolves_alias_before_fallback() {
+        let card = card_with(
+            HashMap::from([
+                ("claude-sonnet-5".into(), rate(3.0)),
+                ("fallback-model".into(), rate(9.0)),
+            ]),
+            HashMap::from([("claude-sonnet-5-20260815".into(), "claude-sonnet-5".into())]),
+        );
+        let now = instant("2026-01-01T00:00:00Z");
+
+        let aliased = card.resolve_model_pricing(
+            "claude-sonnet-5-20260815",
+            "claude_code",
+            &card.models,
+            now,
+        );
+        assert_eq!(aliased.basis, PricingBasis::Aliased);
+        assert_eq!(aliased.resolved_model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn resolve_model_pricing_falls_back_when_neither_model_nor_alias_resolve() {
+        let card = card_with(
+            HashMap::from([("fallback-model".into(), rate(9.0))]),
+            HashMap::new(),
+        );
+        let now = instant("2026-01-01T00:00:00Z");
+
+        let fallback = card.resolve_model_pricing("totally-unknown", "codex", &card.models, now);
+        assert_eq!(fallback.basis, PricingBasis::Fallback);
+        assert_eq!(fallback.resolved_model, "fallback-model");
+    }
+
+    #[test]
+    fn resolve_model_pricing_is_unavailable_without_model_alias_or_fallback_rate() {
+        let card = card_with(HashMap::new(), HashMap::new());
+        let now = instant("2026-01-01T00:00:00Z");
+
+        let unavailable = card.resolve_model_pricing("totally-unknown", "codex", &card.models, now);
+        assert_eq!(unavailable.basis, PricingBasis::Unavailable);
+    }
+
+    #[test]
+    fn resolve_model_pricing_distinguishes_unpriced_and_free_local_from_unavailable() {
+        let mut card = card_with(HashMap::new(), HashMap::new());
+        card.unpriced_models.push("known-unpriced".into());
+        card.free_local_models.push("local-llama".into());
+        let now = instant("2026-01-01T00:00:00Z");
+
+        assert_eq!(
+            card.resolve_model_pricing("known-unpriced", "codex", &card.models, now)
+                .basis,
+            PricingBasis::Unavailable
+        );
+        assert_eq!(
+            card.resolve_model_pricing("local-llama", "codex", &card.models, now)
+                .basis,
+            PricingBasis::FreeLocal
+        );
+    }
+
+    #[test]
+    fn resolve_model_pricing_downgrades_to_stale_when_refresh_is_old() {
+        let mut card = card_with(
+            HashMap::from([("claude-sonnet-5".into(), rate(3.0))]),
+            HashMap::new(),
+        );
+        card.refresh = RateRefreshState {
+            last_success_at: Some(instant("2026-01-01T00:00:00Z")),
+            max_cache_age_secs: 60,
+            ..Default::default()
+        };
+        let now = instant("2026-01-01T00:10:00Z"); // 600s later, past the 60s bound
+
+        let resolution =
+            card.resolve_model_pricing("claude-sonnet-5", "claude_code", &card.models, now);
+        assert_eq!(resolution.basis, PricingBasis::Stale);
+    }
+
+    #[test]
+    fn resolve_alias_follows_multi_hop_chains() {
+        let aliases = HashMap::from([
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "c".to_string()),
+        ]);
+        let (resolved, hopped) = resolve_alias("a", &aliases);
+        assert_eq!(resolved, "c");
+        assert!(hopped);
+    }
+
+    #[test]
+    fn resolve_alias_terminates_on_a_cycle_instead_of_looping_forever() {
+        let aliases = HashMap::from([
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ]);
+        // The real assertion is that this returns at all: a naive
+        // implementation without cycle detection would loop forever.
+        let (resolved, hopped) = resolve_alias("a", &aliases);
+        assert!(hopped);
+        assert!(["a", "b"].contains(&resolved));
+    }
+
+    #[test]
+    fn resolve_alias_self_reference_terminates() {
+        let aliases = HashMap::from([("a".to_string(), "a".to_string())]);
+        let (resolved, hopped) = resolve_alias("a", &aliases);
+        assert_eq!(resolved, "a");
+        assert!(hopped);
+    }
+
+    #[test]
+    fn resolve_model_pricing_treats_cycle_as_unresolved_alias() {
+        // Neither "a" nor "b" ever appears in a rate table in this scenario
+        // (only aliases point at each other, with no canonical target) — the
+        // resolution must still terminate and fall through to Fallback
+        // rather than hang or panic.
+        let card = card_with(
+            HashMap::from([("fallback-model".into(), rate(9.0))]),
+            HashMap::from([
+                ("a".to_string(), "b".to_string()),
+                ("b".to_string(), "a".to_string()),
+            ]),
+        );
+        let now = instant("2026-01-01T00:00:00Z");
+        let resolution = card.resolve_model_pricing("a", "codex", &card.models, now);
+        assert_eq!(resolution.basis, PricingBasis::Fallback);
+        assert_eq!(resolution.resolved_model, "fallback-model");
+    }
+
+    #[test]
+    fn apply_refresh_candidate_accepts_a_valid_richer_candidate() {
+        let previous = card_with(
+            HashMap::from([("claude-sonnet-5".into(), rate(3.0))]),
+            HashMap::new(),
+        );
+        let candidate = card_with(
+            HashMap::from([
+                ("claude-sonnet-5".into(), rate(3.5)),
+                ("claude-haiku-5".into(), rate(1.0)),
+            ]),
+            HashMap::new(),
+        );
+        let now = instant("2026-01-01T00:00:00Z");
+
+        let result = apply_refresh_candidate(&previous, candidate, now);
+        assert_eq!(result.models["claude-sonnet-5"].input, 3.5);
+        assert_eq!(result.refresh.last_success_at, Some(now));
+        assert_eq!(result.refresh.last_failure_reason, None);
+        assert_eq!(result.refresh.freshness(now), RateFreshness::Fresh);
+    }
+
+    #[test]
+    fn apply_refresh_candidate_rolls_back_on_invalid_catalog() {
+        let previous = card_with(
+            HashMap::from([("claude-sonnet-5".into(), rate(3.0))]),
+            HashMap::new(),
+        );
+        let provenance = PricingProvenance {
+            evidence: "published".into(),
+            source_url: "https://example.test/rates".into(),
+            verified_at: instant("2026-01-01T00:00:00Z"),
+            note: None,
+        };
+        let invalid_period = EffectiveRatePeriod {
+            id: String::new(), // Empty ID always fails validation.
+            surface: PricingSurface::AnthropicApiUsd,
+            model: "claude-sonnet-5".into(),
+            from: instant("2026-01-01T00:00:00Z"),
+            to: None,
+            rate: rate(3.0),
+            cache_write_input_multiplier: None,
+            provenance,
+            label: "invalid".into(),
+        };
+        let mut candidate = card_with(
+            HashMap::from([("claude-sonnet-5".into(), rate(99.0))]),
+            HashMap::new(),
+        );
+        candidate.pricing_catalog.rate_periods.push(invalid_period);
+        let now = instant("2026-01-01T00:00:00Z");
+
+        let result = apply_refresh_candidate(&previous, candidate, now);
+        // Failed closed: the previous card's prices are retained exactly...
+        assert_eq!(result.models["claude-sonnet-5"].input, 3.0);
+        // ...and the failed attempt is recorded rather than silently dropped.
+        assert_eq!(result.refresh.last_attempt_at, Some(now));
+        assert!(result.refresh.last_success_at.is_none());
+        assert!(result
+            .refresh
+            .last_failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("validation"));
+    }
+
+    #[test]
+    fn apply_refresh_candidate_rolls_back_on_partial_empty_models() {
+        let previous = card_with(
+            HashMap::from([("claude-sonnet-5".into(), rate(3.0))]),
+            HashMap::new(),
+        );
+        // A candidate that parses but comes back with no models at all (e.g.
+        // a truncated or empty payload) must never silently wipe out
+        // existing coverage.
+        let candidate = card_with(HashMap::new(), HashMap::new());
+        let now = instant("2026-01-01T00:00:00Z");
+
+        let result = apply_refresh_candidate(&previous, candidate, now);
+        assert_eq!(result.models["claude-sonnet-5"].input, 3.0);
+        assert!(result
+            .refresh
+            .last_failure_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("partial"));
+    }
+
+    #[test]
+    fn rate_refresh_state_freshness_is_unknown_without_a_success() {
+        let state = RateRefreshState::default();
+        assert_eq!(
+            state.freshness(instant("2026-01-01T00:00:00Z")),
+            RateFreshness::Unknown
+        );
+    }
+
+    #[test]
+    fn currency_conversion_multiplies_by_the_user_supplied_rate_only() {
+        let conversion = CurrencyConversion {
+            target_currency: "EUR".into(),
+            rate: 0.9,
+            as_of: instant("2026-01-01T00:00:00Z"),
+            source: "user-entered".into(),
+        };
+        assert_eq!(conversion.convert(100.0), Some(90.0));
+        let invalid = CurrencyConversion {
+            rate: 0.0,
+            ..conversion
+        };
+        assert_eq!(invalid.convert(100.0), None);
     }
 }

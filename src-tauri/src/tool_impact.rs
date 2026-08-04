@@ -119,11 +119,7 @@ impl CohortAccumulator {
 }
 
 fn add_tokens(target: &mut TokenTotals, value: &TokenTotals) {
-    target.input_tokens += value.input_tokens;
-    target.cached_input_tokens += value.cached_input_tokens;
-    target.output_tokens += value.output_tokens;
-    target.reasoning_output_tokens += value.reasoning_output_tokens;
-    target.total_tokens += value.total_tokens;
+    *target += value;
 }
 
 fn turn_overlaps(
@@ -194,7 +190,7 @@ fn samples_for_session(
             session_id: storage_id.clone(),
             timestamp: turn.started_at.unwrap_or(session.started_at),
             key: MatchKey {
-                harness: session.harness,
+                harness: session.harness.clone(),
                 model: turn
                     .model
                     .as_deref()
@@ -417,6 +413,7 @@ pub fn compare<S: Borrow<Session>>(
 mod tests {
     use super::*;
     use crate::model::{ToolKind, ToolObservation, ToolOutcome, TurnClassification};
+    use crate::provider::{claude_code_provider_id, codex_provider_id};
     use std::collections::HashMap;
 
     fn totals(value: u64) -> TokenTotals {
@@ -441,7 +438,7 @@ mod tests {
         Session {
             id: id.into(),
             storage_id: format!("codex:thread:{id}"),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -492,7 +489,7 @@ mod tests {
             tool_observations: vec![ToolObservation {
                 call_id: format!("call-{id}"),
                 turn_id: Some(turn_id),
-                harness: Harness::Codex,
+                harness: codex_provider_id(),
                 model: Some("gpt-5.5".into()),
                 timestamp,
                 kind: ToolKind::Search,
@@ -521,6 +518,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -581,7 +581,7 @@ mod tests {
     fn colliding_provider_ids_remain_distinct_sessions_and_turns() {
         let codex = session("shared", true, 800, 10);
         let mut claude = session("shared", true, 900, 12);
-        claude.harness = Harness::ClaudeCode;
+        claude.harness = claude_code_provider_id();
         claude.storage_id = "claude_code:session:shared".into();
 
         let sessions = vec![codex, claude];

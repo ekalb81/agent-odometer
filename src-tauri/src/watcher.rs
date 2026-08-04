@@ -1,6 +1,6 @@
-use crate::claude_parser::ClaudeSessionParser;
-use crate::model::{Session, SessionSummary};
-use crate::parser::SessionParser;
+use crate::model::SessionSummary;
+use crate::paths::strip_verbatim_prefix;
+use crate::provider::{IncrementalProviderParser, ProviderRegistry, ProviderSourceSet};
 use crate::store::AppState;
 use dashmap::DashMap;
 use notify::EventKind;
@@ -15,40 +15,17 @@ pub struct WatcherHandle {
     _inner: Box<dyn std::any::Any + Send + Sync>,
 }
 
-/// Per-file incremental parser, dispatching on the harness that owns the root
-/// the file lives under.
-enum AnyParser {
-    Codex(SessionParser),
-    Claude(ClaudeSessionParser),
-}
-
 /// A parser plus when it last saw activity. Each parser holds a full Session
 /// accumulator (a second copy of the session besides AppState), so idle
 /// entries are evicted; the only cost of eviction is one full re-parse if
 /// that file ever changes again.
 struct ParserSlot {
-    parser: AnyParser,
+    parser: Box<dyn IncrementalProviderParser>,
     last_touch: Instant,
 }
 
 /// Idle parsers are dropped after this long without file activity.
 const PARSER_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
-
-impl AnyParser {
-    fn parse_to_end(&mut self) -> anyhow::Result<bool> {
-        match self {
-            AnyParser::Codex(p) => p.parse_to_end(),
-            AnyParser::Claude(p) => p.parse_to_end(),
-        }
-    }
-
-    fn session(&self) -> Option<&Session> {
-        match self {
-            AnyParser::Codex(p) => p.session.as_ref(),
-            AnyParser::Claude(p) => p.session.as_ref(),
-        }
-    }
-}
 
 /// Starts a debounced recursive watcher on the given roots.
 ///
@@ -61,19 +38,15 @@ impl AnyParser {
 pub fn start(
     app: AppHandle,
     state: Arc<AppState>,
-    session_roots: Vec<PathBuf>,
-    archive_roots: Vec<PathBuf>,
-    claude_session_roots: Vec<PathBuf>,
+    sources: ProviderSourceSet,
     session_index_path: PathBuf,
 ) -> anyhow::Result<WatcherHandle> {
     let parsers: Arc<DashMap<PathBuf, ParserSlot>> = Arc::new(DashMap::new());
-    let archive_roots_arc: Arc<Vec<PathBuf>> = Arc::new(archive_roots.clone());
-    let claude_roots_arc: Arc<Vec<PathBuf>> = Arc::new(claude_session_roots.clone());
+    let sources_arc = Arc::new(sources);
     let session_index_path_arc: Arc<PathBuf> = Arc::new(session_index_path.clone());
 
     let parsers_cb = parsers.clone();
-    let archive_roots_cb = archive_roots_arc.clone();
-    let claude_roots_cb = claude_roots_arc.clone();
+    let sources_cb = sources_arc.clone();
     let session_index_path_cb = session_index_path_arc.clone();
     // AppState owns the watcher handle; a strong capture here would create a
     // self-cycle that prevents watcher and recorder teardown.
@@ -135,8 +108,15 @@ pub fn start(
                         continue;
                     }
 
-                    // Only process .jsonl files.
-                    if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    let Some(source) = sources_cb.resolve(path) else {
+                        continue;
+                    };
+                    let provider_id = source.provider_id().clone();
+                    let source_kind = source.kind();
+                    let adapter = ProviderRegistry::builtin()
+                        .adapter(&provider_id)
+                        .expect("validated provider source has a registered adapter");
+                    if !adapter.accepts_path(path) {
                         continue;
                     }
 
@@ -154,20 +134,26 @@ pub fn start(
                         }
                     } else {
                         // Create or Modify — parse incrementally.
-                        let is_claude = claude_roots_cb.iter().any(|root| path.starts_with(root));
-                        let archived = archive_roots_cb.iter().any(|root| path.starts_with(root));
-
-                        let mut entry = parsers_cb.entry(path.clone()).or_insert_with(|| {
-                            let parser = if is_claude {
-                                AnyParser::Claude(ClaudeSessionParser::new(path.clone()))
-                            } else {
-                                AnyParser::Codex(SessionParser::new(path.clone(), archived))
-                            };
-                            ParserSlot {
-                                parser,
-                                last_touch: Instant::now(),
+                        let mut entry = match parsers_cb.entry(path.clone()).or_try_insert_with(
+                            || -> anyhow::Result<ParserSlot> {
+                                Ok(ParserSlot {
+                                    parser: adapter
+                                        .incremental_parser(path.clone(), source_kind)?,
+                                    last_touch: Instant::now(),
+                                })
+                            },
+                        ) {
+                            Ok(entry) => entry,
+                            Err(error) => {
+                                tracing::warn!(
+                                    "could not create '{}' parser for {:?}: {}",
+                                    provider_id,
+                                    path,
+                                    error
+                                );
+                                continue;
                             }
-                        });
+                        };
                         entry.last_touch = Instant::now();
 
                         let parse_started = Instant::now();
@@ -176,10 +162,12 @@ pub fn start(
                             "watcher.incremental_parse",
                             parse_started,
                             parse_result.is_ok(),
-                            std::collections::BTreeMap::from([(
-                                "harness".into(),
-                                if is_claude { "claude_code" } else { "codex" }.into(),
-                            )]),
+                            std::collections::BTreeMap::from([
+                                ("harness".into(), provider_id.as_str().into()),
+                                // Corpus size makes cost-vs-corpus scaling
+                                // measurable inside a single recording.
+                                ("corpus".into(), state_cb.sessions.len().to_string()),
+                            ]),
                         );
                         match parse_result {
                             Ok(true) => {}
@@ -220,11 +208,8 @@ pub fn start(
 
     // Watch all roots recursively. Skip roots that don't exist yet — the user
     // may not have Codex installed, or the directory will be created later.
-    for root in session_roots
-        .iter()
-        .chain(archive_roots.iter())
-        .chain(claude_session_roots.iter())
-    {
+    for source in sources_arc.iter() {
+        let root = source.root();
         if !root.exists() {
             tracing::info!("watch root {:?} does not exist yet, skipping", root);
             continue;
@@ -270,11 +255,38 @@ fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
         .eq(strip_verbatim_prefix(b).components())
 }
 
-fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {
-    if let Some(s) = p.to_str() {
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return std::path::Path::new(rest);
-        }
+#[cfg(test)]
+mod tests {
+    use super::paths_equivalent;
+    use std::path::Path;
+
+    /// The session-index watcher compares a notify event path against the
+    /// configured path. On a UNC root with long-path support active, notify
+    /// delivers the verbatim spelling while configuration carries the plain
+    /// one; a prefix strip that is not UNC-aware turns the former into a
+    /// relative-looking `UNC\server\share\…` and the comparison fails, so
+    /// index changes go undetected.
+    #[test]
+    fn verbatim_unc_event_paths_match_their_plain_configured_form() {
+        assert!(paths_equivalent(
+            Path::new(r"\\?\UNC\server\share\.codex\sessions.json"),
+            Path::new(r"\\server\share\.codex\sessions.json"),
+        ));
     }
-    p
+
+    #[test]
+    fn verbatim_disk_event_paths_match_their_plain_configured_form() {
+        assert!(paths_equivalent(
+            Path::new(r"\\?\C:\Users\dev\.codex\sessions.json"),
+            Path::new(r"C:\Users\dev\.codex\sessions.json"),
+        ));
+    }
+
+    #[test]
+    fn distinct_paths_still_compare_unequal() {
+        assert!(!paths_equivalent(
+            Path::new(r"\\?\UNC\server\share\.codex\sessions.json"),
+            Path::new(r"\\server\other\.codex\sessions.json"),
+        ));
+    }
 }

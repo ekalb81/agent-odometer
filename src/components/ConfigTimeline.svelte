@@ -9,6 +9,7 @@
   } from '../lib/configTimeline';
   import { rates } from '../lib/stores/rates';
   import { sessionsStore } from '../lib/stores/sessions.svelte';
+  import { providersStore } from '../lib/stores/providers.svelte';
   import type { EventCorrelation, ExternalEvent } from '../lib/types';
 
   interface Props { active?: boolean; events: ExternalEvent[]; title?: string; }
@@ -98,7 +99,7 @@
       {#each displayEvents as event (event.id)}
         {@const correlation = correlations.find((item) => item.event.id === event.id)}
         <div class="border-t border-edgerow pt-1.5 text-[11px]">
-          <div class="flex gap-2"><span class="font-mono text-ink-faint">{new Date(event.timestamp).toLocaleString()}</span><span class="font-semibold text-ink">{event.kind}</span><span class="text-ink-muted">{event.metadata.harness}</span></div>
+          <div class="flex gap-2"><span class="font-mono text-ink-faint">{new Date(event.timestamp).toLocaleString()}</span><span class="font-semibold text-ink">{event.kind}</span><span class="text-ink-muted">{providersStore.displayName(event.metadata.harness)}</span></div>
           <div class="text-ink-faint">{event.scope ? 'project' : 'global'} · {event.metadata.safe_diff ?? 'redacted content change'}</div>
           {#if revertLabels.has(event.id)}<div class="text-amber-500">{revertLabels.get(event.id)}</div>{/if}
           {#if correlation}

@@ -1,0 +1,6 @@
+{"sessionId":"77777777-8888-9999-aaaa-bbbbbbbbbbbb","startTime":"2026-07-02T09:00:00.000Z","projectHash":"a1b2c3d4","kind":"chat"}
+{"id":"u1","timestamp":"2026-07-02T09:00:01.000Z","type":"user","content":"Add input validation to the signup handler"}
+{"id":"g1","timestamp":"2026-07-02T09:00:05.000Z","type":"gemini","model":"gemini-2.5-flash","content":"I'll add validation.","tokens":{"input":800,"output":120,"cached":300,"thoughts":40,"tool":10,"total":960},"toolCalls":[{"id":"call-1","name":"edit_file","args":{"path":"signup.ts"},"status":"success","displayName":"EditFile"}]}
+{"id":"u2","timestamp":"2026-07-02T09:01:00.000Z","type":"user","content":"Also add a unit test"}
+{"id":"g2","timestamp":"2026-07-02T09:01:05.000Z","type":"gemini","model":"gemini-2.5-flash","content":"Added a test in signup.test.ts.","tokens":{"input":650,"output":90,"cached":300,"thoughts":15,"tool":0,"total":755},"toolCalls":[{"id":"call-2","name":"write_file","args":{"path":"signup.test.ts"},"status":"success","displayName":"WriteFile"}]}
+{"id":"i1","timestamp":"2026-07-02T09:01:06.000Z","type":"info","content":"session saved"}

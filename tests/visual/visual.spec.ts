@@ -2,7 +2,7 @@ import { expect, test, type Page, type TestInfo } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { APP_VIEWS } from '../../src/lib/appViews';
+import { appViews } from '../../src/lib/appViews';
 import visualManifest from './manifest.json' with { type: 'json' };
 
 type Theme = 'light' | 'dark';
@@ -222,6 +222,16 @@ visualTest('sessions-subagents-collapsed', 'session subagents collapsed', async 
   await expectSessionRollup(page, 8);
 });
 
+visualTest('sessions-subagent-drilldown', 'session subagent drill-down with per-run detail', async (page) => {
+  await visit(page, { view: 'codex' });
+  // The subagent-count chip scopes the grid to one parent and its runs, which
+  // also flattens the ordering so a column sort ranks the runs against
+  // each other rather than nesting them under the parent.
+  await page.getByRole('button', { name: /Show only .* and its \d+ subagent runs?/ }).first().click();
+  await expect(page.getByRole('button', { name: 'Show all sessions' })).toBeVisible();
+  await expect(page.getByText('and its subagent runs')).toBeVisible();
+});
+
 visualTest('sessions-availability-fallback', 'session availability, fallback, and unpriced indicators', async (page) => {
   await visit(page, { scenario: 'sessions-availability-fallback', view: 'codex' });
   await expect(page.getByText(/unpriced model excluded/i)).toBeVisible();
@@ -329,6 +339,21 @@ visualTest('defender-error', 'defender error', async (page) => {
   await expectSessionRollup(page, 15);
 });
 
+test('Defender verification survives Settings remount and suppresses the slow-scan prompt', async ({ page }) => {
+  await visit(page, { scenario: 'defender-slow', view: 'settings' });
+  await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
+  await page.getByRole('button', { name: 'Exclude session folders from Defender…', exact: true }).click();
+  const verifiedStatus = page.getByRole('status').filter({ hasText: 'Last verified' });
+  await expect(verifiedStatus).toContainText('for 3 session folders.');
+
+  await page.getByRole('button', { name: 'All', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Add exclusions…', exact: true })).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
+  await expect(page.getByRole('status').filter({ hasText: 'Last verified' })).toContainText('for 3 session folders.');
+});
+
 visualTest('updater-available', 'updater available banner', async (page) => {
   await visit(page, { scenario: 'updater-available', view: 'all' });
   await expect(page.getByText('Version 9.9.9 is available.')).toBeVisible();
@@ -352,7 +377,12 @@ visualTest('updater-error', 'updater installation error', async (page) => {
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {
-  const registeredIds = APP_VIEWS.map((view) => view.id).sort();
+  // Mirrors the dev-mock `list_providers` fixture (see src/dev-mock.ts) since
+  // tabs are generated from provider descriptors rather than a static list.
+  const registeredIds = appViews([
+    { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true },
+    { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false },
+  ]).map((view) => view.id).sort();
   const expectedIds = primaryViews.map((view) => view.id).sort();
   expect(registeredIds).toEqual(expectedIds);
 });

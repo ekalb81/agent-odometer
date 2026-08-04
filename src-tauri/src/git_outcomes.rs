@@ -35,9 +35,57 @@ struct CommitInfo {
 }
 
 fn repository_scope(repo: &gix::Repository) -> PathBuf {
-    repo.work_dir()
+    repo.workdir()
         .unwrap_or_else(|| repo.git_dir())
         .to_path_buf()
+}
+
+/// The working tree root of the repository containing `path`, if any.
+///
+/// Three call sites previously each open-coded `gix::discover` followed by the
+/// same workdir/git-dir fallback; they now share this one.
+pub(crate) fn discover_repository_root(path: &Path) -> Option<PathBuf> {
+    gix::discover(path).ok().map(|repo| repository_scope(&repo))
+}
+
+/// Richer discovery result used by the project-identity dimension (#41),
+/// alongside [`discover_repository_root`] rather than a second `gix::discover`
+/// call site.
+pub(crate) struct RepositoryIdentity {
+    /// The shared repository root: for a linked worktree this resolves
+    /// through its `commondir` file to the *main* worktree's repository, so
+    /// every linked worktree of one repository collapses to the same
+    /// project identity instead of fragmenting per checkout.
+    pub common_root: PathBuf,
+}
+
+/// Resolves the repository containing `path`, if any, exposing the
+/// worktree-shared `common_root` used for project-identity grouping.
+pub(crate) fn discover_repository_identity(path: &Path) -> Option<RepositoryIdentity> {
+    let repo = gix::discover(path).ok()?;
+    let common_dir = repo.common_dir();
+    // A linked worktree's `commondir` file is conventionally a *relative*
+    // path (e.g. `../..`) read straight off disk with no normalization: its
+    // literal final component is `..`, not `.git`, even though it resolves
+    // to the shared `.git` directory. Canonicalize before inspecting the
+    // final component so that check (and every caller's comparison) sees the
+    // real resolved path rather than the unresolved spelling; a moved or
+    // deleted repository falls back to the unresolved path rather than
+    // failing discovery outright.
+    let common_dir = std::fs::canonicalize(common_dir).unwrap_or_else(|_| common_dir.to_path_buf());
+    // The resolved common dir is the shared `.git` directory (or, for a bare
+    // repository, the repository directory itself). Its parent names the
+    // conventional repository root when it is literally named `.git`; a bare
+    // repository has no such parent to prefer.
+    let common_root = if common_dir.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        common_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or(common_dir)
+    } else {
+        common_dir
+    };
+    Some(RepositoryIdentity { common_root })
 }
 
 fn load_commits(repo: &gix::Repository) -> anyhow::Result<Vec<CommitInfo>> {
@@ -223,14 +271,15 @@ pub fn evaluate<S: Borrow<Session>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Harness, TokenTotals, ToolMetrics};
+    use crate::model::{TokenTotals, ToolMetrics};
+    use crate::provider::{claude_code_provider_id, codex_provider_id};
     use std::process::Command;
 
     fn session(id: &str, cwd: Option<&Path>, started_at: &str, last_event_at: &str) -> Session {
         Session {
             id: id.into(),
             storage_id: format!("codex:thread:{id}"),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -268,12 +317,47 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
+    }
+
+    /// Path to a permanently empty config file, used to blank out
+    /// `GIT_CONFIG_GLOBAL` for every git invocation these tests make.
+    ///
+    /// These tests must not inherit the host's git configuration. A
+    /// developer's global `~/.gitconfig` can set `commit.gpgsign = true`
+    /// (this repo's own maintainer signs commits via a 1Password SSH
+    /// agent), and a non-interactive signer refuses to sign, so `git
+    /// commit` fails — even though the test has nothing to do with
+    /// signing. The same leak path applies to `core.hooksPath`,
+    /// `commit.template`, `gpg.format`, and any other global setting.
+    ///
+    /// Rather than chase each interfering key individually, every `git()`
+    /// call below points `GIT_CONFIG_GLOBAL` at this empty file and sets
+    /// `GIT_CONFIG_NOSYSTEM=1`, so the only configuration a test repo ever
+    /// sees is what these helpers write into its own `.git/config`. The
+    /// explicit `commit.gpgsign`/`tag.gpgsign` overrides in `repository()`
+    /// are kept too, as defense in depth in case a future helper runs git
+    /// against a repo without going through this `git()` function.
+    fn empty_global_config() -> &'static Path {
+        static PATH: std::sync::OnceLock<tempfile::TempPath> = std::sync::OnceLock::new();
+        let path: &'static tempfile::TempPath = PATH.get_or_init(|| {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            file.into_temp_path()
+        });
+        path.as_ref()
     }
 
     fn git(repo: &Path, args: &[&str], timestamp: Option<&str>) -> String {
         let mut command = Command::new("git");
-        command.arg("-C").arg(repo).args(args);
+        command
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", empty_global_config())
+            .env("GIT_CONFIG_NOSYSTEM", "1");
         if let Some(timestamp) = timestamp {
             command
                 .env("GIT_AUTHOR_DATE", timestamp)
@@ -311,6 +395,15 @@ mod tests {
             &["config", "user.email", "synthetic@example.invalid"],
             None,
         );
+        // Belt-and-suspenders: even with the global/system config blanked
+        // out above, pin signing off explicitly so this repo's behavior
+        // does not depend on git's compiled-in defaults either.
+        git(
+            directory.path(),
+            &["config", "commit.gpgsign", "false"],
+            None,
+        );
+        git(directory.path(), &["config", "tag.gpgsign", "false"], None);
         directory
     }
 
@@ -483,7 +576,7 @@ mod tests {
             "2026-04-03T00:00:00Z",
             "2026-04-03T02:00:00Z",
         );
-        claude.harness = Harness::ClaudeCode;
+        claude.harness = claude_code_provider_id();
         claude.storage_id = "claude_code:session:shared".into();
 
         let (outcomes, events) = evaluate(&[codex, claude], 0);
