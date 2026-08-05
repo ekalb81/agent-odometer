@@ -14,6 +14,7 @@ import type {
   ToolMetrics,
   TokenTotals,
 } from './types';
+import type { DimensionTotals } from './toolDimensions';
 
 export type ViewScope = Harness | 'all';
 
@@ -417,6 +418,46 @@ export function rowsToCsv(rows: Record<string, string | number | boolean | null>
   const lines = [headers.map(csvCell).join(',')];
   for (const row of rows) lines.push(headers.map((header) => csvCell(row[header])).join(','));
   return `${lines.join('\r\n')}\r\n`;
+}
+
+/**
+ * Flattens issue #44's aggregate tool/context dimension totals (MCP server,
+ * shell command family, language, context source) into export rows — one
+ * row per (dimension_kind, dimension_value) pair, sorted for a stable diff
+ * between exports of the same view.
+ *
+ * Privacy boundary (unchanged from the values already rendered in
+ * `ToolImpact.svelte`): `dimension_value` is always one of a bounded,
+ * argument-free label — an MCP server identifier (from
+ * `ToolObservation.providers`, never raw call arguments), a shell-family
+ * allowlist entry (unrecognized commands already collapsed server-side to
+ * `"other"`, never the raw command line), a language-extension allowlist
+ * entry, or a fixed context-source bucket name. None of these are hashes —
+ * there is nothing here that could be reversed to raw content because raw
+ * content was never retained in the first place, on either the ledger or
+ * this export path.
+ */
+export function dimensionExportRows(
+  totals: DimensionTotals,
+): Record<string, string | number | boolean | null>[] {
+  const rows: Record<string, string | number | boolean | null>[] = [];
+  for (const kind of Object.keys(totals).sort()) {
+    const values = totals[kind as keyof DimensionTotals];
+    if (!values) continue;
+    for (const value of Object.keys(values).sort()) {
+      const metrics = values[value];
+      rows.push({
+        dimension_kind: kind,
+        dimension_value: value,
+        calls: metrics.calls,
+        failures: metrics.failures,
+        output_bytes: metrics.output_bytes,
+        duration_ms: metrics.duration_ms,
+        tokens: metrics.tokens,
+      });
+    }
+  }
+  return rows;
 }
 
 /** Minimum a row needs to be ordered: identity plus its day-group anchor. */

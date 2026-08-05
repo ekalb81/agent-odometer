@@ -90,7 +90,7 @@ function at(daysAgo: number, hours: number, minutes = 0): string {
 
 interface Fixture {
   id: string;
-  harness: 'codex' | 'claude_code';
+  harness: 'codex' | 'claude_code' | 'gemini_cli';
   name: string;
   started: string;
   hoursActive: number;
@@ -121,6 +121,27 @@ const FIXTURES: Fixture[] = [
   { id: '9fbad994-22fa-41fc-8888-0000c1de0006', harness: 'claude_code', name: 'Perft debugging session', started: at(5, 13), hoursActive: 4, model: 'claude-fable-5', total: 1_922_308, turns: 9 },
   { id: '9fbad994-22fa-41fc-8888-0000c1de0007', harness: 'claude_code', name: 'Migrate to slash commands', started: at(8, 10), hoursActive: 1, model: 'claude-sonnet-5', total: 585_410, turns: 3 },
 ];
+
+// Issue #44: a genuine Gemini CLI session, added only for the
+// 'tool-dimensions' visual scenario so no other baseline's tab count or
+// session total shifts. Unlike the tool-dimensions.png predecessor (which
+// flipped Claude Code's capability flags — untrue, since provider.rs says
+// Claude Code supports both), this gives the panel a provider that
+// genuinely lacks mcp_dimension/shell_dimension (see the 'list_providers'
+// case below), so the "Unavailable" rendering in the baseline reflects a
+// real capability gap instead of a fixture-only override.
+if (visualScenario === 'tool-dimensions') {
+  FIXTURES.push({
+    id: 'ad0be994-33aa-4a1c-9999-0000cade0001',
+    harness: 'gemini_cli',
+    name: 'Summarize release notes',
+    started: at(2, 11),
+    hoursActive: 1,
+    model: 'gemini-2.5-pro',
+    total: 812_450,
+    turns: 3,
+  });
+}
 
 // Stress mode: `?stress=N` appends N synthetic sessions per harness so list
 // performance can be profiled at realistic history sizes. Dev-mock only.
@@ -172,11 +193,30 @@ function buckets(f: Fixture): TierBucket[] {
   return [{ model: fixtureModel(f), service_tier: null, tokens: tok(f.total, f.harness) }];
 }
 
+// Matches the Rust `storage_id_for_session` convention (model.rs): Codex
+// keeps its historical "thread" segment; every other provider, including
+// Gemini CLI, uses the generic "session" segment.
+function storageIdFor(f: Fixture): string {
+  return f.harness === 'codex' ? `codex:thread:${f.id}` : `${f.harness}:session:${f.id}`;
+}
+
+function modelProviderFor(harness: Fixture['harness']): string {
+  if (harness === 'codex') return 'openai';
+  if (harness === 'claude_code') return 'anthropic';
+  return 'google';
+}
+
+function contextWindowFor(harness: Fixture['harness']): number {
+  if (harness === 'codex') return 272_000;
+  if (harness === 'claude_code') return 200_000;
+  return 1_000_000;
+}
+
 function summary(f: Fixture): SessionSummary {
   const model = fixtureModel(f);
   return {
     id: f.id,
-    storage_id: f.harness === 'codex' ? `codex:thread:${f.id}` : `claude_code:session:${f.id}`,
+    storage_id: storageIdFor(f),
     harness: f.harness,
     thread_name: f.name,
     forked_from_id: null,
@@ -197,13 +237,13 @@ function summary(f: Fixture): SessionSummary {
     originator: f.harness === 'codex' ? 'chatgpt' : 'cli',
     source: f.parent ? 'subagent' : null,
     cli_version: '1.4.2',
-    model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
+    model_provider: modelProviderFor(f.harness),
     model,
     service_tier: null,
     plan_type: f.unlimited ? 'pro' : null,
     credits_unlimited: f.unlimited ?? null,
     credits_balance: null,
-    context_window: f.harness === 'codex' ? 272_000 : 200_000,
+    context_window: contextWindowFor(f.harness),
     total_turns: f.turns,
     first_user_message: `${f.name} — please take a look.`,
     tokens_total: tok(f.total, f.harness),
@@ -270,7 +310,7 @@ function details(f: Fixture): Session {
     subagent_id_is_path_fallback: false,
     history_mode: null,
     memory_mode: null,
-    model_provider: f.harness === 'codex' ? 'openai' : 'anthropic',
+    model_provider: modelProviderFor(f.harness),
     latest_context_tokens: Math.round((s.context_window ?? 200_000) * 0.54),
     tokens_by_model: { [model]: tok(f.total, f.harness) },
     tokens_history: history,
@@ -413,13 +453,15 @@ function subscriptionUsage(): SubscriptionUsageEntry[] {
 }
 
 // Issue #44: only populated for the 'tool-dimensions' visual scenario, so
-// every other baseline is byte-for-byte unaffected. Codex sessions get MCP
-// server, shell family, and language data; Claude Code sessions get
-// language and context-source data only — the 'tool-dimensions' scenario's
-// `list_providers` response below marks Claude Code's mcp/shell dimensions
-// unavailable as a fixture-only demonstration of the unavailable-vs-zero
-// distinction (not a claim about Claude Code's real capability, which is
-// mcp_dimension/shell_dimension: true — see `provider.rs`).
+// every other baseline is byte-for-byte unaffected. Codex and Claude Code
+// both get real mcp_server/shell_family/language/context_source data — both
+// providers are genuinely capable of every dimension (provider.rs). Gemini
+// CLI deliberately omits mcp_server/shell_family here: it genuinely lacks
+// those two capabilities (mcp_dimension/shell_dimension: false in the
+// 'tool-dimensions' branch of the 'list_providers' case below, matching
+// provider.rs's real GEMINI_CLI_DESCRIPTOR), so the panel must render
+// "Unavailable" from that capability flag, not from an absent-vs-zero guess
+// at missing keys here — there is no override anywhere in this file.
 function dimensionTotalsFor(f: Fixture): RangeTotals['tool_dimensions'] {
   if (visualScenario !== 'tool-dimensions') return undefined;
   const dim = (calls: number, failures: number, outputBytes: number, durationMs: number) =>
@@ -448,13 +490,30 @@ function dimensionTotalsFor(f: Fixture): RangeTotals['tool_dimensions'] {
       context_source: contextSource,
     };
   }
-  // Claude Code: mcp_server/shell_family omitted entirely — the panel must
-  // render "unavailable" from the capability flag, not an absent-vs-zero
-  // guess from missing keys here.
+  if (f.harness === 'claude_code') {
+    return {
+      mcp_server: {
+        docs_search: dim(7, 0, 15_000, 3_100),
+      },
+      shell_family: {
+        pytest: dim(4, 1, 22_000, 18_500),
+        git: dim(3, 0, 1_100, 600),
+      },
+      language: {
+        svelte: dim(11, 0, 54_000, 0),
+        typescript: dim(9, 0, 47_000, 0),
+      },
+      context_source: contextSource,
+    };
+  }
+  // Gemini CLI: mcp_server/shell_family keys are omitted entirely (not
+  // zeroed) — the capability is genuinely absent, not merely unused this
+  // session. language/context_source stay real: those two dimensions are
+  // generic, provider-agnostic signals (see provider.rs's
+  // language_dimension/context_dimension, both true for Gemini CLI).
   return {
     language: {
-      svelte: dim(11, 0, 54_000, 0),
-      typescript: dim(9, 0, 47_000, 0),
+      python: dim(5, 0, 26_000, 0),
     },
     context_source: contextSource,
   };
@@ -708,22 +767,29 @@ mockIPC((cmd, payload) => {
       return null;
     case 'reassign_session_project':
       return 'repo:demo-fixture';
-    case 'list_providers':
-      // Kept to the two shipped-and-visually-baselined providers; Gemini CLI
-      // is registered but intentionally left out of this dev fixture so it
-      // does not shift tab counts in the Playwright visual suite.
-      return [
+    case 'list_providers': {
+      // Kept to the two shipped-and-visually-baselined providers for every
+      // other scenario; Gemini CLI is registered but intentionally left out
+      // so it does not shift tab counts in the Playwright visual suite.
+      const providers = [
         { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true, mcp_dimension: true, shell_dimension: true, language_dimension: true, context_dimension: true },
-        {
-          id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false,
-          // Fixture-only override for the 'tool-dimensions' visual scenario,
-          // to demonstrate the unavailable-vs-zero distinction in a
-          // baseline — Claude Code's real capability is
-          // mcp_dimension/shell_dimension: true (provider.rs).
-          mcp_dimension: visualScenario !== 'tool-dimensions', shell_dimension: visualScenario !== 'tool-dimensions',
-          language_dimension: true, context_dimension: true,
-        },
+        { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false, mcp_dimension: true, shell_dimension: true, language_dimension: true, context_dimension: true },
       ];
+      // Issue #44: the 'tool-dimensions' scenario adds Gemini CLI so the
+      // panel can show a real, uncontrived "Unavailable" state — no
+      // capability-flag override on any provider anywhere in this file.
+      // These flags match provider.rs's real GEMINI_CLI_DESCRIPTOR exactly:
+      // mcp_dimension/shell_dimension false (not corroborated against a
+      // real transcript in this codebase), language_dimension/
+      // context_dimension true (generic, provider-agnostic signals).
+      if (visualScenario === 'tool-dimensions') {
+        providers.push({
+          id: 'gemini_cli', display_name: 'Gemini CLI', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false,
+          mcp_dimension: false, shell_dimension: false, language_dimension: true, context_dimension: true,
+        });
+      }
+      return providers;
+    }
     case 'get_provider_diagnostics':
       return providerDiagnostics();
     case 'sessions_in_ranges': {
