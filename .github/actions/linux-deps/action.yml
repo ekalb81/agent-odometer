@@ -1,0 +1,62 @@
+name: Install Linux system deps
+description: >-
+  Installs the Tauri build dependencies, retrying on transient apt failures.
+  Four CI jobs need this identical set; keeping it here means they cannot
+  drift apart.
+
+runs:
+  using: composite
+  steps:
+    - name: Install Linux system deps
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        # A hung apt mirror used to consume the entire job. `apt-get update`
+        # produced no output for fourteen minutes and the job hit its
+        # timeout-minutes with nothing installed and nothing tested — three
+        # separate pull requests lost a full 15-minute budget that way.
+        #
+        # `timeout` bounds each attempt so a stalled mirror fails fast
+        # instead of silently burning the job, and the retry covers the
+        # transient case that a rerun always fixed by hand.
+        attempt=1
+        max_attempts=3
+
+        while [ "$attempt" -le "$max_attempts" ]; do
+          echo "::group::apt attempt ${attempt}/${max_attempts}"
+
+          if timeout 240 sudo apt-get update \
+            && timeout 420 sudo apt-get install -y --no-install-recommends \
+              libwebkit2gtk-4.1-dev \
+              libsoup-3.0-dev \
+              librsvg2-dev \
+              libayatana-appindicator3-dev \
+              libgtk-3-dev \
+              libssl-dev \
+              build-essential \
+              pkg-config
+          then
+            echo "::endgroup::"
+            echo "Installed on attempt ${attempt}."
+            exit 0
+          fi
+
+          status=$?
+          echo "::endgroup::"
+
+          # 124 is `timeout`'s "command timed out"; anything else is a real
+          # apt failure (bad package, resolver conflict) that retrying is
+          # unlikely to fix, but a retry is cheap next to a 15-minute stall.
+          if [ "$status" -eq 124 ]; then
+            echo "::warning::apt timed out on attempt ${attempt}."
+          else
+            echo "::warning::apt failed with status ${status} on attempt ${attempt}."
+          fi
+
+          attempt=$((attempt + 1))
+          [ "$attempt" -le "$max_attempts" ] && sleep 15
+        done
+
+        echo "::error::apt failed after ${max_attempts} attempts."
+        exit 1
