@@ -185,6 +185,20 @@ pub struct AppState {
     /// the on-demand provider diagnostics report. Never populated eagerly
     /// beyond the scan that already runs at startup/config-save.
     last_scan_report: Mutex<Option<ScanSummary>>,
+    /// Bumped every time `sessions` gains a new/replaced entry or an
+    /// existing one's availability changes (issue #128). `quota_snapshots`
+    /// compares this against the value it last recomputed from instead of
+    /// diffing session content, mirroring how `scan_generation` gates scan
+    /// publication rather than re-deriving "did anything change".
+    sessions_generation: AtomicU64,
+    /// Cached `quota_store::QuotaStoreFile`, loaded from disk once and kept
+    /// current only by [`Self::set_quota_store`] (`commands::set_quota_config`'s
+    /// write path) rather than reloaded from disk on every
+    /// `get_quota_snapshots` call (issue #128).
+    quota_store_cache: Mutex<Option<Arc<crate::quota_store::QuotaStoreFile>>>,
+    /// Cached `get_quota_snapshots` output; see [`crate::quota::QuotaSnapshotCache`]
+    /// (issue #128).
+    quota_snapshot_cache: crate::quota::QuotaSnapshotCache,
 }
 
 impl AppState {
@@ -216,6 +230,9 @@ impl AppState {
             tray: Mutex::new(None),
             tray_available: AtomicBool::new(false),
             last_scan_report: Mutex::new(None),
+            sessions_generation: AtomicU64::new(0),
+            quota_store_cache: Mutex::new(None),
+            quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
         }
     }
 
@@ -422,6 +439,7 @@ impl AppState {
                 let displaced = displaced.map(|stored| {
                     self.sessions
                         .insert(stored.key, Arc::new(stored.session.clone()));
+                    self.touch_sessions_generation();
                     stored.session
                 });
                 ReconciledSession {
@@ -502,6 +520,7 @@ impl AppState {
                     || existing.file_path != session.file_path
             });
             self.sessions.insert(key, Arc::new(session.clone()));
+            self.touch_sessions_generation();
             if is_changed {
                 changed.push(session);
             }
@@ -571,6 +590,7 @@ impl AppState {
         if let Some(stored) = persisted {
             self.sessions
                 .insert(stored.key, Arc::new(stored.session.clone()));
+            self.touch_sessions_generation();
             return Some(stored.session);
         }
         let storage_id = storage_id?;
@@ -587,7 +607,9 @@ impl AppState {
         let mut session = self.sessions.get_mut(&storage_id)?;
         let session = std::sync::Arc::make_mut(session.value_mut());
         session.source_availability = SourceAvailability::Missing;
-        Some(session.clone())
+        let session = session.clone();
+        self.touch_sessions_generation();
+        Some(session)
     }
 
     pub fn publish_instruction_paths_if_current(
@@ -645,6 +667,7 @@ impl AppState {
             removed: false,
         };
         self.sessions.insert(storage_id, Arc::new(session));
+        self.touch_sessions_generation();
         drop(path_state);
         let _ = replaced;
         true
@@ -673,6 +696,7 @@ impl AppState {
             removed: false,
         };
         self.sessions.insert(storage_id, Arc::new(session));
+        self.touch_sessions_generation();
         drop(path_state);
         let _ = replaced;
     }
@@ -707,6 +731,67 @@ impl AppState {
     /// The last completed scan's counters, if any scan has finished yet.
     pub fn last_scan_summary(&self) -> Option<ScanSummary> {
         self.last_scan_report.lock().unwrap().clone()
+    }
+
+    /// Marks that `sessions` changed. Every call site that inserts into or
+    /// mutates an entry in `sessions` must call this (issue #128) so
+    /// [`Self::quota_snapshots`]'s cache knows a recompute is warranted.
+    /// Over-invalidating (e.g. on a metadata-only change quota doesn't
+    /// care about) is harmless — it only means the next
+    /// `get_quota_snapshots` call is eligible to recompute, gated by
+    /// [`crate::quota::QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL`] either way.
+    fn touch_sessions_generation(&self) {
+        self.sessions_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The current session-change generation; see
+    /// [`Self::touch_sessions_generation`].
+    pub fn sessions_generation(&self) -> u64 {
+        self.sessions_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The cached quota-config file, loading it from disk on first access.
+    /// Only [`Self::set_quota_store`] replaces it thereafter (issue #128).
+    pub fn quota_store(&self) -> Arc<crate::quota_store::QuotaStoreFile> {
+        let mut cache = self.quota_store_cache.lock().unwrap();
+        if let Some(store) = cache.as_ref() {
+            return store.clone();
+        }
+        let store = Arc::new(crate::quota_store::QuotaStoreFile::load());
+        *cache = Some(store.clone());
+        store
+    }
+
+    /// Replaces the cached quota-config file and invalidates the quota
+    /// snapshot cache, since `max_cache_age_secs` feeds it directly. The
+    /// only caller is `commands::set_quota_config`, immediately after it
+    /// persists a new file to disk (issue #128).
+    pub fn set_quota_store(&self, store: crate::quota_store::QuotaStoreFile) {
+        *self.quota_store_cache.lock().unwrap() = Some(Arc::new(store));
+        self.quota_snapshot_cache.invalidate();
+    }
+
+    /// Returns every provider's quota snapshot, recomputing from the
+    /// current session projection only when warranted; see
+    /// [`crate::quota::QuotaSnapshotCache`] (issue #128).
+    pub fn quota_snapshots(
+        &self,
+        max_cache_age: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> Vec<crate::quota::QuotaSnapshot> {
+        let generation = self.sessions_generation();
+        self.quota_snapshot_cache
+            .get_or_recompute(generation, std::time::Instant::now(), || {
+                let sessions: Vec<Arc<Session>> =
+                    self.sessions.iter().map(|e| e.value().clone()).collect();
+                crate::quota::quota_snapshots_from_sessions(
+                    sessions.iter().map(Arc::as_ref),
+                    now,
+                    max_cache_age,
+                )
+            })
     }
 }
 
@@ -758,6 +843,9 @@ mod tests {
             tray: Mutex::new(None),
             tray_available: AtomicBool::new(false),
             last_scan_report: Mutex::new(None),
+            sessions_generation: AtomicU64::new(0),
+            quota_store_cache: Mutex::new(None),
+            quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
         }
     }
 

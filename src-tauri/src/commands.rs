@@ -2876,15 +2876,10 @@ pub fn clear_session_project_override(
 #[tauri::command]
 pub fn get_quota_snapshots(state: State<'_, Arc<AppState>>) -> Vec<crate::quota::QuotaSnapshot> {
     let started = Instant::now();
-    let store = crate::quota_store::QuotaStoreFile::load();
+    let store = state.quota_store();
     let now = Utc::now();
     let max_cache_age = chrono::Duration::seconds(store.max_cache_age_secs);
-    let sessions: Vec<Arc<Session>> = state.sessions.iter().map(|e| e.value().clone()).collect();
-    let result = crate::quota::quota_snapshots_from_sessions(
-        sessions.iter().map(Arc::as_ref),
-        now,
-        max_cache_age,
-    );
+    let result = state.quota_snapshots(max_cache_age, now);
     state.performance.record_backend(
         "ipc.get_quota_snapshots",
         started,
@@ -2908,6 +2903,7 @@ pub fn get_quota_config() -> crate::quota_store::QuotaConfigWire {
 /// is internal bookkeeping the caller never sees or supplies.
 #[tauri::command]
 pub fn set_quota_config(
+    state: State<'_, Arc<AppState>>,
     config: crate::quota_store::QuotaConfigWire,
 ) -> Result<crate::quota_store::QuotaConfigWire, String> {
     crate::quota_store::validate_quota_config(&config)?;
@@ -2916,7 +2912,13 @@ pub fn set_quota_config(
     store.notifications = config.notifications;
     store.max_cache_age_secs = config.max_cache_age_secs;
     store.save().map_err(|error| error.to_string())?;
-    Ok(crate::quota_store::QuotaConfigWire::from(&store))
+    let wire = crate::quota_store::QuotaConfigWire::from(&store);
+    // Issue #128: `get_quota_snapshots` no longer reloads this file per
+    // call, so the in-memory cache must be brought current here, at the
+    // one write path — and the (small, one-per-provider) snapshot cache
+    // invalidated, since `max_cache_age_secs` feeds it directly.
+    state.set_quota_store(store);
+    Ok(wire)
 }
 
 /// Token usage for one budget's provider/project scope over its rolling

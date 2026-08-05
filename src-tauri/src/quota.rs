@@ -245,7 +245,7 @@ pub struct QuotaWindow {
     pub forecast: Option<QuotaForecast>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuotaSnapshot {
     pub provider: ProviderId,
     pub provenance: QuotaProvenance,
@@ -575,6 +575,145 @@ pub fn quota_snapshots_from_sessions<'a>(
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Quota snapshot cache (issue #128)
+//
+// `quota_snapshots_from_sessions` clones every rate-limit point of every
+// session in the corpus — O(corpus), measured at 1.3-1.8s on a ~4,000-
+// session field recording. The tray refresh path (`App.svelte`) calls
+// `get_quota_snapshots` on essentially every session update (a median
+// ~289ms apart during active use), which turned an otherwise-incremental
+// hot path into a near-continuous full-corpus rebuild: 32.3s of an 87s
+// run.
+//
+// This cache makes the steady-state cost O(1): most calls return a clone
+// of the last computed (small — one entry per provider) `Vec<QuotaSnapshot>`
+// rather than re-aggregating. It recomputes whenever *either*:
+//   1. `sessions_generation` (see `AppState::sessions_generation`) has
+//      changed since the last recompute *and* at least
+//      `QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL` has elapsed — collapses a
+//      burst of rapid session updates into a single recompute, or
+//   2. at least `QUOTA_SNAPSHOT_MAX_AGE` has elapsed since the last
+//      recompute, regardless of whether sessions changed at all.
+//
+// Condition 2 is not optional. A `QuotaSnapshot` is not a pure function of
+// session data — `QuotaWindow.stale` (`age > max_cache_age`), the elapsed
+// fraction driving `reserve_deficit_percent`, and pace/projected-exhaustion
+// math (`forecast_from_series`) are all functions of `now`. A generation-
+// only condition never recomputes on an idle app (no session updates), so
+// a window computed as fresh at 09:00 would still be served as fresh at
+// 10:00 even though an hour has genuinely passed — the staleness detector
+// itself going stale, exactly inverting #43's "never present a cached
+// value as fresher than it is". Condition 2 bounds that.
+//
+// This never fabricates freshness: a cache hit returns the exact
+// `Vec<QuotaSnapshot>` a prior call already computed (with its own
+// `observed_at`/`stale` fields intact, honestly reflecting the `now` used
+// when it was actually computed), not a value whose timestamps get
+// silently bumped to "now" on serve — condition 2 exists precisely so that
+// value doesn't get served for longer than `QUOTA_SNAPSHOT_MAX_AGE` once
+// it's actually gone stale.
+// ---------------------------------------------------------------------------
+
+/// Minimum wall-clock time between two full recomputes triggered by a
+/// session change, even if sessions keep changing in between. Every
+/// provider quota window Odometer tracks moves on the order of minutes
+/// (`daily`/`weekly`/`monthly`; even a `burst` window is measured in tens
+/// of minutes — see `classify_window_kind`), so no consumer benefits from
+/// a data-driven recompute more often than this. A live session can mutate
+/// roughly every ~289ms during active use (issue #128's field recording),
+/// so without a floor the cache would still recompute on almost every
+/// call. 5 seconds keeps the tray visibly live (it already debounces its
+/// own refresh by 250ms) while turning the field recording's 21 recomputes
+/// at ~1.5s each (32.3s total) into at most ~1 every 5s.
+pub const QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Upper bound on how long a cached snapshot may be served without a
+/// recompute, regardless of whether `sessions_generation` ever changes —
+/// the fix for the time-dependence described above. Chosen against what I
+/// found checking the configurable floor: `quota_store::validate_quota_config`
+/// only rejects `max_cache_age_secs <= 0` (no lower bound beyond that), so
+/// a value of 1 is technically writable through `set_quota_config`, and a
+/// hand-edited `quota-v1.json` isn't validated on load at all. Neither is
+/// reachable through today's UI, though: nothing in `SubscriptionUsage.svelte`
+/// ever edits `max_cache_age_secs`, so every real installation runs with
+/// the shipped default of 21,600s (6h). 30 seconds keeps every realistic
+/// staleness transition within an easily-noticed margin, stays well above
+/// `QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL` so it never fights the
+/// session-change throttle, and — being a small fraction of even the
+/// shortest real window kind (`burst`, tens of minutes) — never turns into
+/// a meaningful fraction of "recomputing too often". A hand-edited
+/// `max_cache_age_secs` under 30s would still see its staleness transition
+/// lag by up to this bound; that is an accepted tradeoff of bounding
+/// recompute cost on an otherwise-idle app at all, for a configuration no
+/// shipped UI can produce.
+pub const QUOTA_SNAPSHOT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+struct QuotaSnapshotCacheEntry {
+    snapshots: Vec<QuotaSnapshot>,
+    sessions_generation: u64,
+    computed_at: std::time::Instant,
+}
+
+/// Caches `quota_snapshots_from_sessions`'s output. See the module section
+/// above for the recompute policy and the honesty guarantee.
+#[derive(Default)]
+pub struct QuotaSnapshotCache {
+    entry: std::sync::Mutex<Option<QuotaSnapshotCacheEntry>>,
+}
+
+impl QuotaSnapshotCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the cached snapshots, calling `compute` to refresh them only
+    /// when at least one recompute condition is met (see the module doc).
+    /// `now` is the caller's monotonic-clock reading, passed in rather than
+    /// read internally so the recompute gate is deterministic and
+    /// unit-testable without real sleeps.
+    pub fn get_or_recompute(
+        &self,
+        sessions_generation: u64,
+        now: std::time::Instant,
+        compute: impl FnOnce() -> Vec<QuotaSnapshot>,
+    ) -> Vec<QuotaSnapshot> {
+        let mut guard = self.entry.lock().unwrap();
+        let should_recompute = match guard.as_ref() {
+            None => true,
+            Some(entry) => {
+                let age = now.saturating_duration_since(entry.computed_at);
+                let changed_and_throttle_elapsed = entry.sessions_generation != sessions_generation
+                    && age >= QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL;
+                let max_age_elapsed = age >= QUOTA_SNAPSHOT_MAX_AGE;
+                changed_and_throttle_elapsed || max_age_elapsed
+            }
+        };
+        if should_recompute {
+            let snapshots = compute();
+            *guard = Some(QuotaSnapshotCacheEntry {
+                snapshots: snapshots.clone(),
+                sessions_generation,
+                computed_at: now,
+            });
+            snapshots
+        } else {
+            guard.as_ref().expect("checked above").snapshots.clone()
+        }
+    }
+
+    /// Forces the next call to recompute, regardless of generation or
+    /// elapsed time. The only caller is a quota-config change
+    /// (`AppState::set_quota_store`, from `commands::set_quota_config`):
+    /// `max_cache_age_secs` feeds `quota_snapshots_from_sessions` directly,
+    /// so an edit to it must not wait out the recompute interval to take
+    /// effect.
+    pub fn invalidate(&self) {
+        *self.entry.lock().unwrap() = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,5 +1475,215 @@ mod tests {
         let (alerts, log) = evaluate_alerts(&evaluations, &settings, &[], Utc::now(), 12);
         assert!(alerts.is_empty());
         assert!(log.is_empty());
+    }
+
+    // -- QuotaSnapshotCache: recompute policy (issue #128) -------------------
+    //
+    // These use a counting stand-in for the expensive aggregation
+    // (`quota_snapshots_from_sessions` in production) to prove it runs at
+    // most once across many calls with no intervening session change, and
+    // exactly once more after a change plus the min-recompute interval —
+    // the behavior that was missing before this fix, when every call
+    // recomputed unconditionally.
+
+    #[test]
+    fn quota_snapshot_cache_computes_once_across_many_calls_with_no_session_change() {
+        let cache = QuotaSnapshotCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        };
+        let t0 = std::time::Instant::now();
+
+        cache.get_or_recompute(1, t0, compute);
+        assert_eq!(calls.get(), 1, "the first call always computes");
+
+        // Same generation (nothing changed), called repeatedly, including
+        // well past the min-recompute interval but still short of
+        // QUOTA_SNAPSHOT_MAX_AGE: must never recompute purely from data
+        // being unchanged. (Time alone crossing QUOTA_SNAPSHOT_MAX_AGE is
+        // its own, separately-tested recompute trigger — see
+        // `quota_snapshot_cache_recomputes_after_max_age_even_without_a_session_change`.)
+        cache.get_or_recompute(1, t0, compute);
+        cache.get_or_recompute(1, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL * 2, compute);
+        cache.get_or_recompute(
+            1,
+            t0 + QUOTA_SNAPSHOT_MAX_AGE - std::time::Duration::from_millis(1),
+            compute,
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "no session change means no recompute, however many calls, as long as the max age hasn't elapsed"
+        );
+    }
+
+    #[test]
+    fn quota_snapshot_cache_recomputes_after_max_age_even_without_a_session_change() {
+        // The bug this guards against: on an idle app (no session updates,
+        // so `sessions_generation` never moves), a generation-only
+        // recompute condition would cache a snapshot forever. Time alone
+        // must still force a recompute, because `stale`/pace/forecast are
+        // functions of `now`, not just session data.
+        let cache = QuotaSnapshotCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        };
+        let t0 = std::time::Instant::now();
+        cache.get_or_recompute(1, t0, compute);
+        assert_eq!(calls.get(), 1);
+
+        // Still generation 1 (no session change), but QUOTA_SNAPSHOT_MAX_AGE
+        // has fully elapsed.
+        cache.get_or_recompute(1, t0 + QUOTA_SNAPSHOT_MAX_AGE, compute);
+        assert_eq!(
+            calls.get(),
+            2,
+            "an idle app must still recompute once the max age elapses, even with no session change"
+        );
+    }
+
+    #[test]
+    fn quota_snapshot_cache_recomputes_once_after_a_session_change_once_the_interval_elapses() {
+        let cache = QuotaSnapshotCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        };
+        let t0 = std::time::Instant::now();
+        cache.get_or_recompute(1, t0, compute);
+        assert_eq!(calls.get(), 1);
+
+        // A session changed (generation 1 -> 2) immediately after, but the
+        // min-recompute interval has not elapsed: repeated rapid calls must
+        // keep serving the cached result, not recompute on every call.
+        cache.get_or_recompute(2, t0 + std::time::Duration::from_millis(1), compute);
+        cache.get_or_recompute(2, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL / 2, compute);
+        assert_eq!(
+            calls.get(),
+            1,
+            "a changed generation inside the min-recompute interval must not recompute yet"
+        );
+
+        // Once the generation differs *and* the interval has elapsed, the
+        // next call recomputes exactly once.
+        cache.get_or_recompute(2, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL, compute);
+        assert_eq!(calls.get(), 2);
+
+        // ...and settles back into "no further recompute" for that
+        // generation, exactly like the first assertion.
+        cache.get_or_recompute(2, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL * 5, compute);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn quota_snapshot_cache_invalidate_forces_an_immediate_recompute() {
+        let cache = QuotaSnapshotCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        };
+        let t0 = std::time::Instant::now();
+        cache.get_or_recompute(1, t0, compute);
+        assert_eq!(calls.get(), 1);
+
+        // Same generation, well inside the interval: ordinarily a cache
+        // hit. An explicit invalidation (a quota-config change) must force
+        // a recompute anyway rather than waiting out the interval.
+        cache.invalidate();
+        cache.get_or_recompute(1, t0 + std::time::Duration::from_millis(1), compute);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn quota_snapshot_cache_hit_returns_exactly_the_prior_computation() {
+        // Honesty: a served cache hit must be the same value the last real
+        // recompute produced, not something that looks "freshened" merely
+        // because time passed between calls.
+        let now = ts("2026-01-01T00:00:00Z");
+        let points = [point(
+            "2026-01-01T00:00:00Z",
+            42.0,
+            300,
+            "2026-01-01T05:00:00Z",
+        )];
+        let compute = || {
+            vec![build_quota_snapshot(
+                codex_provider_id(),
+                true,
+                &points,
+                QuotaAccountInfo::default(),
+                now,
+                Duration::hours(6),
+            )]
+        };
+        let cache = QuotaSnapshotCache::new();
+        let t0 = std::time::Instant::now();
+        let first = cache.get_or_recompute(1, t0, compute);
+        let served = cache.get_or_recompute(1, t0 + std::time::Duration::from_millis(1), compute);
+        assert_eq!(first[0].windows[0].used, Some(42.0));
+        assert_eq!(
+            served, first,
+            "a cache hit must return exactly what was last computed, not a refreshed value"
+        );
+    }
+
+    #[test]
+    fn a_window_that_goes_stale_purely_from_elapsed_time_is_reported_stale_once_the_max_age_recompute_runs(
+    ) {
+        // The precise user-visible consequence of the bug: on an idle app
+        // (no session updates, so `sessions_generation` never moves), a
+        // window that was fresh when first cached must not still read as
+        // fresh once real time has made it genuinely stale.
+        let observed_at = ts("2026-01-01T00:00:00Z");
+        let points = [point(
+            "2026-01-01T00:00:00Z",
+            40.0,
+            300,
+            "2026-01-01T05:00:00Z",
+        )];
+        let max_cache_age = Duration::seconds(120);
+        let cache = QuotaSnapshotCache::new();
+        let t0 = std::time::Instant::now();
+
+        // First computation: 30s after the observation, well inside the
+        // 120s max_cache_age, so the window is fresh.
+        let now_fresh = observed_at + Duration::seconds(30);
+        let fresh = cache.get_or_recompute(1, t0, || {
+            vec![build_quota_snapshot(
+                codex_provider_id(),
+                true,
+                &points,
+                QuotaAccountInfo::default(),
+                now_fresh,
+                max_cache_age,
+            )]
+        });
+        assert!(!fresh[0].windows[0].stale);
+
+        // No session change (still generation 1), but QUOTA_SNAPSHOT_MAX_AGE
+        // of monotonic time has passed, and wall-clock time has moved far
+        // enough that the same observation is now genuinely past
+        // max_cache_age (200s > 120s).
+        let now_stale = observed_at + Duration::seconds(200);
+        let served = cache.get_or_recompute(1, t0 + QUOTA_SNAPSHOT_MAX_AGE, || {
+            vec![build_quota_snapshot(
+                codex_provider_id(),
+                true,
+                &points,
+                QuotaAccountInfo::default(),
+                now_stale,
+                max_cache_age,
+            )]
+        });
+        assert!(
+            served[0].windows[0].stale,
+            "staleness must not stay frozen at 'fresh' on an idle app just because sessions never changed"
+        );
     }
 }
