@@ -281,6 +281,64 @@ fn parses_custom_tool_calls_and_tags_nested_mcp_providers() {
 }
 
 #[test]
+fn classifies_shell_family_and_language_for_codex_tool_calls() {
+    // Issue #44: shell command family and language are computed generically
+    // in `telemetry.rs` from data every provider's tool call already
+    // carries. Codex's `shell_command` tool's `command` argument is a plain
+    // string (see `tests/fixtures/sample-session.jsonl`'s real fixture
+    // data), matching the same shape `classify_shell_family` expects for
+    // Claude's `Bash` tool.
+    let mut parser = parser::SessionParser::new(PathBuf::from("synthetic-dimensions.jsonl"), false);
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:00Z","type":"session_meta","payload":{"id":"synthetic-dimensions","timestamp":"2026-07-24T12:00:00Z","cwd":"C:\\synthetic","originator":"Codex Desktop","source":"app"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:00.100Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:01Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"npm test\",\"workdir\":\"C:\\\\synthetic\"}","call_id":"call-shell"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:01.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-shell","output":"ok"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:02Z","type":"response_item","payload":{"type":"function_call","name":"read_file","arguments":"{\"path\":\"C:\\\\synthetic\\\\src\\\\main.py\"}","call_id":"call-read"}}"#,
+        )
+        .unwrap();
+    parser
+        .apply_line(
+            r#"{"timestamp":"2026-07-24T12:00:02.500Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-read","output":"print(1)"}}"#,
+        )
+        .unwrap();
+
+    let session = parser.session.unwrap();
+    assert_eq!(session.tool_observations.len(), 2);
+    let shell = session
+        .tool_observations
+        .iter()
+        .find(|o| o.call_id == "call-shell")
+        .unwrap();
+    assert_eq!(shell.shell_family.as_deref(), Some("npm"));
+    assert_eq!(shell.language, None);
+    let read = session
+        .tool_observations
+        .iter()
+        .find(|o| o.call_id == "call-read")
+        .unwrap();
+    assert_eq!(read.language.as_deref(), Some("python"));
+    assert_eq!(read.shell_family, None);
+}
+
+#[test]
 fn populates_tokens_history_from_token_count_events() {
     let s = parser::parse_file(&fixture(), false).unwrap().unwrap();
     // The fixture has 8 token_count events; the first has info: null, so 7 history points.

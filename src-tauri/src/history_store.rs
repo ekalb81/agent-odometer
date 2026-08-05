@@ -9,8 +9,8 @@
 
 use crate::model::{
     OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session,
-    SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolKind, ToolMetrics,
-    ToolObservation, ToolOrigin, ToolOutcome,
+    SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolDimensionMetrics, ToolKind,
+    ToolMetrics, ToolObservation, ToolOrigin, ToolOutcome,
 };
 use crate::provider::{claude_code_provider_id, codex_provider_id};
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -590,6 +590,10 @@ impl HistoryStore {
             "SELECT timestamp_ms, rule_id, severity, avoidable_calls
              FROM durable_finding_events WHERE session_key = ?1",
         )?;
+        let mut dimension_rollup_query = connection.prepare(
+            "SELECT hour_bucket, dimension_kind, dimension_value, calls, failures, output_bytes, duration_ms
+             FROM rollup_tool_dimensions WHERE session_key = ?1",
+        )?;
         let edge_predicate = edge_predicate_sql(&edge_ranges);
         let mut token_edge_query = (!edge_ranges.is_empty())
             .then(|| {
@@ -608,6 +612,15 @@ impl HistoryStore {
                 connection.prepare(&format!(
                     "SELECT timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes, origin
                      FROM durable_tool_events WHERE session_key = ?1 AND ({edge_predicate})
+                     ORDER BY timestamp_ms"
+                ))
+            })
+            .transpose()?;
+        let mut dimension_edge_query = (!edge_ranges.is_empty())
+            .then(|| {
+                connection.prepare(&format!(
+                    "SELECT timestamp_ms, dimension_kind, dimension_value, outcome, output_bytes, duration_ms
+                     FROM durable_tool_dimension_events WHERE session_key = ?1 AND ({edge_predicate})
                      ORDER BY timestamp_ms"
                 ))
             })
@@ -668,6 +681,23 @@ impl HistoryStore {
                     ))
                 })?
                 .collect::<std::result::Result<_, _>>()?;
+            let dimension_rows: Vec<(i64, String, String, ToolDimensionMetrics)> =
+                dimension_rollup_query
+                    .query_map([key.as_str()], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            ToolDimensionMetrics {
+                                calls: row.get::<_, i64>(3)? as u64,
+                                failures: row.get::<_, i64>(4)? as u64,
+                                output_bytes: row.get::<_, i64>(5)? as u64,
+                                duration_ms: row.get::<_, i64>(6)? as u64,
+                                tokens: 0,
+                            },
+                        ))
+                    })?
+                    .collect::<std::result::Result<_, _>>()?;
             let edge_params = |key: &str| -> Vec<Box<dyn rusqlite::ToSql>> {
                 let mut params: Vec<Box<dyn rusqlite::ToSql>> =
                     Vec::with_capacity(1 + edge_ranges.len() * 2);
@@ -738,11 +768,41 @@ impl HistoryStore {
                                 target: row.get(5)?,
                                 resource_id: None,
                                 origin: ToolOrigin::from_str_or_unknown(&row.get::<_, String>(8)?),
+                                // Not persisted here either: the issue #44
+                                // open-set dimensions (mcp_server/
+                                // shell_family/language) are reconstructed
+                                // from `durable_tool_dimension_events`
+                                // separately (see `dimension_edge_rows`),
+                                // not from this fact row.
+                                shell_family: None,
+                                language: None,
                                 outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
                                 duration_ms: row
                                     .get::<_, Option<i64>>(6)?
                                     .map(|value| value as u64),
                                 output_bytes: row.get::<_, i64>(7)? as u64,
+                            })
+                        })?
+                        .collect::<std::result::Result<_, _>>()?
+                }
+                None => Vec::new(),
+            };
+            let edge_dimensions: Vec<DimensionEdgeEvent> = match dimension_edge_query.as_mut() {
+                Some(query) => {
+                    let params = edge_params(key);
+                    let refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|value| value.as_ref()).collect();
+                    query
+                        .query_map(refs.as_slice(), |row| {
+                            Ok(DimensionEdgeEvent {
+                                timestamp_ms: row.get::<_, i64>(0)?,
+                                dimension_kind: row.get::<_, String>(1)?,
+                                dimension_value: row.get::<_, String>(2)?,
+                                outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
+                                output_bytes: row.get::<_, i64>(4)? as u64,
+                                duration_ms: row
+                                    .get::<_, Option<i64>>(5)?
+                                    .map(|value| value as u64),
                             })
                         })?
                         .collect::<std::result::Result<_, _>>()?
@@ -775,6 +835,8 @@ impl HistoryStore {
                     &edge_tokens,
                     &edge_tools,
                     &findings,
+                    &dimension_rows,
+                    &edge_dimensions,
                 );
                 if crate::commands::range_has_data(&range) {
                     out[window_index].insert(key.clone(), range);
@@ -983,6 +1045,8 @@ fn compute_range_totals(
     edge_tokens: &[TokenHistoryPoint],
     edge_tools: &[ToolObservation],
     findings: &[OptimizationFinding],
+    dimension_rollup_rows: &[(i64, String, String, ToolDimensionMetrics)],
+    edge_dimension_events: &[DimensionEdgeEvent],
 ) -> RangeTotals {
     let in_bucket_range = |bucket: i64| {
         plan.full_buckets
@@ -1117,6 +1181,60 @@ fn compute_range_totals(
     let optimization_findings_count = selected_findings.len() as u64;
     let optimization_summary = OptimizationSummary::from_findings(selected_findings);
 
+    // Issue #44 open-set dimensions (mcp_server/shell_family/language):
+    // whole-bucket rollup rows plus sub-hour edge facts, merged with the
+    // same rollup/edge split every other dimension in this function uses.
+    // `ToolDimensionMetrics`'s four counters are plain per-call sums with no
+    // chain-derived field (see its doc comment), so — unlike
+    // `mutation_targets`/`one_shot_mutations`/`retry_count` above — summing
+    // rollup rows directly is always correct; there is nothing to
+    // reconstruct from a merged chain map.
+    let mut tool_dimensions: BTreeMap<String, BTreeMap<String, ToolDimensionMetrics>> =
+        BTreeMap::new();
+    for (bucket, kind, value, metrics) in dimension_rollup_rows {
+        if !in_bucket_range(*bucket) {
+            continue;
+        }
+        tool_dimensions
+            .entry(kind.clone())
+            .or_default()
+            .entry(value.clone())
+            .or_default()
+            .add_assign(metrics);
+    }
+    for event in edge_dimension_events {
+        if !in_window(event.timestamp_ms) || in_bucket_range(hour_bucket(event.timestamp_ms)) {
+            continue;
+        }
+        let entry = tool_dimensions
+            .entry(event.dimension_kind.clone())
+            .or_default()
+            .entry(event.dimension_value.clone())
+            .or_default();
+        crate::telemetry::accumulate_dimension_call(
+            entry,
+            event.outcome,
+            event.output_bytes,
+            event.duration_ms,
+        );
+    }
+    // context_source has no fact/rollup table of its own: it is derived
+    // purely from `tokens` above (already correctly rollup+edge merged),
+    // via the same formula `Session::range_totals_multi` (the in-memory
+    // oracle) uses.
+    for (value, token_count) in crate::telemetry::context_source_breakdown(&tokens) {
+        tool_dimensions
+            .entry("context_source".to_owned())
+            .or_default()
+            .insert(
+                value,
+                ToolDimensionMetrics {
+                    tokens: token_count,
+                    ..Default::default()
+                },
+            );
+    }
+
     RangeTotals {
         tokens,
         buckets,
@@ -1124,7 +1242,21 @@ fn compute_range_totals(
         tool_metrics_by_model,
         optimization_findings_count,
         optimization_summary,
+        tool_dimensions,
     }
+}
+
+/// One sub-hour edge fact for an issue #44 open-set dimension
+/// (`durable_tool_dimension_events`), pooled across every window in a batch
+/// exactly like `edge_tokens`/`edge_tools` above.
+#[derive(Debug, Clone)]
+struct DimensionEdgeEvent {
+    timestamp_ms: i64,
+    dimension_kind: String,
+    dimension_value: String,
+    outcome: ToolOutcome,
+    output_bytes: u64,
+    duration_ms: Option<u64>,
 }
 
 /// True when `table` already has a column named `column`. Used to guard an
@@ -1255,6 +1387,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 6 {
         steps += 1;
+        version = 7;
+    }
+    if version == 7 {
+        steps += 1;
     }
     steps
 }
@@ -1379,6 +1515,7 @@ fn migrate(
              CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key);"
         )?;
         transaction.execute_batch(ROLLUP_SCHEMA_SQL)?;
+        transaction.execute_batch(DIMENSION_SCHEMA_SQL)?;
         transaction.execute(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -1857,6 +1994,97 @@ fn migrate(
             started.elapsed(),
         ));
     }
+    let version_before_tool_dimensions: i64 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version_before_tool_dimensions == 7 {
+        // Issue #44's open-set dimensions (MCP server identity, shell
+        // command family, language) get their own fact + rollup tables
+        // (`DIMENSION_SCHEMA_SQL`) rather than `rollup_tool_metrics`
+        // columns: unlike tool-origin's closed four-value set, these label
+        // sets are unbounded or open-ended (see the constant's doc
+        // comment). Both tables are brand new — `DIMENSION_SCHEMA_SQL` uses
+        // `CREATE TABLE IF NOT EXISTS` throughout, so this is safe whether
+        // or not this same migrate() call already created them at `version
+        // == 0` (impossible to reach here in that case) or at some earlier
+        // step (also impossible: no earlier step references them).
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v7_to_v8_tool_dimensions_backfill",
+            step_index,
+            step_total,
+            7,
+            8,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(DIMENSION_SCHEMA_SQL)?;
+        // Backfill `durable_tool_dimension_events` from existing session
+        // snapshots, one blob at a time (mirrors the v1->v3 fact backfill
+        // and the v5->v6 project-identity backfill earlier in this
+        // function) — never materializing every session's snapshot at
+        // once. Only the `mcp_server` dimension can recover real historical
+        // data this way: `providers` already existed on `ToolObservation`
+        // before this migration, but `shell_family`/`language` are new
+        // fields that a pre-existing snapshot's JSON simply does not carry
+        // (they deserialize to `None` via serde defaults), so no
+        // shell_family/language rows are backfilled for historical data —
+        // consistent with "unavailable, not a fabricated zero": those two
+        // dimensions repopulate from real data the next time each session
+        // is reparsed, exactly like the v6->v7 tool-origin backfill's
+        // `unknown_origin_calls` bucket for data it cannot recover either.
+        {
+            let mut select = transaction.prepare(
+                "SELECT d.session_key, s.session_json
+                 FROM durable_sessions d JOIN session_snapshots s
+                   ON s.session_key = d.session_key
+                  AND s.version = d.current_snapshot_version",
+            )?;
+            let mut rows = select.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                let raw: Vec<u8> = row.get(1)?;
+                match serde_json::from_slice::<Session>(&raw) {
+                    Ok(session) => {
+                        store_tool_dimension_facts(&transaction, &key, &session.tool_observations)?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            "could not backfill tool dimensions for {key}: snapshot did not \
+                             deserialize: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        // Second pass: one SQL aggregate over the fact rows just written,
+        // never re-touching a Session or snapshot — the same shape the
+        // v3->v4 rollup backfill uses.
+        transaction.execute_batch(
+            "INSERT INTO rollup_tool_dimensions(
+               session_key, hour_bucket, dimension_kind, dimension_value, calls, failures, output_bytes, duration_ms)
+             SELECT session_key, timestamp_ms / 3600000, dimension_kind, dimension_value,
+               COUNT(*),
+               SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END),
+               SUM(output_bytes),
+               SUM(COALESCE(duration_ms, 0))
+             FROM durable_tool_dimension_events
+             GROUP BY session_key, timestamp_ms / 3600000, dimension_kind, dimension_value;",
+        )?;
+        transaction.execute_batch(
+            "INSERT INTO history_meta(key, value) VALUES('schema_version', '8')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 8;",
+        )?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v7_to_v8_tool_dimensions_backfill",
+            step_index,
+            step_total,
+            7,
+            8,
+            started.elapsed(),
+        ));
+    }
     Ok(())
 }
 
@@ -2052,6 +2280,48 @@ const ROLLUP_SCHEMA_SQL: &str = "
     );
     CREATE UNIQUE INDEX IF NOT EXISTS rollup_mutation_chains_key_idx
       ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target);
+";
+
+/// Issue #44 open-set dimensions (MCP server identity, shell command
+/// family, language) — a per-call fact table plus its hour-bucket rollup,
+/// keyed by an open-ended `(dimension_kind, dimension_value)` pair rather
+/// than flat `rollup_tool_metrics` columns, because these label sets are
+/// unbounded (arbitrary MCP server names) or open-ended and growing (shell
+/// families, languages), unlike the closed four-value tool-origin
+/// dimension. A session that uses none of these contributes zero rows —
+/// this does not multiply `rollup_tool_metrics`'s grain. Shared by the
+/// fresh-database path (`version == 0`) and the v7->v8 migration step, so
+/// the two can never drift, mirroring `ROLLUP_SCHEMA_SQL` immediately above.
+/// `context_source` (the fourth issue #44 dimension) deliberately has no
+/// table here: it is derived entirely from `TokenTotals`
+/// (`telemetry::context_source_breakdown`), which is already correctly
+/// rollup+edge merged by the existing `rollup_token_totals`/
+/// `durable_token_events` machinery.
+const DIMENSION_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS durable_tool_dimension_events (
+      session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+      timestamp_ms INTEGER NOT NULL,
+      model TEXT,
+      dimension_kind TEXT NOT NULL,
+      dimension_value TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      output_bytes INTEGER NOT NULL,
+      duration_ms INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS durable_tool_dimension_events_session_timestamp_idx
+      ON durable_tool_dimension_events(session_key, timestamp_ms);
+    CREATE TABLE IF NOT EXISTS rollup_tool_dimensions (
+      session_key TEXT NOT NULL REFERENCES durable_sessions(session_key),
+      hour_bucket INTEGER NOT NULL,
+      dimension_kind TEXT NOT NULL,
+      dimension_value TEXT NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      failures INTEGER NOT NULL DEFAULT 0,
+      output_bytes INTEGER NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS rollup_tool_dimensions_key_idx
+      ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value);
 ";
 
 /// Resolves (or reuses) project identity onto `session` in place, and
@@ -2498,6 +2768,55 @@ fn store_tool_event_facts(
     Ok(())
 }
 
+/// Replaces the `durable_tool_dimension_events` fact rows for one session —
+/// the issue #44 open-set dimensions (MCP server identity, shell command
+/// family, language) — with no rollup side effects. Mirrors
+/// `store_tool_event_facts`'s split from `store_tool_events`. One row per
+/// (observation, dimension_kind, dimension_value): an MCP call naming two
+/// servers writes two `mcp_server` rows; `shell_family`/`language`
+/// contribute at most one row each. `context_source` (the fourth issue #44
+/// dimension) has no fact rows at all — see `DIMENSION_SCHEMA_SQL`.
+fn store_tool_dimension_facts(
+    transaction: &Transaction<'_>,
+    key: &str,
+    observations: &[ToolObservation],
+) -> Result<()> {
+    transaction.execute(
+        "DELETE FROM durable_tool_dimension_events WHERE session_key = ?1",
+        [key],
+    )?;
+    let mut insert = transaction.prepare(
+        "INSERT INTO durable_tool_dimension_events(session_key, timestamp_ms, model, dimension_kind, dimension_value, outcome, output_bytes, duration_ms)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )?;
+    for item in observations {
+        let mut entries: Vec<(&str, &str)> = item
+            .providers
+            .iter()
+            .map(|p| ("mcp_server", p.as_str()))
+            .collect();
+        if let Some(family) = &item.shell_family {
+            entries.push(("shell_family", family.as_str()));
+        }
+        if let Some(language) = &item.language {
+            entries.push(("language", language.as_str()));
+        }
+        for (kind, value) in entries {
+            insert.execute(params![
+                key,
+                item.timestamp.timestamp_millis(),
+                item.model,
+                kind,
+                value,
+                tool_outcome_str(item.outcome),
+                to_i64(item.output_bytes)?,
+                item.duration_ms.map(|value| value as i64),
+            ])?;
+        }
+    }
+    Ok(())
+}
+
 /// Replaceable per-session materialization of tool observations, carrying
 /// exactly the fields window-scoped `ToolMetrics` reconstruction needs, plus
 /// the #107 hour-bucket rollups derived from the same observations. Unlike
@@ -2509,6 +2828,7 @@ fn store_tool_events(
     observations: &[ToolObservation],
 ) -> Result<()> {
     store_tool_event_facts(transaction, key, observations)?;
+    store_tool_dimension_facts(transaction, key, observations)?;
     transaction.execute(
         "DELETE FROM rollup_tool_metrics WHERE session_key = ?1",
         [key],
@@ -2517,11 +2837,17 @@ fn store_tool_events(
         "DELETE FROM rollup_mutation_chains WHERE session_key = ?1",
         [key],
     )?;
+    transaction.execute(
+        "DELETE FROM rollup_tool_dimensions WHERE session_key = ?1",
+        [key],
+    )?;
     // Rebuilt wholesale from the same observations just written above (this
     // path is a replace-all, not an append), so the rollups can never
     // observe a durable_tool_events row they did not also account for.
     let mut tool_metrics: HashMap<(i64, String), ToolMetrics> = HashMap::new();
     let mut chain_counts: HashMap<(i64, String, String, String), u64> = HashMap::new();
+    let mut dimension_metrics: HashMap<(i64, String, String), ToolDimensionMetrics> =
+        HashMap::new();
     for item in observations {
         let bucket = hour_bucket(item.timestamp.timestamp_millis());
         let model = key_sentinel(item.model.as_deref()).to_owned();
@@ -2535,6 +2861,54 @@ fn store_tool_events(
             *chain_counts
                 .entry((bucket, model, turn, target))
                 .or_insert(0) += 1;
+        }
+        for provider in &item.providers {
+            crate::telemetry::accumulate_dimension_call(
+                dimension_metrics
+                    .entry((bucket, "mcp_server".to_owned(), provider.clone()))
+                    .or_default(),
+                item.outcome,
+                item.output_bytes,
+                item.duration_ms,
+            );
+        }
+        if let Some(family) = &item.shell_family {
+            crate::telemetry::accumulate_dimension_call(
+                dimension_metrics
+                    .entry((bucket, "shell_family".to_owned(), family.clone()))
+                    .or_default(),
+                item.outcome,
+                item.output_bytes,
+                item.duration_ms,
+            );
+        }
+        if let Some(language) = &item.language {
+            crate::telemetry::accumulate_dimension_call(
+                dimension_metrics
+                    .entry((bucket, "language".to_owned(), language.clone()))
+                    .or_default(),
+                item.outcome,
+                item.output_bytes,
+                item.duration_ms,
+            );
+        }
+    }
+    if !dimension_metrics.is_empty() {
+        let mut insert_dimensions = transaction.prepare(
+            "INSERT INTO rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value, calls, failures, output_bytes, duration_ms)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for ((bucket, kind, value), metrics) in &dimension_metrics {
+            insert_dimensions.execute(params![
+                key,
+                bucket,
+                kind,
+                value,
+                to_i64(metrics.calls)?,
+                to_i64(metrics.failures)?,
+                to_i64(metrics.output_bytes)?,
+                to_i64(metrics.duration_ms)?,
+            ])?;
         }
     }
     if !tool_metrics.is_empty() {
@@ -3009,6 +3383,36 @@ mod tests {
         target: Option<&str>,
         origin: ToolOrigin,
     ) -> ToolObservation {
+        tool_with_dimensions(
+            at,
+            kind,
+            outcome,
+            model,
+            turn,
+            target,
+            origin,
+            &[],
+            None,
+            None,
+        )
+    }
+
+    /// Full-control fixture builder for the issue #44 open-set dimensions:
+    /// `providers` (mcp_server, one row per entry), `shell_family`, and
+    /// `language`.
+    #[allow(clippy::too_many_arguments)]
+    fn tool_with_dimensions(
+        at: &str,
+        kind: crate::model::ToolKind,
+        outcome: ToolOutcome,
+        model: Option<&str>,
+        turn: Option<&str>,
+        target: Option<&str>,
+        origin: ToolOrigin,
+        providers: &[&str],
+        shell_family: Option<&str>,
+        language: Option<&str>,
+    ) -> ToolObservation {
         ToolObservation {
             call_id: format!("call-{at}"),
             turn_id: turn.map(Into::into),
@@ -3017,11 +3421,13 @@ mod tests {
             timestamp: timestamp(at),
             kind,
             name: "tool".into(),
-            providers: Vec::new(),
+            providers: providers.iter().map(|value| (*value).to_owned()).collect(),
             effective_tools: Vec::new(),
             target: target.map(Into::into),
             resource_id: None,
             origin,
+            shell_family: shell_family.map(str::to_owned),
+            language: language.map(str::to_owned),
             outcome,
             duration_ms: Some(40),
             output_bytes: 128,
@@ -3311,6 +3717,8 @@ mod tests {
             target: None,
             resource_id: None,
             origin,
+            shell_family: None,
+            language: None,
             outcome: ToolOutcome::Success,
             duration_ms: Some(1),
             output_bytes: 1,
@@ -3375,6 +3783,184 @@ mod tests {
         assert_eq!(
             &actual.tool_metrics, &expected[0].tool_metrics,
             "ledger tool-origin counters must match the in-memory oracle across rollup and edge reads"
+        );
+    }
+
+    #[test]
+    fn ledger_range_totals_include_open_set_dimensions_across_rollup_and_edge_reads() {
+        // Golden regression guard for the AGENTS.md ledger-rollup-dimension
+        // invariant, applied to issue #44's open-set dimensions: MCP server
+        // identity, shell command family, and language must be served from
+        // `rollup_tool_dimensions` for the whole-hour bucket and from
+        // `durable_tool_dimension_events` for the sub-hour edges, or a
+        // window spanning both silently drops the rollup-served bucket's
+        // contribution. `context_source` is exercised too, from
+        // `rollup_token_totals`/`durable_token_events` via
+        // `context_source_breakdown` — proving that dimension's derivation
+        // is also rollup+edge correct without a table of its own.
+        let (_directory, store) = store();
+        let mut fixture = session("open-set-dimension-golden", 0);
+        let call = |at: &str,
+                    id: &str,
+                    providers: &[&str],
+                    shell_family: Option<&str>,
+                    language: Option<&str>| ToolObservation {
+            call_id: id.into(),
+            turn_id: Some("t1".into()),
+            harness: codex_provider_id(),
+            model: Some("gpt-test".into()),
+            timestamp: timestamp(at),
+            kind: if shell_family.is_some() {
+                ToolKind::Command
+            } else {
+                ToolKind::Read
+            },
+            name: "tool".into(),
+            providers: providers.iter().map(|p| (*p).to_owned()).collect(),
+            effective_tools: Vec::new(),
+            target: None,
+            resource_id: None,
+            origin: ToolOrigin::Core,
+            shell_family: shell_family.map(str::to_owned),
+            language: language.map(str::to_owned),
+            outcome: ToolOutcome::Success,
+            duration_ms: Some(1),
+            output_bytes: 1,
+        };
+        // Bucket 0 (00:00-01:00) and bucket 2 (02:00-03:00) are edge-served
+        // by the window below; bucket 1 (01:00-02:00) is fully inside it
+        // and is rollup-served. mcp_server activity spans both an edge
+        // bucket (alpha_server, bucket 0) and the rollup bucket
+        // (beta_server); a third mcp_server value (gamma_server) lands in
+        // the other edge bucket; shell_family and language activity land
+        // only in the rollup bucket — the exact combination a
+        // fact-table-only fix cannot get right for any of the three.
+        fixture.tool_observations = vec![
+            call(
+                "2026-01-01T00:30:00Z",
+                "edge-mcp-a",
+                &["alpha_server"],
+                None,
+                None,
+            ),
+            call(
+                "2026-01-01T01:10:00Z",
+                "rollup-mcp",
+                &["beta_server"],
+                None,
+                None,
+            ),
+            call(
+                "2026-01-01T01:20:00Z",
+                "rollup-shell",
+                &[],
+                Some("npm"),
+                None,
+            ),
+            call(
+                "2026-01-01T01:30:00Z",
+                "rollup-lang",
+                &[],
+                None,
+                Some("rust"),
+            ),
+            call(
+                "2026-01-01T02:45:00Z",
+                "edge-mcp-b",
+                &["gamma_server"],
+                None,
+                None,
+            ),
+        ];
+        let token_event =
+            |at: &str, cached: u64, cache_creation: u64, input: u64| TokenHistoryPoint {
+                timestamp: timestamp(at),
+                model: Some("gpt-test".into()),
+                service_tier: None,
+                request_input_tokens: Some(input),
+                total_tokens: 0,
+                delta: TokenTotals {
+                    input_tokens: input,
+                    cached_input_tokens: cached,
+                    cache_creation_input_tokens: cache_creation,
+                    output_tokens: 1,
+                    reasoning_output_tokens: 0,
+                    total_tokens: input + 1,
+                },
+            };
+        // context_source: conversation_cache lands in the edge bucket,
+        // newly_cached_context in the rollup bucket — both derived purely
+        // from these already-rollup+edge-correct token totals.
+        fixture.tokens_history = vec![
+            token_event("2026-01-01T00:35:00Z", 40, 0, 40),
+            token_event("2026-01-01T01:25:00Z", 0, 25, 25),
+        ];
+        let mut total = TokenTotals::default();
+        for point in &fixture.tokens_history {
+            total += &point.delta;
+        }
+        fixture.tokens_total = total;
+        fixture.last_event_at = timestamp("2026-01-01T02:45:00Z");
+
+        let generation = store.begin_scan().unwrap().max(1);
+        let key = store
+            .observe(
+                Path::new("open-set-dimension-golden.jsonl"),
+                &fixture,
+                generation,
+            )
+            .unwrap()
+            .key;
+
+        // Both bounds land inside a bucket (not on an hour boundary), so
+        // this single call exercises a whole-bucket rollup read (bucket 1)
+        // together with two partial-edge event reads (the tails of
+        // buckets 0 and 2) in one query.
+        let windows: Vec<RangeWindow> = vec![(
+            Some(timestamp("2026-01-01T00:15:00Z")),
+            Some(timestamp("2026-01-01T02:50:00Z")),
+        )];
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let expected = fixture.range_totals_multi(&windows);
+
+        let expected_dimensions = &expected[0].tool_dimensions;
+        assert_eq!(
+            expected_dimensions["mcp_server"]["alpha_server"].calls, 1,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected_dimensions["mcp_server"]["beta_server"].calls, 1,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected_dimensions["mcp_server"]["gamma_server"].calls, 1,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected_dimensions["shell_family"]["npm"].calls, 1,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected_dimensions["language"]["rust"].calls, 1,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected_dimensions["context_source"]["conversation_cache"].tokens, 40,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected_dimensions["context_source"]["newly_cached_context"].tokens, 25,
+            "fixture sanity check"
+        );
+
+        let actual = from_ledger[0]
+            .get(&key)
+            .expect("window has data for this session");
+        assert_eq!(
+            &actual.tool_dimensions, expected_dimensions,
+            "ledger open-set dimension totals must match the in-memory oracle across rollup and edge reads"
         );
     }
 
@@ -4878,7 +5464,7 @@ mod tests {
     /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
     /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
     /// `HistoryStore::open` and pasting the result below.
-    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
 
     #[test]
     fn schema_fingerprint_matches_committed_expected_value() {
@@ -5113,6 +5699,10 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                8 => {
+                    "DROP TABLE durable_tool_dimension_events;
+                     DROP TABLE rollup_tool_dimensions;"
+                }
                 7 => {
                     "ALTER TABLE durable_tool_events DROP COLUMN origin;
                      ALTER TABLE rollup_tool_metrics DROP COLUMN core_origin_calls;
@@ -5330,6 +5920,7 @@ mod tests {
                 "v4_to_v5_cache_creation_backfill",
                 "v5_to_v6_project_identity_backfill",
                 "v6_to_v7_tool_origin_backfill",
+                "v7_to_v8_tool_dimensions_backfill",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );
@@ -5695,6 +6286,8 @@ mod tests {
                 target: call.target.map(Into::into),
                 resource_id: None,
                 origin,
+                shell_family: None,
+                language: None,
                 outcome,
                 duration_ms: Some(if index == 0 { 555 } else { 0 }),
                 output_bytes: if index == 0 { 9999 } else { 0 },

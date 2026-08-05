@@ -515,6 +515,8 @@ mod tests {
                 } else {
                     ToolOrigin::Core
                 },
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: Some(500),
                 output_bytes: 10,

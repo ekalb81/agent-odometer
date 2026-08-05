@@ -45,6 +45,7 @@
   import SessionContextMenu from './SessionContextMenu.svelte';
   import SubscriptionUsage from './SubscriptionUsage.svelte';
   import { providersStore } from '../lib/stores/providers.svelte';
+  import { aggregateToolDimensions } from '../lib/toolDimensions';
 
   interface Props {
     harness?: ViewScope;
@@ -782,6 +783,22 @@
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
   let analyticsJobGeneration = 0;
+
+  // Issue #44: dimension totals summed from the same already-fetched
+  // `analyticsCurrent` window — no separate IPC round trip. Availability is
+  // "at least one provider actually in view supports this dimension",
+  // consulted from the already-loaded provider registry rather than
+  // guessed; a dimension with real availability but zero aggregated data
+  // still renders as a real zero (empty section), never conflated with
+  // "unavailable".
+  const dimensionTotals = $derived(aggregateToolDimensions(analyticsCurrent));
+  const activeHarnesses = $derived(new Set(filteredNoDate.map((session) => session.harness)));
+  const dimensionAvailability = $derived({
+    mcp_server: [...activeHarnesses].some((h) => providersStore.byId(h)?.mcp_dimension),
+    shell_family: [...activeHarnesses].some((h) => providersStore.byId(h)?.shell_dimension),
+    language: [...activeHarnesses].some((h) => providersStore.byId(h)?.language_dimension),
+    context_source: [...activeHarnesses].some((h) => providersStore.byId(h)?.context_dimension),
+  });
   // Bumped whenever the cache is invalidated (range change, tab switch); an
   // in-flight job from an older epoch discards its fetch instead of applying
   // stale-range data over the freshly cleared state.
@@ -1761,6 +1778,8 @@
         from={impactFrom}
         to={impactTo}
         {windowLabel}
+        {dimensionTotals}
+        {dimensionAvailability}
       />
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">

@@ -30,7 +30,7 @@ const LEGACY_CACHE_NAME: &str = "scan-cache.json";
 /// invalidate the cache — that was the old `APP_VERSION`-keyed behavior,
 /// and it turned every release into a full cold re-parse of every
 /// transcript.
-const PARSE_VERSION: u32 = 4;
+const PARSE_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
@@ -864,6 +864,7 @@ tool_observations.[].duration_ms
 tool_observations.[].effective_tools.[]
 tool_observations.[].harness
 tool_observations.[].kind
+tool_observations.[].language
 tool_observations.[].model
 tool_observations.[].name
 tool_observations.[].origin
@@ -871,6 +872,7 @@ tool_observations.[].outcome
 tool_observations.[].output_bytes
 tool_observations.[].providers.[]
 tool_observations.[].resource_id
+tool_observations.[].shell_family
 tool_observations.[].target
 tool_observations.[].timestamp
 tool_observations.[].turn_id
@@ -1065,6 +1067,8 @@ working_directory"#;
                 target: Some("h".into()),
                 resource_id: Some("r".into()),
                 origin: ToolOrigin::Mcp,
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: Some(1),
                 output_bytes: 1,

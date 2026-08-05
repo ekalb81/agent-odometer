@@ -228,6 +228,21 @@ export interface TierBucket {
   tokens: TokenTotals;
 }
 
+/** One (dimension_kind, dimension_value) entry's additive counters (issue
+ * #44). `tokens` is populated only for `context_source` values; every other
+ * dimension kind populates `calls`/`failures`/`output_bytes`/`duration_ms`
+ * and leaves `tokens` at 0. */
+export interface ToolDimensionMetrics {
+  calls: number;
+  failures: number;
+  output_bytes: number;
+  duration_ms: number;
+  tokens: number;
+}
+
+/** Issue #44 open-set dimension kind. */
+export type ToolDimensionKind = 'mcp_server' | 'shell_family' | 'language' | 'context_source';
+
 /** Date-scoped rollup returned by sessions_in_ranges. */
 export interface RangeTotals {
   tokens: TokenTotals;
@@ -236,6 +251,11 @@ export interface RangeTotals {
   tool_metrics_by_model: Record<string, ToolMetrics>;
   optimization_findings_count: number;
   optimization_summary?: OptimizationSummary;
+  /** Outer key is the dimension kind, inner key the dimension value. A
+   *  missing kind means no ledger-durable data for this window — consult
+   *  `ProviderDescriptor`'s matching `*_dimension` flag to tell a real zero
+   *  from a provider that cannot supply the dimension at all. */
+  tool_dimensions?: Partial<Record<ToolDimensionKind, Record<string, ToolDimensionMetrics>>>;
 }
 
 export interface ToolImpactCohort {
@@ -475,6 +495,14 @@ export interface ProviderDescriptor {
   /** Whether this provider's local transcripts carry account-wide
    *  rate-limit/quota snapshots usable by the Subscription Usage view. */
   quota_source: boolean;
+  /** Issue #44 open-set tool/context dimension availability. `false` means
+   *  this provider's transcript shape is not corroborated to support the
+   *  dimension — the panel must render "unavailable", never a fabricated
+   *  zero, for a session from this provider. */
+  mcp_dimension: boolean;
+  shell_dimension: boolean;
+  language_dimension: boolean;
+  context_dimension: boolean;
 }
 
 export interface HarnessIntegrationStatus {

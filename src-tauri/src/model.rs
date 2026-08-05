@@ -164,9 +164,58 @@ pub struct ToolObservation {
     /// always compute a real value via `ToolOrigin::classify`.
     #[serde(default)]
     pub origin: ToolOrigin,
+    /// Safe shell command family (issue #44) — the leading token of a
+    /// `Command`-kind call's command line, matched against a bounded
+    /// allowlist (`telemetry::classify_shell_family`) and bucketed to
+    /// `"other"` when not recognized. Never the raw command text. `None`
+    /// for non-command calls or when no command text was available.
+    #[serde(default)]
+    pub shell_family: Option<String>,
+    /// Language inferred from a read/write target's file extension (issue
+    /// #44), matched against a bounded allowlist
+    /// (`telemetry::classify_language`). Never the file path itself. `None`
+    /// when no path was available or its extension is not recognized.
+    #[serde(default)]
+    pub language: Option<String>,
     pub outcome: ToolOutcome,
     pub duration_ms: Option<u64>,
     pub output_bytes: u64,
+}
+
+/// Additive counters for one (dimension_kind, dimension_value) pair in the
+/// issue #44 open-set dimensions — MCP server identity, shell command
+/// family, language, and context source. Unlike `ToolMetrics`, these
+/// dimensions have unbounded label sets, so they are not flat
+/// `rollup_tool_metrics` columns; see `RangeTotals::tool_dimensions` and the
+/// `rollup_tool_dimensions` ledger table (`history_store.rs`).
+///
+/// `tokens` is populated only for the `context_source` dimension kind, which
+/// is derived from `TokenTotals` rather than tool calls and so has no
+/// `calls`/`failures`/`output_bytes`/`duration_ms` of its own; every other
+/// dimension kind (`mcp_server`, `shell_family`, `language`) populates the
+/// first four fields and leaves `tokens` at 0. There is no
+/// `retries`/`mutation_targets`-style chain-derived field here: this struct
+/// carries no `turn_id`/`target`, so — unlike `ToolMetrics::retry_count` —
+/// there is no chain to reconstruct, and a plain sum of `calls` across
+/// buckets is always correct.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ToolDimensionMetrics {
+    pub calls: u64,
+    pub failures: u64,
+    pub output_bytes: u64,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub tokens: u64,
+}
+
+impl ToolDimensionMetrics {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.calls += other.calls;
+        self.failures += other.failures;
+        self.output_bytes += other.output_bytes;
+        self.duration_ms += other.duration_ms;
+        self.tokens += other.tokens;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -537,6 +586,14 @@ pub struct RangeTotals {
     pub optimization_findings_count: u64,
     #[serde(default)]
     pub optimization_summary: OptimizationSummary,
+    /// Issue #44 open-set tool/context dimensions: outer key is the
+    /// dimension kind (`"mcp_server"`, `"shell_family"`, `"language"`,
+    /// `"context_source"`), inner key is the dimension value. Absent kinds
+    /// mean "no ledger-durable data for this window" — the frontend must
+    /// still consult `ProviderCapabilities` to distinguish a real zero from
+    /// a provider that cannot supply the dimension at all.
+    #[serde(default)]
+    pub tool_dimensions: BTreeMap<String, BTreeMap<String, ToolDimensionMetrics>>,
 }
 
 /// Lightweight wire form of a Session for the list view and live update
@@ -828,6 +885,36 @@ impl Session {
                     .cmp(&b.model)
                     .then_with(|| a.service_tier.cmp(&b.service_tier))
             });
+            let tool_dimensions = if observations_sorted {
+                let start = from.as_ref().map_or(0, |from| {
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() < from.timestamp_millis()
+                    })
+                });
+                let end = to.as_ref().map_or(self.tool_observations.len(), |to| {
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() <= to.timestamp_millis()
+                    })
+                });
+                crate::telemetry::dimension_totals(
+                    self.tool_observations[start.min(end)..end].iter(),
+                    &tokens,
+                )
+            } else {
+                crate::telemetry::dimension_totals(
+                    self.tool_observations.iter().filter(|item| {
+                        (from.is_none()
+                            || from.as_ref().is_some_and(|start| {
+                                item.timestamp.timestamp_millis() >= start.timestamp_millis()
+                            }))
+                            && (to.is_none()
+                                || to.as_ref().is_some_and(|end| {
+                                    item.timestamp.timestamp_millis() <= end.timestamp_millis()
+                                }))
+                    }),
+                    &tokens,
+                )
+            };
             results.push(RangeTotals {
                 tokens,
                 buckets,
@@ -835,6 +922,7 @@ impl Session {
                 tool_metrics_by_model,
                 optimization_findings_count,
                 optimization_summary,
+                tool_dimensions,
             });
         }
         results
@@ -1039,6 +1127,8 @@ mod tests {
                 target: Some("read:synthetic".into()),
                 resource_id: Some("synthetic".into()),
                 origin: ToolOrigin::Core,
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
                 output_bytes: 0,
