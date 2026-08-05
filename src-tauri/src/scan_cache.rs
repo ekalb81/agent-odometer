@@ -30,7 +30,7 @@ const LEGACY_CACHE_NAME: &str = "scan-cache.json";
 /// invalidate the cache — that was the old `APP_VERSION`-keyed behavior,
 /// and it turned every release into a full cold re-parse of every
 /// transcript.
-const PARSE_VERSION: u32 = 3;
+const PARSE_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
@@ -825,32 +825,40 @@ tokens_total.reasoning_output_tokens
 tokens_total.total_tokens
 tool_metrics.calls
 tool_metrics.commands
+tool_metrics.core_origin_calls
 tool_metrics.duration_ms
 tool_metrics.failures
+tool_metrics.mcp_origin_calls
 tool_metrics.mutation_targets
 tool_metrics.mutations
 tool_metrics.one_shot_mutations
 tool_metrics.other
 tool_metrics.output_bytes
+tool_metrics.provider_origin_calls
 tool_metrics.reads
 tool_metrics.retry_count
 tool_metrics.searches
 tool_metrics.successes
 tool_metrics.unknown
+tool_metrics.unknown_origin_calls
 tool_metrics_by_model.m.calls
 tool_metrics_by_model.m.commands
+tool_metrics_by_model.m.core_origin_calls
 tool_metrics_by_model.m.duration_ms
 tool_metrics_by_model.m.failures
+tool_metrics_by_model.m.mcp_origin_calls
 tool_metrics_by_model.m.mutation_targets
 tool_metrics_by_model.m.mutations
 tool_metrics_by_model.m.one_shot_mutations
 tool_metrics_by_model.m.other
 tool_metrics_by_model.m.output_bytes
+tool_metrics_by_model.m.provider_origin_calls
 tool_metrics_by_model.m.reads
 tool_metrics_by_model.m.retry_count
 tool_metrics_by_model.m.searches
 tool_metrics_by_model.m.successes
 tool_metrics_by_model.m.unknown
+tool_metrics_by_model.m.unknown_origin_calls
 tool_observations.[].call_id
 tool_observations.[].duration_ms
 tool_observations.[].effective_tools.[]
@@ -858,6 +866,7 @@ tool_observations.[].harness
 tool_observations.[].kind
 tool_observations.[].model
 tool_observations.[].name
+tool_observations.[].origin
 tool_observations.[].outcome
 tool_observations.[].output_bytes
 tool_observations.[].providers.[]
@@ -890,18 +899,22 @@ turns.[].tokens.reasoning_output_tokens
 turns.[].tokens.total_tokens
 turns.[].tool_metrics.calls
 turns.[].tool_metrics.commands
+turns.[].tool_metrics.core_origin_calls
 turns.[].tool_metrics.duration_ms
 turns.[].tool_metrics.failures
+turns.[].tool_metrics.mcp_origin_calls
 turns.[].tool_metrics.mutation_targets
 turns.[].tool_metrics.mutations
 turns.[].tool_metrics.one_shot_mutations
 turns.[].tool_metrics.other
 turns.[].tool_metrics.output_bytes
+turns.[].tool_metrics.provider_origin_calls
 turns.[].tool_metrics.reads
 turns.[].tool_metrics.retry_count
 turns.[].tool_metrics.searches
 turns.[].tool_metrics.successes
 turns.[].tool_metrics.unknown
+turns.[].tool_metrics.unknown_origin_calls
 turns.[].turn_id
 turns.[].user_message
 working_directory"#;
@@ -951,7 +964,7 @@ working_directory"#;
         use crate::model::{
             CategoryMetric, OptimizationFinding, RateLimitSnapshotPoint, RateLimitWindow,
             SourceAvailability, TaskCategory, TierBucket, TokenHistoryPoint, ToolKind,
-            ToolObservation, ToolOutcome, TurnClassification, TurnInfo, TurnStatus,
+            ToolObservation, ToolOrigin, ToolOutcome, TurnClassification, TurnInfo, TurnStatus,
         };
         let now: chrono::DateTime<chrono::Utc> = "2026-08-03T00:00:00Z".parse().unwrap();
         let totals = TokenTotals {
@@ -1051,6 +1064,7 @@ working_directory"#;
                 effective_tools: vec!["read".into()],
                 target: Some("h".into()),
                 resource_id: Some("r".into()),
+                origin: ToolOrigin::Mcp,
                 outcome: ToolOutcome::Success,
                 duration_ms: Some(1),
                 output_bytes: 1,

@@ -10,7 +10,7 @@
 use crate::model::{
     OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session,
     SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolKind, ToolMetrics,
-    ToolObservation, ToolOutcome,
+    ToolObservation, ToolOrigin, ToolOutcome,
 };
 use crate::provider::{claude_code_provider_id, codex_provider_id};
 use anyhow::{anyhow, bail, Context, Result};
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -578,7 +578,8 @@ impl HistoryStore {
         )?;
         let mut tool_rollup_query = connection.prepare(
             "SELECT hour_bucket, model, calls, reads, searches, mutations, commands, other,
-                    successes, failures, unknown, duration_ms, output_bytes
+                    successes, failures, unknown, duration_ms, output_bytes,
+                    core_origin_calls, mcp_origin_calls, provider_origin_calls, unknown_origin_calls
              FROM rollup_tool_metrics WHERE session_key = ?1",
         )?;
         let mut chain_rollup_query = connection.prepare(
@@ -605,7 +606,7 @@ impl HistoryStore {
         let mut tool_edge_query = (!edge_ranges.is_empty())
             .then(|| {
                 connection.prepare(&format!(
-                    "SELECT timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes
+                    "SELECT timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes, origin
                      FROM durable_tool_events WHERE session_key = ?1 AND ({edge_predicate})
                      ORDER BY timestamp_ms"
                 ))
@@ -647,6 +648,10 @@ impl HistoryStore {
                             unknown: row.get::<_, i64>(10)? as u64,
                             duration_ms: row.get::<_, i64>(11)? as u64,
                             output_bytes: row.get::<_, i64>(12)? as u64,
+                            core_origin_calls: row.get::<_, i64>(13)? as u64,
+                            mcp_origin_calls: row.get::<_, i64>(14)? as u64,
+                            provider_origin_calls: row.get::<_, i64>(15)? as u64,
+                            unknown_origin_calls: row.get::<_, i64>(16)? as u64,
                             ..Default::default()
                         },
                     ))
@@ -716,10 +721,10 @@ impl HistoryStore {
                                 call_id: String::new(),
                                 turn_id: row.get(4)?,
                                 // Not persisted: metric reconstruction reads
-                                // only kind/outcome/model/turn/target/
+                                // only kind/outcome/origin/model/turn/target/
                                 // duration/bytes. Any future metric keyed on
-                                // harness or name must extend the fact schema
-                                // first.
+                                // harness, name, providers, or effective_tools
+                                // must extend the fact schema first.
                                 harness: codex_provider_id(),
                                 model: row.get(1)?,
                                 timestamp: chrono::Utc
@@ -732,6 +737,7 @@ impl HistoryStore {
                                 effective_tools: Vec::new(),
                                 target: row.get(5)?,
                                 resource_id: None,
+                                origin: ToolOrigin::from_str_or_unknown(&row.get::<_, String>(8)?),
                                 outcome: tool_outcome_from_str(&row.get::<_, String>(3)?),
                                 duration_ms: row
                                     .get::<_, Option<i64>>(6)?
@@ -1245,6 +1251,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 5 {
         steps += 1;
+        version = 6;
+    }
+    if version == 6 {
+        steps += 1;
     }
     steps
 }
@@ -1355,7 +1365,8 @@ fn migrate(
                turn_id TEXT,
                target TEXT,
                duration_ms INTEGER,
-               output_bytes INTEGER NOT NULL
+               output_bytes INTEGER NOT NULL,
+               origin TEXT NOT NULL DEFAULT 'unknown'
              );
              CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms);
              CREATE TABLE durable_finding_events (
@@ -1431,7 +1442,8 @@ fn migrate(
                turn_id TEXT,
                target TEXT,
                duration_ms INTEGER,
-               output_bytes INTEGER NOT NULL
+               output_bytes INTEGER NOT NULL,
+               origin TEXT NOT NULL DEFAULT 'unknown'
              );
              CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms);
              CREATE TABLE durable_finding_events (
@@ -1756,6 +1768,95 @@ fn migrate(
             started.elapsed(),
         ));
     }
+    let version_before_tool_origin: i64 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version_before_tool_origin == 6 {
+        // Tool-origin (issue #44) is the first of the #44 normalized tool
+        // dimensions to land on the durable ledger: a per-call `origin`
+        // (core/mcp/provider) fact column plus four plain, additive
+        // `rollup_tool_metrics` counters at the *existing*
+        // `(session_key, hour_bucket, model)` grain — this backfill does not
+        // change rollup cardinality. Guarded by `table_has_column` rather
+        // than inferred from *how* this migrate() call reached version 6,
+        // for the same reason the v4->v5 cache-creation step is: a fresh
+        // upgrade from below 4 in this same call already created
+        // `rollup_tool_metrics` with these columns via `ROLLUP_SCHEMA_SQL`
+        // (the v3->v4 step above), while a real pre-#44 database that was
+        // already sitting at version 6 has neither table's new column yet.
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v6_to_v7_tool_origin_backfill",
+            step_index,
+            step_total,
+            6,
+            7,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !table_has_column(&transaction, "durable_tool_events", "origin")? {
+            transaction.execute_batch(
+                "ALTER TABLE durable_tool_events
+                   ADD COLUMN origin TEXT NOT NULL DEFAULT 'unknown';",
+            )?;
+        }
+        for column in [
+            "core_origin_calls",
+            "mcp_origin_calls",
+            "provider_origin_calls",
+            "unknown_origin_calls",
+        ] {
+            if !table_has_column(&transaction, "rollup_tool_metrics", column)? {
+                transaction.execute_batch(&format!(
+                    "ALTER TABLE rollup_tool_metrics ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0;"
+                ))?;
+            }
+        }
+        // Backfill via the same SQL `GROUP BY` shape the v3->v4 and v4->v5
+        // migrations use: one aggregate pass over `durable_tool_events`,
+        // never by re-parsing transcripts or materializing a `Session` in
+        // Rust. `durable_tool_events.origin` is 'unknown' for every row that
+        // predates this migration (the `ALTER TABLE ... DEFAULT 'unknown'`
+        // above), so this backfill is a no-op that sets
+        // `unknown_origin_calls = calls` for genuinely historical data —
+        // never a fabricated 0 — while still correctly reconciling any
+        // `rollup_tool_metrics` row this same migrate() call already created
+        // with real per-origin counts, if a fresh v3->v4 upgrade ran earlier
+        // in this call and a fact row already carried a real origin.
+        transaction.execute_batch(
+            "UPDATE rollup_tool_metrics
+             SET core_origin_calls = agg.core,
+                 mcp_origin_calls = agg.mcp,
+                 provider_origin_calls = agg.provider,
+                 unknown_origin_calls = agg.unknown
+             FROM (
+               SELECT session_key, timestamp_ms / 3600000 AS hour_bucket,
+                      COALESCE(model, '') AS model,
+                      SUM(CASE WHEN origin = 'core' THEN 1 ELSE 0 END) AS core,
+                      SUM(CASE WHEN origin = 'mcp' THEN 1 ELSE 0 END) AS mcp,
+                      SUM(CASE WHEN origin = 'provider' THEN 1 ELSE 0 END) AS provider,
+                      SUM(CASE WHEN origin NOT IN ('core', 'mcp', 'provider') THEN 1 ELSE 0 END) AS unknown
+               FROM durable_tool_events
+               GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, '')
+             ) AS agg
+             WHERE rollup_tool_metrics.session_key = agg.session_key
+               AND rollup_tool_metrics.hour_bucket = agg.hour_bucket
+               AND rollup_tool_metrics.model = agg.model;",
+        )?;
+        transaction.execute_batch(
+            "INSERT INTO history_meta(key, value) VALUES('schema_version', '7')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 7;",
+        )?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v6_to_v7_tool_origin_backfill",
+            step_index,
+            step_total,
+            6,
+            7,
+            started.elapsed(),
+        ));
+    }
     Ok(())
 }
 
@@ -1933,7 +2034,11 @@ const ROLLUP_SCHEMA_SQL: &str = "
       failures INTEGER NOT NULL DEFAULT 0,
       unknown INTEGER NOT NULL DEFAULT 0,
       duration_ms INTEGER NOT NULL DEFAULT 0,
-      output_bytes INTEGER NOT NULL DEFAULT 0
+      output_bytes INTEGER NOT NULL DEFAULT 0,
+      core_origin_calls INTEGER NOT NULL DEFAULT 0,
+      mcp_origin_calls INTEGER NOT NULL DEFAULT 0,
+      provider_origin_calls INTEGER NOT NULL DEFAULT 0,
+      unknown_origin_calls INTEGER NOT NULL DEFAULT 0
     );
     CREATE UNIQUE INDEX IF NOT EXISTS rollup_tool_metrics_key_idx
       ON rollup_tool_metrics(session_key, hour_bucket, model);
@@ -2353,6 +2458,16 @@ fn tool_kind_from_str(value: &str) -> ToolKind {
 /// exist; the later v3->v4 migration step populates rollups for every
 /// session from whatever `durable_tool_events` holds at that point, however
 /// it got there, so backfilling rollups here would double-insert.
+///
+/// The `origin` column (issue #44) is present on `durable_tool_events` from
+/// the moment the table exists — both the fresh-install (`version == 0`) and
+/// legacy v1/v2->v3 `CREATE TABLE` declare it — so this always writes a real
+/// value, including a value recovered from an old session snapshot's
+/// `ToolObservation::origin` during the v1/v2 legacy backfill. A snapshot
+/// captured before this dimension existed simply deserializes that field to
+/// `Unknown` via its serde default, which this then persists like any other
+/// value; a real pre-#44 database that already reached schema v6 takes the
+/// v6->v7 `ALTER TABLE ... DEFAULT 'unknown'` path instead (see `migrate()`).
 fn store_tool_event_facts(
     transaction: &Transaction<'_>,
     key: &str,
@@ -2363,8 +2478,8 @@ fn store_tool_event_facts(
         [key],
     )?;
     let mut insert = transaction.prepare(
-        "INSERT INTO durable_tool_events(session_key, timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO durable_tool_events(session_key, timestamp_ms, model, kind, outcome, turn_id, target, duration_ms, output_bytes, origin)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
     )?;
     for item in observations {
         insert.execute(params![
@@ -2377,6 +2492,7 @@ fn store_tool_event_facts(
             item.target,
             item.duration_ms.map(|value| value as i64),
             to_i64(item.output_bytes)?,
+            item.origin.as_str(),
         ])?;
     }
     Ok(())
@@ -2425,8 +2541,9 @@ fn store_tool_events(
         let mut insert_metrics = transaction.prepare(
             "INSERT INTO rollup_tool_metrics(
                session_key, hour_bucket, model, calls, reads, searches, mutations, commands, other,
-               successes, failures, unknown, duration_ms, output_bytes)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+               successes, failures, unknown, duration_ms, output_bytes,
+               core_origin_calls, mcp_origin_calls, provider_origin_calls, unknown_origin_calls)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         )?;
         for ((bucket, model), metrics) in &tool_metrics {
             insert_metrics.execute(params![
@@ -2444,6 +2561,10 @@ fn store_tool_events(
                 to_i64(metrics.unknown)?,
                 to_i64(metrics.duration_ms)?,
                 to_i64(metrics.output_bytes)?,
+                to_i64(metrics.core_origin_calls)?,
+                to_i64(metrics.mcp_origin_calls)?,
+                to_i64(metrics.provider_origin_calls)?,
+                to_i64(metrics.unknown_origin_calls)?,
             ])?;
         }
     }
@@ -2875,6 +2996,19 @@ mod tests {
         turn: Option<&str>,
         target: Option<&str>,
     ) -> ToolObservation {
+        tool_with_origin(at, kind, outcome, model, turn, target, ToolOrigin::Core)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tool_with_origin(
+        at: &str,
+        kind: crate::model::ToolKind,
+        outcome: ToolOutcome,
+        model: Option<&str>,
+        turn: Option<&str>,
+        target: Option<&str>,
+        origin: ToolOrigin,
+    ) -> ToolObservation {
         ToolObservation {
             call_id: format!("call-{at}"),
             turn_id: turn.map(Into::into),
@@ -2887,6 +3021,7 @@ mod tests {
             effective_tools: Vec::new(),
             target: target.map(Into::into),
             resource_id: None,
+            origin,
             outcome,
             duration_ms: Some(40),
             output_bytes: 128,
@@ -3146,6 +3281,101 @@ mod tests {
             "ledger cache-creation tokens must match the in-memory oracle across rollup and edge reads"
         );
         assert_eq!(&actual.tokens, &expected[0].tokens);
+    }
+
+    #[test]
+    fn ledger_range_totals_include_tool_origin_across_rollup_and_edge_reads() {
+        // Golden regression guard for the AGENTS.md ledger-rollup-dimension
+        // invariant, applied to issue #44's tool-origin dimension:
+        // `rollup_tool_metrics` must carry `core_origin_calls`,
+        // `mcp_origin_calls`, `provider_origin_calls`, and
+        // `unknown_origin_calls`, or a window that spans a whole-hour
+        // rollup bucket plus sub-hour edges silently drops the origin
+        // dimension for the rollup-served bucket while still reporting it
+        // correctly for the edge-served buckets. Mirrors
+        // `ledger_range_totals_include_cache_creation_tokens_across_rollup_and_edge_reads`'s
+        // shape exactly, one dimension level down (tool metrics, not
+        // tokens).
+        let (_directory, store) = store();
+        let mut fixture = session("tool-origin-golden", 0);
+        let call = |at: &str, id: &str, origin: ToolOrigin| ToolObservation {
+            call_id: id.into(),
+            turn_id: Some("t1".into()),
+            harness: codex_provider_id(),
+            model: Some("gpt-test".into()),
+            timestamp: timestamp(at),
+            kind: ToolKind::Read,
+            name: "tool".into(),
+            providers: Vec::new(),
+            effective_tools: Vec::new(),
+            target: None,
+            resource_id: None,
+            origin,
+            outcome: ToolOutcome::Success,
+            duration_ms: Some(1),
+            output_bytes: 1,
+        };
+        // Bucket 0 (00:00-01:00) and bucket 2 (02:00-03:00) are edge-served
+        // by the window below; bucket 1 (01:00-02:00) is fully inside it and
+        // is rollup-served. Non-zero, distinct-origin calls land in the
+        // rollup-served bucket (mcp, provider) as well as both edge buckets
+        // (core in bucket 0, unknown in bucket 2) — exactly the combination
+        // a fact-table-only fix cannot get right.
+        fixture.tool_observations = vec![
+            call("2026-01-01T00:30:00Z", "edge-core", ToolOrigin::Core),
+            call("2026-01-01T01:10:00Z", "rollup-mcp-1", ToolOrigin::Mcp),
+            call("2026-01-01T01:20:00Z", "rollup-mcp-2", ToolOrigin::Mcp),
+            call(
+                "2026-01-01T01:40:00Z",
+                "rollup-provider",
+                ToolOrigin::Provider,
+            ),
+            call("2026-01-01T02:45:00Z", "edge-unknown", ToolOrigin::Unknown),
+        ];
+        fixture.last_event_at = timestamp("2026-01-01T02:45:00Z");
+
+        let generation = store.begin_scan().unwrap().max(1);
+        let key = store
+            .observe(Path::new("tool-origin-golden.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        // Both bounds land inside a bucket (not on an hour boundary), so
+        // this single call exercises a whole-bucket rollup read (bucket 1)
+        // together with two partial-edge event reads (the tails of buckets
+        // 0 and 2) in one query.
+        let windows: Vec<RangeWindow> = vec![(
+            Some(timestamp("2026-01-01T00:15:00Z")),
+            Some(timestamp("2026-01-01T02:50:00Z")),
+        )];
+        let from_ledger = store
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let expected = fixture.range_totals_multi(&windows);
+
+        assert_eq!(
+            expected[0].tool_metrics.core_origin_calls, 1,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected[0].tool_metrics.mcp_origin_calls, 2,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected[0].tool_metrics.provider_origin_calls, 1,
+            "fixture sanity check"
+        );
+        assert_eq!(
+            expected[0].tool_metrics.unknown_origin_calls, 1,
+            "fixture sanity check"
+        );
+        let actual = from_ledger[0]
+            .get(&key)
+            .expect("window has data for this session");
+        assert_eq!(
+            &actual.tool_metrics, &expected[0].tool_metrics,
+            "ledger tool-origin counters must match the in-memory oracle across rollup and edge reads"
+        );
     }
 
     #[test]
@@ -4648,7 +4878,7 @@ mod tests {
     /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
     /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
     /// `HistoryStore::open` and pasting the result below.
-    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
 
     #[test]
     fn schema_fingerprint_matches_committed_expected_value() {
@@ -4883,6 +5113,13 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                7 => {
+                    "ALTER TABLE durable_tool_events DROP COLUMN origin;
+                     ALTER TABLE rollup_tool_metrics DROP COLUMN core_origin_calls;
+                     ALTER TABLE rollup_tool_metrics DROP COLUMN mcp_origin_calls;
+                     ALTER TABLE rollup_tool_metrics DROP COLUMN provider_origin_calls;
+                     ALTER TABLE rollup_tool_metrics DROP COLUMN unknown_origin_calls;"
+                }
                 6 => {
                     "DROP INDEX IF EXISTS durable_sessions_project_idx;
                      ALTER TABLE durable_sessions DROP COLUMN project_key;
@@ -5092,6 +5329,7 @@ mod tests {
             vec![
                 "v4_to_v5_cache_creation_backfill",
                 "v5_to_v6_project_identity_backfill",
+                "v6_to_v7_tool_origin_backfill",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );
@@ -5290,9 +5528,10 @@ mod tests {
     }
 
     /// Builds a `Session` whose every `TokenTotals` field and every
-    /// `ToolMetrics` counter is non-zero and pairwise distinct within its
-    /// struct, spread across three consecutive hour buckets on
-    /// 2026-01-01 (00:xx, 01:xx, 02:xx).
+    /// `ToolMetrics` counter — including the issue #44 origin-dimension
+    /// counters — is non-zero and pairwise distinct within its struct,
+    /// spread across three consecutive hour buckets on 2026-01-01 (00:xx,
+    /// 01:xx, 02:xx).
     fn every_dimension_session(id: &str) -> Session {
         use crate::model::ToolKind;
         let mut fixture = session(id, 1);
@@ -5333,70 +5572,84 @@ mod tests {
         }
         fixture.tokens_total = total;
 
-        // Tool dimension: 30 observations across the same three buckets.
-        // Kind counts: reads=4, searches=6, mutations=5, commands=7, other=8
-        // (calls=30). The 5 mutations are two (turn, target) chains: a
-        // one-shot chain (turn-a/target-a, bucket 1) and a four-call retry
-        // chain (turn-b/target-b) that straddles an edge bucket, the
-        // rollup-served bucket (twice), and the other edge bucket — giving
-        // mutation_targets=2, one_shot_mutations=1, retry_count=3. Outcome
-        // counts: successes=9, failures=10, unknown=11. duration_ms and
+        // Tool dimension: 100 observations across the same three buckets.
+        // Kind counts: reads=12, searches=14, mutations=20, commands=25,
+        // other=29 (calls=100). The 20 mutations form 7 distinct
+        // (turn, target) chains: 4 one-shot chains plus 3 repeat chains of
+        // length 8, 5, and 3 — giving mutation_targets=7,
+        // one_shot_mutations=4, retry_count=20-7=13. Outcome counts:
+        // successes=31, failures=33, unknown=36. Origin counts (issue #44):
+        // core=15, mcp=17, provider=23, unknown_origin=45 — `unknown` models
+        // ledger facts recorded before the origin dimension existed, mixed
+        // in alongside fresh core/mcp/provider calls. duration_ms and
         // output_bytes are concentrated on one call so their totals (555,
-        // 9999) stay distinct from every other counter.
+        // 9999) stay distinct from every other counter. Every one of these
+        // 18 values — 100, 12, 14, 20, 25, 29, 31, 33, 36, 7, 4, 13, 15, 17,
+        // 23, 45, 555, 9999 — is pairwise distinct, matching ToolMetrics's
+        // 18 fields. Both mutation chains and plain calls are round-robined
+        // across all three hour buckets (with minutes kept inside the
+        // window used below) so bucket 1's rollup-served path and buckets
+        // 0/2's edge path both carry every dimension's data.
         struct Call {
             at: String,
             kind: ToolKind,
             turn: Option<&'static str>,
             target: Option<&'static str>,
         }
-        let mut calls = vec![
-            Call {
-                at: "2026-01-01T01:05:00Z".into(),
-                kind: ToolKind::Mutation,
-                turn: Some("turn-a"),
-                target: Some("target-a"),
-            },
-            Call {
-                at: "2026-01-01T00:20:00Z".into(),
-                kind: ToolKind::Mutation,
-                turn: Some("turn-b"),
-                target: Some("target-b"),
-            },
-            Call {
-                at: "2026-01-01T01:10:00Z".into(),
-                kind: ToolKind::Mutation,
-                turn: Some("turn-b"),
-                target: Some("target-b"),
-            },
-            Call {
-                at: "2026-01-01T01:40:00Z".into(),
-                kind: ToolKind::Mutation,
-                turn: Some("turn-b"),
-                target: Some("target-b"),
-            },
-            Call {
-                at: "2026-01-01T02:10:00Z".into(),
-                kind: ToolKind::Mutation,
-                turn: Some("turn-b"),
-                target: Some("target-b"),
-            },
-        ];
         let hours = ["00", "01", "02"];
-        let mut minute = [16usize, 16usize, 16usize];
-        let plain_kinds = [
-            ToolKind::Read,
-            ToolKind::Search,
-            ToolKind::Command,
-            ToolKind::Other,
+        // Bucket-safe minute for a running sequence number: bucket 0 (hour
+        // 00) must stay >= :15 and bucket 2 (hour 02) must stay <= :50 to
+        // remain inside the [00:15, 02:50] window exercised below; bucket 1
+        // (hour 01) is fully inside the window regardless of minute.
+        let safe_minute = |bucket: usize, seq: usize| -> usize {
+            match bucket {
+                0 => 15 + seq % 45,
+                2 => seq % 51,
+                _ => seq % 60,
+            }
+        };
+        let mut calls: Vec<Call> = Vec::new();
+        let mutation_chains: &[(&str, &str, usize)] = &[
+            ("turn-b", "target-b", 8),
+            ("turn-c", "target-c", 5),
+            ("turn-d", "target-d", 3),
+            ("turn-e", "target-e", 1),
+            ("turn-f", "target-f", 1),
+            ("turn-g", "target-g", 1),
+            ("turn-h", "target-h", 1),
         ];
-        let plain_counts = [4usize, 6, 7, 8];
-        let mut plain_generated = 0usize;
-        for (kind, count) in plain_kinds.into_iter().zip(plain_counts) {
+        for (turn, target, count) in mutation_chains {
+            for _ in 0..*count {
+                let index = calls.len();
+                let bucket = index % 3;
+                let minute = safe_minute(bucket, index);
+                let at = format!("2026-01-01T{}:{minute:02}:00Z", hours[bucket]);
+                calls.push(Call {
+                    at,
+                    kind: ToolKind::Mutation,
+                    turn: Some(turn),
+                    target: Some(target),
+                });
+            }
+        }
+        assert_eq!(
+            calls.len(),
+            20,
+            "fixture sanity check: mutation chain calls"
+        );
+
+        let plain_kinds = [
+            (ToolKind::Read, 12usize),
+            (ToolKind::Search, 14),
+            (ToolKind::Command, 25),
+            (ToolKind::Other, 29),
+        ];
+        for (kind, count) in plain_kinds {
             for _ in 0..count {
-                let bucket = plain_generated % 3;
-                let at = format!("2026-01-01T{}:{:02}:00Z", hours[bucket], minute[bucket]);
-                minute[bucket] += 1;
-                plain_generated += 1;
+                let index = calls.len();
+                let bucket = index % 3;
+                let minute = safe_minute(bucket, index);
+                let at = format!("2026-01-01T{}:{minute:02}:00Z", hours[bucket]);
                 calls.push(Call {
                     at,
                     kind,
@@ -5407,21 +5660,29 @@ mod tests {
         }
         assert_eq!(
             calls.len(),
-            30,
+            100,
             "fixture sanity check: reads+searches+mutations+commands+other"
         );
 
-        let outcomes: Vec<ToolOutcome> = std::iter::repeat_n(ToolOutcome::Success, 9)
-            .chain(std::iter::repeat_n(ToolOutcome::Failure, 10))
-            .chain(std::iter::repeat_n(ToolOutcome::Unknown, 11))
+        let outcomes: Vec<ToolOutcome> = std::iter::repeat_n(ToolOutcome::Success, 31)
+            .chain(std::iter::repeat_n(ToolOutcome::Failure, 33))
+            .chain(std::iter::repeat_n(ToolOutcome::Unknown, 36))
             .collect();
-        assert_eq!(outcomes.len(), 30);
+        assert_eq!(outcomes.len(), 100);
+
+        let origins: Vec<ToolOrigin> = std::iter::repeat_n(ToolOrigin::Core, 15)
+            .chain(std::iter::repeat_n(ToolOrigin::Mcp, 17))
+            .chain(std::iter::repeat_n(ToolOrigin::Provider, 23))
+            .chain(std::iter::repeat_n(ToolOrigin::Unknown, 45))
+            .collect();
+        assert_eq!(origins.len(), 100);
 
         fixture.tool_observations = calls
             .into_iter()
             .zip(outcomes)
+            .zip(origins)
             .enumerate()
-            .map(|(index, (call, outcome))| ToolObservation {
+            .map(|(index, ((call, outcome), origin))| ToolObservation {
                 call_id: format!("dimension-call-{index}"),
                 turn_id: call.turn.map(Into::into),
                 harness: codex_provider_id(),
@@ -5433,6 +5694,7 @@ mod tests {
                 effective_tools: Vec::new(),
                 target: call.target.map(Into::into),
                 resource_id: None,
+                origin,
                 outcome,
                 duration_ms: Some(if index == 0 { 555 } else { 0 }),
                 output_bytes: if index == 0 { 9999 } else { 0 },

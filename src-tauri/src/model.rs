@@ -76,6 +76,64 @@ pub enum ToolOutcome {
     Unknown,
 }
 
+/// Versioned, normalized tool-origin dimension (issue #44). Computed once
+/// during parsing from data `ToolObservation` already carries (`kind` and
+/// `providers`) — never by reparsing a transcript in the UI or optimizer.
+///
+/// - `Mcp`: the call resolved at least one MCP server identity.
+/// - `Core`: a generic file/search/shell primitive (`kind` is `Read`,
+///   `Search`, `Mutation`, or `Command`) with no MCP provider.
+/// - `Provider`: a harness-native tool that is not one of the generic
+///   primitives above and not MCP (e.g. subagent orchestration, todo lists,
+///   web search) — `kind` is `Other` with no MCP provider.
+/// - `Unknown`: the default for historical data that predates this field
+///   (deserialized snapshots, and durable-ledger facts recorded before the
+///   dimension existed). Never emitted by fresh parsing; unknown means
+///   "not available", not zero.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOrigin {
+    Core,
+    Mcp,
+    Provider,
+    #[default]
+    Unknown,
+}
+
+impl ToolOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Mcp => "mcp",
+            Self::Provider => "provider",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_str_or_unknown(value: &str) -> Self {
+        match value {
+            "core" => Self::Core,
+            "mcp" => Self::Mcp,
+            "provider" => Self::Provider,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Classifies origin from data already collected by `observe_call`.
+    /// Deterministic and total: fresh observations always resolve to
+    /// `Core`, `Mcp`, or `Provider`, never `Unknown` (that variant is
+    /// reserved for data recorded before this dimension existed).
+    pub fn classify(kind: ToolKind, providers: &[String]) -> Self {
+        if !providers.is_empty() {
+            Self::Mcp
+        } else if kind == ToolKind::Other {
+            Self::Provider
+        } else {
+            Self::Core
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolObservation {
     pub call_id: String,
@@ -101,6 +159,11 @@ pub struct ToolObservation {
     /// reads without retaining the resource name or path.
     #[serde(default)]
     pub resource_id: Option<String>,
+    /// Normalized tool-origin dimension (issue #44). Defaulted to `Unknown`
+    /// for data recorded before this field existed; fresh observations
+    /// always compute a real value via `ToolOrigin::classify`.
+    #[serde(default)]
+    pub origin: ToolOrigin,
     pub outcome: ToolOutcome,
     pub duration_ms: Option<u64>,
     pub output_bytes: u64,
@@ -122,6 +185,20 @@ pub struct ToolMetrics {
     pub retry_count: u64,
     pub duration_ms: u64,
     pub output_bytes: u64,
+    /// Origin-dimension breakdown (issue #44). These four fields always sum
+    /// to `calls`: every observation resolves to exactly one origin,
+    /// including `unknown_origin_calls` for data recorded before the
+    /// dimension existed. Plain additive counters at the existing
+    /// `(session_key, hour_bucket, model)` rollup grain — this does not
+    /// change `rollup_tool_metrics` cardinality.
+    #[serde(default)]
+    pub core_origin_calls: u64,
+    #[serde(default)]
+    pub mcp_origin_calls: u64,
+    #[serde(default)]
+    pub provider_origin_calls: u64,
+    #[serde(default)]
+    pub unknown_origin_calls: u64,
 }
 
 impl ToolMetrics {
@@ -140,6 +217,10 @@ impl ToolMetrics {
         self.retry_count += value.retry_count;
         self.duration_ms += value.duration_ms;
         self.output_bytes += value.output_bytes;
+        self.core_origin_calls += value.core_origin_calls;
+        self.mcp_origin_calls += value.mcp_origin_calls;
+        self.provider_origin_calls += value.provider_origin_calls;
+        self.unknown_origin_calls += value.unknown_origin_calls;
     }
 }
 
@@ -957,6 +1038,7 @@ mod tests {
                 effective_tools: vec!["read".into()],
                 target: Some("read:synthetic".into()),
                 resource_id: Some("synthetic".into()),
+                origin: ToolOrigin::Core,
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
                 output_bytes: 0,

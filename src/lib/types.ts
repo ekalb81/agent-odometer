@@ -23,6 +23,9 @@ export interface TokenTotals {
 export type ToolKind = 'read' | 'search' | 'mutation' | 'command' | 'other';
 export type ToolOutcome = 'pending' | 'success' | 'failure' | 'unknown';
 export type TaskCategory = 'planning' | 'exploration' | 'coding' | 'debugging' | 'testing' | 'review' | 'other';
+/** Normalized tool-origin dimension (issue #44). `unknown` means the
+ * dimension was recorded before this field existed, never a real zero. */
+export type ToolOrigin = 'core' | 'mcp' | 'provider' | 'unknown';
 
 export interface ToolMetrics {
   calls: number;
@@ -39,6 +42,14 @@ export interface ToolMetrics {
   retry_count: number;
   duration_ms: number;
   output_bytes: number;
+  /** Origin-dimension breakdown (issue #44): always sums to `calls`.
+   * Optional here (mirroring `resource_id` above) so existing fixtures and
+   * historical serialized data need not populate it; real backend responses
+   * always include it. */
+  core_origin_calls?: number;
+  mcp_origin_calls?: number;
+  provider_origin_calls?: number;
+  unknown_origin_calls?: number;
 }
 
 export interface ToolObservation {
@@ -53,6 +64,7 @@ export interface ToolObservation {
   effective_tools: string[];
   target: string | null;
   resource_id?: string | null;
+  origin: ToolOrigin;
   outcome: ToolOutcome;
   duration_ms: number | null;
   output_bytes: number;

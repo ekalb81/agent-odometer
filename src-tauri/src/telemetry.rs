@@ -1,6 +1,6 @@
 use crate::model::{
     CategoryMetric, Harness, OptimizationFinding, TaskCategory, ToolKind, ToolMetrics,
-    ToolObservation, ToolOutcome, TurnClassification,
+    ToolObservation, ToolOrigin, ToolOutcome, TurnClassification,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -198,18 +198,21 @@ pub fn observe_call(observations: &mut Vec<ToolObservation>, input: ToolCallInpu
     let providers = tool_providers(&input.name, input.arguments);
     let effective_tools = effective_tools(&input.name, input.arguments);
     let resource_id = normalized_resource(input.arguments);
+    let kind = classify_tool(&input.name);
+    let origin = ToolOrigin::classify(kind, &providers);
     observations.push(ToolObservation {
         call_id: input.call_id,
         turn_id: input.turn_id,
         harness: input.harness,
         model: input.model,
         timestamp: input.timestamp,
-        kind: classify_tool(&input.name),
+        kind,
         name: input.name,
         providers,
         effective_tools,
         target,
         resource_id,
+        origin,
         outcome: ToolOutcome::Pending,
         duration_ms: None,
         output_bytes: 0,
@@ -263,6 +266,12 @@ pub(crate) fn accumulate_observation(counters: &mut ToolMetrics, item: &ToolObse
         ToolOutcome::Success => counters.successes += 1,
         ToolOutcome::Failure => counters.failures += 1,
         ToolOutcome::Pending | ToolOutcome::Unknown => counters.unknown += 1,
+    }
+    match item.origin {
+        ToolOrigin::Core => counters.core_origin_calls += 1,
+        ToolOrigin::Mcp => counters.mcp_origin_calls += 1,
+        ToolOrigin::Provider => counters.provider_origin_calls += 1,
+        ToolOrigin::Unknown => counters.unknown_origin_calls += 1,
     }
 }
 
@@ -730,6 +739,7 @@ mod tests {
             effective_tools: vec!["edit".into()],
             target: Some(target.into()),
             resource_id: Some(target.into()),
+            origin: ToolOrigin::Core,
             outcome: ToolOutcome::Success,
             duration_ms: None,
             output_bytes: 0,
@@ -757,6 +767,7 @@ mod tests {
                 effective_tools: vec!["read".into()],
                 target: Some("read:abc".into()),
                 resource_id: Some("abc".into()),
+                origin: ToolOrigin::Core,
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
                 output_bytes: 0,
@@ -843,6 +854,7 @@ mod tests {
                     .map_or(target, |(_, resource)| resource)
                     .to_owned()
             }),
+            origin: ToolOrigin::classify(kind, &[]),
             outcome,
             duration_ms: None,
             output_bytes,
