@@ -6,7 +6,7 @@ use crate::model::{
 };
 use crate::rates::RateCard;
 use crate::scan_cache;
-use crate::store::AppState;
+use crate::store::{AppState, HistoryReadinessKind, HistoryStepSnapshot};
 #[cfg(any(windows, test))]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Local, Timelike, Utc};
@@ -593,13 +593,36 @@ pub async fn sessions_in_ranges(
     };
     let session_count = keys.len();
     let range_count = bounds.len();
+    // The ledger is the accounting authority for this endpoint (AGENTS.md).
+    // While it is still opening/migrating (#116), the in-memory fallback
+    // below would only cover whatever the bulk scan has managed to observe
+    // so far — itself gated behind this same readiness signal, see
+    // `spawn_scan` — and a partial-looking-complete answer is worse than an
+    // honest "not ready yet". Callers already treat a failure here as "leave
+    // the cache as-is and retry on the next mutation" (see
+    // `SessionsView.svelte`'s `sessions_in_ranges` call sites), which
+    // self-heals automatically once the scan resumes after the ledger opens
+    // and its `session-updated` events retrigger the fetch.
+    if matches!(app_state.history_readiness(), HistoryReadinessKind::Pending) {
+        app_state.performance.record_backend(
+            "ipc.sessions_in_ranges",
+            started,
+            false,
+            BTreeMap::from([
+                ("sessions".into(), session_count.to_string()),
+                ("ranges".into(), range_count.to_string()),
+                ("source".into(), "pending".into()),
+            ]),
+        );
+        return Err("durable history is still preparing; retry shortly".into());
+    }
     let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
         // The ledger is authoritative when available; sessions whose latest
         // persist failed (plus everything, when the store never opened) fall
         // back to walking in-memory history, keeping answers complete.
         let (ledger_keys, memory_keys): (Vec<String>, Vec<String>) =
-            match blocking_state.history.as_ref() {
+            match blocking_state.history_ready() {
                 Some(_) => keys
                     .into_iter()
                     .partition(|key| !blocking_state.ledger_is_stale(key)),
@@ -608,7 +631,7 @@ pub async fn sessions_in_ranges(
         let mut source = "memory";
         let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); bounds.len()];
         let mut memory_keys = memory_keys;
-        if let Some(history) = blocking_state.history.as_ref() {
+        if let Some(history) = blocking_state.history_ready() {
             match history.range_totals_multi(&ledger_keys, &bounds) {
                 Ok(maps) => {
                     source = if memory_keys.is_empty() {
@@ -1108,18 +1131,31 @@ pub fn spawn_scan(
     source_configuration_valid: bool,
 ) {
     let generation = state.current_scan_generation();
-    // Allocate the archive generation before workers start. Live watcher
-    // writes during discovery use the same generation, preventing a newly
-    // created file from being falsely marked missing at completion.
-    let history_generation = source_configuration_valid
-        .then(|| state.begin_history_scan())
-        .flatten();
     state.scanned.store(false, Ordering::Release);
     state.scan_done.store(0, Ordering::Release);
     state.scan_total.store(0, Ordering::Release);
     *state.cold_reason.lock().unwrap() = None;
 
     std::thread::spawn(move || {
+        // The durable archive may still be opening/migrating (#116):
+        // AppState starts `Pending` and only `spawn_history_open` resolves
+        // it. Waiting here — rather than treating Pending like a
+        // permanently unavailable archive — preserves the ordering
+        // `AppState::new()` used to guarantee synchronously before #116:
+        // every archived session is hydrated into `state.sessions` (by
+        // `AppState::set_history_ready`) before this scan's first
+        // `observe()`, so a bulk scan can never race `hydrate_history`'s
+        // wholesale overwrite of the in-memory map.
+        state.wait_for_history_ready();
+
+        // Allocate the archive generation before workers start. Live
+        // watcher writes during discovery use the same generation,
+        // preventing a newly created file from being falsely marked missing
+        // at completion.
+        let history_generation = source_configuration_valid
+            .then(|| state.begin_history_scan())
+            .flatten();
+
         let started = std::time::Instant::now();
         // An invalid legacy source configuration must not prune an otherwise
         // healthy cache merely because the fail-closed scan has no roots.
@@ -1351,6 +1387,140 @@ pub fn get_scan_status(state: State<'_, Arc<AppState>>) -> ScanStatus {
             .then(|| state.scan_elapsed_ms.load(Ordering::Acquire))
             .filter(|ms| *ms > 0),
         cold_reason: *state.cold_reason.lock().unwrap(),
+    }
+}
+
+/// Opens (and migrates, if needed) the durable history archive on a
+/// background thread so Tauri can create a window before a chained schema
+/// migration on an existing install completes (#116). `AppState` starts in
+/// `HistoryReadiness::Pending`; this is the only path that ever resolves it.
+/// `spawn_scan` and every IPC command that needs the ledger wait on or check
+/// that readiness rather than treating `Pending` like a permanently
+/// unavailable archive.
+pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let progress_app = app.clone();
+        let progress_state = state.clone();
+        let result = crate::history_store::HistoryStore::open_default_with_progress(move |event| {
+            let snapshot = HistoryStepSnapshot {
+                step: event.step.to_string(),
+                step_index: event.step_index,
+                step_total: event.step_total,
+                items_done: event.items_done,
+                items_total: event.items_total,
+                elapsed_ms: event.elapsed_ms,
+            };
+            progress_state.record_history_step(snapshot.clone());
+            if let Some(elapsed_ms) = event.elapsed_ms {
+                progress_state.performance.record_backend_duration_ms(
+                    format!("history.migration.{}", event.step),
+                    elapsed_ms as f64,
+                    true,
+                    BTreeMap::from([
+                        ("from_version".into(), event.from_version.to_string()),
+                        ("to_version".into(), event.to_version.to_string()),
+                    ]),
+                );
+            }
+            let _ = progress_app.emit(
+                "history-progress",
+                &HistoryStatus {
+                    status: HistoryReadinessStatus::Pending,
+                    step: Some(snapshot.step),
+                    step_index: Some(snapshot.step_index),
+                    step_total: Some(snapshot.step_total),
+                    items_done: snapshot.items_done,
+                    items_total: snapshot.items_total,
+                    elapsed_ms: snapshot.elapsed_ms,
+                },
+            );
+        });
+        let success = result.is_ok();
+        match result {
+            Ok(store) => state.set_history_ready(Some(Arc::new(store))),
+            Err(error) => {
+                tracing::warn!("durable history unavailable: {}", error);
+                state.set_history_ready(None);
+            }
+        }
+        let total_elapsed_ms = started.elapsed().as_millis() as u64;
+        state.performance.record_backend(
+            "startup.history_open",
+            started,
+            success,
+            BTreeMap::from([("available".into(), success.to_string())]),
+        );
+        let last_step = state.last_history_step();
+        let _ = app.emit(
+            "history-progress",
+            &HistoryStatus {
+                status: if success {
+                    HistoryReadinessStatus::Ready
+                } else {
+                    HistoryReadinessStatus::Unavailable
+                },
+                step: last_step.as_ref().map(|s| s.step.clone()),
+                step_index: last_step.as_ref().map(|s| s.step_index),
+                step_total: last_step.as_ref().map(|s| s.step_total),
+                items_done: None,
+                items_total: None,
+                elapsed_ms: Some(total_elapsed_ms),
+            },
+        );
+    });
+}
+
+/// Wire status for `HistoryReadinessKind` (#116): `pending` while the
+/// archive is opening/migrating, `ready` once available, `unavailable` if it
+/// failed to open (the app still degrades gracefully — live transcripts stay
+/// readable, see `AGENTS.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryReadinessStatus {
+    Pending,
+    Ready,
+    Unavailable,
+}
+
+/// Durable-history open/migration progress, mirroring `ScanStatus`'s
+/// "call `get_history_status` once on mount, then follow `history-progress`
+/// events" contract (#116). `step`/`step_index`/`step_total` describe the
+/// step most recently reported (in progress while `status` is `pending`,
+/// otherwise the last one that ran, or all `None` if the archive needed no
+/// migration at all). `items_done`/`items_total` are `Some` only while a
+/// step that streams per-row progress — currently just the v5->v6 project
+/// identity backfill — is running.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryStatus {
+    pub status: HistoryReadinessStatus,
+    pub step: Option<String>,
+    pub step_index: Option<u32>,
+    pub step_total: Option<u32>,
+    pub items_done: Option<usize>,
+    pub items_total: Option<usize>,
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Returns the current durable-history open/migration status. The frontend
+/// calls this once on mount (progress events may have fired before its
+/// listeners attached) and then follows "history-progress" events.
+#[tauri::command]
+pub fn get_history_status(state: State<'_, Arc<AppState>>) -> HistoryStatus {
+    let status = match state.history_readiness() {
+        HistoryReadinessKind::Pending => HistoryReadinessStatus::Pending,
+        HistoryReadinessKind::Ready => HistoryReadinessStatus::Ready,
+        HistoryReadinessKind::Unavailable => HistoryReadinessStatus::Unavailable,
+    };
+    let last_step = state.last_history_step();
+    HistoryStatus {
+        status,
+        step: last_step.as_ref().map(|s| s.step.clone()),
+        step_index: last_step.as_ref().map(|s| s.step_index),
+        step_total: last_step.as_ref().map(|s| s.step_total),
+        items_done: last_step.as_ref().and_then(|s| s.items_done),
+        items_total: last_step.as_ref().and_then(|s| s.items_total),
+        elapsed_ms: last_step.as_ref().and_then(|s| s.elapsed_ms),
     }
 }
 
@@ -2568,14 +2738,14 @@ fn resolve_projects_from<'a>(
 #[tauri::command]
 pub fn resolve_projects(state: State<'_, Arc<AppState>>) -> Result<Vec<ProjectInfo>, String> {
     let started = Instant::now();
-    let session_overrides = match state.history.as_ref() {
+    let session_overrides = match state.history_ready() {
         Some(history) => history
             .list_session_project_overrides()
             .map_err(|error| error.to_string())?,
         None => HashMap::new(),
     };
     let project_overrides: HashMap<String, crate::history_store::ProjectOverrideRow> =
-        match state.history.as_ref() {
+        match state.history_ready() {
             Some(history) => history
                 .list_project_overrides()
                 .map_err(|error| error.to_string())?
@@ -2613,8 +2783,7 @@ pub fn set_project_alias(
     display_label: Option<String>,
 ) -> Result<(), String> {
     let history = state
-        .history
-        .as_ref()
+        .history_ready()
         .ok_or("the history store is unavailable")?;
     history
         .set_project_alias(&project_key, display_label.as_deref())
@@ -2631,8 +2800,7 @@ pub fn merge_projects(
     canonical_project_key: String,
 ) -> Result<(), String> {
     let history = state
-        .history
-        .as_ref()
+        .history_ready()
         .ok_or("the history store is unavailable")?;
     history
         .merge_project(&source_project_key, &canonical_project_key)
@@ -2643,8 +2811,7 @@ pub fn merge_projects(
 #[tauri::command]
 pub fn unmerge_project(state: State<'_, Arc<AppState>>, project_key: String) -> Result<(), String> {
     let history = state
-        .history
-        .as_ref()
+        .history_ready()
         .ok_or("the history store is unavailable")?;
     history
         .unmerge_project(&project_key)
@@ -2662,8 +2829,7 @@ pub fn reassign_session_project(
     project_key: Option<String>,
 ) -> Result<String, String> {
     let history = state
-        .history
-        .as_ref()
+        .history_ready()
         .ok_or("the history store is unavailable")?;
     history
         .reassign_session_project(&session_key, project_key.as_deref())
@@ -2678,8 +2844,7 @@ pub fn clear_session_project_override(
     session_key: String,
 ) -> Result<(), String> {
     let history = state
-        .history
-        .as_ref()
+        .history_ready()
         .ok_or("the history store is unavailable")?;
     history
         .clear_session_project_override(&session_key)
