@@ -1,7 +1,8 @@
 use odometer_lib::model::Harness;
 use odometer_lib::provider::{
-    claude_code_provider_id, codex_provider_id, IncrementalProviderParser, ProviderAdapter,
-    ProviderId, ProviderRegistry, ProviderSource, ProviderSourceKind, ProviderSourceSet,
+    claude_code_provider_id, codex_provider_id, gemini_cli_provider_id, IncrementalProviderParser,
+    ProviderAdapter, ProviderId, ProviderRegistry, ProviderSource, ProviderSourceKind,
+    ProviderSourceSet,
 };
 use odometer_lib::scanner;
 use std::collections::HashSet;
@@ -16,21 +17,48 @@ struct ProviderCase {
     harness: Harness,
 }
 
-fn cases() -> [ProviderCase; 2] {
-    [
-        ProviderCase {
-            id: "codex",
-            fixture: "sample-session.jsonl",
-            expected_session_id: "019e2ba6-95be-7bd2-a255-238cdf02936c",
-            harness: codex_provider_id(),
-        },
-        ProviderCase {
-            id: "claude_code",
-            fixture: "claude-session.jsonl",
-            expected_session_id: "11111111-2222-3333-4444-555555555555",
-            harness: claude_code_provider_id(),
-        },
-    ]
+/// Generated from the live registry rather than hand-listed (issue #40 entry
+/// condition): every adapter `ProviderRegistry::builtin()` returns must have
+/// a matching arm here with its own synthetic fixture and expected session
+/// id, or this panics immediately instead of letting the contract suite
+/// quietly cover fewer providers than are actually registered.
+fn cases() -> Vec<ProviderCase> {
+    ProviderRegistry::builtin()
+        .adapters()
+        .map(|adapter| {
+            let descriptor = adapter.descriptor();
+            let id = descriptor.id.as_str();
+            match id {
+                "codex" => ProviderCase {
+                    id: "codex",
+                    fixture: "sample-session.jsonl",
+                    expected_session_id: "019e2ba6-95be-7bd2-a255-238cdf02936c",
+                    harness: codex_provider_id(),
+                },
+                "claude_code" => ProviderCase {
+                    id: "claude_code",
+                    fixture: "claude-session.jsonl",
+                    expected_session_id: "11111111-2222-3333-4444-555555555555",
+                    harness: claude_code_provider_id(),
+                },
+                "gemini_cli" => ProviderCase {
+                    id: "gemini_cli",
+                    // Mirrors the real on-disk layout
+                    // (`~/.gemini/tmp/<project-hash>/chats/session-*.jsonl`)
+                    // since `accepts_path` requires a `chats` parent
+                    // directory and a `session-` filename prefix.
+                    fixture: "gemini/chats/session-1.jsonl",
+                    expected_session_id: "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
+                    harness: gemini_cli_provider_id(),
+                },
+                other => panic!(
+                    "provider '{other}' is registered in ProviderRegistry::builtin() but has no \
+                     contract-test case in provider_contract_tests.rs::cases(); add a synthetic \
+                     fixture and a matching arm before enabling this provider"
+                ),
+            }
+        })
+        .collect()
 }
 
 fn fixture(name: &str) -> PathBuf {
@@ -58,13 +86,28 @@ fn registry_has_unique_stable_ids_and_unknowns_fail_closed() {
         .iter()
         .map(|descriptor| descriptor.id.as_str())
         .collect();
-    assert_eq!(ids, vec!["codex", "claude_code"]);
+    assert_eq!(ids, vec!["codex", "claude_code", "gemini_cli"]);
     assert_eq!(ids.iter().copied().collect::<HashSet<_>>().len(), ids.len());
     assert_eq!(registry.adapters().len(), descriptors.len());
+    // Every registered adapter must have a matching contract case (issue #40
+    // entry condition): a provider added to the registry without a fixture
+    // here would otherwise silently ship uncovered.
+    assert_eq!(cases().len(), registry.adapters().len());
     assert!(descriptors[0].capabilities.archived_sources);
     assert!(descriptors[0].capabilities.session_index);
+    assert_eq!(descriptors[0].capabilities.currency, "credits");
+    assert!(descriptors[0].capabilities.deep_link);
+    assert!(descriptors[0].capabilities.quota_source);
     assert!(!descriptors[1].capabilities.archived_sources);
     assert!(!descriptors[1].capabilities.session_index);
+    assert_eq!(descriptors[1].capabilities.currency, "USD");
+    assert!(!descriptors[1].capabilities.deep_link);
+    assert!(!descriptors[1].capabilities.quota_source);
+    assert!(!descriptors[2].capabilities.archived_sources);
+    assert!(!descriptors[2].capabilities.session_index);
+    assert_eq!(descriptors[2].capabilities.currency, "USD");
+    assert!(!descriptors[2].capabilities.deep_link);
+    assert!(!descriptors[2].capabilities.quota_source);
 
     let unknown = ProviderId::new("future_provider").unwrap();
     assert!(registry.adapter(&unknown).is_none());
@@ -295,6 +338,18 @@ fn mixed_provider_scan_uses_adapters_and_keeps_progress_monotonic() {
     assert_eq!(report.files, 2);
     assert_eq!(report.parsed_files, 2);
     assert_eq!(report.parse_failures, 0);
+
+    // Per-provider breakdown (issue #39 diagnostics) must attribute each
+    // discovered/parsed file to its owning provider, not just the aggregate.
+    assert_eq!(report.per_provider.len(), 2);
+    let codex_counts = &report.per_provider[&codex_provider_id()];
+    assert_eq!(codex_counts.discovered, 1);
+    assert_eq!(codex_counts.parsed, 1);
+    assert_eq!(codex_counts.parse_failures, 0);
+    let claude_counts = &report.per_provider[&claude_code_provider_id()];
+    assert_eq!(claude_counts.discovered, 1);
+    assert_eq!(claude_counts.parsed, 1);
+    assert_eq!(claude_counts.parse_failures, 0);
 
     let progress = progress.into_inner().unwrap();
     assert_eq!(progress.first(), Some(&(0, 2)));

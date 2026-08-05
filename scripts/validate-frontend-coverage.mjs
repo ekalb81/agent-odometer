@@ -3,10 +3,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/DiagnosticsPanel.svelte',
   'src/components/SessionContextMenu.svelte',
   'src/components/SessionGridControls.svelte',
   'src/lib/configTimeline.ts',
   'src/lib/defenderStatus.ts',
+  'src/lib/diagnosticsExport.ts',
   'src/lib/flushCadence.ts',
   'src/lib/rangeData.ts',
   'src/lib/sessionExport.ts',

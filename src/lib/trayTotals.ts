@@ -10,6 +10,12 @@ export interface TrayTotals {
   codex_credits: string;
   codex_api_usd: string;
   claude_usd: string;
+  /** Live-quota headroom label (issue #43), e.g. "codex 5h 37% left". Empty
+   *  string when nothing is available to show — the tray keeps its
+   *  placeholder text rather than rendering a blank menu item. The label
+   *  itself is formatted by `quotaTrayLabel` (lib/subscriptionUsage.ts) from
+   *  already-backend-computed numbers; this module never re-derives one. */
+  quota: string;
 }
 
 export interface TraySessionLike {
@@ -22,6 +28,7 @@ export function computeTrayTotals(
   sessions: Iterable<TraySessionLike>,
   ranges: Record<string, RangeTotals>,
   rateCard: RateCard,
+  quotaLabel: string | null = null,
 ): TrayTotals {
   let tokens = 0; let codexCredits = 0; let codexApi = 0; let claudeUsd = 0;
   let unlimited = 0; let missingCredits = false; let missingApi = false; let missingClaude = false;
@@ -48,5 +55,6 @@ export function computeTrayTotals(
     codex_credits: creditText,
     codex_api_usd: missingApi ? 'unavailable · missing direct rate' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
     claude_usd: `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}`,
+    quota: quotaLabel ?? '',
   };
 }

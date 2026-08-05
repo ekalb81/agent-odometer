@@ -119,11 +119,7 @@ impl CohortAccumulator {
 }
 
 fn add_tokens(target: &mut TokenTotals, value: &TokenTotals) {
-    target.input_tokens += value.input_tokens;
-    target.cached_input_tokens += value.cached_input_tokens;
-    target.output_tokens += value.output_tokens;
-    target.reasoning_output_tokens += value.reasoning_output_tokens;
-    target.total_tokens += value.total_tokens;
+    *target += value;
 }
 
 fn turn_overlaps(
@@ -416,7 +412,7 @@ pub fn compare<S: Borrow<Session>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ToolKind, ToolObservation, ToolOutcome, TurnClassification};
+    use crate::model::{ToolKind, ToolObservation, ToolOrigin, ToolOutcome, TurnClassification};
     use crate::provider::{claude_code_provider_id, codex_provider_id};
     use std::collections::HashMap;
 
@@ -514,6 +510,13 @@ mod tests {
                 }],
                 target: None,
                 resource_id: None,
+                origin: if alpha_provider {
+                    ToolOrigin::Mcp
+                } else {
+                    ToolOrigin::Core
+                },
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: Some(500),
                 output_bytes: 10,
@@ -522,6 +525,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 

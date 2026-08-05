@@ -1,6 +1,6 @@
 [package]
 name = "agent-odometer"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
@@ -58,3 +58,6 @@ lto           = true
 opt-level     = "s"
 panic         = "abort"
 strip         = true
+
+[dev-dependencies]
+chacha20poly1305 = "0.11.0"

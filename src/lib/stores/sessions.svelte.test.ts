@@ -3,7 +3,7 @@ import { sessionsStore } from './sessions.svelte';
 import type { SessionSummary, TokenTotals } from '../types';
 
 const zero: TokenTotals = {
-  input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
+  input_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0,
   reasoning_output_tokens: 0, total_tokens: 0,
 };
 

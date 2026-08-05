@@ -1,4 +1,5 @@
 use crate::model::SessionSummary;
+use crate::paths::strip_verbatim_prefix;
 use crate::provider::{IncrementalProviderParser, ProviderRegistry, ProviderSourceSet};
 use crate::store::AppState;
 use dashmap::DashMap;
@@ -254,11 +255,38 @@ fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
         .eq(strip_verbatim_prefix(b).components())
 }
 
-fn strip_verbatim_prefix(p: &std::path::Path) -> &std::path::Path {
-    if let Some(s) = p.to_str() {
-        if let Some(rest) = s.strip_prefix(r"\\?\") {
-            return std::path::Path::new(rest);
-        }
+#[cfg(test)]
+mod tests {
+    use super::paths_equivalent;
+    use std::path::Path;
+
+    /// The session-index watcher compares a notify event path against the
+    /// configured path. On a UNC root with long-path support active, notify
+    /// delivers the verbatim spelling while configuration carries the plain
+    /// one; a prefix strip that is not UNC-aware turns the former into a
+    /// relative-looking `UNC\server\share\…` and the comparison fails, so
+    /// index changes go undetected.
+    #[test]
+    fn verbatim_unc_event_paths_match_their_plain_configured_form() {
+        assert!(paths_equivalent(
+            Path::new(r"\\?\UNC\server\share\.codex\sessions.json"),
+            Path::new(r"\\server\share\.codex\sessions.json"),
+        ));
     }
-    p
+
+    #[test]
+    fn verbatim_disk_event_paths_match_their_plain_configured_form() {
+        assert!(paths_equivalent(
+            Path::new(r"\\?\C:\Users\dev\.codex\sessions.json"),
+            Path::new(r"C:\Users\dev\.codex\sessions.json"),
+        ));
+    }
+
+    #[test]
+    fn distinct_paths_still_compare_unequal() {
+        assert!(!paths_equivalent(
+            Path::new(r"\\?\UNC\server\share\.codex\sessions.json"),
+            Path::new(r"\\server\other\.codex\sessions.json"),
+        ));
+    }
 }

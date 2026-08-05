@@ -279,3 +279,51 @@ fn parent_transcript_still_ignores_sidechain_prompts() {
     assert!(s.parent_thread_id.is_none());
     assert!(s.source.is_none());
 }
+
+#[test]
+fn classifies_shell_family_language_and_mcp_server_for_claude_tool_calls() {
+    // Issue #44: shell command family, language, and MCP server identity
+    // are computed generically in `telemetry.rs` from data every provider's
+    // tool call already carries, so a synthetic session exercising Claude's
+    // own tool-name/argument shapes (direct `mcp__<server>__<tool>` naming,
+    // a `command` string on `Bash`, a `file_path` string on `Read`) proves
+    // the dimension actually flows end to end for this provider, not just
+    // through the shared telemetry unit tests.
+    let lines = [
+        r#"{"parentUuid":null,"isSidechain":false,"userType":"external","cwd":"D:\\projects\\demo-app","sessionId":"22222222-3333-4444-5555-666666666666","version":"2.1.209","gitBranch":"main","entrypoint":"cli","type":"user","message":{"role":"user","content":"Check status and read main.rs"},"uuid":"u-turn-1","timestamp":"2026-07-01T10:00:01.000Z"}"#,
+        r#"{"parentUuid":"u-turn-1","isSidechain":false,"userType":"external","cwd":"D:\\projects\\demo-app","sessionId":"22222222-3333-4444-5555-666666666666","version":"2.1.209","gitBranch":"main","type":"assistant","requestId":"req_1","message":{"id":"msg_dims","type":"message","role":"assistant","model":"claude-opus-4-8","content":[{"type":"tool_use","id":"toolu_shell","name":"Bash","input":{"command":"git status"}},{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"D:\\projects\\demo-app\\src\\main.rs"}},{"type":"tool_use","id":"toolu_mcp","name":"mcp__code_search__query","input":{"query":"healthcheck"}}],"stop_reason":"tool_use","usage":{"input_tokens":100,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":50,"service_tier":"standard","speed":"standard"}},"uuid":"a-1","timestamp":"2026-07-01T10:00:02.000Z"}"#,
+        r#"{"parentUuid":"a-1","isSidechain":false,"userType":"external","cwd":"D:\\projects\\demo-app","sessionId":"22222222-3333-4444-5555-666666666666","version":"2.1.209","gitBranch":"main","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_shell","content":"clean"},{"type":"tool_result","tool_use_id":"toolu_read","content":"fn main() {}"},{"type":"tool_result","tool_use_id":"toolu_mcp","content":"[]"}]},"uuid":"u-toolres-1","timestamp":"2026-07-01T10:00:03.000Z"}"#,
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.jsonl");
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let s = claude_parser::parse_file(&path).unwrap().unwrap();
+    assert_eq!(s.tool_observations.len(), 3, "{:?}", s.tool_observations);
+
+    let shell = s
+        .tool_observations
+        .iter()
+        .find(|o| o.call_id == "toolu_shell")
+        .unwrap();
+    assert_eq!(shell.shell_family.as_deref(), Some("git"));
+    assert_eq!(shell.language, None);
+    assert!(shell.providers.is_empty());
+
+    let read = s
+        .tool_observations
+        .iter()
+        .find(|o| o.call_id == "toolu_read")
+        .unwrap();
+    assert_eq!(read.language.as_deref(), Some("rust"));
+    assert_eq!(read.shell_family, None);
+
+    let mcp = s
+        .tool_observations
+        .iter()
+        .find(|o| o.call_id == "toolu_mcp")
+        .unwrap();
+    assert_eq!(mcp.providers, vec!["code_search"]);
+    assert_eq!(mcp.shell_family, None);
+    assert_eq!(mcp.language, None);
+}

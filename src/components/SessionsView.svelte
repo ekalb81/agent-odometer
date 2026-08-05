@@ -2,6 +2,7 @@
   import { onDestroy, onMount, untrack } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
+  import { projectStore } from '../lib/stores/projects.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { apiCostFromBuckets, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
@@ -16,9 +17,11 @@
     defaultFilters,
     exportRows,
     filterSessions,
+    costIsUnmeasured,
+    disambiguateSiblingNames,
     isSubagent,
+    orderSessionsForDisplay,
     projectSessions,
-    repositoryLabel,
     rowsToCsv,
     sessionName,
     toUtcIso,
@@ -31,7 +34,7 @@
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
-  import { formatStartedLocal, formatTokenCategory, modelProviderVisual } from '../lib/sessionGrid';
+  import { formatStartedLocal, formatTokenCategory, formatTokenTotal, modelProviderVisual } from '../lib/sessionGrid';
   import {
     collectSessionExportTree,
     sessionExportContent,
@@ -42,6 +45,7 @@
   import SessionContextMenu from './SessionContextMenu.svelte';
   import SubscriptionUsage from './SubscriptionUsage.svelte';
   import { providersStore } from '../lib/stores/providers.svelte';
+  import { aggregateToolDimensions } from '../lib/toolDimensions';
 
   interface Props {
     harness?: ViewScope;
@@ -64,14 +68,23 @@
   }
 
   // Codex additionally shows what the usage would cost at OpenAI API rates;
-  // its money column and analytics use that figure. Claude Code prices at
-  // Anthropic API rates directly.
-  const showApiCost = $derived(harness !== 'claude_code' && Object.keys($rates?.api_models ?? {}).length > 0);
+  // its money column and analytics use that figure. Every other provider
+  // prices directly in USD already (see `ProviderCapabilities.currency`), so
+  // it has no separate "estimated at API rates" figure to show.
+  const showApiCost = $derived(
+    (harness === 'all' || harness === 'codex')
+    && Object.keys($rates?.api_models ?? {}).length > 0,
+  );
+  // Sanity-checks that every registered non-Codex provider (all USD-priced
+  // today) actually resolves to USD before the "All" scope combines Codex's
+  // converted API-USD estimate with their native USD costs.
   const allUsdAvailable = $derived(
     harness !== 'all' || Boolean(
       $rates &&
       Object.keys($rates.api_models ?? {}).length > 0 &&
-      harnessCurrency($rates, 'claude_code') === 'USD'
+      providersStore.descriptors
+        .filter((descriptor) => descriptor.id !== 'codex')
+        .every((descriptor) => harnessCurrency($rates!, descriptor.id) === 'USD')
     ),
   );
 
@@ -179,7 +192,41 @@
   // Datetime range — overlap semantics: include any session whose
   // [started_at, last_event_at] window intersects the filter range.
   // Comparison is lexical on UTC ISO strings, which sorts chronologically.
-  const filtered = $derived(filterSessions(filteredNoDate, harness, filters, true));
+  const dateFiltered = $derived(filterSessions(filteredNoDate, harness, filters, true));
+
+  // Drill-down: when set, the table shows one parent and its descendants only.
+  // Storage id, so it survives the provider-id indirection in parentStorageId.
+  let focusedParentId = $state<string | null>(null);
+  const focusedParent = $derived(
+    focusedParentId ? (dateFiltered.find((s) => s.storage_id === focusedParentId) ?? null) : null,
+  );
+  // Descendants at any depth: a subagent can itself spawn subagents, and
+  // scoping to direct children only would silently drop the deeper runs.
+  const filtered = $derived((() => {
+    if (!focusedParentId) return dateFiltered;
+    const childrenOf = new Map<string, TrackedSession[]>();
+    for (const session of dateFiltered) {
+      const parentId = parentStorageId(session);
+      if (!parentId) continue;
+      const arr = childrenOf.get(parentId);
+      if (arr) arr.push(session);
+      else childrenOf.set(parentId, [session]);
+    }
+    const out: TrackedSession[] = [];
+    const seen = new Set<string>();
+    const walk = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      for (const child of childrenOf.get(id) ?? []) {
+        out.push(child);
+        walk(child.storage_id);
+      }
+    };
+    const root = dateFiltered.find((s) => s.storage_id === focusedParentId);
+    if (root) out.unshift(root);
+    walk(focusedParentId);
+    return out;
+  })());
   const filteredIds = $derived(filtered.map((session) => session.storage_id));
   const analyticsSessionIds = $derived(filteredNoDate.map((session) => session.storage_id));
 
@@ -316,6 +363,57 @@
     return d.displayCost;
   }
 
+  /// The grid's label for a session's project (#41): the backend-owned
+  /// `project_label`, with any local alias/merge applied through
+  /// `projectStore`. Falls back to the session's own auto-computed label
+  /// only until that resolve completes.
+  function repositoryDisplay(session: TrackedSession): string {
+    if (!session.project_key) return '';
+    return projectStore.info(session.project_key)?.label ?? session.project_label ?? '';
+  }
+
+  /// Splits a `repository_root` label at its first `/` so the repository
+  /// name segment can be highlighted distinctly from the relative path
+  /// beneath it, the way the grid has always rendered a repository hit.
+  function splitRepositoryLabel(label: string): { name: string; rest: string } | null {
+    if (!label) return null;
+    const slash = label.indexOf('/');
+    return slash === -1 ? { name: label, rest: '' } : { name: label.slice(0, slash), rest: label.slice(slash + 1) };
+  }
+
+  // Wall-clock span of the run. Subagents are typically short-lived under a
+  // parent that stays open for days, so this is the column that separates them.
+  function durationMs(session: TrackedSession): number {
+    return Math.max(0, session.lastEventMs - session.startedMs);
+  }
+
+  function formatDuration(ms: number): string {
+    if (ms < 1000) return '—';
+    const seconds = Math.floor(ms / 1000);
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ${minutes % 60}m`;
+    return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+  }
+
+  /// The agent identity of a subagent run: nickname when the harness recorded
+  /// one, else the agent path's last segment. Empty for main threads.
+  function agentLabel(session: TrackedSession): string {
+    if (session.agent_nickname) return session.agent_nickname;
+    if (!session.agent_path) return '';
+    const segments = session.agent_path.split(/[\\/]/).filter(Boolean);
+    return segments.at(-1) ?? session.agent_path;
+  }
+
+  function parentLabel(session: TrackedSession): string {
+    const parentId = parentStorageId(session);
+    if (!parentId) return '';
+    const parent = sessionsStore.map.get(parentId);
+    return parent ? sessionName(parent) : '';
+  }
+
   function compareSession(a: TrackedSession, b: TrackedSession): number {
     if (sortKey === null) {
       // Default: start time desc — matches the day-grouped presentation.
@@ -330,10 +428,25 @@
         cmp = a.startedMs - b.startedMs;
         break;
       case 'repository':
-        cmp = (repositoryLabel(a) ?? '').localeCompare(repositoryLabel(b) ?? '');
+        cmp = repositoryDisplay(a).localeCompare(repositoryDisplay(b));
         break;
       case 'model':
         cmp = (a.model ?? '').localeCompare(b.model ?? '');
+        break;
+      case 'duration':
+        cmp = durationMs(a) - durationMs(b);
+        break;
+      case 'agent':
+        cmp = agentLabel(a).localeCompare(agentLabel(b));
+        break;
+      case 'parent':
+        cmp = parentLabel(a).localeCompare(parentLabel(b));
+        break;
+      case 'turns':
+        cmp = a.total_turns - b.total_turns;
+        break;
+      case 'tools':
+        cmp = (a.tool_metrics?.calls ?? 0) - (b.tool_metrics?.calls ?? 0);
         break;
       case 'input': {
         const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
@@ -366,40 +479,6 @@
     return sortDir === 'asc' ? cmp : -cmp;
   }
 
-  // Subagent rows tuck in directly beneath their parent (when the parent is
-  // in view) under every sort order: column sorts rank the parents, and each
-  // parent's children among themselves, so a child never floats above its
-  // parent. anchorMs records which day group a row belongs to — children
-  // inherit their parent's group so a nested row never splits a day section.
-  const displayedWithAnchors = $derived((() => {
-    const sorted = [...filtered].sort(compareSession);
-    const anchorMs = new Map<string, number>();
-    const ids = new Set(sorted.map((s) => s.storage_id));
-    const children = new Map<string, TrackedSession[]>();
-    const roots: TrackedSession[] = [];
-    for (const s of sorted) {
-      const parentId = parentStorageId(s);
-      if (parentId && ids.has(parentId)) {
-        const arr = children.get(parentId);
-        if (arr) arr.push(s);
-        else children.set(parentId, [s]);
-      } else {
-        roots.push(s);
-      }
-    }
-    const list: TrackedSession[] = [];
-    const append = (s: TrackedSession, anchor: number) => {
-      list.push(s);
-      anchorMs.set(s.storage_id, anchor);
-      if (collapsedParents.has(s.storage_id)) return;
-      for (const c of children.get(s.storage_id) ?? []) append(c, anchor);
-    };
-    for (const r of roots) append(r, r.startedMs);
-    return { list, anchorMs };
-  })());
-
-  const displayed = $derived(displayedWithAnchors.list);
-
   // Collapsed parents hide their nested subagent rows.
   let collapsedParents = $state<ReadonlySet<string>>(new Set());
   function toggleCollapsed(id: string) {
@@ -407,6 +486,65 @@
     if (next.has(id)) next.delete(id);
     else next.add(id);
     collapsedParents = next;
+  }
+
+  // Tree mode keeps subagents tucked under their parent, which means a column
+  // sort can only rank parents (and each parent's children among themselves) —
+  // a child never outranks its parent. Flat mode drops the nesting so a sort
+  // ranks every thread against every other, which is the only way to ask
+  // "which subagent runs cost the most" across sessions. Each row then anchors
+  // to its own start time rather than inheriting its parent's day group.
+  // Drilling into one parent is inherently a flat question ("which of these
+  // runs cost the most"), so the scope implies the flattening.
+  const flatMode = $derived(sessionGridStore.flattenSubagents || focusedParentId !== null);
+  const displayedWithAnchors = $derived(
+    orderSessionsForDisplay([...filtered].sort(compareSession), {
+      parentOf: parentStorageId,
+      collapsed: collapsedParents,
+      flat: flatMode,
+    }),
+  );
+
+  const displayed = $derived(displayedWithAnchors.list);
+
+
+  // Fan-out spawns siblings from one templated prompt, so their names are
+  // identical for hundreds of characters and the grid shows N rows of the same
+  // truncated text. Per parent, strip the shared prefix and number the runs in
+  // start order so a row is identifiable without opening it.
+  const siblingDisplay = $derived((() => {
+    const out = new Map<string, { label: string; ordinal: number; total: number }>();
+    const groups = new Map<string, TrackedSession[]>();
+    for (const session of filtered) {
+      if (!isSubagent(session)) continue;
+      const parentId = parentStorageId(session);
+      if (!parentId) continue;
+      const arr = groups.get(parentId);
+      if (arr) arr.push(session);
+      else groups.set(parentId, [session]);
+    }
+    for (const siblings of groups.values()) {
+      if (siblings.length < 2) continue;
+      // Start order, so the ordinal reads as run order rather than sort order.
+      const ordered = [...siblings].sort((a, b) => a.startedMs - b.startedMs);
+      const labels = disambiguateSiblingNames(ordered.map((session) => sessionName(session)));
+      ordered.forEach((session, index) => {
+        out.set(session.storage_id, {
+          label: labels[index],
+          ordinal: index + 1,
+          total: ordered.length,
+        });
+      });
+    }
+    return out;
+  })());
+
+  interface CombinedUsage {
+    tokens: number;
+    cost: number;
+    /** True when this session or any in-view descendant ran a model with no
+     *  published rate, so the summed cost is a floor rather than a total. */
+    unpriced: boolean;
   }
 
   // Combined usage (session + all in-view descendant subagents) per row that
@@ -422,27 +560,35 @@
         else childrenOf.set(parentId, [s]);
       }
     }
-    const memo = new Map<string, { tokens: number; cost: number }>();
-    const total = (session: TrackedSession): { tokens: number; cost: number } => {
+    // `unpriced` propagates up the subtree: a parent whose descendant ran an
+    // unpriced model cannot report a complete cost, and a Σ that silently
+    // omits that usage reads as "these runs were cheap" rather than
+    // "these runs were not measured".
+    const memo = new Map<string, CombinedUsage>();
+    const total = (session: TrackedSession): CombinedUsage => {
       const cached = memo.get(session.storage_id);
       if (cached !== undefined) return cached;
+      const display = sessionDisplayMap.get(session.storage_id);
       const own = {
-        tokens: sessionDisplayMap.get(session.storage_id)?.tokens.total_tokens ?? session.tokens_total.total_tokens,
+        tokens: display?.tokens.total_tokens ?? session.tokens_total.total_tokens,
         cost: costOf(session.storage_id),
+        unpriced: (display?.unpricedModels.length ?? 0) > 0,
       };
       memo.set(session.storage_id, own); // pre-set guards against parent-id cycles
       let tokens = own.tokens;
       let cost = own.cost;
+      let unpriced = own.unpriced;
       for (const childSession of childrenOf.get(session.storage_id) ?? []) {
         const child = total(childSession);
         tokens += child.tokens;
         cost += child.cost;
+        unpriced = unpriced || child.unpriced;
       }
-      const sum = { tokens, cost };
+      const sum = { tokens, cost, unpriced };
       memo.set(session.storage_id, sum);
       return sum;
     };
-    const out = new Map<string, { tokens: number; cost: number }>();
+    const out = new Map<string, CombinedUsage>();
     for (const s of filtered) {
       if ((childrenOf.get(s.storage_id)?.length ?? 0) > 0) out.set(s.storage_id, total(s));
     }
@@ -479,6 +625,12 @@
     return `${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
   }
 
+  /// Groups by project identity (#41). The backend already resolved and
+  /// persisted `project_key`/`project_label` from the working directory
+  /// (Git repository root, workspace marker, or normalized path) — grouping
+  /// here only joins that key through `projectStore` for any local
+  /// alias/merge; it never recomputes identity from `working_directory`
+  /// itself, so this can never disagree with the grid's sort/filter/label.
   function groupByRepository(sessions: TrackedSession[]): { label: string; sessions: TrackedSession[] }[] {
     const groups = new Map<string, { label: string; sessions: TrackedSession[] }>();
     const byStorageId = new Map(sessions.map((session) => [session.storage_id, session]));
@@ -492,15 +644,12 @@
         if (!parent) break;
         anchor = parent;
       }
-      const workingDirectory = anchor.working_directory;
-      const normalized = workingDirectory?.replace(/\\/g, '/').replace(/\/+$/, '') ?? '';
-      const windowsStyle = Boolean(workingDirectory && (/\\/.test(workingDirectory) || /^[A-Za-z]:[\\/]/.test(workingDirectory)));
-      const key = workingDirectory
-        ? `path:${windowsStyle ? normalized.toLowerCase() : normalized}`
-        : 'missing:';
+      const info = anchor.project_key ? projectStore.info(anchor.project_key) : undefined;
+      const key = info?.project_key ?? anchor.project_key ?? 'missing:';
+      const label = info?.label ?? anchor.project_label ?? 'No working directory recorded';
       const group = groups.get(key);
       if (group) group.sessions.push(session);
-      else groups.set(key, { label: repositoryLabel(anchor) ?? 'No repository recorded', sessions: [session] });
+      else groups.set(key, { label, sessions: [session] });
     }
     return [...groups.values()];
   }
@@ -595,6 +744,8 @@
       listViewportHeight = entry.contentRect.height;
     });
     if (listViewport) resize.observe(listViewport);
+    // Fetch-once and shared across tabs; the store dedupes concurrent calls.
+    void projectStore.load();
     return () => resize.disconnect();
   });
 
@@ -632,6 +783,22 @@
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
   let analyticsJobGeneration = 0;
+
+  // Issue #44: dimension totals summed from the same already-fetched
+  // `analyticsCurrent` window — no separate IPC round trip. Availability is
+  // "at least one provider actually in view supports this dimension",
+  // consulted from the already-loaded provider registry rather than
+  // guessed; a dimension with real availability but zero aggregated data
+  // still renders as a real zero (empty section), never conflated with
+  // "unavailable".
+  const dimensionTotals = $derived(aggregateToolDimensions(analyticsCurrent));
+  const activeHarnesses = $derived(new Set(filteredNoDate.map((session) => session.harness)));
+  const dimensionAvailability = $derived({
+    mcp_server: [...activeHarnesses].some((h) => providersStore.byId(h)?.mcp_dimension),
+    shell_family: [...activeHarnesses].some((h) => providersStore.byId(h)?.shell_dimension),
+    language: [...activeHarnesses].some((h) => providersStore.byId(h)?.language_dimension),
+    context_source: [...activeHarnesses].some((h) => providersStore.byId(h)?.context_dimension),
+  });
   // Bumped whenever the cache is invalidated (range change, tab switch); an
   // in-flight job from an older epoch discards its fetch instead of applying
   // stale-range data over the freshly cleared state.
@@ -1584,7 +1751,7 @@
             <tbody>
               {#each modelComparison as metric (`${metric.harness}:${metric.model}`)}
                 <tr class="border-t border-edgerow">
-                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{providersStore.displayName(metric.harness)}</span> · {metric.model}{#if metric.unpriced}<span class="text-amber-500" title="Excluded because no published rate is available"> ◇</span>{:else if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
+                  <td class="py-1.5 text-ink"><span class="text-ink-faint">{providersStore.displayName(metric.harness)}</span> · {metric.model}{#if metric.unpriced}<span class="text-amber-500" title="Excluded because no published rate is available"> ◇</span>{:else if metric.basis === 'aliased'}<span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match"> ↝</span>{:else if metric.basis === 'estimated'}<span class="text-sky-500" title="Includes cache-write tokens priced at the ordinary input rate — no published cache-write premium for this model"> ≈</span>{:else if metric.fallbackUsed}<span class="text-amber-500" title="Configured fallback rate used"> ⚠</span>{/if}</td>
                   <td class="text-right">{fmt.format(metric.tokens.input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.cached_input_tokens)}</td>
                   <td class="text-right">{fmt.format(metric.tokens.output_tokens)}</td>
@@ -1611,6 +1778,8 @@
         from={impactFrom}
         to={impactTo}
         {windowLabel}
+        {dimensionTotals}
+        {dimensionAvailability}
       />
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
@@ -1715,6 +1884,20 @@
           </button>
         </div>
       {:else}
+        {#if focusedParent}
+          <div class="px-5 py-1.5 border-b border-edge bg-card flex items-center gap-2 text-xs">
+            <span class="text-ink-muted">Showing</span>
+            <span class="text-ink font-medium truncate max-w-[28rem]">{sessionName(focusedParent)}</span>
+            <span class="text-ink-faint">and its subagent runs</span>
+            <button
+              type="button"
+              class="ml-auto text-accent-chipfg hover:underline underline-offset-2"
+              onclick={() => { focusedParentId = null; }}
+            >
+              Show all sessions
+            </button>
+          </div>
+        {/if}
         <div
           class="flex-1 overflow-y-auto min-h-0 relative"
           bind:this={listViewport}
@@ -1740,6 +1923,7 @@
             {:else}
               {@const session = row.session}
               {@const name = sessionName(session)}
+              {@const sibling = siblingDisplay.get(session.storage_id)}
               {@const display = sessionDisplayMap.get(session.storage_id)}
               {@const rowTokens = display?.tokens ?? session.tokens_total}
               {@const sub = isSubagent(session)}
@@ -1768,17 +1952,39 @@
               >
                 {#each visibleColumns as column (column.id)}
                   {#if column.id === 'name'}
-                    <span class="truncate min-w-0 {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-(--row-name)'}" title={name}>
-                      {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.storage_id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
-                      {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5" aria-hidden="true">↳</span>{/if}{truncate(name, 90)}
-                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">subagent</span>{:else if kids > 0}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap">{kids} {kids === 1 ? 'subagent' : 'subagents'}</span>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap" title="The saved transcript source is currently unavailable">source missing</span>{/if}
-                      {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg) ml-1 whitespace-nowrap">archived</span>{/if}
-                      {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap">{providersStore.displayName(session.harness)}</span>{/if}
+                    <span class="flex items-center min-w-0 whitespace-nowrap {sub ? 'pl-7' : ''} {selected ? 'font-semibold text-ink' : 'text-(--row-name)'}" title={name}>
+                      {#if combined !== undefined}<button class="text-ink-faint hover:text-ink w-4 -ml-1 mr-0.5 text-center shrink-0" onclick={(e) => { e.stopPropagation(); toggleCollapsed(session.storage_id); }} aria-expanded={!collapsed} aria-label="{collapsed ? 'Expand' : 'Collapse'} subagent rows for {name}">{collapsed ? '▸' : '▾'}</button>{/if}
+                      {#if sub}<span class="text-(--subagent-chip-fg) font-semibold mr-1.5 shrink-0" aria-hidden="true">↳</span>{/if}<span class="truncate">{truncate(sibling?.label ?? name, 90)}</span>
+                      {#if sub}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0" title={sibling ? `Run ${sibling.ordinal} of ${sibling.total} spawned by this parent, in start order` : undefined}>subagent{#if sibling}&nbsp;{sibling.ordinal}/{sibling.total}{/if}</span>{:else if kids > 0}<button type="button" class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--subagent-chip-bg) text-(--subagent-chip-fg) ml-1 whitespace-nowrap shrink-0 hover:ring-1 hover:ring-accent focus:outline-hidden focus:ring-1 focus:ring-accent" onclick={(e) => { e.stopPropagation(); focusedParentId = session.storage_id; }} title="Show only this session and its subagent runs" aria-label="Show only {name} and its {kids} subagent {kids === 1 ? 'run' : 'runs'}">{kids} {kids === 1 ? 'subagent' : 'subagents'}</button>{/if}{#if session.source_availability === 'missing'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-amber-500/10 text-amber-500 ml-1 whitespace-nowrap shrink-0" title="The saved transcript source is currently unavailable">source missing</span>{/if}
+                      {#if session.archived}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg) ml-1 whitespace-nowrap shrink-0">archived</span>{/if}
+                      {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap shrink-0">{providersStore.displayName(session.harness)}</span>{/if}
                     </span>
                   {:else if column.id === 'started'}
                     <span class="text-ink-muted font-mono text-xs" title={`UTC: ${session.started_at}`}>{formatStartedLocal(session.startedMs)}</span>
+                  {:else if column.id === 'duration'}
+                    <span class="text-right text-ink-muted font-mono text-xs" title={`Ended ${session.last_event_at}`}>{formatDuration(durationMs(session))}</span>
+                  {:else if column.id === 'agent'}
+                    <span class="text-ink-muted text-xs truncate" title={session.agent_path ?? (session.agent_nickname ?? 'Not a subagent run')}>{agentLabel(session) || '—'}</span>
+                  {:else if column.id === 'parent'}
+                    <span class="text-ink-muted text-xs truncate" title={parentLabel(session) || 'Top-level session'}>{parentLabel(session) || '—'}</span>
+                  {:else if column.id === 'turns'}
+                    <span class="text-right font-mono text-xs text-ink">{fmt.format(session.total_turns)}</span>
+                  {:else if column.id === 'tools'}
+                    <span class="text-right font-mono text-xs text-ink" title={session.tool_metrics ? `${session.tool_metrics.reads} read · ${session.tool_metrics.searches} search · ${session.tool_metrics.mutations} mutation · ${session.tool_metrics.commands} command` : undefined}>{fmt.format(session.tool_metrics?.calls ?? 0)}</span>
                   {:else if column.id === 'repository'}
-                    <span class="text-ink-muted text-xs truncate" title={session.working_directory ? 'Recorded project folder' : 'No repository recorded for this session'}>{repositoryLabel(session) ?? 'No repository recorded'}</span>
+                    {@const project = session.project_key ? projectStore.info(session.project_key) : undefined}
+                    {@const label = project?.label ?? session.project_label ?? ''}
+                    {@const provenance = project?.provenance ?? session.project_provenance}
+                    {@const repoSplit = provenance === 'repository_root' ? splitRepositoryLabel(label) : null}
+                    {#if !session.project_key}
+                      <span class="text-ink-faint text-xs truncate" title="No working directory recorded for this session">—</span>
+                    {:else if repoSplit}
+                      <span class="flex items-center min-w-0 whitespace-nowrap text-xs" title={`${label}${session.working_directory ? ` · ${session.working_directory}` : ''}`}>
+                        <span class="text-emerald-500 font-medium truncate">{repoSplit.name}</span>{#if repoSplit.rest}<span class="text-ink-faint truncate">/{repoSplit.rest}</span>{/if}
+                      </span>
+                    {:else}
+                      <span class="text-ink-muted text-xs truncate" title={session.working_directory ?? label}>{label || '—'}</span>
+                    {/if}
                   {:else if column.id === 'model'}
                     <span class="text-ink-muted font-mono text-xs truncate flex items-center gap-1.5" title={`${session.model ?? 'Unknown model'} · ${providerVisual.label}`}>
                       {#if sessionGridStore.colorByModelProvider}<span class="inline-block size-2 rounded-full shrink-0" style:background-color={providerVisual.tint} aria-hidden="true"></span>{/if}
@@ -1793,7 +1999,8 @@
                   {:else if column.id === 'total'}
                     <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmt.format(combined.tokens)}</span>{/if}</span>
                   {:else if column.id === 'cost'}
-                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{allUsdAvailable ? fmtAmount(costOf(session.storage_id)) : 'unavailable'}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmtAmount(combined.cost)}</div>{/if}</span>
+                    {@const unpricedOnly = costIsUnmeasured(display?.unpricedModels, costOf(session.storage_id))}
+                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{#if !allUsdAvailable}unavailable{:else if unpricedOnly}<span class="text-ink-faint cursor-help" title="Not measured: every model in this session is unpriced ({display?.unpricedModels.join(', ')}). This is not a zero cost.">—</span>{:else}{fmtAmount(costOf(session.storage_id))}{/if}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] {combined.unpriced ? 'text-amber-500/80' : 'text-ink-faint'} font-normal cursor-help" title={combined.unpriced ? 'At least one thread in this subtree ran an unpriced model, so this is a floor, not a total.' : 'This session plus its subagent threads (in view)'}>Σ {fmtAmount(combined.cost)}{combined.unpriced ? '+' : ''}</div>{/if}</span>
                   {/if}
                 {/each}
               </div>
@@ -1808,10 +2015,10 @@
           >
             {#each visibleColumns as column (column.id)}
               {#if column.id === 'name'}<span class="section-label">Totals · in view</span>
-              {:else if column.id === 'input'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.input_tokens)}</span>
-              {:else if column.id === 'cached'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.cached_input_tokens)}</span>
-              {:else if column.id === 'output'}<span class="text-right font-mono text-xs text-ink">{formatTokenCategory(filteredTokenTotals.output_tokens)}</span>
-              {:else if column.id === 'total'}<span class="text-right font-mono text-xs text-ink">{fmt.format(filteredTotal)}</span>
+              {:else if column.id === 'input'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTokenTotals.input_tokens)}>{formatTokenTotal(filteredTokenTotals.input_tokens)}</span>
+              {:else if column.id === 'cached'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTokenTotals.cached_input_tokens)}>{formatTokenTotal(filteredTokenTotals.cached_input_tokens)}</span>
+              {:else if column.id === 'output'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTokenTotals.output_tokens)}>{formatTokenTotal(filteredTokenTotals.output_tokens)}</span>
+              {:else if column.id === 'total'}<span class="text-right font-mono text-xs text-ink truncate" title={fmt.format(filteredTotal)}>{formatTokenTotal(filteredTotal)}</span>
               {:else if column.id === 'cost'}<span class="text-right font-mono text-xs text-accent-cost">{allUsdAvailable ? fmtAmount(costTotal) : 'unavailable'}</span>
               {:else}<span></span>{/if}
             {/each}

@@ -30,7 +30,7 @@ const LEGACY_CACHE_NAME: &str = "scan-cache.json";
 /// invalidate the cache — that was the old `APP_VERSION`-keyed behavior,
 /// and it turned every release into a full cold re-parse of every
 /// transcript.
-const PARSE_VERSION: u32 = 1;
+const PARSE_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
@@ -506,6 +506,9 @@ mod tests {
             tool_metrics_by_model: Default::default(),
             category_totals: Default::default(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -737,11 +740,13 @@ agent_path
 archived
 category_totals.coding.buckets.[].model
 category_totals.coding.buckets.[].service_tier
+category_totals.coding.buckets.[].tokens.cache_creation_input_tokens
 category_totals.coding.buckets.[].tokens.cached_input_tokens
 category_totals.coding.buckets.[].tokens.input_tokens
 category_totals.coding.buckets.[].tokens.output_tokens
 category_totals.coding.buckets.[].tokens.reasoning_output_tokens
 category_totals.coding.buckets.[].tokens.total_tokens
+category_totals.coding.tokens.cache_creation_input_tokens
 category_totals.coding.tokens.cached_input_tokens
 category_totals.coding.tokens.input_tokens
 category_totals.coding.tokens.output_tokens
@@ -778,6 +783,9 @@ optimization_findings.[].version
 originator
 parent_thread_id
 plan_type
+project_key
+project_label
+project_provenance
 rate_limits_history.[].limit_id
 rate_limits_history.[].primary.resets_at
 rate_limits_history.[].primary.used_percent
@@ -792,11 +800,13 @@ started_at
 storage_id
 subagent_id_is_path_fallback
 thread_name
+tokens_by_model.m.cache_creation_input_tokens
 tokens_by_model.m.cached_input_tokens
 tokens_by_model.m.input_tokens
 tokens_by_model.m.output_tokens
 tokens_by_model.m.reasoning_output_tokens
 tokens_by_model.m.total_tokens
+tokens_history.[].delta.cache_creation_input_tokens
 tokens_history.[].delta.cached_input_tokens
 tokens_history.[].delta.input_tokens
 tokens_history.[].delta.output_tokens
@@ -807,6 +817,7 @@ tokens_history.[].request_input_tokens
 tokens_history.[].service_tier
 tokens_history.[].timestamp
 tokens_history.[].total_tokens
+tokens_total.cache_creation_input_tokens
 tokens_total.cached_input_tokens
 tokens_total.input_tokens
 tokens_total.output_tokens
@@ -814,43 +825,54 @@ tokens_total.reasoning_output_tokens
 tokens_total.total_tokens
 tool_metrics.calls
 tool_metrics.commands
+tool_metrics.core_origin_calls
 tool_metrics.duration_ms
 tool_metrics.failures
+tool_metrics.mcp_origin_calls
 tool_metrics.mutation_targets
 tool_metrics.mutations
 tool_metrics.one_shot_mutations
 tool_metrics.other
 tool_metrics.output_bytes
+tool_metrics.provider_origin_calls
 tool_metrics.reads
 tool_metrics.retry_count
 tool_metrics.searches
 tool_metrics.successes
 tool_metrics.unknown
+tool_metrics.unknown_origin_calls
 tool_metrics_by_model.m.calls
 tool_metrics_by_model.m.commands
+tool_metrics_by_model.m.core_origin_calls
 tool_metrics_by_model.m.duration_ms
 tool_metrics_by_model.m.failures
+tool_metrics_by_model.m.mcp_origin_calls
 tool_metrics_by_model.m.mutation_targets
 tool_metrics_by_model.m.mutations
 tool_metrics_by_model.m.one_shot_mutations
 tool_metrics_by_model.m.other
 tool_metrics_by_model.m.output_bytes
+tool_metrics_by_model.m.provider_origin_calls
 tool_metrics_by_model.m.reads
 tool_metrics_by_model.m.retry_count
 tool_metrics_by_model.m.searches
 tool_metrics_by_model.m.successes
 tool_metrics_by_model.m.unknown
+tool_metrics_by_model.m.unknown_origin_calls
 tool_observations.[].call_id
 tool_observations.[].duration_ms
 tool_observations.[].effective_tools.[]
 tool_observations.[].harness
 tool_observations.[].kind
+tool_observations.[].language
 tool_observations.[].model
 tool_observations.[].name
+tool_observations.[].origin
 tool_observations.[].outcome
 tool_observations.[].output_bytes
 tool_observations.[].providers.[]
 tool_observations.[].resource_id
+tool_observations.[].shell_family
 tool_observations.[].target
 tool_observations.[].timestamp
 tool_observations.[].turn_id
@@ -871,6 +893,7 @@ turns.[].service_tier
 turns.[].started_at
 turns.[].status
 turns.[].time_to_first_token_ms
+turns.[].tokens.cache_creation_input_tokens
 turns.[].tokens.cached_input_tokens
 turns.[].tokens.input_tokens
 turns.[].tokens.output_tokens
@@ -878,18 +901,22 @@ turns.[].tokens.reasoning_output_tokens
 turns.[].tokens.total_tokens
 turns.[].tool_metrics.calls
 turns.[].tool_metrics.commands
+turns.[].tool_metrics.core_origin_calls
 turns.[].tool_metrics.duration_ms
 turns.[].tool_metrics.failures
+turns.[].tool_metrics.mcp_origin_calls
 turns.[].tool_metrics.mutation_targets
 turns.[].tool_metrics.mutations
 turns.[].tool_metrics.one_shot_mutations
 turns.[].tool_metrics.other
 turns.[].tool_metrics.output_bytes
+turns.[].tool_metrics.provider_origin_calls
 turns.[].tool_metrics.reads
 turns.[].tool_metrics.retry_count
 turns.[].tool_metrics.searches
 turns.[].tool_metrics.successes
 turns.[].tool_metrics.unknown
+turns.[].tool_metrics.unknown_origin_calls
 turns.[].turn_id
 turns.[].user_message
 working_directory"#;
@@ -939,12 +966,13 @@ working_directory"#;
         use crate::model::{
             CategoryMetric, OptimizationFinding, RateLimitSnapshotPoint, RateLimitWindow,
             SourceAvailability, TaskCategory, TierBucket, TokenHistoryPoint, ToolKind,
-            ToolObservation, ToolOutcome, TurnClassification, TurnInfo, TurnStatus,
+            ToolObservation, ToolOrigin, ToolOutcome, TurnClassification, TurnInfo, TurnStatus,
         };
         let now: chrono::DateTime<chrono::Utc> = "2026-08-03T00:00:00Z".parse().unwrap();
         let totals = TokenTotals {
             input_tokens: 1,
             cached_input_tokens: 1,
+            cache_creation_input_tokens: 1,
             output_tokens: 1,
             reasoning_output_tokens: 1,
             total_tokens: 2,
@@ -1038,6 +1066,9 @@ working_directory"#;
                 effective_tools: vec!["read".into()],
                 target: Some("h".into()),
                 resource_id: Some("r".into()),
+                origin: ToolOrigin::Mcp,
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: Some(1),
                 output_bytes: 1,
@@ -1069,6 +1100,9 @@ working_directory"#;
                 occurrences: 1,
                 avoidable_calls: 1,
             }],
+            project_key: Some("repo:abc".into()),
+            project_label: Some("odometer".into()),
+            project_provenance: Some(crate::project_identity::ProjectProvenance::RepositoryRoot),
         }
     }
 

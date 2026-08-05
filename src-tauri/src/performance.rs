@@ -111,6 +111,20 @@ impl PerformanceRecorder {
         );
     }
 
+    /// Like [`Self::record_backend`], but for a duration measured elsewhere
+    /// (e.g. a step inside a background migration reported through its own
+    /// progress callback) rather than an `Instant` held for this call's
+    /// entire span.
+    pub fn record_backend_duration_ms(
+        &self,
+        operation: impl Into<String>,
+        duration_ms: f64,
+        success: bool,
+        metadata: BTreeMap<String, String>,
+    ) {
+        self.record("backend", operation.into(), duration_ms, success, metadata);
+    }
+
     pub fn record_frontend(
         &self,
         operation: String,

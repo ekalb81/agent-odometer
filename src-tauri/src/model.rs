@@ -76,6 +76,64 @@ pub enum ToolOutcome {
     Unknown,
 }
 
+/// Versioned, normalized tool-origin dimension (issue #44). Computed once
+/// during parsing from data `ToolObservation` already carries (`kind` and
+/// `providers`) — never by reparsing a transcript in the UI or optimizer.
+///
+/// - `Mcp`: the call resolved at least one MCP server identity.
+/// - `Core`: a generic file/search/shell primitive (`kind` is `Read`,
+///   `Search`, `Mutation`, or `Command`) with no MCP provider.
+/// - `Provider`: a harness-native tool that is not one of the generic
+///   primitives above and not MCP (e.g. subagent orchestration, todo lists,
+///   web search) — `kind` is `Other` with no MCP provider.
+/// - `Unknown`: the default for historical data that predates this field
+///   (deserialized snapshots, and durable-ledger facts recorded before the
+///   dimension existed). Never emitted by fresh parsing; unknown means
+///   "not available", not zero.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOrigin {
+    Core,
+    Mcp,
+    Provider,
+    #[default]
+    Unknown,
+}
+
+impl ToolOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Core => "core",
+            Self::Mcp => "mcp",
+            Self::Provider => "provider",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_str_or_unknown(value: &str) -> Self {
+        match value {
+            "core" => Self::Core,
+            "mcp" => Self::Mcp,
+            "provider" => Self::Provider,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Classifies origin from data already collected by `observe_call`.
+    /// Deterministic and total: fresh observations always resolve to
+    /// `Core`, `Mcp`, or `Provider`, never `Unknown` (that variant is
+    /// reserved for data recorded before this dimension existed).
+    pub fn classify(kind: ToolKind, providers: &[String]) -> Self {
+        if !providers.is_empty() {
+            Self::Mcp
+        } else if kind == ToolKind::Other {
+            Self::Provider
+        } else {
+            Self::Core
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolObservation {
     pub call_id: String,
@@ -101,9 +159,63 @@ pub struct ToolObservation {
     /// reads without retaining the resource name or path.
     #[serde(default)]
     pub resource_id: Option<String>,
+    /// Normalized tool-origin dimension (issue #44). Defaulted to `Unknown`
+    /// for data recorded before this field existed; fresh observations
+    /// always compute a real value via `ToolOrigin::classify`.
+    #[serde(default)]
+    pub origin: ToolOrigin,
+    /// Safe shell command family (issue #44) — the leading token of a
+    /// `Command`-kind call's command line, matched against a bounded
+    /// allowlist (`telemetry::classify_shell_family`) and bucketed to
+    /// `"other"` when not recognized. Never the raw command text. `None`
+    /// for non-command calls or when no command text was available.
+    #[serde(default)]
+    pub shell_family: Option<String>,
+    /// Language inferred from a read/write target's file extension (issue
+    /// #44), matched against a bounded allowlist
+    /// (`telemetry::classify_language`). Never the file path itself. `None`
+    /// when no path was available or its extension is not recognized.
+    #[serde(default)]
+    pub language: Option<String>,
     pub outcome: ToolOutcome,
     pub duration_ms: Option<u64>,
     pub output_bytes: u64,
+}
+
+/// Additive counters for one (dimension_kind, dimension_value) pair in the
+/// issue #44 open-set dimensions — MCP server identity, shell command
+/// family, language, and context source. Unlike `ToolMetrics`, these
+/// dimensions have unbounded label sets, so they are not flat
+/// `rollup_tool_metrics` columns; see `RangeTotals::tool_dimensions` and the
+/// `rollup_tool_dimensions` ledger table (`history_store.rs`).
+///
+/// `tokens` is populated only for the `context_source` dimension kind, which
+/// is derived from `TokenTotals` rather than tool calls and so has no
+/// `calls`/`failures`/`output_bytes`/`duration_ms` of its own; every other
+/// dimension kind (`mcp_server`, `shell_family`, `language`) populates the
+/// first four fields and leaves `tokens` at 0. There is no
+/// `retries`/`mutation_targets`-style chain-derived field here: this struct
+/// carries no `turn_id`/`target`, so — unlike `ToolMetrics::retry_count` —
+/// there is no chain to reconstruct, and a plain sum of `calls` across
+/// buckets is always correct.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ToolDimensionMetrics {
+    pub calls: u64,
+    pub failures: u64,
+    pub output_bytes: u64,
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub tokens: u64,
+}
+
+impl ToolDimensionMetrics {
+    pub fn add_assign(&mut self, other: &Self) {
+        self.calls += other.calls;
+        self.failures += other.failures;
+        self.output_bytes += other.output_bytes;
+        self.duration_ms += other.duration_ms;
+        self.tokens += other.tokens;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -122,6 +234,20 @@ pub struct ToolMetrics {
     pub retry_count: u64,
     pub duration_ms: u64,
     pub output_bytes: u64,
+    /// Origin-dimension breakdown (issue #44). These four fields always sum
+    /// to `calls`: every observation resolves to exactly one origin,
+    /// including `unknown_origin_calls` for data recorded before the
+    /// dimension existed. Plain additive counters at the existing
+    /// `(session_key, hour_bucket, model)` rollup grain — this does not
+    /// change `rollup_tool_metrics` cardinality.
+    #[serde(default)]
+    pub core_origin_calls: u64,
+    #[serde(default)]
+    pub mcp_origin_calls: u64,
+    #[serde(default)]
+    pub provider_origin_calls: u64,
+    #[serde(default)]
+    pub unknown_origin_calls: u64,
 }
 
 impl ToolMetrics {
@@ -140,6 +266,10 @@ impl ToolMetrics {
         self.retry_count += value.retry_count;
         self.duration_ms += value.duration_ms;
         self.output_bytes += value.output_bytes;
+        self.core_origin_calls += value.core_origin_calls;
+        self.mcp_origin_calls += value.mcp_origin_calls;
+        self.provider_origin_calls += value.provider_origin_calls;
+        self.unknown_origin_calls += value.unknown_origin_calls;
     }
 }
 
@@ -235,9 +365,34 @@ impl OptimizationSummary {
 pub struct TokenTotals {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
+    /// Anthropic cache-creation ("cache write") tokens. A subset of
+    /// `input_tokens`, disjoint from `cached_input_tokens` (cache reads).
+    /// Always 0 for Codex, whose provider does not report this dimension.
+    /// Defaulted for backward compatibility with durable/cached data written
+    /// before this field existed.
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
     pub total_tokens: u64,
+}
+
+/// Field-wise accumulation, defined once.
+///
+/// This fold was previously written out per module — a new field had to be
+/// added to every copy, and any copy that was missed would have silently
+/// under-counted on whichever surface used it. For a tool whose entire output
+/// is token accounting, that is the wrong failure mode, so the operation lives
+/// with the type.
+impl std::ops::AddAssign<&TokenTotals> for TokenTotals {
+    fn add_assign(&mut self, other: &TokenTotals) {
+        self.input_tokens += other.input_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.reasoning_output_tokens += other.reasoning_output_tokens;
+        self.total_tokens += other.total_tokens;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -385,6 +540,18 @@ pub struct Session {
     pub category_totals: BTreeMap<TaskCategory, CategoryMetric>,
     #[serde(default)]
     pub optimization_findings: Vec<OptimizationFinding>,
+    /// Stable project-identity key resolved from `working_directory` (#41).
+    /// `None` when the session has no working directory to resolve from.
+    /// This is the auto-computed identity; user aliases/merges/splits are a
+    /// separate overlay applied at read time and never mutate this field.
+    #[serde(default)]
+    pub project_key: Option<String>,
+    /// Local display label for `project_key`. Never redacted here — see
+    /// `crate::project_identity` for the redaction/aggregate-export contract.
+    #[serde(default)]
+    pub project_label: Option<String>,
+    #[serde(default)]
+    pub project_provenance: Option<crate::project_identity::ProjectProvenance>,
 }
 
 /// Token usage grouped by (model, service_tier). Credit math is linear per
@@ -419,6 +586,14 @@ pub struct RangeTotals {
     pub optimization_findings_count: u64,
     #[serde(default)]
     pub optimization_summary: OptimizationSummary,
+    /// Issue #44 open-set tool/context dimensions: outer key is the
+    /// dimension kind (`"mcp_server"`, `"shell_family"`, `"language"`,
+    /// `"context_source"`), inner key is the dimension value. Absent kinds
+    /// mean "no ledger-durable data for this window" — the frontend must
+    /// still consult `ProviderCapabilities` to distinguish a real zero from
+    /// a provider that cannot supply the dimension at all.
+    #[serde(default)]
+    pub tool_dimensions: BTreeMap<String, BTreeMap<String, ToolDimensionMetrics>>,
 }
 
 /// Lightweight wire form of a Session for the list view and live update
@@ -468,6 +643,12 @@ pub struct SessionSummary {
     pub optimization_findings_count: u64,
     #[serde(default)]
     pub optimization_summary: OptimizationSummary,
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub project_label: Option<String>,
+    #[serde(default)]
+    pub project_provenance: Option<crate::project_identity::ProjectProvenance>,
 }
 
 impl SessionSummary {
@@ -507,16 +688,15 @@ impl SessionSummary {
             category_totals: s.category_totals.clone(),
             optimization_findings_count: s.optimization_findings.len() as u64,
             optimization_summary,
+            project_key: s.project_key.clone(),
+            project_label: s.project_label.clone(),
+            project_provenance: s.project_provenance,
         }
     }
 }
 
 pub(crate) fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
-    dst.input_tokens += src.input_tokens;
-    dst.cached_input_tokens += src.cached_input_tokens;
-    dst.output_tokens += src.output_tokens;
-    dst.reasoning_output_tokens += src.reasoning_output_tokens;
-    dst.total_tokens += src.total_tokens;
+    *dst += src;
 }
 
 /// Groups history deltas by (model, tier), skipping events that had no model
@@ -705,6 +885,36 @@ impl Session {
                     .cmp(&b.model)
                     .then_with(|| a.service_tier.cmp(&b.service_tier))
             });
+            let tool_dimensions = if observations_sorted {
+                let start = from.as_ref().map_or(0, |from| {
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() < from.timestamp_millis()
+                    })
+                });
+                let end = to.as_ref().map_or(self.tool_observations.len(), |to| {
+                    self.tool_observations.partition_point(|item| {
+                        item.timestamp.timestamp_millis() <= to.timestamp_millis()
+                    })
+                });
+                crate::telemetry::dimension_totals(
+                    self.tool_observations[start.min(end)..end].iter(),
+                    &tokens,
+                )
+            } else {
+                crate::telemetry::dimension_totals(
+                    self.tool_observations.iter().filter(|item| {
+                        (from.is_none()
+                            || from.as_ref().is_some_and(|start| {
+                                item.timestamp.timestamp_millis() >= start.timestamp_millis()
+                            }))
+                            && (to.is_none()
+                                || to.as_ref().is_some_and(|end| {
+                                    item.timestamp.timestamp_millis() <= end.timestamp_millis()
+                                }))
+                    }),
+                    &tokens,
+                )
+            };
             results.push(RangeTotals {
                 tokens,
                 buckets,
@@ -712,6 +922,7 @@ impl Session {
                 tool_metrics_by_model,
                 optimization_findings_count,
                 optimization_summary,
+                tool_dimensions,
             });
         }
         results
@@ -726,6 +937,7 @@ mod tests {
         TokenTotals {
             input_tokens: n,
             cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
             output_tokens: n / 2,
             reasoning_output_tokens: 0,
             total_tokens: n + n / 2,
@@ -785,6 +997,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -911,6 +1126,9 @@ mod tests {
                 effective_tools: vec!["read".into()],
                 target: Some("read:synthetic".into()),
                 resource_id: Some("synthetic".into()),
+                origin: ToolOrigin::Core,
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
                 output_bytes: 0,

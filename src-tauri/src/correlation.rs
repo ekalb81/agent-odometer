@@ -141,11 +141,7 @@ fn scope_matches(session: &Session, event: &ExternalEvent) -> bool {
 }
 
 fn add_tokens(target: &mut TokenTotals, value: &TokenTotals) {
-    target.input_tokens += value.input_tokens;
-    target.cached_input_tokens += value.cached_input_tokens;
-    target.output_tokens += value.output_tokens;
-    target.reasoning_output_tokens += value.reasoning_output_tokens;
-    target.total_tokens += value.total_tokens;
+    *target += value;
 }
 
 fn add_bucket(target: &mut Vec<TierBucket>, value: &TierBucket) {
@@ -421,6 +417,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 

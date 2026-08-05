@@ -1,6 +1,6 @@
 use crate::model::{
-    CategoryMetric, Harness, OptimizationFinding, TaskCategory, ToolKind, ToolMetrics,
-    ToolObservation, ToolOutcome, TurnClassification,
+    CategoryMetric, Harness, OptimizationFinding, TaskCategory, TokenTotals, ToolDimensionMetrics,
+    ToolKind, ToolMetrics, ToolObservation, ToolOrigin, ToolOutcome, TurnClassification,
 };
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -177,6 +177,237 @@ pub fn tool_providers(name: &str, arguments: &Value) -> Vec<String> {
     providers
 }
 
+/// Bounded allowlist of safe shell command "families" (issue #44). Only the
+/// leading token of a command line is ever inspected — after peeling off at
+/// most one layer of a known interpreter wrapper (`bash -lc "..."`,
+/// `powershell -Command "..."`, etc.) — never the raw arguments. A command
+/// whose leading token is not in this list is bucketed under the safe
+/// `"other"` label rather than stored verbatim.
+const SHELL_FAMILIES: &[&str] = &[
+    "git",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "cargo",
+    "rustc",
+    "python",
+    "python3",
+    "pip",
+    "pip3",
+    "node",
+    "docker",
+    "docker-compose",
+    "make",
+    "cmake",
+    "go",
+    "pytest",
+    "ls",
+    "cat",
+    "grep",
+    "find",
+    "curl",
+    "wget",
+    "kubectl",
+    "terraform",
+    "dotnet",
+    "mvn",
+    "gradle",
+    "ruby",
+    "gem",
+    "bundle",
+    "brew",
+    "apt",
+    "apt-get",
+    "systemctl",
+    "ssh",
+    "scp",
+    "rsync",
+    "tar",
+    "zip",
+    "unzip",
+    "sed",
+    "awk",
+    "chmod",
+    "chown",
+    "mkdir",
+    "rm",
+    "cp",
+    "mv",
+    "echo",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "bash",
+    "sh",
+    "zsh",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "gh",
+    "az",
+    "aws",
+    "gcloud",
+    "jq",
+    "tsc",
+    "eslint",
+    "prettier",
+    "vitest",
+    "jest",
+    "playwright",
+    // Windows PowerShell cmdlets, matched case-insensitively like everything
+    // else in this list.
+    "get-content",
+    "get-childitem",
+    "set-location",
+    "new-item",
+    "remove-item",
+    "copy-item",
+    "move-item",
+    "select-string",
+    "where-object",
+    "foreach-object",
+    "write-output",
+    "test-path",
+    "join-path",
+    "get-item",
+    "invoke-webrequest",
+    "invoke-restmethod",
+];
+
+/// Peels at most one layer of a known interpreter wrapper so the classified
+/// family reflects the program actually being run, not the shell that
+/// launched it (`bash -lc "npm test"` classifies as `npm`, not `bash`).
+fn strip_shell_wrapper(command: &str) -> &str {
+    let trimmed = command.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    const WRAPPERS: &[&str] = &[
+        "bash -lc ",
+        "bash -c ",
+        "sh -lc ",
+        "sh -c ",
+        "zsh -lc ",
+        "powershell -command ",
+        "powershell.exe -command ",
+        "pwsh -command ",
+        "cmd /c ",
+        "cmd.exe /c ",
+    ];
+    for wrapper in WRAPPERS {
+        if lower.starts_with(wrapper) {
+            return trimmed[wrapper.len()..]
+                .trim()
+                .trim_matches(|c| c == '"' || c == '\'');
+        }
+    }
+    trimmed
+}
+
+/// Classifies a command line's safe shell family. Never retains the raw
+/// command text: only a bounded allowlisted label, or the safe `"other"`
+/// catch-all, is ever returned.
+pub fn classify_shell_family(command: &str) -> Option<String> {
+    let command = strip_shell_wrapper(command);
+    // A leading token quoted with `"` or `'` (common for a Windows path
+    // containing spaces, e.g. `"C:\Program Files\Git\bin\git.exe" status`)
+    // is read up to its matching quote; an unquoted leading token with a
+    // space in it (no shell would accept that unquoted) is not something
+    // this can recover — its first whitespace-delimited piece still
+    // classifies safely to `"other"` rather than guessing.
+    let first = if let Some(rest) = command.strip_prefix('"') {
+        rest.split('"').next()?
+    } else if let Some(rest) = command.strip_prefix('\'') {
+        rest.split('\'').next()?
+    } else {
+        command
+            .split(|c: char| c.is_whitespace() || matches!(c, '&' | '|' | ';'))
+            .find(|token| !token.is_empty())?
+    };
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    let base = base.strip_suffix(".exe").unwrap_or(base);
+    let lower = base.to_ascii_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if SHELL_FAMILIES.contains(&lower.as_str()) {
+        Some(lower)
+    } else {
+        Some("other".to_owned())
+    }
+}
+
+/// `Command`-kind calls only; other kinds have no shell family.
+fn shell_family_for_call(kind: ToolKind, arguments: &Value) -> Option<String> {
+    if kind != ToolKind::Command {
+        return None;
+    }
+    let command = arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .or_else(|| arguments.as_str())?;
+    classify_shell_family(command)
+}
+
+/// Bounded allowlist mapping a file extension to a normalized language label
+/// (issue #44). Extensions not listed here classify as `None` — "unknown",
+/// not an invented label.
+const LANGUAGE_EXTENSIONS: &[(&str, &str)] = &[
+    ("rs", "rust"),
+    ("ts", "typescript"),
+    ("tsx", "typescript"),
+    ("js", "javascript"),
+    ("jsx", "javascript"),
+    ("mjs", "javascript"),
+    ("py", "python"),
+    ("go", "go"),
+    ("java", "java"),
+    ("kt", "kotlin"),
+    ("swift", "swift"),
+    ("c", "c"),
+    ("h", "c"),
+    ("cpp", "cpp"),
+    ("cc", "cpp"),
+    ("hpp", "cpp"),
+    ("cs", "csharp"),
+    ("rb", "ruby"),
+    ("php", "php"),
+    ("sh", "shell"),
+    ("bash", "shell"),
+    ("ps1", "powershell"),
+    ("sql", "sql"),
+    ("md", "markdown"),
+    ("json", "json"),
+    ("yaml", "yaml"),
+    ("yml", "yaml"),
+    ("toml", "toml"),
+    ("html", "html"),
+    ("css", "css"),
+    ("scss", "css"),
+    ("svelte", "svelte"),
+    ("vue", "vue"),
+    ("proto", "protobuf"),
+    ("graphql", "graphql"),
+];
+
+fn language_from_path(path: &str) -> Option<String> {
+    let (_, extension) = path.rsplit_once('.')?;
+    let lower = extension.to_ascii_lowercase();
+    LANGUAGE_EXTENSIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == lower)
+        .map(|(_, language)| (*language).to_owned())
+}
+
+/// Looks only at path-shaped argument keys — never `command`/`query`, which
+/// `resource_candidate` also accepts but which are not file paths.
+fn language_for_call(arguments: &Value) -> Option<String> {
+    ["path", "file_path"]
+        .iter()
+        .find_map(|key| arguments.get(*key))
+        .and_then(Value::as_str)
+        .and_then(language_from_path)
+}
+
 pub struct ToolCallInput<'a> {
     pub call_id: String,
     pub turn_id: Option<String>,
@@ -198,18 +429,25 @@ pub fn observe_call(observations: &mut Vec<ToolObservation>, input: ToolCallInpu
     let providers = tool_providers(&input.name, input.arguments);
     let effective_tools = effective_tools(&input.name, input.arguments);
     let resource_id = normalized_resource(input.arguments);
+    let kind = classify_tool(&input.name);
+    let origin = ToolOrigin::classify(kind, &providers);
+    let shell_family = shell_family_for_call(kind, input.arguments);
+    let language = language_for_call(input.arguments);
     observations.push(ToolObservation {
         call_id: input.call_id,
         turn_id: input.turn_id,
         harness: input.harness,
         model: input.model,
         timestamp: input.timestamp,
-        kind: classify_tool(&input.name),
+        kind,
         name: input.name,
         providers,
         effective_tools,
         target,
         resource_id,
+        origin,
+        shell_family,
+        language,
         outcome: ToolOutcome::Pending,
         duration_ms: None,
         output_bytes: 0,
@@ -243,6 +481,56 @@ pub fn observe_result(
     }
 }
 
+/// Increments the 11 additive `ToolMetrics` counters for one observation.
+/// Shared with the durable-ledger rollup read path (`history_store.rs`,
+/// #107): both a live accumulation over in-memory observations and a
+/// reconstruction from pooled sub-hour edge events must count a call
+/// identically, or the two paths would silently diverge.
+pub(crate) fn accumulate_observation(counters: &mut ToolMetrics, item: &ToolObservation) {
+    counters.calls += 1;
+    counters.output_bytes += item.output_bytes;
+    counters.duration_ms += item.duration_ms.unwrap_or(0);
+    match item.kind {
+        ToolKind::Read => counters.reads += 1,
+        ToolKind::Search => counters.searches += 1,
+        ToolKind::Mutation => counters.mutations += 1,
+        ToolKind::Command => counters.commands += 1,
+        ToolKind::Other => counters.other += 1,
+    }
+    match item.outcome {
+        ToolOutcome::Success => counters.successes += 1,
+        ToolOutcome::Failure => counters.failures += 1,
+        ToolOutcome::Pending | ToolOutcome::Unknown => counters.unknown += 1,
+    }
+    match item.origin {
+        ToolOrigin::Core => counters.core_origin_calls += 1,
+        ToolOrigin::Mcp => counters.mcp_origin_calls += 1,
+        ToolOrigin::Provider => counters.provider_origin_calls += 1,
+        ToolOrigin::Unknown => counters.unknown_origin_calls += 1,
+    }
+}
+
+/// Derives the three non-additive `ToolMetrics` fields — `mutation_targets`,
+/// `one_shot_mutations`, `retry_count` — from mutation-chain event counts
+/// keyed by `(turn_id, target)`. This is the one formula both the in-memory
+/// accumulator below and the durable-ledger rollup reconstruction
+/// (`history_store.rs::compute_range_totals`, #107) use, so a chain that
+/// straddles a rollup bucket or day boundary is still counted exactly once
+/// rather than approximated by summing per-bucket derived fields.
+pub fn mutation_chain_fields(counts: impl Iterator<Item = u64>) -> (u64, u64, u64) {
+    let mut mutation_targets = 0u64;
+    let mut one_shot_mutations = 0u64;
+    let mut retry_count = 0u64;
+    for count in counts {
+        mutation_targets += 1;
+        if count == 1 {
+            one_shot_mutations += 1;
+        }
+        retry_count += count.saturating_sub(1);
+    }
+    (mutation_targets, one_shot_mutations, retry_count)
+}
+
 #[derive(Default)]
 struct MetricsAccumulator<'a> {
     out: ToolMetrics,
@@ -251,38 +539,21 @@ struct MetricsAccumulator<'a> {
 
 impl<'a> MetricsAccumulator<'a> {
     fn push(&mut self, item: &'a ToolObservation) {
-        self.out.calls += 1;
-        self.out.output_bytes += item.output_bytes;
-        self.out.duration_ms += item.duration_ms.unwrap_or(0);
-        match item.kind {
-            ToolKind::Read => self.out.reads += 1,
-            ToolKind::Search => self.out.searches += 1,
-            ToolKind::Mutation => {
-                self.out.mutations += 1;
-                *self
-                    .mutations
-                    .entry((item.turn_id.as_deref(), item.target.as_deref()))
-                    .or_default() += 1;
-            }
-            ToolKind::Command => self.out.commands += 1,
-            ToolKind::Other => self.out.other += 1,
-        }
-        match item.outcome {
-            ToolOutcome::Success => self.out.successes += 1,
-            ToolOutcome::Failure => self.out.failures += 1,
-            ToolOutcome::Pending | ToolOutcome::Unknown => self.out.unknown += 1,
+        accumulate_observation(&mut self.out, item);
+        if item.kind == ToolKind::Mutation {
+            *self
+                .mutations
+                .entry((item.turn_id.as_deref(), item.target.as_deref()))
+                .or_default() += 1;
         }
     }
 
     fn finish(mut self) -> ToolMetrics {
-        self.out.mutation_targets = self.mutations.len() as u64;
-        self.out.one_shot_mutations =
-            self.mutations.values().filter(|count| **count == 1).count() as u64;
-        self.out.retry_count = self
-            .mutations
-            .values()
-            .map(|count| count.saturating_sub(1))
-            .sum();
+        let (mutation_targets, one_shot_mutations, retry_count) =
+            mutation_chain_fields(self.mutations.values().copied());
+        self.out.mutation_targets = mutation_targets;
+        self.out.one_shot_mutations = one_shot_mutations;
+        self.out.retry_count = retry_count;
         self.out
     }
 }
@@ -313,6 +584,144 @@ pub fn metrics_with_models<'a>(
             .map(|(model, accumulator)| (model.to_owned(), accumulator.finish()))
             .collect(),
     )
+}
+
+/// Increments one (dimension_kind, dimension_value) entry for a single call.
+/// Shared by the in-memory accumulation below and the durable-ledger
+/// edge-fact reconstruction (`history_store.rs`) so a call is counted
+/// identically on both paths — the same discipline
+/// `accumulate_observation` establishes for `ToolMetrics`.
+pub fn accumulate_dimension_call(
+    entry: &mut ToolDimensionMetrics,
+    outcome: ToolOutcome,
+    output_bytes: u64,
+    duration_ms: Option<u64>,
+) {
+    entry.calls += 1;
+    if outcome == ToolOutcome::Failure {
+        entry.failures += 1;
+    }
+    entry.output_bytes += output_bytes;
+    entry.duration_ms += duration_ms.unwrap_or(0);
+}
+
+/// Per-call open-set dimensions (issue #44): MCP server identity, shell
+/// command family, and language. Keyed by (dimension_kind, dimension_value)
+/// — an MCP call can contribute to several `mcp_server` entries at once
+/// (bounded `providers`), while `shell_family`/`language` contribute at
+/// most one entry per call. Does not include `context_source`, which is
+/// derived from `TokenTotals` (see `context_source_breakdown`) rather than
+/// individual tool calls.
+pub fn tool_dimension_metrics<'a>(
+    observations: impl Iterator<Item = &'a ToolObservation>,
+) -> BTreeMap<(String, String), ToolDimensionMetrics> {
+    let mut out: BTreeMap<(String, String), ToolDimensionMetrics> = BTreeMap::new();
+    for item in observations {
+        for provider in &item.providers {
+            accumulate_dimension_call(
+                out.entry(("mcp_server".to_owned(), provider.clone()))
+                    .or_default(),
+                item.outcome,
+                item.output_bytes,
+                item.duration_ms,
+            );
+        }
+        if let Some(family) = &item.shell_family {
+            accumulate_dimension_call(
+                out.entry(("shell_family".to_owned(), family.clone()))
+                    .or_default(),
+                item.outcome,
+                item.output_bytes,
+                item.duration_ms,
+            );
+        }
+        if let Some(language) = &item.language {
+            accumulate_dimension_call(
+                out.entry(("language".to_owned(), language.clone()))
+                    .or_default(),
+                item.outcome,
+                item.output_bytes,
+                item.duration_ms,
+            );
+        }
+    }
+    out
+}
+
+/// Bounded context-source breakdown (issue #44), derived purely from
+/// `TokenTotals` — never from a new fact table — so it automatically
+/// inherits the already-proven rollup/edge correctness of the token
+/// windowing both `Session::range_totals_multi` and
+/// `history_store::compute_range_totals` already perform. Per
+/// `AGENTS.md`'s Claude Code subset convention, `input_tokens` already
+/// includes `cached_input_tokens` (cache reads) and
+/// `cache_creation_input_tokens` (cache writes) as disjoint subsets, so the
+/// three buckets below are exhaustive and non-overlapping by construction:
+///
+/// - `conversation_cache`: reused prior context (`cached_input_tokens`) —
+///   the one category the issue's own list ("conversation and cache") maps
+///   directly onto a provider-reported number.
+/// - `newly_cached_context`: freshly established cacheable context
+///   (`cache_creation_input_tokens`; always 0 for providers without a cache-
+///   write concept, e.g. Codex, Gemini CLI) — provider-attributed as its
+///   own token kind, but not further separable into system prompt vs. tool
+///   schemas vs. file content vs. conversation without inventing precision.
+/// - `unknown`: the remainder (`input_tokens` minus the two subsets above)
+///   — genuinely unattributable to a finer category with the signal
+///   available; deliberately not split into "system", "tool schemas", or
+///   "file reads" buckets, per the issue's "use unknown rather than
+///   invented precision" mandate. Complementary, byte-denominated read
+///   volume is available separately via the `mcp_server`/plain tool
+///   `ToolKind::Read` output-byte totals — a different unit, not folded in
+///   here.
+///
+/// Only non-zero buckets are emitted, matching the "absent means no data"
+/// convention `RangeTotals::tool_dimensions` documents.
+pub fn context_source_breakdown(tokens: &TokenTotals) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    if tokens.cached_input_tokens > 0 {
+        out.insert("conversation_cache".to_owned(), tokens.cached_input_tokens);
+    }
+    if tokens.cache_creation_input_tokens > 0 {
+        out.insert(
+            "newly_cached_context".to_owned(),
+            tokens.cache_creation_input_tokens,
+        );
+    }
+    let unattributed = tokens
+        .input_tokens
+        .saturating_sub(tokens.cached_input_tokens)
+        .saturating_sub(tokens.cache_creation_input_tokens);
+    if unattributed > 0 {
+        out.insert("unknown".to_owned(), unattributed);
+    }
+    out
+}
+
+/// Combines `tool_dimension_metrics` and `context_source_breakdown` into the
+/// shape `RangeTotals::tool_dimensions` carries. Used by the in-memory
+/// oracle (`Session::range_totals_multi`); the durable-ledger read path
+/// (`history_store::compute_range_totals`) builds the equivalent structure
+/// from rollup rows plus edge facts, reusing `accumulate_dimension_call` and
+/// `context_source_breakdown` so both paths apply the same formulas.
+pub fn dimension_totals<'a>(
+    observations: impl Iterator<Item = &'a ToolObservation>,
+    tokens: &TokenTotals,
+) -> BTreeMap<String, BTreeMap<String, ToolDimensionMetrics>> {
+    let mut out: BTreeMap<String, BTreeMap<String, ToolDimensionMetrics>> = BTreeMap::new();
+    for ((kind, value), entry) in tool_dimension_metrics(observations) {
+        out.entry(kind).or_default().insert(value, entry);
+    }
+    for (value, token_count) in context_source_breakdown(tokens) {
+        out.entry("context_source".to_owned()).or_default().insert(
+            value,
+            ToolDimensionMetrics {
+                tokens: token_count,
+                ..Default::default()
+            },
+        );
+    }
+    out
 }
 
 fn contains_any(text: &str, terms: &[&str]) -> bool {
@@ -597,11 +1006,7 @@ pub fn category_totals(turns: &[crate::model::TurnInfo]) -> BTreeMap<TaskCategor
         let category = turn.classification.category;
         let entry: &mut CategoryMetric = out.entry(category).or_default();
         entry.turns += 1;
-        entry.tokens.input_tokens += turn.tokens.input_tokens;
-        entry.tokens.cached_input_tokens += turn.tokens.cached_input_tokens;
-        entry.tokens.output_tokens += turn.tokens.output_tokens;
-        entry.tokens.reasoning_output_tokens += turn.tokens.reasoning_output_tokens;
-        entry.tokens.total_tokens += turn.tokens.total_tokens;
+        entry.tokens += &turn.tokens;
         entry.tool_calls += turn.tool_metrics.calls;
         if let Some(model) = &turn.model {
             let bucket = entry
@@ -610,11 +1015,7 @@ pub fn category_totals(turns: &[crate::model::TurnInfo]) -> BTreeMap<TaskCategor
                 .find(|bucket| bucket.model == *model && bucket.service_tier == turn.service_tier);
             match bucket {
                 Some(bucket) => {
-                    bucket.tokens.input_tokens += turn.tokens.input_tokens;
-                    bucket.tokens.cached_input_tokens += turn.tokens.cached_input_tokens;
-                    bucket.tokens.output_tokens += turn.tokens.output_tokens;
-                    bucket.tokens.reasoning_output_tokens += turn.tokens.reasoning_output_tokens;
-                    bucket.tokens.total_tokens += turn.tokens.total_tokens;
+                    bucket.tokens += &turn.tokens;
                 }
                 None => entry.buckets.push(crate::model::TierBucket {
                     model: model.clone(),
@@ -711,6 +1112,9 @@ mod tests {
             effective_tools: vec!["edit".into()],
             target: Some(target.into()),
             resource_id: Some(target.into()),
+            origin: ToolOrigin::Core,
+            shell_family: None,
+            language: None,
             outcome: ToolOutcome::Success,
             duration_ms: None,
             output_bytes: 0,
@@ -738,6 +1142,9 @@ mod tests {
                 effective_tools: vec!["read".into()],
                 target: Some("read:abc".into()),
                 resource_id: Some("abc".into()),
+                origin: ToolOrigin::Core,
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: None,
                 output_bytes: 0,
@@ -751,6 +1158,155 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn shell_family_matches_allowlisted_leading_token_and_falls_back_to_other() {
+        assert_eq!(classify_shell_family("git status"), Some("git".into()));
+        assert_eq!(
+            classify_shell_family("  npm  test --watch"),
+            Some("npm".into())
+        );
+        // Absolute/relative paths and a trailing .exe both normalize to the
+        // bare allowlisted name.
+        assert_eq!(
+            classify_shell_family("/usr/bin/git log"),
+            Some("git".into())
+        );
+        // A quoted leading token (a Windows path containing spaces) is read
+        // up to its matching quote rather than split on the space inside it.
+        assert_eq!(
+            classify_shell_family(r#""C:\Program Files\Git\bin\git.exe" status"#),
+            Some("git".into())
+        );
+        // A known interpreter wrapper is peeled off so the classified
+        // family reflects the program actually being run.
+        assert_eq!(
+            classify_shell_family(r#"bash -lc "npm run build""#),
+            Some("npm".into())
+        );
+        // An unrecognized leading token buckets to the safe "other" label,
+        // never the raw command text.
+        assert_eq!(
+            classify_shell_family("some-internal-tool --flag secret-arg"),
+            Some("other".into())
+        );
+        assert_eq!(classify_shell_family(""), None);
+    }
+
+    #[test]
+    fn shell_family_is_only_computed_for_command_kind_calls() {
+        let args = serde_json::json!({"command": "git status"});
+        assert_eq!(
+            shell_family_for_call(ToolKind::Command, &args),
+            Some("git".into())
+        );
+        assert_eq!(shell_family_for_call(ToolKind::Read, &args), None);
+        assert_eq!(shell_family_for_call(ToolKind::Other, &args), None);
+    }
+
+    #[test]
+    fn language_is_classified_from_allowlisted_extensions_and_none_otherwise() {
+        assert_eq!(
+            language_for_call(&serde_json::json!({"path": "/repo/src/main.rs"})),
+            Some("rust".into())
+        );
+        assert_eq!(
+            language_for_call(&serde_json::json!({"file_path": "C:\\repo\\app.tsx"})),
+            Some("typescript".into())
+        );
+        // Unrecognized extension: honestly unknown, not an invented label.
+        assert_eq!(
+            language_for_call(&serde_json::json!({"path": "/repo/data.bin"})),
+            None
+        );
+        // `command`/`query` are not path keys, even though
+        // `resource_candidate` (a different function) accepts them.
+        assert_eq!(
+            language_for_call(&serde_json::json!({"command": "cat main.rs"})),
+            None
+        );
+    }
+
+    #[test]
+    fn context_source_breakdown_is_exhaustive_and_non_overlapping() {
+        let tokens = TokenTotals {
+            input_tokens: 100,
+            cached_input_tokens: 30,
+            cache_creation_input_tokens: 20,
+            output_tokens: 5,
+            reasoning_output_tokens: 0,
+            total_tokens: 105,
+        };
+        let breakdown = context_source_breakdown(&tokens);
+        assert_eq!(breakdown["conversation_cache"], 30);
+        assert_eq!(breakdown["newly_cached_context"], 20);
+        assert_eq!(breakdown["unknown"], 50); // 100 - 30 - 20
+        assert_eq!(breakdown.values().sum::<u64>(), tokens.input_tokens);
+
+        // Zero-valued buckets are omitted, not emitted as zero rows.
+        let all_cached = TokenTotals {
+            input_tokens: 30,
+            cached_input_tokens: 30,
+            cache_creation_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 30,
+        };
+        let breakdown = context_source_breakdown(&all_cached);
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown["conversation_cache"], 30);
+    }
+
+    #[test]
+    fn dimension_totals_combines_tool_calls_and_context_source_without_double_counting() {
+        let ts = Utc::now();
+        let make = |id: &str, providers: &[&str], shell_family: Option<&str>| ToolObservation {
+            call_id: id.into(),
+            turn_id: Some("t".into()),
+            harness: codex_provider_id(),
+            model: Some("m".into()),
+            timestamp: ts,
+            kind: if shell_family.is_some() {
+                ToolKind::Command
+            } else {
+                ToolKind::Read
+            },
+            name: "tool".into(),
+            providers: providers.iter().map(|p| (*p).to_string()).collect(),
+            effective_tools: Vec::new(),
+            target: None,
+            resource_id: None,
+            origin: ToolOrigin::Core,
+            shell_family: shell_family.map(str::to_owned),
+            language: None,
+            outcome: ToolOutcome::Success,
+            duration_ms: Some(5),
+            output_bytes: 10,
+        };
+        let items = [
+            make("1", &["alpha"], None),
+            make("2", &["alpha"], None),
+            make("3", &[], Some("npm")),
+        ];
+        let tokens = TokenTotals {
+            input_tokens: 50,
+            cached_input_tokens: 20,
+            cache_creation_input_tokens: 0,
+            output_tokens: 0,
+            reasoning_output_tokens: 0,
+            total_tokens: 50,
+        };
+        let totals = dimension_totals(items.iter(), &tokens);
+        assert_eq!(totals["mcp_server"]["alpha"].calls, 2);
+        assert_eq!(totals["mcp_server"]["alpha"].output_bytes, 20);
+        assert_eq!(totals["shell_family"]["npm"].calls, 1);
+        assert_eq!(totals["context_source"]["conversation_cache"].tokens, 20);
+        assert_eq!(totals["context_source"]["unknown"].tokens, 30);
+        // context_source carries no call-shaped counters, and tool-call
+        // dimensions carry no tokens.
+        assert_eq!(totals["context_source"]["conversation_cache"].calls, 0);
+        assert_eq!(totals["mcp_server"]["alpha"].tokens, 0);
     }
 
     #[test]
@@ -824,6 +1380,9 @@ mod tests {
                     .map_or(target, |(_, resource)| resource)
                     .to_owned()
             }),
+            origin: ToolOrigin::classify(kind, &[]),
+            shell_family: None,
+            language: None,
             outcome,
             duration_ms: None,
             output_bytes,

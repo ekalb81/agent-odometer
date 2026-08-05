@@ -6,6 +6,7 @@ import {
 } from './credits';
 import type {
   Harness,
+  PricingBasis,
   RangeTotals,
   RateCard,
   SessionSummary,
@@ -58,6 +59,8 @@ export interface ModelMetric {
   currency: string;
   fallbackUsed: boolean;
   unpriced: boolean;
+  /** Provenance for `cost` — see rates.rs PricingBasis. */
+  basis: PricingBasis;
   tools: ToolMetrics;
 }
 
@@ -77,6 +80,7 @@ export function zeroTotals(): TokenTotals {
   return {
     input_tokens: 0,
     cached_input_tokens: 0,
+    cache_creation_input_tokens: 0,
     output_tokens: 0,
     reasoning_output_tokens: 0,
     total_tokens: 0,
@@ -86,6 +90,7 @@ export function zeroTotals(): TokenTotals {
 export function addTotals(target: TokenTotals, value: TokenTotals): void {
   target.input_tokens += value.input_tokens;
   target.cached_input_tokens += value.cached_input_tokens;
+  target.cache_creation_input_tokens += value.cache_creation_input_tokens;
   target.output_tokens += value.output_tokens;
   target.reasoning_output_tokens += value.reasoning_output_tokens;
   target.total_tokens += value.total_tokens;
@@ -94,11 +99,17 @@ export function addTotals(target: TokenTotals, value: TokenTotals): void {
 export function zeroToolMetrics(): ToolMetrics {
   return { calls: 0, reads: 0, searches: 0, mutations: 0, commands: 0, other: 0,
     successes: 0, failures: 0, unknown: 0, mutation_targets: 0, one_shot_mutations: 0,
-    retry_count: 0, duration_ms: 0, output_bytes: 0 };
+    retry_count: 0, duration_ms: 0, output_bytes: 0,
+    core_origin_calls: 0, mcp_origin_calls: 0, provider_origin_calls: 0, unknown_origin_calls: 0 };
 }
 
 function addToolMetrics(target: ToolMetrics, value: ToolMetrics): void {
-  for (const key of Object.keys(target) as (keyof ToolMetrics)[]) target[key] += value[key];
+  // The issue #44 origin-breakdown fields are optional on ToolMetrics (older
+  // fixtures and historical data may omit them), so fall back to 0 rather
+  // than propagating `undefined` into the running total.
+  for (const key of Object.keys(target) as (keyof ToolMetrics)[]) {
+    target[key] = (target[key] ?? 0) + (value[key] ?? 0);
+  }
 }
 
 export function toUtcIso(local: string): string | null {
@@ -127,9 +138,13 @@ export function sessionName(session: Pick<
   return session.id.slice(0, 8);
 }
 
-/** A privacy-preserving project label for list views. Session summaries retain
- * the working directory for local actions, but the grid never needs to expose
- * the full path: its final segment is stable for display and grouping. */
+/** The working directory's final path segment.
+ *
+ * This is a fallback, not the grid's label. A directory is only a repository
+ * if it is actually inside a working tree, and its final segment is often a
+ * fragment that identifies nothing — the grid resolves the repository through
+ * `resolve_working_directories` and falls back here only until that resolves,
+ * or if it fails. Kept because the segment is stable and allocation-free. */
 export function repositoryLabel(session: Pick<SessionSummary, 'working_directory'>): string | null {
   if (!session.working_directory) return null;
   const parts = session.working_directory.replace(/\\/g, '/').split('/').filter(Boolean);
@@ -201,7 +216,11 @@ export function projectSession<T extends SessionSummary>(
       planCost: 0,
       apiCost: null,
       displayCost: 0,
-      currency: session.harness === 'claude_code' ? 'USD' : 'credits',
+      // Rates have not loaded yet, so `harnessCurrency` (which reads
+      // `rates.currencies`) is not available. Codex is the only provider
+      // priced in its own plan-credit unit; every other registered provider
+      // prices directly in USD (see `ProviderCapabilities.currency`).
+      currency: session.harness === 'codex' ? 'credits' : 'USD',
       missingModels: [],
       unpricedModels: [],
       timeAwareApiStatus: null,
@@ -264,6 +283,7 @@ function priceBucket(bucket: TierBucket, harness: Harness, rates: RateCard): {
   currency: string;
   fallbackUsed: boolean;
   unpriced: boolean;
+  basis: PricingBasis;
 } {
   const useApi = harness === 'codex' && Object.keys(rates.api_models ?? {}).length > 0;
   const priced = useApi
@@ -274,6 +294,7 @@ function priceBucket(bucket: TierBucket, harness: Harness, rates: RateCard): {
     currency: useApi ? 'USD' : harnessCurrency(rates, harness),
     fallbackUsed: (priced?.missingModels.length ?? 0) > 0,
     unpriced: (priced?.unpricedModels.length ?? 0) > 0,
+    basis: priced?.byModel.find((mc) => mc.model === bucket.model)?.basis ?? 'unavailable',
   };
 }
 
@@ -301,6 +322,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
           currency: priced.currency,
           fallbackUsed: false,
           unpriced: false,
+          basis: priced.basis,
           tools: zeroToolMetrics(),
         };
         grouped.set(key, metric);
@@ -309,6 +331,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
       metric.cost += priced.cost;
       metric.fallbackUsed ||= priced.fallbackUsed;
       metric.unpriced ||= priced.unpriced;
+      metric.basis = priced.basis;
     }
     for (const [model, tools] of Object.entries(range.tool_metrics_by_model ?? {})) {
       const key = `${session.harness}\0${model}`;
@@ -316,7 +339,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
       if (!metric) {
         metric = { harness: session.harness, model, tokens: zeroTotals(), cost: 0,
           currency: displayCurrency(session, rates), fallbackUsed: false, unpriced: false,
-          tools: zeroToolMetrics() };
+          basis: 'unavailable', tools: zeroToolMetrics() };
         grouped.set(key, metric);
       }
       addToolMetrics(metric.tools, tools);
@@ -363,6 +386,7 @@ export function exportRows<T extends SessionSummary>(
       turns: session.total_turns,
       input_tokens: tokens.input_tokens,
       cached_input_tokens: tokens.cached_input_tokens,
+      cache_creation_input_tokens: tokens.cache_creation_input_tokens,
       output_tokens: tokens.output_tokens,
       reasoning_output_tokens: tokens.reasoning_output_tokens,
       total_tokens: tokens.total_tokens,
@@ -393,4 +417,150 @@ export function rowsToCsv(rows: Record<string, string | number | boolean | null>
   const lines = [headers.map(csvCell).join(',')];
   for (const row of rows) lines.push(headers.map((header) => csvCell(row[header])).join(','));
   return `${lines.join('\r\n')}\r\n`;
+}
+
+/** Minimum a row needs to be ordered: identity plus its day-group anchor. */
+export interface OrderableSession {
+  storage_id: string;
+  startedMs: number;
+}
+
+export interface OrderOptions<T extends OrderableSession> {
+  /** Storage id of the row's parent, or null when it is a top-level thread. */
+  parentOf: (session: T) => string | null;
+  /** Parents whose subagent rows are hidden. Ignored when flat. */
+  collapsed?: ReadonlySet<string>;
+  /**
+   * Flat drops the parent/child nesting so the caller's sort ranks every
+   * thread against every other. Tree keeps children directly beneath their
+   * parent, which means a child can never outrank its parent.
+   */
+  flat?: boolean;
+}
+
+/**
+ * Orders already-sorted rows for the session grid and reports which day group
+ * each row belongs to.
+ *
+ * In tree mode a child inherits its parent's anchor, so a nested row never
+ * splits a day section — but a subagent that ran today under a weeks-old
+ * parent is then filed under the parent's start day. Flat mode anchors every
+ * row to its own start time, which is what makes long-lived parents with many
+ * short subagent runs readable.
+ */
+export function orderSessionsForDisplay<T extends OrderableSession>(
+  sorted: readonly T[],
+  options: OrderOptions<T>,
+): { list: T[]; anchorMs: Map<string, number> } {
+  const anchorMs = new Map<string, number>();
+  if (options.flat) {
+    for (const session of sorted) anchorMs.set(session.storage_id, session.startedMs);
+    return { list: [...sorted], anchorMs };
+  }
+
+  const collapsed = options.collapsed ?? new Set<string>();
+  const ids = new Set(sorted.map((session) => session.storage_id));
+  const children = new Map<string, T[]>();
+  const roots: T[] = [];
+  for (const session of sorted) {
+    const parentId = options.parentOf(session);
+    // A child whose parent was filtered out becomes a root rather than
+    // disappearing with it.
+    if (parentId && ids.has(parentId)) {
+      const arr = children.get(parentId);
+      if (arr) arr.push(session);
+      else children.set(parentId, [session]);
+    } else {
+      roots.push(session);
+    }
+  }
+
+  const list: T[] = [];
+  const seen = new Set<string>();
+  // Descendants of a collapsed parent: withheld on purpose, so the
+  // unreachable sweep below must not resurrect them as top-level rows.
+  const withheld = new Set<string>();
+  const withhold = (id: string) => {
+    for (const child of children.get(id) ?? []) {
+      if (withheld.has(child.storage_id)) continue;
+      withheld.add(child.storage_id);
+      withhold(child.storage_id);
+    }
+  };
+  const append = (session: T, anchor: number) => {
+    // Guards against a cyclic parent chain from corrupt lineage metadata.
+    if (seen.has(session.storage_id)) return;
+    seen.add(session.storage_id);
+    list.push(session);
+    anchorMs.set(session.storage_id, anchor);
+    if (collapsed.has(session.storage_id)) {
+      withhold(session.storage_id);
+      return;
+    }
+    for (const child of children.get(session.storage_id) ?? []) append(child, anchor);
+  };
+  for (const root of roots) append(root, root.startedMs);
+  // A parent cycle leaves its members unreachable from every root. Emit them
+  // at top level rather than dropping rows the caller filtered in.
+  for (const session of sorted) {
+    if (!seen.has(session.storage_id) && !withheld.has(session.storage_id)) {
+      append(session, session.startedMs);
+    }
+  }
+  return { list, anchorMs };
+}
+
+/** Below this, a shared prefix is still informative enough to keep. */
+const SIBLING_PREFIX_MIN = 24;
+
+/**
+ * Strips the uninformative shared prefix from a set of sibling subagent names.
+ *
+ * Fan-out spawns children from one templated prompt, so their names are
+ * identical for hundreds of characters and the grid shows N rows of the same
+ * truncated text. Cutting at the first divergence — snapped back to a word
+ * boundary — surfaces the part that actually differs.
+ *
+ * Returns names unchanged when there is only one sibling, when the shared
+ * prefix is short enough to be meaningful on its own, or when the names are
+ * wholly identical (nothing to reveal, so the caller's ordinal is the only
+ * available disambiguator).
+ */
+export function disambiguateSiblingNames(names: readonly string[]): string[] {
+  if (names.length < 2) return [...names];
+
+  let prefix = names[0];
+  for (const name of names.slice(1)) {
+    let index = 0;
+    const max = Math.min(prefix.length, name.length);
+    while (index < max && prefix[index] === name[index]) index += 1;
+    prefix = prefix.slice(0, index);
+    if (prefix.length < SIBLING_PREFIX_MIN) return [...names];
+  }
+
+  // Every name identical: there is no divergent span to show.
+  if (names.every((name) => name.length === prefix.length)) return [...names];
+
+  // Snap back to a word boundary so the visible text starts mid-phrase rather
+  // than mid-word. Falls back to the raw cut when the prefix has no space.
+  const boundary = prefix.lastIndexOf(' ');
+  const cut = boundary >= SIBLING_PREFIX_MIN ? boundary + 1 : prefix.length;
+  return names.map((name) => {
+    const rest = name.slice(cut).trimStart();
+    return rest ? `…${rest}` : name;
+  });
+}
+
+/**
+ * True when a zero cost means "not measured" rather than "cost nothing".
+ *
+ * A session whose every priceable model lacks a published rate produces a
+ * total of exactly zero. Rendering that as `0.00` asserts the run was free,
+ * which for a multi-million-token subagent is the opposite of what happened.
+ */
+export function costIsUnmeasured(
+  unpricedModels: readonly string[] | undefined,
+  displayCost: number,
+): boolean {
+  return (unpricedModels?.length ?? 0) > 0 && displayCost === 0;
 }

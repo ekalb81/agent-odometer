@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -70,6 +70,11 @@ export function getScanStatus(): Promise<ScanStatus> {
   return invoke<ScanStatus>('get_scan_status');
 }
 
+/** Current durable-history open/migration status (call once on mount, then follow events). */
+export function getHistoryStatus(): Promise<HistoryStatus> {
+  return invoke<HistoryStatus>('get_history_status');
+}
+
 /** Windows only: opens the UAC flow to exclude session folders from Defender scanning. */
 export function addDefenderExclusions(): Promise<DefenderExclusionReceipt> {
   return invoke<DefenderExclusionReceipt>('add_defender_exclusions');
@@ -82,6 +87,77 @@ export function getConfig(): Promise<Config> {
 /** Registered providers with display names and capability flags. */
 export function listProviders(): Promise<ProviderDescriptor[]> {
   return invoke<ProviderDescriptor[]>('list_providers');
+}
+
+/** On-demand provider-registry diagnostics report (issue #39): capability
+ *  flags, roots, discovery/parse/cache counters, ledger health, pricing
+ *  coverage, retention risk, and quota status, per provider. Local paths are
+ *  included for on-screen display; redact before exporting (see
+ *  lib/diagnosticsExport.ts). Not fetched automatically on startup. */
+export function getProviderDiagnostics(): Promise<DiagnosticsReport> {
+  return invoke<DiagnosticsReport>('get_provider_diagnostics');
+}
+
+export function resolveWorkingDirectories(): Promise<WorkingDirectoryInfo[]> {
+  return invoke<WorkingDirectoryInfo[]>('resolve_working_directories');
+}
+
+/** Every registered provider's current quota snapshot (issue #43),
+ *  transcript-derived. Always one entry per provider — "no data" is always
+ *  an explicit `unavailable` reason, never an absent row. */
+export function getQuotaSnapshots(): Promise<QuotaSnapshot[]> {
+  return invoke<QuotaSnapshot[]>('get_quota_snapshots');
+}
+
+/** Current soft-budget/notification configuration. */
+export function getQuotaConfig(): Promise<QuotaConfigWire> {
+  return invoke<QuotaConfigWire>('get_quota_config');
+}
+
+/** Replaces the whole soft-budget/notification configuration. */
+export function setQuotaConfig(config: QuotaConfigWire): Promise<QuotaConfigWire> {
+  return invoke<QuotaConfigWire>('set_quota_config', { config });
+}
+
+/** Recomputes quota against configured soft budgets and returns any newly
+ *  crossed thresholds (already deduplicated/reset-aware/quiet-hours-gated
+ *  server-side — see quota.rs::evaluate_alerts). Safe to poll. */
+export function checkQuotaAlerts(): Promise<QuotaAlert[]> {
+  return invoke<QuotaAlert[]>('check_quota_alerts');
+}
+
+/** Every resolved project (#41), after local alias/merge/split overrides —
+ *  the one map every project-scoped surface (grid label/grouping, cards,
+ *  export) joins a session's `project_key` against. Fetch-once-until-refreshed,
+ *  like `resolveWorkingDirectories`: overrides change rarely. */
+export function resolveProjects(): Promise<ProjectInfo[]> {
+  return invoke<ProjectInfo[]>('resolve_projects');
+}
+
+/** Sets (`label`) or clears (`null`) a local display-label alias for a project. */
+export function setProjectAlias(projectKey: string, displayLabel: string | null): Promise<void> {
+  return invoke<void>('set_project_alias', { projectKey, displayLabel });
+}
+
+/** Merges `sourceProjectKey` to display under `canonicalProjectKey`. Rejects a self-merge or a cycle. */
+export function mergeProjects(sourceProjectKey: string, canonicalProjectKey: string): Promise<void> {
+  return invoke<void>('merge_projects', { sourceProjectKey, canonicalProjectKey });
+}
+
+/** Reverses a previous `mergeProjects` call for `projectKey`. */
+export function unmergeProject(projectKey: string): Promise<void> {
+  return invoke<void>('unmerge_project', { projectKey });
+}
+
+/** Manually reassigns one session to `projectKey` (or, when `null`, splits it into a fresh
+ *  standalone project). Returns the effective project key applied. */
+export function reassignSessionProject(sessionKey: string, projectKey: string | null): Promise<string> {
+  return invoke<string>('reassign_session_project', { sessionKey, projectKey });
+}
+
+/** Reverses a previous `reassignSessionProject` call for `sessionKey`. */
+export function clearSessionProjectOverride(sessionKey: string): Promise<void> {
+  return invoke<void>('clear_session_project_override', { sessionKey });
 }
 
 export function setConfig(config: Config): Promise<void> {
@@ -199,6 +275,10 @@ export function onSessionRemoved(cb: (sessionId: string) => void): Promise<Unlis
 
 export function onScanProgress(cb: (status: ScanStatus) => void): Promise<UnlistenFn> {
   return listen<ScanStatus>('scan-progress', (event) => cb(event.payload));
+}
+
+export function onHistoryProgress(cb: (status: HistoryStatus) => void): Promise<UnlistenFn> {
+  return listen<HistoryStatus>('history-progress', (event) => cb(event.payload));
 }
 
 export function onInstructionScanProgress(

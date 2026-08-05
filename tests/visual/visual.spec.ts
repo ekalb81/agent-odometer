@@ -222,6 +222,16 @@ visualTest('sessions-subagents-collapsed', 'session subagents collapsed', async 
   await expectSessionRollup(page, 8);
 });
 
+visualTest('sessions-subagent-drilldown', 'session subagent drill-down with per-run detail', async (page) => {
+  await visit(page, { view: 'codex' });
+  // The subagent-count chip scopes the grid to one parent and its runs, which
+  // also flattens the ordering so a column sort ranks the runs against
+  // each other rather than nesting them under the parent.
+  await page.getByRole('button', { name: /Show only .* and its \d+ subagent runs?/ }).first().click();
+  await expect(page.getByRole('button', { name: 'Show all sessions' })).toBeVisible();
+  await expect(page.getByText('and its subagent runs')).toBeVisible();
+});
+
 visualTest('sessions-availability-fallback', 'session availability, fallback, and unpriced indicators', async (page) => {
   await visit(page, { scenario: 'sessions-availability-fallback', view: 'codex' });
   await expect(page.getByText(/unpriced model excluded/i)).toBeVisible();
@@ -230,6 +240,27 @@ visualTest('sessions-availability-fallback', 'session availability, fallback, an
   await expect(page.locator('[aria-label="Session details"]:visible')).toContainText('source missing');
   await expect(page.locator('[title^="Fallback rate used"]:visible').first()).toBeVisible();
   await expectSessionRollup(page, 8);
+});
+
+visualTest('tool-dimensions', 'issue #44 tool, MCP, shell, and context attribution', async (page) => {
+  // Issue #44's aggregate panel (ToolImpact.svelte) had zero visual coverage
+  // before this test — the fixtures never rendered it. Claude Code's view is
+  // used deliberately: the 'tool-dimensions' fixture scenario marks Claude
+  // Code's mcp/shell dimensions unavailable (a fixture-only demonstration,
+  // not real capability — see dev-mock.ts), so with only Claude Code
+  // sessions in view, the panel must render "Unavailable" for those two
+  // dimensions while still showing real language and context-source data —
+  // the exact unavailable-vs-zero distinction this issue exists to capture.
+  await visit(page, { scenario: 'tool-dimensions', view: 'claude' });
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const dimensionSummary = page
+    .getByText('Tool, MCP, shell & context attribution', { exact: false })
+    .filter({ visible: true });
+  await expect(dimensionSummary).toBeVisible();
+  await dimensionSummary.click();
+  await expect(page.getByText(/Unavailable — no provider/).filter({ visible: true }).first()).toBeVisible();
+  await expect(page.getByText('svelte', { exact: true }).filter({ visible: true })).toBeVisible();
+  await expect(page.getByText('Conversation / cache reuse').filter({ visible: true })).toBeVisible();
 });
 
 test.describe('narrow session drawer', () => {

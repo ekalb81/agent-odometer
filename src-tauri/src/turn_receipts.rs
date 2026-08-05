@@ -344,14 +344,19 @@ fn price_tokens(
 }
 
 fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f64 {
+    // Cached-read and cache-creation are both disjoint subsets of
+    // input_tokens; both must be subtracted before pricing the remainder at
+    // the plain input rate, and neither subset may be priced twice.
     let non_cached_input = tokens
         .input_tokens
-        .saturating_sub(tokens.cached_input_tokens);
+        .saturating_sub(tokens.cached_input_tokens)
+        .saturating_sub(tokens.cache_creation_input_tokens);
     let non_reasoning_output = tokens
         .output_tokens
         .saturating_sub(tokens.reasoning_output_tokens);
     ((non_cached_input as f64 * rate.input)
         + (tokens.cached_input_tokens as f64 * rate.cached_input)
+        + (tokens.cache_creation_input_tokens as f64 * rate.cache_creation_rate())
         + (non_reasoning_output as f64 * rate.output)
         + (tokens.reasoning_output_tokens as f64 * rate.reasoning))
         / 1_000_000.0
@@ -632,6 +637,7 @@ mod tests {
         ModelRate {
             input: value,
             cached_input: value,
+            cache_creation_input: Some(value),
             output: value,
             reasoning: value,
         }
@@ -643,6 +649,7 @@ mod tests {
         let tokens = TokenTotals {
             input_tokens: 100_000,
             cached_input_tokens: 80_000,
+            cache_creation_input_tokens: 0,
             output_tokens: 20_000,
             reasoning_output_tokens: 10_000,
             total_tokens: 120_000,
@@ -719,6 +726,9 @@ mod tests {
             tool_metrics_by_model: BTreeMap::new(),
             category_totals: BTreeMap::new(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         };
         let rates = RateCard {
             version: 1,
@@ -733,6 +743,7 @@ mod tests {
             api_models: HashMap::from([("gpt-test".into(), rate(3.5))]),
             unpriced_models: Vec::new(),
             pricing_catalog: Default::default(),
+            ..Default::default()
         };
         (session, rates)
     }
@@ -818,6 +829,131 @@ mod tests {
                 false,
             ),
             Some(2.5)
+        );
+    }
+
+    #[test]
+    fn cache_creation_tokens_price_at_input_rate_when_no_premium_is_published() {
+        // Regression guard: a model whose ModelRate never states a
+        // cache-write premium (cache_creation_input: None) must price
+        // cache-creation tokens at the ordinary input rate, exactly as they
+        // were priced before the cache-creation dimension existed (when
+        // those tokens were still folded into plain input). Pricing them at
+        // 0 would silently bill real usage as free.
+        let mut rate_without_premium = rate(2.0);
+        rate_without_premium.cache_creation_input = None;
+        let tokens = TokenTotals {
+            input_tokens: 100_000,
+            cached_input_tokens: 10_000,
+            cache_creation_input_tokens: 20_000,
+            output_tokens: 5_000,
+            reasoning_output_tokens: 0,
+            total_tokens: 105_000,
+        };
+
+        let cost = token_cost(&tokens, &rate_without_premium, 1.0);
+
+        // Pre-#42 accounting: cache-creation tokens were indistinguishable
+        // from plain input, so the whole non-cached-read remainder
+        // (input_tokens - cached_input_tokens, which includes what is now
+        // cache_creation_input_tokens) priced at the ordinary input rate.
+        let pre_cache_creation_dimension_cost = (((tokens.input_tokens - tokens.cached_input_tokens)
+            as f64
+            * rate_without_premium.input)
+            + (tokens.cached_input_tokens as f64 * rate_without_premium.cached_input)
+            + (tokens.output_tokens as f64 * rate_without_premium.output))
+            / 1_000_000.0;
+        assert_eq!(cost, pre_cache_creation_dimension_cost);
+        assert!(rate_without_premium.cache_creation_rate_is_fallback());
+    }
+
+    /// Guard against the *next* dimension being added the same wrong way
+    /// `cache_creation_input` originally was: silently priced at zero
+    /// instead of falling back to the ordinary rate of the bucket it is a
+    /// subset of. Runs against every model actually shipped in
+    /// `src-tauri/rates.json` (not one synthetic rate), so it fails the
+    /// instant a real catalog entry regresses.
+    ///
+    /// The invariant: distinguishing a premium-or-fallback dimension
+    /// (cache-creation is a subset of input, reasoning is a subset of
+    /// output) from its parent bucket may raise a session's price (a
+    /// genuine published premium) or leave it unchanged (falls back to the
+    /// parent rate), but must never lower it. A dimension defaulting to a
+    /// zero rate is exactly the shape of that bug, because it makes the
+    /// "distinguished" total cheaper than folding it back into the parent
+    /// bucket would have priced the same tokens.
+    ///
+    /// `cached_input_tokens` (cache *reads*) is deliberately excluded from
+    /// the fold: unlike cache-creation and reasoning, a cache read is a
+    /// genuine, intentional discount below the input rate, not a
+    /// premium-or-fallback dimension, so it is not part of this invariant.
+    /// It stays distinguished — and identical — in both totals below, so it
+    /// cannot affect the comparison's direction.
+    #[test]
+    fn every_bundled_model_prices_added_dimensions_at_or_above_their_folded_cost() {
+        let rates = RateCard::load_bundled().expect("bundled rates.json must load");
+        let mut checked = 0;
+        for (model, rate) in rates.models.iter().chain(rates.api_models.iter()) {
+            let full = TokenTotals {
+                input_tokens: 1_000_000,
+                cached_input_tokens: 200_000,
+                cache_creation_input_tokens: 150_000,
+                output_tokens: 500_000,
+                reasoning_output_tokens: 100_000,
+                total_tokens: 1_500_000,
+            };
+            // Fold cache-creation and reasoning back into their parent
+            // ordinary bucket, exactly as sessions were priced before those
+            // dimensions existed. cached_input_tokens (and input_tokens /
+            // output_tokens themselves) are left untouched.
+            let folded = TokenTotals {
+                cache_creation_input_tokens: 0,
+                reasoning_output_tokens: 0,
+                ..full.clone()
+            };
+
+            let full_cost = token_cost(&full, rate, 1.0);
+            let folded_cost = token_cost(&folded, rate, 1.0);
+            assert!(
+                full_cost >= folded_cost - 1e-9,
+                "model {model:?} prices its distinguished dimensions below folding them into \
+                 ordinary input/output ({full_cost} < {folded_cost}) — a subset dimension is \
+                 defaulting toward zero instead of falling back to its parent rate"
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "rates.json produced no models to check");
+    }
+
+    /// Companion to the monotonicity guard above: for every bundled model
+    /// that has not published a cache-creation premium, cache-creation
+    /// tokens must price at exactly the ordinary input rate rather than at
+    /// zero. `cache_creation_input` is currently the only `Option<f64>`
+    /// rate field, so it is the only one this can check directly today, but
+    /// the assertion is written against the accessor
+    /// (`ModelRate::cache_creation_rate`) and real catalog data rather than
+    /// a single hard-coded rate, so it stays meaningful if more of the
+    /// catalog's fields become optional in the same way.
+    #[test]
+    fn bundled_models_without_a_published_premium_fall_back_to_the_input_rate() {
+        let rates = RateCard::load_bundled().expect("bundled rates.json must load");
+        let mut unpublished_found = false;
+        for (model, rate) in rates.models.iter().chain(rates.api_models.iter()) {
+            if rate.cache_creation_input.is_none() {
+                unpublished_found = true;
+                assert_eq!(
+                    rate.cache_creation_rate(),
+                    rate.input,
+                    "model {model:?} has no published cache-creation premium and must fall back \
+                     to its input rate, not zero"
+                );
+                assert!(rate.cache_creation_rate_is_fallback());
+            }
+        }
+        assert!(
+            unpublished_found,
+            "expected at least one bundled model without a published cache-creation premium; \
+             update this test if rates.json now publishes one for every model"
         );
     }
 
