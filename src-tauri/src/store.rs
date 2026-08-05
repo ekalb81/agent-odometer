@@ -920,7 +920,16 @@ mod tests {
 
     #[test]
     fn history_readiness_starts_pending_and_resolves_to_ready() {
-        let state = state();
+        // Deliberately `AppState::new()`, not the `state()` fixture below:
+        // `state()` hardcodes `Unavailable` so the many unrelated tests that
+        // use it get a deterministic "no archive, degrade gracefully"
+        // fixture without needing a real store. This test exists
+        // specifically to prove what the *real* constructor produces (#116:
+        // construction must never resolve the archive path itself — only
+        // `set_history_ready`, called from a background thread, may decide
+        // `Ready`/`Unavailable`), so it has to go through `new()` itself
+        // rather than a fixture that already encodes an answer.
+        let state = AppState::new();
         assert_eq!(state.history_readiness(), HistoryReadinessKind::Pending);
         assert!(state.history_ready().is_none());
 
@@ -939,7 +948,10 @@ mod tests {
         // resolved, Unavailable itself must behave exactly like the
         // pre-#116 "archive never opened" path: observing a session must
         // not panic or block, and the session stays usable in memory.
-        let state = state();
+        // `AppState::new()` so this actually exercises the Pending ->
+        // Unavailable transition, not just an already-Unavailable fixture.
+        let state = AppState::new();
+        assert_eq!(state.history_readiness(), HistoryReadinessKind::Pending);
         state.set_history_ready(None);
         assert_eq!(state.history_readiness(), HistoryReadinessKind::Unavailable);
         assert!(state.history_ready().is_none());
@@ -952,7 +964,9 @@ mod tests {
 
     #[test]
     fn wait_for_history_ready_blocks_until_set_history_ready_resolves_it() {
-        let state = Arc::new(state());
+        // Same reasoning as above: `AppState::new()`, not `state()`, so the
+        // initial `Pending` this asserts is the real constructor's behavior.
+        let state = Arc::new(AppState::new());
         assert_eq!(state.history_readiness(), HistoryReadinessKind::Pending);
         let waiter_state = state.clone();
         let waiter = std::thread::spawn(move || waiter_state.wait_for_history_ready());
