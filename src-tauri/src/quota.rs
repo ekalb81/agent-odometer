@@ -245,7 +245,7 @@ pub struct QuotaWindow {
     pub forecast: Option<QuotaForecast>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuotaSnapshot {
     pub provider: ProviderId,
     pub provenance: QuotaProvenance,
@@ -575,6 +575,109 @@ pub fn quota_snapshots_from_sessions<'a>(
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Quota snapshot cache (issue #128)
+//
+// `quota_snapshots_from_sessions` clones every rate-limit point of every
+// session in the corpus — O(corpus), measured at 1.3-1.8s on a ~4,000-
+// session field recording. The tray refresh path (`App.svelte`) calls
+// `get_quota_snapshots` on essentially every session update (a median
+// ~289ms apart during active use), which turned an otherwise-incremental
+// hot path into a near-continuous full-corpus rebuild: 32.3s of an 87s
+// run.
+//
+// This cache makes the steady-state cost O(1): most calls return a clone
+// of the last computed (small — one entry per provider) `Vec<QuotaSnapshot>`
+// rather than re-aggregating. It recomputes only when both:
+//   1. `sessions_generation` (see `AppState::sessions_generation`) has
+//      changed since the last recompute — nothing to recompute otherwise, and
+//   2. at least `QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL` has elapsed since the
+//      last recompute — collapses a burst of rapid session updates into a
+//      single recompute.
+//
+// This never fabricates freshness: a cache hit returns the exact
+// `Vec<QuotaSnapshot>` a prior call already computed (with its own
+// `observed_at`/`stale` fields intact, honestly reflecting the `now` used
+// when it was actually computed), not a value whose timestamps get
+// silently bumped to "now" on serve.
+// ---------------------------------------------------------------------------
+
+/// Minimum wall-clock time between two full recomputes, even if sessions
+/// keep changing in between. Every provider quota window Odometer tracks
+/// moves on the order of minutes (`daily`/`weekly`/`monthly`; even a
+/// `burst` window is measured in tens of minutes — see
+/// `classify_window_kind`), so no consumer benefits from a recompute more
+/// often than this. A live session can mutate roughly every ~289ms during
+/// active use (issue #128's field recording), so without a floor the cache
+/// would still recompute on almost every call. 5 seconds keeps the tray
+/// visibly live (it already debounces its own refresh by 250ms) while
+/// turning the field recording's 21 recomputes at ~1.5s each (32.3s total)
+/// into at most ~1 every 5s.
+pub const QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+struct QuotaSnapshotCacheEntry {
+    snapshots: Vec<QuotaSnapshot>,
+    sessions_generation: u64,
+    computed_at: std::time::Instant,
+}
+
+/// Caches `quota_snapshots_from_sessions`'s output. See the module section
+/// above for the recompute policy and the honesty guarantee.
+#[derive(Default)]
+pub struct QuotaSnapshotCache {
+    entry: std::sync::Mutex<Option<QuotaSnapshotCacheEntry>>,
+}
+
+impl QuotaSnapshotCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the cached snapshots, calling `compute` to refresh them only
+    /// when both recompute conditions are met (see the module doc). `now`
+    /// is the caller's monotonic-clock reading, passed in rather than read
+    /// internally so the recompute gate is deterministic and unit-testable
+    /// without real sleeps.
+    pub fn get_or_recompute(
+        &self,
+        sessions_generation: u64,
+        now: std::time::Instant,
+        compute: impl FnOnce() -> Vec<QuotaSnapshot>,
+    ) -> Vec<QuotaSnapshot> {
+        let mut guard = self.entry.lock().unwrap();
+        let should_recompute = match guard.as_ref() {
+            None => true,
+            Some(entry) => {
+                entry.sessions_generation != sessions_generation
+                    && now.saturating_duration_since(entry.computed_at)
+                        >= QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL
+            }
+        };
+        if should_recompute {
+            let snapshots = compute();
+            *guard = Some(QuotaSnapshotCacheEntry {
+                snapshots: snapshots.clone(),
+                sessions_generation,
+                computed_at: now,
+            });
+            snapshots
+        } else {
+            guard.as_ref().expect("checked above").snapshots.clone()
+        }
+    }
+
+    /// Forces the next call to recompute, regardless of generation or
+    /// elapsed time. The only caller is a quota-config change
+    /// (`AppState::set_quota_store`, from `commands::set_quota_config`):
+    /// `max_cache_age_secs` feeds `quota_snapshots_from_sessions` directly,
+    /// so an edit to it must not wait out the recompute interval to take
+    /// effect.
+    pub fn invalidate(&self) {
+        *self.entry.lock().unwrap() = None;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,5 +1439,126 @@ mod tests {
         let (alerts, log) = evaluate_alerts(&evaluations, &settings, &[], Utc::now(), 12);
         assert!(alerts.is_empty());
         assert!(log.is_empty());
+    }
+
+    // -- QuotaSnapshotCache: recompute policy (issue #128) -------------------
+    //
+    // These use a counting stand-in for the expensive aggregation
+    // (`quota_snapshots_from_sessions` in production) to prove it runs at
+    // most once across many calls with no intervening session change, and
+    // exactly once more after a change plus the min-recompute interval —
+    // the behavior that was missing before this fix, when every call
+    // recomputed unconditionally.
+
+    #[test]
+    fn quota_snapshot_cache_computes_once_across_many_calls_with_no_session_change() {
+        let cache = QuotaSnapshotCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        };
+        let t0 = std::time::Instant::now();
+
+        cache.get_or_recompute(1, t0, compute);
+        assert_eq!(calls.get(), 1, "the first call always computes");
+
+        // Same generation (nothing changed), called repeatedly, including
+        // well past the min-recompute interval: must never recompute.
+        cache.get_or_recompute(1, t0, compute);
+        cache.get_or_recompute(1, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL * 10, compute);
+        cache.get_or_recompute(1, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL * 100, compute);
+        assert_eq!(
+            calls.get(),
+            1,
+            "no session change means no recompute, however many calls or however much time passes"
+        );
+    }
+
+    #[test]
+    fn quota_snapshot_cache_recomputes_once_after_a_session_change_once_the_interval_elapses() {
+        let cache = QuotaSnapshotCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        };
+        let t0 = std::time::Instant::now();
+        cache.get_or_recompute(1, t0, compute);
+        assert_eq!(calls.get(), 1);
+
+        // A session changed (generation 1 -> 2) immediately after, but the
+        // min-recompute interval has not elapsed: repeated rapid calls must
+        // keep serving the cached result, not recompute on every call.
+        cache.get_or_recompute(2, t0 + std::time::Duration::from_millis(1), compute);
+        cache.get_or_recompute(2, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL / 2, compute);
+        assert_eq!(
+            calls.get(),
+            1,
+            "a changed generation inside the min-recompute interval must not recompute yet"
+        );
+
+        // Once the generation differs *and* the interval has elapsed, the
+        // next call recomputes exactly once.
+        cache.get_or_recompute(2, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL, compute);
+        assert_eq!(calls.get(), 2);
+
+        // ...and settles back into "no further recompute" for that
+        // generation, exactly like the first assertion.
+        cache.get_or_recompute(2, t0 + QUOTA_SNAPSHOT_MIN_RECOMPUTE_INTERVAL * 5, compute);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn quota_snapshot_cache_invalidate_forces_an_immediate_recompute() {
+        let cache = QuotaSnapshotCache::new();
+        let calls = std::cell::Cell::new(0u32);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        };
+        let t0 = std::time::Instant::now();
+        cache.get_or_recompute(1, t0, compute);
+        assert_eq!(calls.get(), 1);
+
+        // Same generation, well inside the interval: ordinarily a cache
+        // hit. An explicit invalidation (a quota-config change) must force
+        // a recompute anyway rather than waiting out the interval.
+        cache.invalidate();
+        cache.get_or_recompute(1, t0 + std::time::Duration::from_millis(1), compute);
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn quota_snapshot_cache_hit_returns_exactly_the_prior_computation() {
+        // Honesty: a served cache hit must be the same value the last real
+        // recompute produced, not something that looks "freshened" merely
+        // because time passed between calls.
+        let now = ts("2026-01-01T00:00:00Z");
+        let points = [point(
+            "2026-01-01T00:00:00Z",
+            42.0,
+            300,
+            "2026-01-01T05:00:00Z",
+        )];
+        let compute = || {
+            vec![build_quota_snapshot(
+                codex_provider_id(),
+                true,
+                &points,
+                QuotaAccountInfo::default(),
+                now,
+                Duration::hours(6),
+            )]
+        };
+        let cache = QuotaSnapshotCache::new();
+        let t0 = std::time::Instant::now();
+        let first = cache.get_or_recompute(1, t0, compute);
+        let served = cache.get_or_recompute(1, t0 + std::time::Duration::from_millis(1), compute);
+        assert_eq!(first[0].windows[0].used, Some(42.0));
+        assert_eq!(
+            served, first,
+            "a cache hit must return exactly what was last computed, not a refreshed value"
+        );
     }
 }
