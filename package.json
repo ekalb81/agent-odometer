@@ -28,7 +28,7 @@
     "marked": "^18.0.7"
   },
   "devDependencies": {
-    "@playwright/test": "^1.62.0",
+    "@playwright/test": "^1.62.1",
     "@sveltejs/vite-plugin-svelte": "^7.2.0",
     "@tailwindcss/vite": "^4.3.3",
     "@tauri-apps/cli": "^2",
@@ -41,7 +41,7 @@
     "svelte-check": "^4",
     "tailwindcss": "^4.3.3",
     "typescript": "^5",
-    "vite": "^8.1.5",
+    "vite": "^8.2.0",
     "vitest": "^4.1.10"
   },
   "license": "MIT"
