@@ -316,6 +316,31 @@ export interface ScanStatus {
   cold_reason: ColdReason | null;
 }
 
+/**
+ * Durable-history archive lifecycle (#116): `pending` until the archive has
+ * finished opening/migrating, `ready` once available, `unavailable` if it
+ * failed to open (live transcripts stay readable either way).
+ */
+export type HistoryReadinessStatus = 'pending' | 'ready' | 'unavailable';
+
+/**
+ * Durable-history open/migration progress, from get_history_status and
+ * "history-progress" events (#116). `step`/`step_index`/`step_total`
+ * describe the migration step most recently reported — in progress while
+ * `status` is 'pending', otherwise the last one that ran, or all null if the
+ * archive needed no migration at all. `items_done`/`items_total` are
+ * non-null only while a step that streams per-row progress is running.
+ */
+export interface HistoryStatus {
+  status: HistoryReadinessStatus;
+  step: string | null;
+  step_index: number | null;
+  step_total: number | null;
+  items_done: number | null;
+  items_total: number | null;
+  elapsed_ms: number | null;
+}
+
 /** Point-in-time evidence from the explicit, elevated Defender action. */
 export interface DefenderExclusionReceipt {
   version: number;

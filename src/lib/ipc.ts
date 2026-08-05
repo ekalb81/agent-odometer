@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -68,6 +68,11 @@ export function compareToolImpact(
 /** Current bulk-scan progress (call once on mount, then follow events). */
 export function getScanStatus(): Promise<ScanStatus> {
   return invoke<ScanStatus>('get_scan_status');
+}
+
+/** Current durable-history open/migration status (call once on mount, then follow events). */
+export function getHistoryStatus(): Promise<HistoryStatus> {
+  return invoke<HistoryStatus>('get_history_status');
 }
 
 /** Windows only: opens the UAC flow to exclude session folders from Defender scanning. */
@@ -270,6 +275,10 @@ export function onSessionRemoved(cb: (sessionId: string) => void): Promise<Unlis
 
 export function onScanProgress(cb: (status: ScanStatus) => void): Promise<UnlistenFn> {
   return listen<ScanStatus>('scan-progress', (event) => cb(event.payload));
+}
+
+export function onHistoryProgress(cb: (status: HistoryStatus) => void): Promise<UnlistenFn> {
+  return listen<HistoryStatus>('history-progress', (event) => cb(event.payload));
 }
 
 export function onInstructionScanProgress(

@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SCHEMA_VERSION: i64 = 6;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
@@ -96,13 +96,32 @@ impl HistoryStore {
     }
 
     pub fn open_default() -> Result<Self> {
+        Self::open_default_with_progress(|_| {})
+    }
+
+    /// Like [`Self::open_default`], but reports migration progress through
+    /// `on_progress` (#116). Opening the archive (including a chained
+    /// migration over an existing install) can take seconds on a large
+    /// corpus; the caller uses this to drive UI feedback and performance
+    /// instrumentation while the archive is not yet ready, rather than
+    /// blocking silently.
+    pub fn open_default_with_progress(on_progress: impl FnMut(MigrationStepEvent)) -> Result<Self> {
         let path = Self::default_path()?;
-        Self::open(&path)
+        Self::open_with_progress(&path, on_progress)
     }
 
     /// Opens or creates the archive and applies durable, forward-only schema
     /// migrations. Nothing here is keyed to `CARGO_PKG_VERSION`.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_progress(path, |_| {})
+    }
+
+    /// Like [`Self::open`], but reports migration progress through
+    /// `on_progress` (#116). See [`Self::open_default_with_progress`].
+    pub fn open_with_progress(
+        path: &Path,
+        mut on_progress: impl FnMut(MigrationStepEvent),
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
@@ -115,7 +134,7 @@ impl HistoryStore {
             .with_context(|| format!("could not open history store {}", path.display()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
-        migrate(&mut connection)?;
+        migrate(&mut connection, &mut on_progress)?;
         Ok(Self {
             connection: Mutex::new(connection),
             path: path.to_path_buf(),
@@ -499,7 +518,7 @@ impl HistoryStore {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let count = count(&transaction, "SELECT COUNT(*) FROM durable_sessions")?;
-        backfill_project_identities(&transaction)?;
+        backfill_project_identities(&transaction, None)?;
         transaction.commit()?;
         Ok(count)
     }
@@ -1115,12 +1134,141 @@ fn table_has_column(connection: &Transaction<'_>, table: &str, column: &str) -> 
     Ok(count > 0)
 }
 
-fn migrate(connection: &mut Connection) -> Result<()> {
+/// One step of the migration chain reported through `open_with_progress`'s
+/// callback (#116), so a caller can drive a "preparing history" UI and
+/// per-step performance instrumentation the same way `scanner::scan_all`
+/// drives `scan-progress` — without `HistoryStore` knowing whether a
+/// listener, a performance recorder, both, or neither is attached.
+///
+/// A step reports itself twice: once with `elapsed_ms: None` right before it
+/// starts running (so a UI can show "step N of M" immediately), and once with
+/// `elapsed_ms: Some(..)` right after its transaction commits. A step that
+/// streams per-row work (currently only the v5->v6 project-identity
+/// backfill) additionally reports `items_done`/`items_total` between those
+/// two; every other step commits as one SQL statement and cannot report a
+/// fraction without a second full pass, so those fields stay `None`.
+#[derive(Debug, Clone)]
+pub struct MigrationStepEvent {
+    pub step: &'static str,
+    pub step_index: u32,
+    pub step_total: u32,
+    pub from_version: i64,
+    pub to_version: i64,
+    pub elapsed_ms: Option<u64>,
+    pub items_done: Option<usize>,
+    pub items_total: Option<usize>,
+}
+
+impl MigrationStepEvent {
+    fn started(step: &'static str, step_index: u32, step_total: u32, from: i64, to: i64) -> Self {
+        Self {
+            step,
+            step_index,
+            step_total,
+            from_version: from,
+            to_version: to,
+            elapsed_ms: None,
+            items_done: None,
+            items_total: None,
+        }
+    }
+
+    fn finished(
+        step: &'static str,
+        step_index: u32,
+        step_total: u32,
+        from: i64,
+        to: i64,
+        elapsed: Duration,
+    ) -> Self {
+        Self {
+            step,
+            step_index,
+            step_total,
+            from_version: from,
+            to_version: to,
+            elapsed_ms: Some(elapsed.as_millis() as u64),
+            items_done: None,
+            items_total: None,
+        }
+    }
+
+    fn item_progress(
+        step: &'static str,
+        step_index: u32,
+        step_total: u32,
+        from: i64,
+        to: i64,
+        done: usize,
+        total: usize,
+    ) -> Self {
+        Self {
+            step,
+            step_index,
+            step_total,
+            from_version: from,
+            to_version: to,
+            elapsed_ms: None,
+            items_done: Some(done),
+            items_total: Some(total),
+        }
+    }
+}
+
+/// The number of steps `migrate()` will actually run starting from
+/// `from_version`, purely so a progress callback can report "step N of M"
+/// before the first step starts. Mirrors `migrate()`'s own `if version == N`
+/// / `if (A..=B).contains(&version)` gates in the same order; kept beside it
+/// and covered by `migration_step_count_matches_steps_migrate_actually_runs`
+/// so the two cannot silently drift apart.
+fn migration_step_count(from_version: i64) -> u32 {
+    if from_version == 0 {
+        return 1;
+    }
+    let mut version = from_version;
+    let mut steps = 0u32;
+    if version == 1 {
+        steps += 1;
+        version = 2;
+    }
+    if (1..=2).contains(&version) {
+        steps += 1;
+        version = 3;
+    }
+    if version == 3 {
+        steps += 1;
+        version = 4;
+    }
+    if version == 4 {
+        steps += 1;
+        version = 5;
+    }
+    if version == 5 {
+        steps += 1;
+    }
+    steps
+}
+
+fn migrate(
+    connection: &mut Connection,
+    on_progress: &mut dyn FnMut(MigrationStepEvent),
+) -> Result<()> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         bail!("history store schema {version} is newer than this application supports");
     }
+    let step_total = migration_step_count(version);
+    let mut step_index = 0u32;
     if version == 0 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "fresh_install",
+            step_index,
+            step_total,
+            0,
+            SCHEMA_VERSION,
+        ));
+        let started = Instant::now();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -1226,8 +1374,25 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         )?;
         transaction.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
         transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "fresh_install",
+            step_index,
+            step_total,
+            0,
+            SCHEMA_VERSION,
+            started.elapsed(),
+        ));
     }
     if version == 1 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v1_to_v2_request_input_tokens",
+            step_index,
+            step_total,
+            1,
+            2,
+        ));
+        let started = Instant::now();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "ALTER TABLE durable_token_events ADD COLUMN request_input_tokens INTEGER;
@@ -1236,8 +1401,25 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              PRAGMA user_version = 2;",
         )?;
         transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v1_to_v2_request_input_tokens",
+            step_index,
+            step_total,
+            1,
+            2,
+            started.elapsed(),
+        ));
     }
     if (1..=2).contains(&version) {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v1v2_to_v3_tool_finding_facts",
+            step_index,
+            step_total,
+            version,
+            3,
+        ));
+        let started = Instant::now();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(
             "CREATE TABLE durable_tool_events (
@@ -1309,6 +1491,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              PRAGMA user_version = 3;",
         )?;
         transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v1v2_to_v3_tool_finding_facts",
+            step_index,
+            step_total,
+            version,
+            3,
+            started.elapsed(),
+        ));
     }
     // Re-read rather than trust the initial `version` local: the two blocks
     // above run only when the *original* version matched, so a database that
@@ -1329,6 +1519,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         // adds it), so this backfill cannot and does not reference it;
         // `rollup_token_totals.cache_creation_input_tokens` keeps its schema
         // default of 0 here and is reconciled by the v4->v5 step instead.
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v3_to_v4_rollup_backfill",
+            step_index,
+            step_total,
+            3,
+            4,
+        ));
+        let started = Instant::now();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(ROLLUP_SCHEMA_SQL)?;
         transaction.execute_batch(
@@ -1371,6 +1570,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              PRAGMA user_version = 4;",
         )?;
         transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v3_to_v4_rollup_backfill",
+            step_index,
+            step_total,
+            3,
+            4,
+            started.elapsed(),
+        ));
     }
     let version_before_cache_creation: i64 =
         connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -1388,6 +1595,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         // an inferred-from-path guard would be correct for every real
         // upgrade sequence but wrong the moment a database's tables don't
         // precisely match what that inference assumes.
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v4_to_v5_cache_creation_backfill",
+            step_index,
+            step_total,
+            4,
+            5,
+        ));
+        let started = Instant::now();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !table_has_column(
             &transaction,
@@ -1443,6 +1659,14 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              PRAGMA user_version = 5;",
         )?;
         transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v4_to_v5_cache_creation_backfill",
+            step_index,
+            step_total,
+            4,
+            5,
+            started.elapsed(),
+        ));
     }
     let version_before_project_identity: i64 =
         connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -1456,6 +1680,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         // overlay (aliases/merges/splits) resolved at read time; they never
         // rewrite the auto-computed columns added here or any source
         // transcript, and are fully reversible by deleting the override row.
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v5_to_v6_project_identity_backfill",
+            step_index,
+            step_total,
+            5,
+            6,
+        ));
+        let started = Instant::now();
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !table_has_column(&transaction, "durable_sessions", "project_key")? {
             transaction.execute_batch(
@@ -1488,13 +1721,40 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         // backfill earlier in this function), so at most one snapshot blob
         // is resident at a time; it is bounded by session count, not event
         // count, so it stays cheap even on a multi-GB ledger.
-        backfill_project_identities(&transaction)?;
+        backfill_project_identities(
+            &transaction,
+            Some(&mut |done, total| {
+                // Throttled like `scanner::scan_all`'s progress callback: the
+                // endpoints plus every 100th session is smooth enough for a
+                // UI without turning a multi-thousand-session backfill into
+                // that many IPC events.
+                if done == 1 || done == total || done % 100 == 0 {
+                    on_progress(MigrationStepEvent::item_progress(
+                        "v5_to_v6_project_identity_backfill",
+                        step_index,
+                        step_total,
+                        5,
+                        6,
+                        done,
+                        total,
+                    ));
+                }
+            }),
+        )?;
         transaction.execute_batch(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', '6')
                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
              PRAGMA user_version = 6;",
         )?;
         transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v5_to_v6_project_identity_backfill",
+            step_index,
+            step_total,
+            5,
+            6,
+            started.elapsed(),
+        ));
     }
     Ok(())
 }
@@ -1542,7 +1802,10 @@ const BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL: &str = "SELECT s.session_json
 ///   ~30x reduction `commands::resolve_working_directories` already relies
 ///   on (124 distinct directories against 4,083 sessions on a real corpus).
 ///   A session with no working directory never reaches the cache at all.
-fn backfill_project_identities(transaction: &Transaction<'_>) -> Result<()> {
+fn backfill_project_identities(
+    transaction: &Transaction<'_>,
+    mut on_item: Option<&mut dyn FnMut(usize, usize)>,
+) -> Result<()> {
     let home = dirs::home_dir();
 
     let keys: Vec<String> = {
@@ -1550,11 +1813,15 @@ fn backfill_project_identities(transaction: &Transaction<'_>) -> Result<()> {
         let rows = select.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
+    let total = keys.len();
 
     let mut directory_cache: HashMap<String, crate::project_identity::DirectoryResolution> =
         HashMap::new();
 
-    for key in keys {
+    for (index, key) in keys.into_iter().enumerate() {
+        if let Some(callback) = on_item.as_deref_mut() {
+            callback(index + 1, total);
+        }
         let raw: Option<Vec<u8>> = transaction
             .query_row(
                 BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL,
@@ -4700,6 +4967,326 @@ mod tests {
                 .unwrap();
             assert_eq!(recorded_version, SCHEMA_VERSION.to_string());
         }
+    }
+
+    #[test]
+    fn migration_step_count_matches_steps_migrate_actually_runs() {
+        // `migration_step_count` mirrors `migrate()`'s own `if` gates purely
+        // to size a progress callback's `step_total` before the first step
+        // starts (#116, see its doc comment); this proves the two agree by
+        // counting real "step started" events against it for every version
+        // migrate() actually chains from, rather than trusting the mirrored
+        // logic never drifts silently.
+        let fresh_directory = tempdir().unwrap();
+        let fresh_path = fresh_directory.path().join("history.sqlite3");
+        let mut fresh_starts = 0u32;
+        let mut fresh_totals = HashSet::new();
+        let _ = HistoryStore::open_with_progress(&fresh_path, |event| {
+            if event.elapsed_ms.is_none() && event.items_done.is_none() {
+                fresh_starts += 1;
+                fresh_totals.insert(event.step_total);
+            }
+        })
+        .unwrap();
+        assert_eq!(fresh_starts, migration_step_count(0));
+        assert_eq!(fresh_totals.into_iter().collect::<Vec<_>>(), vec![1]);
+
+        for target_version in 1..SCHEMA_VERSION {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("history.sqlite3");
+            {
+                let _ = HistoryStore::open(&path).unwrap();
+            }
+            rewind_database_to_version(&path, target_version);
+
+            let mut started_steps = 0u32;
+            let mut reported_totals = HashSet::new();
+            let _ = HistoryStore::open_with_progress(&path, |event| {
+                if event.elapsed_ms.is_none() && event.items_done.is_none() {
+                    started_steps += 1;
+                    reported_totals.insert(event.step_total);
+                }
+            })
+            .unwrap();
+
+            assert_eq!(
+                started_steps,
+                migration_step_count(target_version),
+                "migrating from v{target_version}"
+            );
+            assert_eq!(
+                reported_totals.into_iter().collect::<Vec<_>>(),
+                vec![migration_step_count(target_version)],
+                "step_total must be reported consistently for v{target_version}"
+            );
+        }
+    }
+
+    #[test]
+    fn interrupting_migration_between_steps_resumes_cleanly_at_the_right_version() {
+        // Each migration step commits its own transaction before the next
+        // one starts (AGENTS.md), so a process kill between steps must never
+        // re-run a completed step or leave `PRAGMA user_version` disagreeing
+        // with `history_meta`. This proves it without an actual process
+        // kill: rewind a fully-migrated database to v3, then unwind out of
+        // `open_with_progress` immediately after its first step's
+        // transaction has committed (simulating the app dying at that exact
+        // instant — nothing about SQLite's durability depends on the Rust
+        // call stack unwinding cleanly afterward), and confirm a fresh open
+        // (as a relaunched app would perform) resumes at v4 and reaches
+        // `SCHEMA_VERSION` with the same data an uninterrupted migration
+        // would have produced.
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        const SESSIONS: usize = 5;
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            for index in 0..SESSIONS {
+                let fixture = session(&format!("interrupt-{index}"), 100 + index as u64);
+                store
+                    .observe(
+                        Path::new(&format!("interrupt-{index}.jsonl")),
+                        &fixture,
+                        generation,
+                    )
+                    .unwrap();
+            }
+        }
+        rewind_database_to_version(&path, 3);
+
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            HistoryStore::open_with_progress(&path, |event| {
+                if event.step == "v3_to_v4_rollup_backfill" && event.elapsed_ms.is_some() {
+                    panic!("simulated interruption immediately after v3->v4 commits");
+                }
+            })
+        }));
+        assert!(
+            interrupted.is_err(),
+            "expected the simulated interruption to unwind"
+        );
+
+        // The committed v3->v4 step must have survived the interruption on
+        // its own — nothing runs after the panic to persist it.
+        {
+            let connection = Connection::open(&path).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                version, 4,
+                "the committed v3->v4 step should have persisted despite the interruption"
+            );
+        }
+
+        let mut resumed_steps = Vec::new();
+        let store = HistoryStore::open_with_progress(&path, |event| {
+            if event.elapsed_ms.is_some() {
+                resumed_steps.push(event.step);
+            }
+        })
+        .unwrap();
+        assert_eq!(
+            resumed_steps,
+            vec![
+                "v4_to_v5_cache_creation_backfill",
+                "v5_to_v6_project_identity_backfill",
+            ],
+            "resuming must run exactly the remaining steps, never re-running v3->v4"
+        );
+
+        let connection = store.connection().unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let schema_version_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM history_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            schema_version_rows, 1,
+            "resuming must not duplicate the schema_version row"
+        );
+        // A re-run of the v3->v4 backfill would violate
+        // rollup_token_totals_key_idx on its second INSERT (no ON CONFLICT
+        // clause) and this open would already have failed above; this
+        // additionally proves the row counts are exactly what one pass over
+        // the fixture data produces, not silently doubled some other way.
+        let token_event_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM durable_token_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(token_event_rows, SESSIONS as i64);
+        let rollup_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM rollup_token_totals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rollup_rows, SESSIONS as i64);
+        drop(connection);
+
+        let loaded = store.load_sessions().unwrap();
+        assert_eq!(loaded.len(), SESSIONS);
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn performance_v3_to_v6_chained_migration_large_ledger() {
+        // Issue #116: the chained v3->v6 migration runs as one blocking pass
+        // before any window exists, and its ~10-20s estimate was inferred
+        // from #107's isolated per-step benchmarks, never measured end to
+        // end on one corpus. This builds one large enough for the chain's
+        // real, combined cost to show up: a handful of "hot" sessions
+        // carrying a million-plus token/tool events each (driving the
+        // v3->v4 rollup GROUP BY and the v4->v5 cache-creation
+        // UPDATE...FROM, both full-table aggregate passes) plus thousands of
+        // "cold" sessions across many distinct, deliberately non-existent
+        // working directories (driving the v5->v6 project-identity
+        // backfill, isolated from real Git-discovery cost exactly like the
+        // #41 precedent probe above it in this file).
+        const HOT_SESSIONS: usize = 20;
+        const TOKEN_EVENTS: usize = 1_000_000;
+        const TOOL_EVENTS: usize = 100_000;
+        const COLD_SESSIONS: usize = 4_000;
+        const DIRECTORIES: usize = 120;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let hot_keys: Vec<String> = {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            let mut keys = Vec::with_capacity(HOT_SESSIONS);
+            for index in 0..HOT_SESSIONS {
+                let fixture = session(&format!("hot-{index}"), 100);
+                let stored = store
+                    .observe(
+                        Path::new(&format!("hot-{index}.jsonl")),
+                        &fixture,
+                        generation,
+                    )
+                    .unwrap();
+                keys.push(stored.key);
+            }
+            for index in 0..COLD_SESSIONS {
+                let mut fixture = session(&format!("cold-{index}"), 10);
+                fixture.working_directory = Some(format!(
+                    "/synthetic/does-not-exist/project-{}",
+                    index % DIRECTORIES
+                ));
+                store
+                    .observe(
+                        Path::new(&format!("cold-{index}.jsonl")),
+                        &fixture,
+                        generation,
+                    )
+                    .unwrap();
+            }
+            keys
+        };
+        {
+            // Bulk fixture setup, not the migration itself: a plain
+            // prepared-statement loop (rather than SQL-side generation) is
+            // fine here even at this row count, unlike inside the real
+            // backfill, which AGENTS.md requires to stay SQL-side.
+            let mut connection = Connection::open(&path).unwrap();
+            let transaction = connection.transaction().unwrap();
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO durable_token_events(
+                           session_key, event_key, event_index, timestamp_ms, model, service_tier,
+                           request_input_tokens, cumulative_total_tokens, input_tokens,
+                           cached_input_tokens, output_tokens, reasoning_output_tokens,
+                           total_tokens, cache_creation_input_tokens)
+                         VALUES (?1, ?2, ?3, ?4, 'gpt-test', NULL, 100, 1000, 100, 10, 50, 5, 150, 2)",
+                    )
+                    .unwrap();
+                for n in 0..TOKEN_EVENTS {
+                    insert
+                        .execute(params![
+                            hot_keys[n % HOT_SESSIONS],
+                            format!("bulk-{n}"),
+                            n as i64,
+                            1_735_689_600_000i64 + n as i64 * 60_000,
+                        ])
+                        .unwrap();
+                }
+            }
+            {
+                let mut insert = transaction
+                    .prepare(
+                        "INSERT INTO durable_tool_events(
+                           session_key, timestamp_ms, model, kind, outcome, turn_id, target,
+                           duration_ms, output_bytes)
+                         VALUES (?1, ?2, 'gpt-test', ?3, ?4, ?5, ?6, 120, 256)",
+                    )
+                    .unwrap();
+                const KINDS: [&str; 4] = ["read", "search", "mutation", "command"];
+                const OUTCOMES: [&str; 3] = ["success", "failure", "unknown"];
+                for n in 0..TOOL_EVENTS {
+                    insert
+                        .execute(params![
+                            hot_keys[n % HOT_SESSIONS],
+                            1_735_689_600_000i64 + n as i64 * 60_000,
+                            KINDS[n % KINDS.len()],
+                            OUTCOMES[n % OUTCOMES.len()],
+                            format!("turn-{}", n % 500),
+                            format!("target-{}", n % 50),
+                        ])
+                        .unwrap();
+                }
+            }
+            transaction.commit().unwrap();
+        }
+        rewind_database_to_version(&path, 3);
+
+        let mut step_timings: Vec<(String, u64)> = Vec::new();
+        let started = Instant::now();
+        let store = HistoryStore::open_with_progress(&path, |event| {
+            if let Some(elapsed_ms) = event.elapsed_ms {
+                step_timings.push((event.step.to_string(), elapsed_ms));
+            }
+        })
+        .unwrap();
+        let total = started.elapsed();
+
+        eprintln!(
+            "v3->v6 chained migration over {TOKEN_EVENTS} token events / {TOOL_EVENTS} tool \
+             events across {HOT_SESSIONS} sessions, plus {COLD_SESSIONS} sessions across \
+             {DIRECTORIES} distinct (non-existent, no Git discovery) directories: {total:?} total"
+        );
+        for (step, elapsed_ms) in &step_timings {
+            eprintln!("  {step}: {elapsed_ms}ms");
+        }
+
+        let connection = store.connection().unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let rollup_rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM rollup_token_totals", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            rollup_rows > 0,
+            "v3->v4 backfill should have populated rollups"
+        );
+        let projects: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM durable_sessions WHERE project_key IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projects, COLD_SESSIONS as i64);
     }
 
     /// Builds a `Session` whose every `TokenTotals` field and every

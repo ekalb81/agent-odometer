@@ -617,7 +617,7 @@ pub fn generate_report(state: &AppState, config: &Config, rates: &RateCard) -> D
             .cloned()
             .unwrap_or_default();
         let ledger = LedgerHealth {
-            history_store_available: state.history.is_some(),
+            history_store_available: state.history_ready().is_some(),
             durable_sessions: stats.durable_sessions,
             available_sessions: stats.available_sessions,
             collision_sessions: stats.collision_sessions,
@@ -658,7 +658,7 @@ pub fn generate_report(state: &AppState, config: &Config, rates: &RateCard) -> D
             roots,
             discovery: DiscoveryHealth::default(),
             ledger: LedgerHealth {
-                history_store_available: state.history.is_some(),
+                history_store_available: state.history_ready().is_some(),
                 ..LedgerHealth::default()
             },
             pricing: pricing_health(&HashSet::new(), rates),

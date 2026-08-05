@@ -6,9 +6,10 @@
   import Filters from './components/Filters.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, getHistoryStatus, onHistoryProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
+  import { historyStore } from './lib/stores/history.svelte';
   import { instructionScanStore } from './lib/stores/instructionScan.svelte';
   import { updaterStore } from './lib/stores/updater.svelte';
   import './lib/stores/theme.svelte'; // applies data-theme on import
@@ -269,6 +270,17 @@
       : 'Scanning sessions',
   );
 
+  // Shown instead of the scan indicator while the durable-history archive is
+  // still opening/migrating (#116): the bulk scan itself waits on that same
+  // readiness signal before it starts, so without this the status bar would
+  // otherwise sit at "Scanning sessions… 0/0" with no explanation for a
+  // possibly multi-second wait on the first launch after an update.
+  const historyLabel = $derived(
+    historyStore.status.step_total
+      ? `Preparing history… step ${historyStore.status.step_index}/${historyStore.status.step_total}`
+      : 'Preparing history',
+  );
+
   const instructionScanStatus = $derived(instructionScanStore.status);
   const instructionScanActive = $derived(
     instructionScanStatus !== null &&
@@ -326,6 +338,7 @@
     let reloadGeneration = 0;
     let configEventRevision = 0;
     let scanEventRevision = 0;
+    let historyEventRevision = 0;
     let ratesEventRevision = 0;
     const unlisteners: UnlistenFn[] = [];
     sessionsReady = false;
@@ -380,6 +393,11 @@
           scanEventRevision += 1;
           scanStore.set(status);
         })),
+        attach('history-progress', onHistoryProgress((status) => {
+          if (disposed) return;
+          historyEventRevision += 1;
+          historyStore.set(status);
+        })),
         attach('instruction-scan-progress', onInstructionScanProgress((status) => {
           if (!disposed) instructionScanStore.set(status);
         })),
@@ -430,6 +448,7 @@
       if (disposed) return;
 
       const scanRevision = scanEventRevision;
+      const historyRevision = historyEventRevision;
       const rateRevision = ratesEventRevision;
       await Promise.allSettled([
         reloadSessions('frontend.initial_list_sessions'),
@@ -437,6 +456,9 @@
         measureAsync('frontend.initial_scan_status', getScanStatus).then((status) => {
           if (!disposed && scanRevision === scanEventRevision) scanStore.set(status);
         }).catch((error) => console.error('getScanStatus failed:', error)),
+        measureAsync('frontend.initial_history_status', getHistoryStatus).then((status) => {
+          if (!disposed && historyRevision === historyEventRevision) historyStore.set(status);
+        }).catch((error) => console.error('getHistoryStatus failed:', error)),
         measureAsync('frontend.initial_rates', getRates).then((card) => {
           if (!disposed && rateRevision === ratesEventRevision) rates.set(card);
         }).catch((error) => console.error('getRates failed:', error)),
@@ -600,7 +622,15 @@
 
   <!-- Status bar -->
   <footer class="flex items-center gap-4 px-4 h-7 bg-chrome border-t border-edge text-[11px] text-ink-faint shrink-0">
-    {#if !scanStore.status.complete}
+    {#if historyStore.status.status === 'pending'}
+      <span class="flex items-center gap-1.5" role="status">
+        <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />
+          <path d="M22 12a10 10 0 0 0-10-10" stroke="currentColor" stroke-width="4" stroke-linecap="round" />
+        </svg>
+        {historyLabel}
+      </span>
+    {:else if !scanStore.status.complete}
       <span class="flex items-center gap-1.5" role="status">
         <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />

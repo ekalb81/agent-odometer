@@ -7,6 +7,7 @@ import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } fr
 import type {
   DiagnosticsReport,
   Harness,
+  HistoryStatus,
   ProviderDiagnostic,
   QuotaAlert,
   QuotaConfigWire,
@@ -462,6 +463,23 @@ function scanStatus() {
   return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240, cold_reason: null };
 }
 
+function historyStatus(): HistoryStatus {
+  // No visual scenario models a still-migrating archive: every fixture
+  // scenario represents an already-warm install, and browser dev mode has
+  // no Rust backend to actually migrate. `get_history_status` always
+  // resolves 'ready' here so the mount sequence proceeds exactly like a
+  // normal warm start.
+  return {
+    status: 'ready',
+    step: null,
+    step_index: null,
+    step_total: null,
+    items_done: null,
+    items_total: null,
+    elapsed_ms: 42,
+  };
+}
+
 function turnReceiptStatus(): TurnReceiptIntegrationStatus {
   return {
     enabled: false,
@@ -697,6 +715,8 @@ mockIPC((cmd, payload) => {
     }
     case 'get_scan_status':
       return scanStatus();
+    case 'get_history_status':
+      return historyStatus();
     case 'get_performance_status':
       return { enabled: false, max_log_mb: 64, stored_bytes: 0, recorded_this_run: 0, dropped_this_run: 0 };
     case 'get_turn_receipt_status':
