@@ -19,3 +19,7 @@ src-tauri/target/
 # Env
 .env
 .env.local
+
+# Agent worktrees created by Claude Code (isolation: worktree).
+# Each is a full checkout; committing one would add the repository to itself.
+.claude/worktrees/
