@@ -73,17 +73,7 @@ jobs:
           key: ci-linux
 
       - name: Install Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            libgtk-3-dev \
-            libssl-dev \
-            build-essential \
-            pkg-config
+        uses: ./.github/actions/linux-deps
 
       - name: Install frontend deps
         run: npm ci
@@ -236,17 +226,7 @@ jobs:
           key: msrv-linux-${{ steps.msrv.outputs.version }}
 
       - name: Install Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            libgtk-3-dev \
-            libssl-dev \
-            build-essential \
-            pkg-config
+        uses: ./.github/actions/linux-deps
 
       - name: Check declared MSRV
         working-directory: ./src-tauri
@@ -282,17 +262,7 @@ jobs:
           key: coverage-linux
 
       - name: Install Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            libgtk-3-dev \
-            libssl-dev \
-            build-essential \
-            pkg-config
+        uses: ./.github/actions/linux-deps
 
       - name: Coverage
         working-directory: ./src-tauri
@@ -342,17 +312,7 @@ jobs:
           cache-targets: ${{ matrix.cache_targets }}
 
       - name: Install Linux system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libsoup-3.0-dev \
-            librsvg2-dev \
-            libayatana-appindicator3-dev \
-            libgtk-3-dev \
-            libssl-dev \
-            build-essential \
-            pkg-config
+        uses: ./.github/actions/linux-deps
 
       - name: Measure Cargo tests
         working-directory: ./src-tauri
