@@ -3,14 +3,20 @@ pub mod commands;
 pub mod config;
 pub mod config_events;
 pub mod correlation;
+pub mod diagnostics;
+pub mod gemini_parser;
 pub mod git_outcomes;
 pub mod harness_integration;
 pub mod history_store;
 pub mod instructions;
 pub mod model;
 pub mod parser;
+pub mod paths;
 pub mod performance;
+pub mod project_identity;
 pub mod provider;
+pub mod quota;
+pub mod quota_store;
 pub mod rates;
 pub mod scan_cache;
 pub mod scanner;
@@ -23,13 +29,17 @@ pub mod turn_receipts;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, cancel_instruction_scan, compare_tool_impact, correlate_events,
-    export_performance_data, get_bundled_rates, get_config, get_performance_status, get_rates,
-    get_scan_status, get_session_details, get_turn_receipt_status, list_external_events,
-    list_instruction_files, list_sessions, list_tool_impact_targets, open_instruction_file,
-    open_task_in_chatgpt, read_instruction_file, record_frontend_performance,
-    repair_turn_receipt_integrations, reveal_in_file_manager, scan_git_outcomes,
-    sessions_in_ranges, set_config, set_rates, set_tray_totals, write_export,
+    add_defender_exclusions, cancel_instruction_scan, check_quota_alerts,
+    clear_session_project_override, compare_tool_impact, correlate_events, export_performance_data,
+    get_bundled_rates, get_config, get_history_status, get_performance_status,
+    get_provider_diagnostics, get_quota_config, get_quota_snapshots, get_rates, get_scan_status,
+    get_session_details, get_subscription_usage, get_turn_receipt_status, list_external_events,
+    list_instruction_files, list_providers, list_sessions, list_tool_impact_targets,
+    merge_projects, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
+    reassign_session_project, record_frontend_performance, repair_turn_receipt_integrations,
+    resolve_projects, resolve_working_directories, reveal_in_file_manager, scan_git_outcomes,
+    sessions_in_ranges, set_config, set_project_alias, set_quota_config, set_rates,
+    set_tray_totals, unmerge_project, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -56,11 +66,20 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             get_session_details,
+            get_subscription_usage,
             sessions_in_ranges,
             list_tool_impact_targets,
             compare_tool_impact,
             get_scan_status,
             get_config,
+            list_providers,
+            resolve_working_directories,
+            resolve_projects,
+            set_project_alias,
+            merge_projects,
+            unmerge_project,
+            reassign_session_project,
+            clear_session_project_override,
             set_config,
             get_turn_receipt_status,
             repair_turn_receipt_integrations,
@@ -82,6 +101,12 @@ pub fn run() {
             get_performance_status,
             record_frontend_performance,
             export_performance_data,
+            get_provider_diagnostics,
+            get_quota_snapshots,
+            get_quota_config,
+            set_quota_config,
+            check_quota_alerts,
+            get_history_status,
         ])
         .setup(move |app| {
             let setup_started = Instant::now();
@@ -102,6 +127,17 @@ pub fn run() {
                 config_loaded,
                 Default::default(),
             );
+
+            // Opens (and migrates, if needed) the durable history archive on
+            // a background thread (#116). AppState starts `Pending`, so a
+            // window can appear before a chained schema migration on an
+            // existing install completes; `spawn_scan` and the ledger-backed
+            // IPC commands wait on or check that readiness instead of
+            // treating `Pending` like a permanently unavailable archive.
+            // Dispatched after `performance.configure` above so every step's
+            // instrumentation is captured even on a very fast (near-instant)
+            // open.
+            commands::spawn_history_open(app.handle().clone(), state_for_setup.clone());
 
             // Start the live watcher first so changes made during the initial
             // scan are not missed; store the handle so set_config can restart it.

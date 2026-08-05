@@ -8,6 +8,7 @@ export const VISUAL_SCENARIOS = [
   'sessions-empty',
   'sessions-scanning',
   'sessions-availability-fallback',
+  'tool-dimensions',
   'instructions-empty',
   'instructions-loading',
   'instructions-error',
@@ -41,10 +42,6 @@ export function selectVisualScenario(search: string): VisualScenarioSelection {
     scenario: 'default',
     warning: `[dev-mock] unknown visualScenario=${JSON.stringify(requested)}; using default`,
   };
-}
-
-export function isDefenderVisualScenario(scenario: VisualScenario | undefined): boolean {
-  return scenario === 'defender-slow' || scenario === 'defender-error';
 }
 
 export function isUpdaterVisualScenario(scenario: VisualScenario): boolean {

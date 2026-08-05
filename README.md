@@ -64,12 +64,32 @@ Turn receipts are disabled by default. To enable them, open **Settings → Turn 
 Codex and/or Claude Code, and choose **Save setup**. Odometer adds one identifiable `Stop` hook to
 the selected user-level harness configuration while preserving unrelated settings and hooks.
 
+- For Codex, Odometer keeps an existing Odometer hook in its current source. For a new setup it
+  uses the `[[hooks.Stop]]` representation in `config.toml` when those inline hooks already exist;
+  otherwise it uses `hooks.json`. Repair removes duplicate Odometer-owned handlers instead of
+  leaving both representations active. Symlinked configs and other valid inline-array TOML shapes
+  fail closed with manual setup guidance rather than being replaced or creating a second source.
 - In Codex, open `/hooks` once after setup to inspect and trust the command. New or changed
   non-managed hooks do not run until Codex records that trust.
-- In Claude Code, use `/hooks` to inspect the installed command.
-- Start a new harness task if an existing session does not reload configuration automatically.
-- **Refresh status** shows the exact configuration file, whether the hook is present, its last run,
-  and the last receipt. **Repair setup** reconciles missing or stale Odometer-owned entries.
+- Claude Code user settings cover the CLI and local Desktop Code sessions. Use `/hooks` to inspect
+  the command. Odometer uses Claude's direct executable plus `args` form so paths with spaces do not
+  depend on shell quoting; this requires Claude Code 2.1.139 or later. Remote and SSH sessions use
+  the settings on their host and must be configured there.
+- A running AppImage records its absolute AppImage launcher only when the process is actually inside
+  the matching mounted `APPDIR`; other launches use the current executable path.
+- Start a fresh harness task when status recommends it; an existing session may not reload changed
+  configuration automatically.
+- **Refresh status** distinguishes a configured hook from a receipt observed after that user-level
+  configuration was written, and shows its source, last run, and last receipt. Managed or
+  project-level policy can subsequently block a user hook without changing that historical
+  observation. **Repair setup** reconciles missing, stale, or duplicate Odometer-owned entries.
+
+Setup rechecks each source immediately before a platform-atomic replacement. An edit visible at the
+configured path before replacement aborts setup. The prior file stays in a random recovery path
+until the settings transaction commits. Commit atomically detaches that recovery name before its
+final check; an already-open-handle edit visible in that check is preserved and reported. Writes
+racing the final verification or arriving afterward follow normal operating-system open-handle
+semantics.
 
 The helper receives the harness-provided transcript path, verifies that it is a JSONL file inside
 Odometer's configured roots, and parses that exact file. It exits successfully on every error and

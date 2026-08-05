@@ -1,7 +1,7 @@
 use crate::config::{Config, InstructionRoot};
 use crate::correlation::project_scope_identity;
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, Instant};
@@ -39,7 +39,7 @@ const DEFINITIONS: &[InstructionDefinition] = &[
     },
 ];
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstructionWarning {
     pub kind: String,
     pub severity: String,
@@ -47,7 +47,7 @@ pub struct InstructionWarning {
     pub related_paths: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstructionFile {
     pub id: String,
     pub path_id: String,
@@ -71,7 +71,7 @@ pub struct InstructionFile {
     pub warnings: Vec<InstructionWarning>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstructionRootSummary {
     pub path: String,
     pub source: String,
@@ -79,7 +79,7 @@ pub struct InstructionRootSummary {
     pub exists: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InstructionInventory {
     pub files: Vec<InstructionFile>,
     pub roots: Vec<InstructionRootSummary>,
@@ -88,6 +88,10 @@ pub struct InstructionInventory {
     pub entries_visited: usize,
     pub elapsed_ms: u64,
     pub scanned_at: DateTime<Utc>,
+    /// True when this inventory was served from the persisted copy while a
+    /// background rescan runs (never true on freshly scanned inventories).
+    #[serde(default)]
+    pub stale: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -179,6 +183,7 @@ where
             entries_visited: 0,
             elapsed_ms: 0,
             scanned_at: Utc::now(),
+            stale: false,
         });
     }
     on_progress(scan_progress(
@@ -200,6 +205,56 @@ where
         &mut on_progress,
         &is_cancelled,
     )
+}
+
+const INVENTORY_FILE: &str = "instruction-inventory-v1.json";
+
+fn inventory_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|path| path.join("agent-odometer").join(INVENTORY_FILE))
+}
+
+/// Persist the freshly scanned inventory so the next launch can serve it
+/// stale-while-revalidating instead of blocking on a cold filesystem walk.
+pub fn persist_inventory(inventory: &InstructionInventory) -> anyhow::Result<()> {
+    let path = inventory_path()
+        .ok_or_else(|| anyhow::anyhow!("could not determine local data directory"))?;
+    persist_inventory_at(&path, inventory)
+}
+
+fn persist_inventory_at(path: &Path, inventory: &InstructionInventory) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write-then-rename so a crash mid-write cannot leave a torn inventory.
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec(inventory)?)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+pub fn load_persisted_inventory() -> Option<InstructionInventory> {
+    load_persisted_inventory_at(&inventory_path()?)
+}
+
+fn load_persisted_inventory_at(path: &Path) -> Option<InstructionInventory> {
+    let raw = std::fs::read(path).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+/// Remove the persisted inventory. Used when the feature is disabled so a
+/// stale cache cannot outlive the user's decision to turn discovery off.
+pub fn remove_persisted_inventory() {
+    let Some(path) = inventory_path() else {
+        return;
+    };
+    if let Err(error) = std::fs::remove_file(&path) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                "could not remove persisted instruction inventory: {}",
+                error
+            );
+        }
+    }
 }
 
 pub fn read_content(path: &Path) -> anyhow::Result<InstructionContent> {
@@ -231,14 +286,7 @@ pub fn validate_instruction_path(path: &Path) -> anyhow::Result<std::fs::Metadat
 }
 
 pub fn normalized_path_key(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    let value = value.strip_prefix(r"\\?\").unwrap_or(&value);
-    let normalized = value.replace('\\', "/").trim_end_matches('/').to_owned();
-    if cfg!(windows) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    }
+    crate::paths::normalized_path_key(path, true)
 }
 
 pub fn path_identity(path: &Path) -> String {
@@ -496,6 +544,7 @@ fn discover_from_roots(
         entries_visited: budget.entries_visited,
         elapsed_ms,
         scanned_at: Utc::now(),
+        stale: false,
     };
     on_progress(InstructionScanProgress {
         scan_id,
@@ -928,12 +977,7 @@ fn latest_project_activity(projects: &[ProjectContext]) -> HashMap<String, DateT
 }
 
 fn discover_project_root(path: &Path) -> Option<PathBuf> {
-    gix::discover(path).ok().map(|repository| {
-        repository
-            .workdir()
-            .unwrap_or_else(|| repository.git_dir())
-            .to_path_buf()
-    })
+    crate::git_outcomes::discover_repository_root(path)
 }
 
 fn project_root_or(path: &Path, fallback: &Path) -> PathBuf {
@@ -965,8 +1009,9 @@ fn path_depth(path: &Path) -> usize {
 }
 
 fn display_path(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    value.strip_prefix(r"\\?\").unwrap_or(&value).to_owned()
+    crate::paths::strip_verbatim_prefix(path)
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn stable_hash(bytes: &[u8]) -> String {
@@ -1066,6 +1111,37 @@ mod tests {
             &|| false,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn persisted_inventory_round_trips_and_overwrites() {
+        let workspace = tempdir().unwrap();
+        std::fs::write(workspace.path().join("AGENTS.md"), "# Root").unwrap();
+        let inventory = discover_roots(&[root(workspace.path(), false)]);
+        assert_eq!(inventory.files.len(), 1);
+        assert!(!inventory.stale);
+
+        let store = tempdir().unwrap();
+        let path = store.path().join("nested").join("inventory.json");
+        persist_inventory_at(&path, &inventory).unwrap();
+        let loaded = load_persisted_inventory_at(&path).unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.files[0].path, inventory.files[0].path);
+        assert_eq!(loaded.scanned_at, inventory.scanned_at);
+        assert!(!loaded.stale);
+
+        // Overwriting an existing inventory must succeed (Windows rename
+        // replaces the destination) and later loads must see the new copy.
+        let mut updated = inventory.clone();
+        updated.files.clear();
+        persist_inventory_at(&path, &updated).unwrap();
+        let reloaded = load_persisted_inventory_at(&path).unwrap();
+        assert!(reloaded.files.is_empty());
+
+        // A torn or unreadable file is treated as no cache.
+        std::fs::write(&path, b"{ not json").unwrap();
+        assert!(load_persisted_inventory_at(&path).is_none());
+        assert!(load_persisted_inventory_at(&store.path().join("missing.json")).is_none());
     }
 
     #[test]

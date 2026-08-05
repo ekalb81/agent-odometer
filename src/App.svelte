@@ -6,41 +6,52 @@
   import Filters from './components/Filters.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, onInstructionScanProgress, addDefenderExclusions, sessionsInRanges, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, getHistoryStatus, onHistoryProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
+  import { historyStore } from './lib/stores/history.svelte';
   import { instructionScanStore } from './lib/stores/instructionScan.svelte';
   import { updaterStore } from './lib/stores/updater.svelte';
   import './lib/stores/theme.svelte'; // applies data-theme on import
   import { rates } from './lib/stores/rates';
   import { config } from './lib/stores/config';
+  import { defenderActionStore } from './lib/stores/defender.svelte';
+  import { defenderReceiptStatus, isWindowsDefenderSurface } from './lib/defenderStatus';
   import { getVersion } from '@tauri-apps/api/app';
-  import type { InstructionScanProgress, SessionSummary } from './lib/types';
+  import type { InstructionScanProgress, RateCard, SessionSummary } from './lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
-  import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from './lib/credits';
+  import { computeTrayTotals } from './lib/trayTotals';
+  import { quotaTrayLabel } from './lib/subscriptionUsage';
+  import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
+  import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
-  import { APP_VIEWS, type AppView } from './lib/appViews';
+  import { appViews, providerIdForTab, type AppView } from './lib/appViews';
+  import { providersStore } from './lib/stores/providers.svelte';
+  import { providerAccent } from './lib/providerAccents';
 
   let activeView: AppView = $state('all');
   let appVersion = $state('');
   const appStarted = performance.now();
 
   // Filter state lives here per view scope so the toolbar can drive the
-  // active tab while every sessions view remains mounted.
-  let filtersByScope = $state<Record<ViewScope, FilterState>>({
+  // active tab while every sessions view remains mounted. 'all' is always
+  // present; a provider's entry is added the first time its descriptor is
+  // observed and then persists for the life of the app.
+  let filtersByScope = $state<Record<string, FilterState>>({
     all: defaultFilters(),
-    codex: defaultFilters(),
-    claude_code: defaultFilters(),
   });
 
+  $effect(() => {
+    for (const descriptor of providersStore.descriptors) {
+      if (!(descriptor.id in filtersByScope)) filtersByScope[descriptor.id] = defaultFilters();
+    }
+  });
+
+  // Tabs are generated from descriptors, so the active scope is just the
+  // active view's provider id (identity for every provider except the one
+  // legacy short tab id) — except for the two static, non-provider views.
   const activeScope = $derived<ViewScope | null>(
-    activeView === 'all'
-      ? 'all'
-      : activeView === 'codex'
-        ? 'codex'
-        : activeView === 'claude'
-          ? 'claude_code'
-          : null,
+    activeView === 'instructions' || activeView === 'settings' ? null : providerIdForTab(activeView),
   );
 
   const toolbarSessions = $derived(
@@ -67,45 +78,78 @@
 
   let trayRefreshGeneration = $state(0);
   let trayTimer: ReturnType<typeof setTimeout> | null = null;
+  let trayJobGeneration = 0;
+  let trayQueue: Promise<void> = Promise.resolve();
+  const trayCache = new RangeDataCache();
+  const trayMutations = new MutationAccumulator();
+
+  // The queue serializes refresh jobs so a drain/plan never runs against a
+  // cache that an in-flight fetch hasn't updated yet. A superseded job skips
+  // before draining, leaving its pending mutations to the newer job.
+  async function runTrayRefresh(generation: number, rateCard: RateCard): Promise<void> {
+    if (generation !== trayJobGeneration) return;
+    const start = new Date(); start.setHours(0, 0, 0, 0);
+    const end = new Date(start); end.setDate(end.getDate() + 1); end.setMilliseconds(-1);
+    const trayRange = [{ from: start.toISOString(), to: end.toISOString() }];
+    // The day is the only variable in the range, so rollover forces a full fetch.
+    const rangesKey = `tray:${trayRange[0].from}`;
+    const ids = [...sessionsStore.map.keys()];
+    const drained = trayMutations.drain();
+    const plan = trayCache.plan({
+      rangesKey,
+      ids,
+      changedIds: drained.changedIds,
+      removedIds: drained.removedIds,
+    });
+    try {
+      let results = trayCache.current();
+      if (plan.mode === 'full') {
+        const fetched = await measureAsync(
+          'frontend.tray_range_fetch',
+          () => sessionsInRanges(trayRange),
+          { sessions: ids.length, fetched: ids.length, mode: 'full' },
+        );
+        results = trayCache.applyFull(rangesKey, ids, fetched);
+      } else if (plan.mode === 'delta') {
+        const fetched = plan.fetchIds.length > 0
+          ? await measureAsync(
+              'frontend.tray_range_fetch',
+              () => sessionsInRanges(trayRange, plan.fetchIds),
+              { sessions: ids.length, fetched: plan.fetchIds.length, mode: 'delta' },
+            )
+          : null;
+        results = trayCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
+      }
+      if (!results) return;
+      // Best-effort: a quota-fetch failure must never block the existing
+      // token/credit tray update, so it's fetched and formatted (via the
+      // same helper the dashboard panel uses) outside the cache/plan path
+      // above and defaults to no label on failure.
+      let quotaLabel: string | null = null;
+      try {
+        quotaLabel = quotaTrayLabel(await getQuotaSnapshots());
+      } catch (error) {
+        console.error('quota tray label refresh failed:', error);
+      }
+      await setTrayTotals(computeTrayTotals(sessionsStore.map.values(), results[0], rateCard, quotaLabel));
+    } catch (error) {
+      trayCache.invalidate();
+      console.error('tray totals refresh failed:', error);
+    }
+  }
+
   $effect(() => {
-    void sessionsStore.map;
+    trayMutations.observe(sessionsStore.mutationLog);
     const rateCard = $rates;
     void trayRefreshGeneration;
     if (!rateCard) return;
     if (trayTimer !== null) clearTimeout(trayTimer);
-    trayTimer = setTimeout(async () => {
-      const start = new Date(); start.setHours(0, 0, 0, 0);
-      const end = new Date(start); end.setDate(end.getDate() + 1); end.setMilliseconds(-1);
-      try {
-        const [ranges] = await measureAsync(
-          'frontend.tray_range_fetch',
-          () => sessionsInRanges([{ from: start.toISOString(), to: end.toISOString() }]),
-          { sessions: sessionsStore.map.size },
-        );
-        let tokens = 0; let codexCredits = 0; let codexApi = 0; let claudeUsd = 0;
-        let unlimited = 0; let missingCredits = false; let missingApi = false; let missingClaude = false;
-        let unpricedCredits = false; let unpricedApi = false; let unpricedClaude = false;
-        for (const session of sessionsStore.map.values()) {
-          const range = ranges[session.storage_id]; if (!range) continue;
-          tokens += range.tokens.total_tokens;
-          const plan = creditsFromBuckets(range.buckets, rateCard, session.harness);
-          if (session.harness === 'codex') {
-            if (session.credits_unlimited) unlimited++; else codexCredits += plan.total;
-            missingCredits ||= plan.missingModels.length > 0;
-            unpricedCredits ||= plan.unpricedModels.length > 0;
-            const api = apiCostFromBuckets(range.buckets, rateCard, session.harness);
-            codexApi += api?.total ?? 0; missingApi ||= !api || api.missingModels.length > 0;
-            unpricedApi ||= (api?.unpricedModels.length ?? 0) > 0;
-          } else {
-            claudeUsd += plan.total; missingClaude ||= plan.missingModels.length > 0;
-            unpricedClaude ||= plan.unpricedModels.length > 0;
-          }
-        }
-        const creditText = unlimited > 0 && codexCredits === 0 ? `unlimited (${unlimited})` : `${codexCredits.toFixed(2)}${unlimited ? ` + ${unlimited} unlimited` : ''}${unpricedCredits ? ' · excludes unpriced' : missingCredits ? ' · fallback' : ''}`;
-        await setTrayTotals({ tokens: tokens.toLocaleString(), codex_credits: creditText,
-          codex_api_usd: missingApi ? 'unavailable · missing direct rate' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
-          claude_usd: `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}` });
-      } catch (error) { console.error('tray totals refresh failed:', error); }
+    trayTimer = setTimeout(() => {
+      trayTimer = null;
+      const generation = ++trayJobGeneration;
+      trayQueue = trayQueue
+        .then(() => runTrayRefresh(generation, rateCard))
+        .catch(() => {});
     }, 250);
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);
     const boundary = setTimeout(() => { trayRefreshGeneration += 1; }, next.getTime() - now.getTime());
@@ -132,36 +176,30 @@
   // ---------------------------------------------------------------------------
   const SLOW_SCAN_MS = 20_000;
   const DEFENDER_DISMISSED_KEY = 'defenderPromptDismissed';
-  // main.ts adds this marker only in the browser fixture branch. It lets the
-  // visual matrix exercise the Windows-specific banner without allowing a
-  // URL parameter to alter a real native launch.
   const visualScenario = document.documentElement.dataset.visualScenario ?? null;
-  const isWindows = navigator.userAgent.includes('Windows') ||
-    visualScenario === 'defender-slow' || visualScenario === 'defender-error';
+  const isWindows = isWindowsDefenderSurface(navigator.userAgent, visualScenario);
   let defenderDismissed = $state(localStorage.getItem(DEFENDER_DISMISSED_KEY) === '1');
-  let defenderRequested = $state(false);
-  let defenderError = $state<string | null>(null);
+  const defenderStatus = $derived(defenderReceiptStatus($config));
+  const showDefenderConfirmation = $derived(
+    defenderActionStore.phase === 'success' && defenderActionStore.origin === 'banner',
+  );
 
   const showDefenderBanner = $derived(
     isWindows &&
       !defenderDismissed &&
       scanStore.status.complete &&
-      (scanStore.status.elapsed_ms ?? 0) > SLOW_SCAN_MS,
+      (scanStore.status.elapsed_ms ?? 0) > SLOW_SCAN_MS &&
+      (defenderStatus !== 'current' || showDefenderConfirmation),
   );
 
-  async function requestDefenderExclusion() {
-    defenderError = null;
-    try {
-      await addDefenderExclusions();
-      defenderRequested = true;
-    } catch (e) {
-      defenderError = String(e);
-    }
+  function requestDefenderExclusion() {
+    void defenderActionStore.request('banner').catch(() => {});
   }
 
   function dismissDefenderBanner() {
     defenderDismissed = true;
     localStorage.setItem(DEFENDER_DISMISSED_KEY, '1');
+    defenderActionStore.clearFeedback();
   }
 
   // During the initial scan, session-updated events arrive by the hundred.
@@ -173,9 +211,11 @@
   let pendingMutations = new Map<string, PendingMutation>();
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   let sessionsReady = false;
+  const flushHistory: number[] = [];
 
   function flushMutations() {
     if (!sessionsReady || pendingMutations.size === 0) return;
+    recordFlush(flushHistory, Date.now());
     const batch = pendingMutations;
     pendingMutations = new Map();
     const upserts: SessionSummary[] = [];
@@ -195,10 +235,12 @@
 
   function scheduleMutationFlush() {
     if (!sessionsReady || flushTimer !== null || pendingMutations.size === 0) return;
+    // The window widens under sustained streaming so continuous agent output
+    // coalesces into ~1Hz-or-slower paints instead of one per parse.
     flushTimer = setTimeout(() => {
       flushTimer = null;
       flushMutations();
-    }, 150);
+    }, computeFlushDelay(flushHistory, Date.now()));
   }
 
   function queueUpsert(s: SessionSummary) {
@@ -218,6 +260,25 @@
     $config.session_roots.length +
       $config.archive_roots.length +
       ($config.claude_session_roots?.length ?? 0),
+  );
+
+  // A parser-version bump forces one cold rescan of every transcript; say so
+  // explicitly rather than leaving the user staring at an unexplained delay.
+  const scanningLabel = $derived(
+    scanStore.status.cold_reason === 'parse_version_changed'
+      ? 'Re-indexing after update'
+      : 'Scanning sessions',
+  );
+
+  // Shown instead of the scan indicator while the durable-history archive is
+  // still opening/migrating (#116): the bulk scan itself waits on that same
+  // readiness signal before it starts, so without this the status bar would
+  // otherwise sit at "Scanning sessions… 0/0" with no explanation for a
+  // possibly multi-second wait on the first launch after an update.
+  const historyLabel = $derived(
+    historyStore.status.step_total
+      ? `Preparing history… step ${historyStore.status.step_index}/${historyStore.status.step_total}`
+      : 'Preparing history',
   );
 
   const instructionScanStatus = $derived(instructionScanStore.status);
@@ -277,6 +338,7 @@
     let reloadGeneration = 0;
     let configEventRevision = 0;
     let scanEventRevision = 0;
+    let historyEventRevision = 0;
     let ratesEventRevision = 0;
     const unlisteners: UnlistenFn[] = [];
     sessionsReady = false;
@@ -331,6 +393,11 @@
           scanEventRevision += 1;
           scanStore.set(status);
         })),
+        attach('history-progress', onHistoryProgress((status) => {
+          if (disposed) return;
+          historyEventRevision += 1;
+          historyStore.set(status);
+        })),
         attach('instruction-scan-progress', onInstructionScanProgress((status) => {
           if (!disposed) instructionScanStore.set(status);
         })),
@@ -381,12 +448,17 @@
       if (disposed) return;
 
       const scanRevision = scanEventRevision;
+      const historyRevision = historyEventRevision;
       const rateRevision = ratesEventRevision;
       await Promise.allSettled([
         reloadSessions('frontend.initial_list_sessions'),
+        providersStore.init(),
         measureAsync('frontend.initial_scan_status', getScanStatus).then((status) => {
           if (!disposed && scanRevision === scanEventRevision) scanStore.set(status);
         }).catch((error) => console.error('getScanStatus failed:', error)),
+        measureAsync('frontend.initial_history_status', getHistoryStatus).then((status) => {
+          if (!disposed && historyRevision === historyEventRevision) historyStore.set(status);
+        }).catch((error) => console.error('getHistoryStatus failed:', error)),
         measureAsync('frontend.initial_rates', getRates).then((card) => {
           if (!disposed && rateRevision === ratesEventRevision) rates.set(card);
         }).catch((error) => console.error('getRates failed:', error)),
@@ -423,16 +495,10 @@
     `px-4 py-[5px] rounded-md text-xs transition-colors ${
       isActive ? `${fill} text-white font-semibold` : 'text-ink-muted hover:text-ink font-normal'
     }`;
-
-  function tabFill(view: AppView): string {
-    if (view === 'codex') return 'bg-[#2b58c9]';
-    if (view === 'claude') return 'bg-[#e8935a]';
-    return 'bg-ink text-app!';
-  }
 </script>
 
 <div
-  class="flex flex-col h-screen bg-app text-ink text-[13px] {activeView === 'claude' ? 'accent-claude' : 'accent-codex'}"
+  class="flex flex-col h-screen bg-app text-ink text-[13px] {activeScope === 'claude_code' ? 'accent-claude' : 'accent-codex'}"
   data-visual-scenario={visualScenario ?? undefined}
 >
   <!-- Update banner -->
@@ -463,8 +529,10 @@
   <!-- Defender-exclusion suggestion (Windows, slow scan only) -->
   {#if showDefenderBanner}
     <div class="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 px-4 py-1.5 bg-chrome border-b border-edge text-xs text-ink-2 shrink-0">
-      {#if defenderRequested}
-        <span>Approve the Windows security prompt to finish adding the exclusions. Takes effect next launch.</span>
+      {#if defenderActionStore.phase === 'pending'}
+        <span role="status" aria-live="polite">Waiting for approval and Windows Defender verification…</span>
+      {:else if showDefenderConfirmation}
+        <span role="status" aria-live="polite">Verified — the existing session folders are excluded. Future scans can use the change.</span>
         <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded-sm text-xs text-ink-muted hover:text-ink transition-colors">Done</button>
       {:else}
         <span>
@@ -479,8 +547,8 @@
           Add exclusions…
         </button>
         <button onclick={dismissDefenderBanner} class="px-2 py-0.5 rounded-sm text-xs text-ink-muted hover:text-ink transition-colors">No thanks</button>
-        {#if defenderError}
-          <span class="text-xs text-red-400">{defenderError}</span>
+        {#if defenderActionStore.phase === 'error' && defenderActionStore.origin === 'banner'}
+          <span class="text-xs text-red-400" role="alert">{defenderActionStore.error}</span>
         {/if}
       {/if}
     </div>
@@ -502,9 +570,9 @@
     </span>
 
     <nav class="flex bg-app rounded-lg p-[2px] gap-[2px] border border-edge" aria-label="Views">
-      {#each APP_VIEWS as view (view.id)}
+      {#each appViews(providersStore.descriptors) as view (view.id)}
         {#if view.id !== 'instructions' || ($config.instructions_enabled && $config.instructions_tab_visible)}
-          <button class={tabClass(activeView === view.id, tabFill(view.id))} onclick={() => (activeView = view.id)}>
+          <button class={tabClass(activeView === view.id, providerAccent(providerIdForTab(view.id)).tabFill)} onclick={() => (activeView = view.id)}>
             {view.label}
           </button>
         {/if}
@@ -515,7 +583,7 @@
       <div class="ml-auto">
         {#key activeScope}
           <Filters
-            filters={filtersByScope[activeScope]}
+            filters={filtersByScope[activeScope] ?? defaultFilters()}
             sessions={toolbarSessions}
             onchange={(f) => { if (activeScope) filtersByScope[activeScope] = f; }}
           />
@@ -534,22 +602,16 @@
         onfilterschange={(f) => (filtersByScope.all = f)}
       />
     </div>
-    <div class="h-full accent-codex {activeView === 'codex' ? '' : 'hidden'}">
-      <SessionsView
-        harness="codex"
-        active={activeView === 'codex'}
-        filters={filtersByScope.codex}
-        onfilterschange={(f) => (filtersByScope.codex = f)}
-      />
-    </div>
-    <div class="h-full accent-claude {activeView === 'claude' ? '' : 'hidden'}">
-      <SessionsView
-        harness="claude_code"
-        active={activeView === 'claude'}
-        filters={filtersByScope.claude_code}
-        onfilterschange={(f) => (filtersByScope.claude_code = f)}
-      />
-    </div>
+    {#each providersStore.descriptors as descriptor (descriptor.id)}
+      <div class="h-full {providerAccent(descriptor.id).accentClass ?? ''} {activeScope === descriptor.id ? '' : 'hidden'}">
+        <SessionsView
+          harness={descriptor.id}
+          active={activeScope === descriptor.id}
+          filters={filtersByScope[descriptor.id] ?? defaultFilters()}
+          onfilterschange={(f) => (filtersByScope[descriptor.id] = f)}
+        />
+      </div>
+    {/each}
     {#if activeView === 'instructions'}
       <InstructionsView onhide={hideInstructionsTab} />
     {/if}
@@ -560,16 +622,24 @@
 
   <!-- Status bar -->
   <footer class="flex items-center gap-4 px-4 h-7 bg-chrome border-t border-edge text-[11px] text-ink-faint shrink-0">
-    {#if !scanStore.status.complete}
+    {#if historyStore.status.status === 'pending'}
+      <span class="flex items-center gap-1.5" role="status">
+        <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />
+          <path d="M22 12a10 10 0 0 0-10-10" stroke="currentColor" stroke-width="4" stroke-linecap="round" />
+        </svg>
+        {historyLabel}
+      </span>
+    {:else if !scanStore.status.complete}
       <span class="flex items-center gap-1.5" role="status">
         <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />
           <path d="M22 12a10 10 0 0 0-10-10" stroke="currentColor" stroke-width="4" stroke-linecap="round" />
         </svg>
         {#if scanStore.status.total > 0}
-          Scanning sessions… {scanStore.status.done}/{scanStore.status.total} files
+          {scanningLabel}… {scanStore.status.done}/{scanStore.status.total} files
         {:else}
-          Scanning sessions…
+          {scanningLabel}…
         {/if}
       </span>
     {:else}

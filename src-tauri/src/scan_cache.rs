@@ -5,9 +5,14 @@
 //! This avoids deserializing, cloning, and rewriting the entire cached corpus
 //! whenever one rollout changes.
 //!
-//! The cache is versioned by the app version: any release may change parser
-//! semantics or the `Session` shape, and a stale cache must lose to a fresh
-//! parse, never win. Read, decode, or database errors degrade to a cache miss.
+//! The cache is versioned by `PARSE_VERSION`, not the app version: most
+//! releases touch UI, packaging, or backend code that has nothing to do with
+//! parsing, and must not force every transcript to be re-parsed. On a real
+//! mismatch, invalidation drops and recreates the entries table instead of
+//! deleting rows one at a time, so `cache_open_ms` stays cheap even for a
+//! large cache. Read, decode, or database errors degrade to a cache miss; an
+//! unreadable cache file is rebuilt from scratch once before caching is
+//! disabled for the run.
 
 use crate::model::Session;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -15,10 +20,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LEGACY_CACHE_NAME: &str = "scan-cache.json";
+
+/// Bump ONLY when parser output or the cached `Session` shape changes.
+/// An app release alone (packaging, UI, unrelated backend code) must not
+/// invalidate the cache — that was the old `APP_VERSION`-keyed behavior,
+/// and it turned every release into a full cold re-parse of every
+/// transcript.
+const PARSE_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
@@ -33,12 +45,31 @@ struct LegacyScanCache {
     entries: HashMap<String, CacheEntry>,
 }
 
+/// Why this scan could not treat the cache as fully warm. Absent (`None`)
+/// means the stored `parse_version` matched and entries were consulted
+/// normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ColdReason {
+    /// Stored `parse_version` did not match the current one, including a
+    /// legacy `app_version`-only cache being converted for the first time.
+    ParseVersionChanged,
+    /// No cache existed yet: first run, or the database file was just created.
+    CacheMissing,
+    /// The cache file was unreadable and had to be rebuilt from scratch.
+    CacheCorrupt,
+}
+
 /// A failed cache open becomes a disabled cache. Scanning and parsing remain
 /// fully functional because this layer is never a source of truth.
 #[derive(Default)]
 pub struct ScanCache {
     connection: Option<Mutex<Connection>>,
     generation: i64,
+    cold_reason: Option<ColdReason>,
+    /// Time spent dropping and recreating the entries table on a
+    /// parse-version mismatch; 0 when no invalidation happened.
+    invalidation_ms: f64,
 }
 
 /// (size, mtime in ms since epoch) for a file; None when it can't be stat'ed.
@@ -72,6 +103,29 @@ impl ScanCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        match Self::open_existing(path) {
+            Ok(cache) => Ok(cache),
+            Err(error) if is_corruption_error(&error) => {
+                // A garbage or partially-written file (e.g. a crash mid-write,
+                // or a foreign file at this path) must not permanently disable
+                // caching. Rebuild from scratch exactly once; a second failure
+                // is a real, unrecoverable error and disables the cache for
+                // this run same as before.
+                tracing::warn!("scan cache at {:?} is corrupt, rebuilding: {}", path, error);
+                remove_sqlite_files(path);
+                let mut cache = Self::open_existing(path)?;
+                cache.cold_reason = Some(ColdReason::CacheCorrupt);
+                Ok(cache)
+            }
+            // Everything else — a busy write lock held by another process,
+            // permissions, transient I/O — must never delete a valid
+            // database out from under its owner; degrade to a disabled
+            // cache for this run exactly as before.
+            Err(error) => Err(error),
+        }
+    }
+
+    fn open_existing(path: &Path) -> anyhow::Result<Self> {
         let mut connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
@@ -95,21 +149,64 @@ impl ScanCache {
         // processes/concurrent scans using SQLite's write lock. A read followed
         // by a later write can hand two scans the same generation.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let stored_version: Option<String> = transaction
+        let stored_parse_version: Option<String> = transaction
             .query_row(
-                "SELECT value FROM cache_meta WHERE key = 'app_version'",
+                "SELECT value FROM cache_meta WHERE key = 'parse_version'",
                 [],
                 |row| row.get(0),
             )
             .optional()?;
-        if stored_version.as_deref().is_some_and(|v| v != APP_VERSION) {
-            tracing::info!("scan cache version mismatch; invalidating entries");
-            transaction.execute("DELETE FROM sessions", [])?;
+        let cold_reason = match &stored_parse_version {
+            Some(value) if value.parse::<u32>().ok() == Some(PARSE_VERSION) => None,
+            Some(_) => Some(ColdReason::ParseVersionChanged),
+            None => {
+                // No `parse_version` yet. A cache written before parser
+                // versioning existed still has `app_version`: treat it as one
+                // final mismatch, after which it converts to parse_version
+                // keying below. No `app_version` either means this cache
+                // never held anything.
+                let had_legacy_app_version: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM cache_meta WHERE key = 'app_version')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if had_legacy_app_version {
+                    Some(ColdReason::ParseVersionChanged)
+                } else {
+                    Some(ColdReason::CacheMissing)
+                }
+            }
+        };
+
+        let mut invalidation_ms = 0.0;
+        if cold_reason == Some(ColdReason::ParseVersionChanged) {
+            tracing::info!("scan cache parse version mismatch; invalidating entries");
+            let invalidation_started = Instant::now();
+            // Drop and recreate rather than deleting rows one at a time: a
+            // row-wise DELETE over a large cache is what made every release
+            // cost tens of seconds of cache_open_ms even though nothing about
+            // the cached data actually needed to change.
+            transaction.execute_batch(
+                "DROP TABLE sessions;
+                 CREATE TABLE sessions (
+                     path TEXT PRIMARY KEY,
+                     size INTEGER NOT NULL,
+                     mtime_ms INTEGER NOT NULL,
+                     session_json BLOB NOT NULL,
+                     seen_generation INTEGER NOT NULL
+                 );",
+            )?;
+            invalidation_ms = invalidation_started.elapsed().as_secs_f64() * 1_000.0;
         }
         transaction.execute(
             "INSERT INTO cache_meta(key, value) VALUES('app_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [APP_VERSION],
+        )?;
+        transaction.execute(
+            "INSERT INTO cache_meta(key, value) VALUES('parse_version', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [PARSE_VERSION.to_string()],
         )?;
         let generation: i64 = transaction.query_row(
             "INSERT INTO cache_meta(key, value) VALUES('generation', '1')
@@ -126,7 +223,21 @@ impl ScanCache {
         Ok(Self {
             connection: Some(Mutex::new(connection)),
             generation,
+            cold_reason,
+            invalidation_ms,
         })
+    }
+
+    /// Why this scan's cache could not be treated as fully warm; `None` when
+    /// the stored parse version matched.
+    pub fn cold_reason(&self) -> Option<ColdReason> {
+        self.cold_reason
+    }
+
+    /// Milliseconds spent invalidating entries on a parse-version mismatch;
+    /// 0 when no invalidation was needed.
+    pub fn invalidation_ms(&self) -> f64 {
+        self.invalidation_ms
     }
 
     pub fn len(&self) -> usize {
@@ -313,17 +424,51 @@ fn remove_legacy_cache(legacy_path: &Path) {
     }
 }
 
+/// Removes the SQLite main file and its WAL/SHM/journal siblings so a
+/// corrupt or foreign file at this path can be rebuilt from scratch.
+/// True only for confirmed database corruption (`SQLITE_CORRUPT` /
+/// `SQLITE_NOTADB`). Lock contention from another process, permissions, and
+/// transient I/O must never be classified as corruption — the corruption
+/// path deletes the database file out from under its owner.
+fn is_corruption_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(inner, _))
+                if matches!(
+                    inner.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    })
+}
+
+fn remove_sqlite_files(path: &Path) {
+    let base = path.as_os_str().to_os_string();
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut candidate = base.clone();
+        candidate.push(suffix);
+        let candidate = PathBuf::from(candidate);
+        if let Err(error) = std::fs::remove_file(&candidate) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("could not remove {:?}: {}", candidate, error);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Harness, TokenTotals};
+    use crate::model::TokenTotals;
+    use crate::provider::codex_provider_id;
     use std::collections::HashMap as StdHashMap;
 
     fn session(id: &str) -> Session {
         Session {
             id: id.into(),
             storage_id: format!("codex:thread:{id}"),
-            harness: Harness::Codex,
+            harness: codex_provider_id(),
             thread_name: None,
             forked_from_id: None,
             parent_thread_id: None,
@@ -361,6 +506,9 @@ mod tests {
             tool_metrics_by_model: Default::default(),
             category_totals: Default::default(),
             optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
         }
     }
 
@@ -432,6 +580,134 @@ mod tests {
     }
 
     #[test]
+    fn matching_parse_version_across_opens_is_a_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        let cache = ScanCache::load(&path);
+        // First-ever open of a brand new file: cold, but not a mismatch.
+        assert_eq!(cache.cold_reason(), Some(ColdReason::CacheMissing));
+        cache.store("a.jsonl", 100, 5_000, &session("s1"));
+        cache.finish_scan();
+        drop(cache);
+
+        let cache = ScanCache::load(&path);
+        assert_eq!(cache.cold_reason(), None, "same parse version reopens warm");
+        assert_eq!(cache.lookup("a.jsonl", 100, 5_000).unwrap().id, "s1");
+    }
+
+    #[test]
+    fn parse_version_mismatch_invalidates_without_row_by_row_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        let cache = ScanCache::load(&path);
+        cache.store("a.jsonl", 100, 5_000, &session("s1"));
+        cache.finish_scan();
+        assert_eq!(cache.len(), 1);
+        drop(cache);
+
+        // Simulate a parser change: bump the stored parse_version behind the
+        // cache's back, as a future PARSE_VERSION bump would.
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute(
+                "UPDATE cache_meta SET value = '999' WHERE key = 'parse_version'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let cache = ScanCache::load(&path);
+        assert_eq!(cache.cold_reason(), Some(ColdReason::ParseVersionChanged));
+        assert_eq!(cache.len(), 0, "mismatch drops all entries");
+        assert!(cache.lookup("a.jsonl", 100, 5_000).is_none());
+        // The drop+recreate happens once, synchronously, inside open(); it
+        // does not scale with the number of invalidated rows the way a
+        // row-wise DELETE would.
+        assert!(
+            cache.invalidation_ms() < 2_000.0,
+            "invalidation should be O(1), not proportional to cache size: {}ms",
+            cache.invalidation_ms()
+        );
+
+        let raw = Connection::open(&path).unwrap();
+        let stored_parse_version: String = raw
+            .query_row(
+                "SELECT value FROM cache_meta WHERE key = 'parse_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_parse_version, PARSE_VERSION.to_string());
+    }
+
+    #[test]
+    fn legacy_app_version_cache_converts_after_one_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        {
+            // Hand-build a pre-parse-version cache: cache_meta has
+            // 'app_version' but no 'parse_version', with an existing entry.
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "CREATE TABLE cache_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE sessions (
+                     path TEXT PRIMARY KEY,
+                     size INTEGER NOT NULL,
+                     mtime_ms INTEGER NOT NULL,
+                     session_json BLOB NOT NULL,
+                     seen_generation INTEGER NOT NULL
+                 );
+                 INSERT INTO cache_meta(key, value) VALUES ('app_version', '0.1.0');
+                 INSERT INTO cache_meta(key, value) VALUES ('generation', '1');",
+            )
+            .unwrap();
+            raw.execute(
+                "INSERT INTO sessions(path, size, mtime_ms, session_json, seen_generation)
+                 VALUES ('a.jsonl', 100, 5000, ?1, 1)",
+                params![serde_json::to_vec(&session("s1")).unwrap()],
+            )
+            .unwrap();
+        }
+
+        let cache = ScanCache::load(&path);
+        assert_eq!(cache.cold_reason(), Some(ColdReason::ParseVersionChanged));
+        assert_eq!(
+            cache.len(),
+            0,
+            "legacy app_version-keyed cache is invalidated once"
+        );
+        drop(cache);
+
+        let cache = ScanCache::load(&path);
+        assert_eq!(
+            cache.cold_reason(),
+            None,
+            "second open is warm under parse_version keying"
+        );
+    }
+
+    #[test]
+    fn corrupt_cache_file_recovers_to_a_working_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite3");
+        std::fs::write(&path, b"not a sqlite database, just garbage bytes").unwrap();
+
+        let cache = ScanCache::load(&path);
+        assert!(
+            cache.is_enabled(),
+            "a corrupt file must be rebuilt, not just disable the cache"
+        );
+        assert_eq!(cache.cold_reason(), Some(ColdReason::CacheCorrupt));
+        cache.store("a.jsonl", 100, 5_000, &session("s1"));
+        cache.finish_scan();
+        assert_eq!(cache.len(), 1);
+        drop(cache);
+
+        let cache = ScanCache::load(&path);
+        assert_eq!(cache.lookup("a.jsonl", 100, 5_000).unwrap().id, "s1");
+    }
+
+    #[test]
     #[ignore = "performance probe; run with --release --ignored --nocapture"]
     fn performance_incremental_cache_1000_entries() {
         let dir = tempfile::tempdir().unwrap();
@@ -456,6 +732,397 @@ mod tests {
             "1000 incremental writes: {:?}; 1000 warm reads: {:?}",
             write_elapsed,
             started.elapsed()
+        );
+    }
+
+    const EXPECTED_SESSION_WIRE_SHAPE: &str = r#"agent_nickname
+agent_path
+archived
+category_totals.coding.buckets.[].model
+category_totals.coding.buckets.[].service_tier
+category_totals.coding.buckets.[].tokens.cache_creation_input_tokens
+category_totals.coding.buckets.[].tokens.cached_input_tokens
+category_totals.coding.buckets.[].tokens.input_tokens
+category_totals.coding.buckets.[].tokens.output_tokens
+category_totals.coding.buckets.[].tokens.reasoning_output_tokens
+category_totals.coding.buckets.[].tokens.total_tokens
+category_totals.coding.tokens.cache_creation_input_tokens
+category_totals.coding.tokens.cached_input_tokens
+category_totals.coding.tokens.input_tokens
+category_totals.coding.tokens.output_tokens
+category_totals.coding.tokens.reasoning_output_tokens
+category_totals.coding.tokens.total_tokens
+category_totals.coding.tool_calls
+category_totals.coding.turns
+cli_version
+context_window
+credits_balance
+credits_unlimited
+file_path
+first_user_message
+forked_from_id
+harness
+history_mode
+id
+last_event_at
+latest_context_tokens
+memory_mode
+model
+model_provider
+optimization_findings.[].avoidable_calls
+optimization_findings.[].confidence
+optimization_findings.[].evidence
+optimization_findings.[].model
+optimization_findings.[].occurrences
+optimization_findings.[].remediation
+optimization_findings.[].rule_id
+optimization_findings.[].severity
+optimization_findings.[].timestamp
+optimization_findings.[].turn_id
+optimization_findings.[].version
+originator
+parent_thread_id
+plan_type
+project_key
+project_label
+project_provenance
+rate_limits_history.[].limit_id
+rate_limits_history.[].primary.resets_at
+rate_limits_history.[].primary.used_percent
+rate_limits_history.[].primary.window_minutes
+rate_limits_history.[].secondary
+rate_limits_history.[].timestamp
+rate_limits_history.[].turn_id
+service_tier
+source
+source_availability
+started_at
+storage_id
+subagent_id_is_path_fallback
+thread_name
+tokens_by_model.m.cache_creation_input_tokens
+tokens_by_model.m.cached_input_tokens
+tokens_by_model.m.input_tokens
+tokens_by_model.m.output_tokens
+tokens_by_model.m.reasoning_output_tokens
+tokens_by_model.m.total_tokens
+tokens_history.[].delta.cache_creation_input_tokens
+tokens_history.[].delta.cached_input_tokens
+tokens_history.[].delta.input_tokens
+tokens_history.[].delta.output_tokens
+tokens_history.[].delta.reasoning_output_tokens
+tokens_history.[].delta.total_tokens
+tokens_history.[].model
+tokens_history.[].request_input_tokens
+tokens_history.[].service_tier
+tokens_history.[].timestamp
+tokens_history.[].total_tokens
+tokens_total.cache_creation_input_tokens
+tokens_total.cached_input_tokens
+tokens_total.input_tokens
+tokens_total.output_tokens
+tokens_total.reasoning_output_tokens
+tokens_total.total_tokens
+tool_metrics.calls
+tool_metrics.commands
+tool_metrics.core_origin_calls
+tool_metrics.duration_ms
+tool_metrics.failures
+tool_metrics.mcp_origin_calls
+tool_metrics.mutation_targets
+tool_metrics.mutations
+tool_metrics.one_shot_mutations
+tool_metrics.other
+tool_metrics.output_bytes
+tool_metrics.provider_origin_calls
+tool_metrics.reads
+tool_metrics.retry_count
+tool_metrics.searches
+tool_metrics.successes
+tool_metrics.unknown
+tool_metrics.unknown_origin_calls
+tool_metrics_by_model.m.calls
+tool_metrics_by_model.m.commands
+tool_metrics_by_model.m.core_origin_calls
+tool_metrics_by_model.m.duration_ms
+tool_metrics_by_model.m.failures
+tool_metrics_by_model.m.mcp_origin_calls
+tool_metrics_by_model.m.mutation_targets
+tool_metrics_by_model.m.mutations
+tool_metrics_by_model.m.one_shot_mutations
+tool_metrics_by_model.m.other
+tool_metrics_by_model.m.output_bytes
+tool_metrics_by_model.m.provider_origin_calls
+tool_metrics_by_model.m.reads
+tool_metrics_by_model.m.retry_count
+tool_metrics_by_model.m.searches
+tool_metrics_by_model.m.successes
+tool_metrics_by_model.m.unknown
+tool_metrics_by_model.m.unknown_origin_calls
+tool_observations.[].call_id
+tool_observations.[].duration_ms
+tool_observations.[].effective_tools.[]
+tool_observations.[].harness
+tool_observations.[].kind
+tool_observations.[].language
+tool_observations.[].model
+tool_observations.[].name
+tool_observations.[].origin
+tool_observations.[].outcome
+tool_observations.[].output_bytes
+tool_observations.[].providers.[]
+tool_observations.[].resource_id
+tool_observations.[].shell_family
+tool_observations.[].target
+tool_observations.[].timestamp
+tool_observations.[].turn_id
+total_turns
+turns.[].abort_reason
+turns.[].classification.category
+turns.[].classification.confidence
+turns.[].classification.signals.[]
+turns.[].classification.version
+turns.[].collaboration_mode
+turns.[].completed_at
+turns.[].duration_ms
+turns.[].index
+turns.[].last_agent_message
+turns.[].model
+turns.[].reasoning_effort
+turns.[].service_tier
+turns.[].started_at
+turns.[].status
+turns.[].time_to_first_token_ms
+turns.[].tokens.cache_creation_input_tokens
+turns.[].tokens.cached_input_tokens
+turns.[].tokens.input_tokens
+turns.[].tokens.output_tokens
+turns.[].tokens.reasoning_output_tokens
+turns.[].tokens.total_tokens
+turns.[].tool_metrics.calls
+turns.[].tool_metrics.commands
+turns.[].tool_metrics.core_origin_calls
+turns.[].tool_metrics.duration_ms
+turns.[].tool_metrics.failures
+turns.[].tool_metrics.mcp_origin_calls
+turns.[].tool_metrics.mutation_targets
+turns.[].tool_metrics.mutations
+turns.[].tool_metrics.one_shot_mutations
+turns.[].tool_metrics.other
+turns.[].tool_metrics.output_bytes
+turns.[].tool_metrics.provider_origin_calls
+turns.[].tool_metrics.reads
+turns.[].tool_metrics.retry_count
+turns.[].tool_metrics.searches
+turns.[].tool_metrics.successes
+turns.[].tool_metrics.unknown
+turns.[].tool_metrics.unknown_origin_calls
+turns.[].turn_id
+turns.[].user_message
+working_directory"#;
+
+    #[test]
+    fn only_confirmed_corruption_is_classified_for_rebuild() {
+        let corrupt = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_NOTADB),
+            None,
+        ));
+        assert!(is_corruption_error(&corrupt));
+        let really_corrupt = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        ));
+        assert!(is_corruption_error(&really_corrupt));
+        // A write lock held by another Odometer process is not corruption.
+        let busy = anyhow::Error::new(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        ));
+        assert!(!is_corruption_error(&busy));
+        let io = anyhow::Error::new(std::io::Error::other("disk unplugged"));
+        assert!(!is_corruption_error(&io));
+    }
+
+    /// Collects the JSON field paths of a value, descending into the first
+    /// element of arrays and using fixture map keys verbatim.
+    fn collect_paths(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, inner) in map {
+                    collect_paths(&format!("{prefix}{key}."), inner, out);
+                }
+            }
+            serde_json::Value::Array(items) => match items.first() {
+                Some(first) => collect_paths(&format!("{prefix}[]."), first, out),
+                None => out.push(format!("{prefix}[]")),
+            },
+            _ => out.push(prefix.trim_end_matches('.').to_string()),
+        }
+    }
+
+    /// Every field populated, one element per collection, so the serialized
+    /// shape covers each nested struct the cache persists.
+    fn fully_populated_session() -> Session {
+        use crate::model::{
+            CategoryMetric, OptimizationFinding, RateLimitSnapshotPoint, RateLimitWindow,
+            SourceAvailability, TaskCategory, TierBucket, TokenHistoryPoint, ToolKind,
+            ToolObservation, ToolOrigin, ToolOutcome, TurnClassification, TurnInfo, TurnStatus,
+        };
+        let now: chrono::DateTime<chrono::Utc> = "2026-08-03T00:00:00Z".parse().unwrap();
+        let totals = TokenTotals {
+            input_tokens: 1,
+            cached_input_tokens: 1,
+            cache_creation_input_tokens: 1,
+            output_tokens: 1,
+            reasoning_output_tokens: 1,
+            total_tokens: 2,
+        };
+        let bucket = TierBucket {
+            model: "m".into(),
+            service_tier: Some("fast".into()),
+            tokens: totals.clone(),
+        };
+        let tool_metrics = crate::model::ToolMetrics::default();
+        Session {
+            id: "s".into(),
+            storage_id: "codex:thread:s".into(),
+            harness: crate::provider::codex_provider_id(),
+            thread_name: Some("t".into()),
+            forked_from_id: Some("f".into()),
+            parent_thread_id: Some("p".into()),
+            agent_path: Some("a".into()),
+            agent_nickname: Some("n".into()),
+            file_path: "s.jsonl".into(),
+            source_availability: SourceAvailability::Present,
+            archived: false,
+            started_at: now,
+            last_event_at: now,
+            working_directory: Some("w".into()),
+            originator: Some("o".into()),
+            source: Some("cli".into()),
+            subagent_id_is_path_fallback: false,
+            history_mode: Some("h".into()),
+            memory_mode: Some("m".into()),
+            cli_version: Some("1".into()),
+            model_provider: Some("openai".into()),
+            model: Some("m".into()),
+            service_tier: Some("fast".into()),
+            plan_type: Some("pro".into()),
+            credits_unlimited: Some(false),
+            credits_balance: Some(1.0),
+            context_window: Some(1),
+            latest_context_tokens: Some(1),
+            total_turns: 1,
+            first_user_message: Some("hi".into()),
+            tokens_total: totals.clone(),
+            tokens_by_model: std::collections::HashMap::from([("m".to_string(), totals.clone())]),
+            tokens_history: vec![TokenHistoryPoint {
+                timestamp: now,
+                model: Some("m".into()),
+                service_tier: Some("fast".into()),
+                request_input_tokens: Some(1),
+                total_tokens: 2,
+                delta: totals.clone(),
+            }],
+            rate_limits_history: vec![RateLimitSnapshotPoint {
+                timestamp: now,
+                turn_id: Some("t1".into()),
+                limit_id: Some("l".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 1.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(now),
+                }),
+                secondary: None,
+            }],
+            turns: vec![TurnInfo {
+                turn_id: "t1".into(),
+                index: 1,
+                model: Some("m".into()),
+                reasoning_effort: Some("high".into()),
+                collaboration_mode: Some("c".into()),
+                service_tier: Some("fast".into()),
+                status: TurnStatus::Completed,
+                abort_reason: Some("r".into()),
+                started_at: Some(now),
+                completed_at: Some(now),
+                duration_ms: Some(1),
+                time_to_first_token_ms: Some(1),
+                user_message: Some("u".into()),
+                last_agent_message: Some("a".into()),
+                tokens: totals.clone(),
+                tool_metrics: tool_metrics.clone(),
+                classification: TurnClassification::default(),
+            }],
+            tool_observations: vec![ToolObservation {
+                call_id: "c".into(),
+                turn_id: Some("t1".into()),
+                harness: crate::provider::codex_provider_id(),
+                model: Some("m".into()),
+                timestamp: now,
+                kind: ToolKind::Read,
+                name: "read".into(),
+                providers: vec!["mcp".into()],
+                effective_tools: vec!["read".into()],
+                target: Some("h".into()),
+                resource_id: Some("r".into()),
+                origin: ToolOrigin::Mcp,
+                shell_family: None,
+                language: None,
+                outcome: ToolOutcome::Success,
+                duration_ms: Some(1),
+                output_bytes: 1,
+            }],
+            tool_metrics: tool_metrics.clone(),
+            tool_metrics_by_model: std::collections::BTreeMap::from([(
+                "m".to_string(),
+                tool_metrics,
+            )]),
+            category_totals: std::collections::BTreeMap::from([(
+                TaskCategory::Coding,
+                CategoryMetric {
+                    turns: 1,
+                    tokens: totals,
+                    tool_calls: 1,
+                    buckets: vec![bucket],
+                },
+            )]),
+            optimization_findings: vec![OptimizationFinding {
+                version: 1,
+                rule_id: "rule".into(),
+                severity: "warning".into(),
+                confidence: "high".into(),
+                turn_id: Some("t1".into()),
+                model: Some("m".into()),
+                timestamp: Some(now),
+                evidence: "e".into(),
+                remediation: "r".into(),
+                occurrences: 1,
+                avoidable_calls: 1,
+            }],
+            project_key: Some("repo:abc".into()),
+            project_label: Some("odometer".into()),
+            project_provenance: Some(crate::project_identity::ProjectProvenance::RepositoryRoot),
+        }
+    }
+
+    /// The guard the PARSE_VERSION policy relies on: cached rows are reused
+    /// across releases, so any change to the serialized `Session` shape MUST
+    /// bump `PARSE_VERSION`. This fails when the wire shape drifts without a
+    /// bump. (Value-level parser changes with an unchanged shape still need
+    /// a human bump — this guard covers the structural hazard.)
+    #[test]
+    fn cached_session_wire_shape_is_pinned_to_parse_version() {
+        let value = serde_json::to_value(fully_populated_session()).unwrap();
+        let mut paths = Vec::new();
+        collect_paths("", &value, &mut paths);
+        paths.sort();
+        let actual = paths.join("\n");
+        assert_eq!(
+            actual, EXPECTED_SESSION_WIRE_SHAPE,
+            "\nThe serialized Session shape changed. If cached rows from the \
+             previous shape must not be reused, bump PARSE_VERSION; then \
+             update EXPECTED_SESSION_WIRE_SHAPE to the new shape.\n\nActual:\n{actual}\n"
         );
     }
 }

@@ -144,13 +144,7 @@ jobs:
               '- **macOS (Apple Silicon)**: the `.dmg`. Right-click → Open on first launch (the app is not notarized yet).' \
               '- **Linux**: the `.AppImage` (single file, no install) or `.deb` (Debian/Ubuntu).' \
               '' \
-              'Installed copies check for new releases on launch and offer a one-click update.' \
-              '' \
-              '## Changes' \
-              '' \
-              '- Repair in-app update checks after the malformed v0.6.1 updater manifest.' \
-              '- Validate updater field types, signed platform mappings, asset digests, and exact release ownership before publication.' \
-              '- Build all platforms in parallel, then publish one complete and validated updater manifest from a single draft-release writer.'
+              'Installed copies check for new releases on launch and offer a one-click update.'
           )"
           release_id="$(
             gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
@@ -160,6 +154,7 @@ jobs:
               -f body="$release_notes" \
               -F draft=true \
               -F prerelease=false \
+              -F generate_release_notes=true \
               --jq '.id'
           )"
           echo "release_id=${release_id}" >> "$GITHUB_OUTPUT"
@@ -250,7 +245,7 @@ jobs:
 
       - name: Preserve signed release bundles for the publisher
         if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact_name }}
           path: src-tauri/target/**/release/bundle/**
@@ -274,7 +269,7 @@ jobs:
           node-version: 22
 
       - name: Download signed platform bundles
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-bundles-*
           path: release-artifacts

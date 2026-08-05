@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -7,7 +7,9 @@ use std::time::Instant;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::provider::{ProviderAdapter, ProviderRegistry, ProviderSourceKind, ProviderSourceSet};
+use crate::provider::{
+    ProviderAdapter, ProviderId, ProviderRegistry, ProviderSourceKind, ProviderSourceSet,
+};
 use crate::scan_cache::{self, ScanCache};
 
 pub fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
@@ -34,12 +36,27 @@ fn scan_files(root: &Path, accepts_path: impl Fn(&Path) -> bool) -> Vec<PathBuf>
         .collect()
 }
 
+/// Per-provider breakdown of one scan, for the provider diagnostics report
+/// (issue #39). These are the same counters the aggregate `ScanReport` fields
+/// derive from, just attributed to the provider that owns each file — no
+/// second discovery or parsing pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderScanCounts {
+    pub discovered: u64,
+    pub parsed: u64,
+    /// A file was parsed without error but produced no session (e.g. an
+    /// adapter-specific filter declined it).
+    pub skipped: u64,
+    pub parse_failures: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScanReport {
     pub files: usize,
     pub discovery_ms: f64,
     pub processing_ms: f64,
-    pub cache_open_ms: f64,
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub parsed_files: u64,
@@ -47,19 +64,34 @@ pub struct ScanReport {
     pub parse_total_ms: f64,
     pub parse_max_ms: f64,
     pub cache_lookup_total_ms: f64,
+    pub per_provider: HashMap<ProviderId, ProviderScanCounts>,
+}
+
+#[derive(Default)]
+struct ProviderAtomics {
+    parsed: AtomicU64,
+    skipped: AtomicU64,
+    parse_failures: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
 }
 
 /// Scans all roots in parallel, invoking `on_session(path, session)` from
 /// worker threads as each file finishes. Progress callbacks are serialized
 /// and monotonic.
-/// When `cache_path` is set, files whose (size, mtime) match the cache are
+/// When `cache` is `Some`, files whose (size, mtime) match the cache are
 /// served from it without being read or parsed, and cache rows are updated
-/// individually. When duplicate session IDs exist
-/// under multiple roots, callback order (and thus which one wins in the
-/// caller's map) is nondeterministic.
+/// individually. The cache must already be open: opening it is the caller's
+/// job, both because it must happen only once (a second `ScanCache::load` on
+/// the same file would see this open's just-written version metadata and
+/// report a false warm cache) and because the caller needs the freshly
+/// opened cache's `cold_reason` before this function's first progress
+/// callback fires. When duplicate session IDs exist under multiple roots,
+/// callback order (and thus which one wins in the caller's map) is
+/// nondeterministic.
 pub fn scan_all<F, P>(
     sources: &ProviderSourceSet,
-    cache_path: Option<&Path>,
+    cache: Option<ScanCache>,
     on_session: F,
     on_progress: P,
 ) -> ScanReport
@@ -71,6 +103,7 @@ where
     let registry = ProviderRegistry::builtin();
     let mut work: Vec<(PathBuf, &'static dyn ProviderAdapter, ProviderSourceKind)> = Vec::new();
     let mut discovered = HashSet::new();
+    let mut discovered_counts: HashMap<ProviderId, u64> = HashMap::new();
 
     for source in sources.iter() {
         // ProviderSourceSet construction validates this lookup. Keeping the
@@ -78,8 +111,17 @@ where
         let adapter = registry
             .adapter(source.provider_id())
             .expect("validated provider source has a registered adapter");
+        // Every configured provider gets a zero-filled entry even with no
+        // discovered files, so the diagnostics report can distinguish "found
+        // zero files" from "provider never scanned".
+        discovered_counts
+            .entry(adapter.descriptor().id.clone())
+            .or_insert(0);
         for path in scan_provider_files(source.root(), adapter) {
             if discovered.insert(path.clone()) {
+                *discovered_counts
+                    .entry(adapter.descriptor().id.clone())
+                    .or_insert(0) += 1;
                 work.push((path, adapter, source.kind()));
             }
         }
@@ -89,9 +131,13 @@ where
     let discovery_ms = discovery_started.elapsed().as_secs_f64() * 1_000.0;
     on_progress(0, total);
 
-    let cache_started = Instant::now();
-    let cache = cache_path.map(ScanCache::load);
-    let cache_open_ms = cache_started.elapsed().as_secs_f64() * 1_000.0;
+    // Read-only after this point: workers only look up an entry's atomics and
+    // mutate those, never the map itself.
+    let provider_atomics: HashMap<ProviderId, ProviderAtomics> = discovered_counts
+        .keys()
+        .map(|id| (id.clone(), ProviderAtomics::default()))
+        .collect();
+
     // The callback mutates shared UI progress. Keep both sequence allocation
     // and delivery under one lock so parallel workers cannot publish 25, then
     // regress to a delayed 24.
@@ -106,6 +152,7 @@ where
     let processing_started = Instant::now();
 
     work.par_iter().for_each(|(path, adapter, kind)| {
+        let provider_counters = provider_atomics.get(&adapter.descriptor().id);
         let key = path.to_string_lossy().into_owned();
         // The stamp is taken BEFORE parsing so a file that grows mid-parse
         // looks changed on the next launch rather than serving stale data.
@@ -122,8 +169,14 @@ where
             cache_lookup_total_ns.fetch_add(elapsed_ns(cache_started), Ordering::Relaxed);
             if cached.is_some() {
                 cache_hits.fetch_add(1, Ordering::Relaxed);
+                if let Some(counters) = provider_counters {
+                    counters.cache_hits.fetch_add(1, Ordering::Relaxed);
+                }
             } else {
                 cache_misses.fetch_add(1, Ordering::Relaxed);
+                if let Some(counters) = provider_counters {
+                    counters.cache_misses.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -136,6 +189,9 @@ where
                 parsed_files.fetch_add(1, Ordering::Relaxed);
                 parse_total_ns.fetch_add(parse_ns, Ordering::Relaxed);
                 parse_max_ns.fetch_max(parse_ns, Ordering::Relaxed);
+                if let Some(counters) = provider_counters {
+                    counters.parsed.fetch_add(1, Ordering::Relaxed);
+                }
                 match result {
                     Ok(Some(session)) => {
                         if let (Some(cache), Some((size, mtime_ms))) = (&cache, stamp) {
@@ -143,9 +199,17 @@ where
                         }
                         Some(session)
                     }
-                    Ok(None) => None,
+                    Ok(None) => {
+                        if let Some(counters) = provider_counters {
+                            counters.skipped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        None
+                    }
                     Err(e) => {
                         parse_failures.fetch_add(1, Ordering::Relaxed);
+                        if let Some(counters) = provider_counters {
+                            counters.parse_failures.fetch_add(1, Ordering::Relaxed);
+                        }
                         tracing::warn!("failed to parse {:?}: {}", path, e);
                         None
                     }
@@ -165,11 +229,25 @@ where
     if let Some(cache) = cache {
         cache.finish_scan();
     }
+    let per_provider = provider_atomics
+        .into_iter()
+        .map(|(id, counters)| {
+            let discovered = discovered_counts.get(&id).copied().unwrap_or(0);
+            let counts = ProviderScanCounts {
+                discovered,
+                parsed: counters.parsed.load(Ordering::Relaxed),
+                skipped: counters.skipped.load(Ordering::Relaxed),
+                parse_failures: counters.parse_failures.load(Ordering::Relaxed),
+                cache_hits: counters.cache_hits.load(Ordering::Relaxed),
+                cache_misses: counters.cache_misses.load(Ordering::Relaxed),
+            };
+            (id, counts)
+        })
+        .collect();
     ScanReport {
         files: total,
         discovery_ms,
         processing_ms: processing_started.elapsed().as_secs_f64() * 1_000.0,
-        cache_open_ms,
         cache_hits: cache_hits.load(Ordering::Relaxed),
         cache_misses: cache_misses.load(Ordering::Relaxed),
         parsed_files: parsed_files.load(Ordering::Relaxed),
@@ -177,6 +255,7 @@ where
         parse_total_ms: nanos_to_ms(parse_total_ns.load(Ordering::Relaxed)),
         parse_max_ms: nanos_to_ms(parse_max_ns.load(Ordering::Relaxed)),
         cache_lookup_total_ms: nanos_to_ms(cache_lookup_total_ns.load(Ordering::Relaxed)),
+        per_provider,
     }
 }
 
