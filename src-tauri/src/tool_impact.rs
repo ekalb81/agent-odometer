@@ -412,7 +412,7 @@ pub fn compare<S: Borrow<Session>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ToolKind, ToolObservation, ToolOutcome, TurnClassification};
+    use crate::model::{ToolKind, ToolObservation, ToolOrigin, ToolOutcome, TurnClassification};
     use crate::provider::{claude_code_provider_id, codex_provider_id};
     use std::collections::HashMap;
 
@@ -510,6 +510,13 @@ mod tests {
                 }],
                 target: None,
                 resource_id: None,
+                origin: if alpha_provider {
+                    ToolOrigin::Mcp
+                } else {
+                    ToolOrigin::Core
+                },
+                shell_family: None,
+                language: None,
                 outcome: ToolOutcome::Success,
                 duration_ms: Some(500),
                 output_bytes: 10,

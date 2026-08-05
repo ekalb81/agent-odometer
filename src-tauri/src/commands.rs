@@ -1049,6 +1049,12 @@ pub struct ProviderDescriptorWire {
     pub currency: String,
     pub deep_link: bool,
     pub quota_source: bool,
+    /// Issue #44 open-set tool/context dimension availability; see
+    /// `ProviderCapabilities`'s field docs.
+    pub mcp_dimension: bool,
+    pub shell_dimension: bool,
+    pub language_dimension: bool,
+    pub context_dimension: bool,
 }
 
 #[tauri::command]
@@ -1063,6 +1069,10 @@ pub fn list_providers() -> Vec<ProviderDescriptorWire> {
             currency: descriptor.capabilities.currency.to_string(),
             deep_link: descriptor.capabilities.deep_link,
             quota_source: descriptor.capabilities.quota_source,
+            mcp_dimension: descriptor.capabilities.mcp_dimension,
+            shell_dimension: descriptor.capabilities.shell_dimension,
+            language_dimension: descriptor.capabilities.language_dimension,
+            context_dimension: descriptor.capabilities.context_dimension,
         })
         .collect()
 }
@@ -2143,6 +2153,7 @@ mod tests {
             tool_metrics_by_model: Default::default(),
             optimization_findings_count: 0,
             optimization_summary: Default::default(),
+            tool_dimensions: Default::default(),
         };
         assert!(range_has_data(&range));
     }

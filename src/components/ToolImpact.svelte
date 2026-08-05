@@ -1,6 +1,7 @@
 <script lang="ts">
   import { compareToolImpact, listToolImpactTargets } from '../lib/ipc';
-  import type { ToolImpactCohort, ToolImpactResult, ToolImpactTarget } from '../lib/types';
+  import type { ToolDimensionKind, ToolImpactCohort, ToolImpactResult, ToolImpactTarget } from '../lib/types';
+  import { topDimensionValues, type DimensionTotals } from '../lib/toolDimensions';
 
   interface Props {
     active?: boolean;
@@ -8,9 +9,57 @@
     from: string | null;
     to: string | null;
     windowLabel: string;
+    /** Issue #44 open-set dimension totals, already aggregated by the
+     *  caller across the sessions in view. */
+    dimensionTotals?: DimensionTotals;
+    /** Whether at least one provider in view supports each dimension kind
+     *  — `false` renders "unavailable", never a fabricated zero. */
+    dimensionAvailability?: Record<ToolDimensionKind, boolean>;
   }
 
-  let { active = true, sessionIds, from, to, windowLabel }: Props = $props();
+  let {
+    active = true,
+    sessionIds,
+    from,
+    to,
+    windowLabel,
+    dimensionTotals = {},
+    dimensionAvailability = {
+      mcp_server: false,
+      shell_family: false,
+      language: false,
+      context_source: false,
+    },
+  }: Props = $props();
+
+  const DIMENSION_PANELS: { kind: ToolDimensionKind; label: string; unit: 'calls' | 'tokens' }[] = [
+    { kind: 'mcp_server', label: 'MCP servers', unit: 'calls' },
+    { kind: 'shell_family', label: 'Shell command families', unit: 'calls' },
+    { kind: 'language', label: 'Languages', unit: 'calls' },
+    { kind: 'context_source', label: 'Context source', unit: 'tokens' },
+  ];
+
+  const CONTEXT_SOURCE_LABELS: Record<string, string> = {
+    conversation_cache: 'Conversation / cache reuse',
+    newly_cached_context: 'Newly established context',
+    unknown: 'Unattributed (system, tools, files, or new conversation)',
+  };
+
+  function dimensionValueLabel(kind: ToolDimensionKind, value: string): string {
+    return kind === 'context_source' ? (CONTEXT_SOURCE_LABELS[value] ?? value) : value;
+  }
+
+  const dimensionRows = $derived(
+    DIMENSION_PANELS.map((panel) => ({
+      ...panel,
+      available: dimensionAvailability[panel.kind],
+      rows: topDimensionValues(dimensionTotals, panel.kind),
+    })),
+  );
+
+  function compactNumber(value: number): string {
+    return Math.round(value).toLocaleString();
+  }
   let targets = $state<ToolImpactTarget[]>([]);
   let selectedTargetId = $state('');
   let result = $state<ToolImpactResult | null>(null);
@@ -227,5 +276,57 @@
         {/if}
       {/if}
     {/if}
+  </div>
+</details>
+
+<details class="bg-card border border-edge rounded-lg px-3 py-2">
+  <summary class="cursor-pointer text-xs font-semibold text-ink">
+    Tool, MCP, shell &amp; context attribution · {windowLabel}
+  </summary>
+  <div class="mt-2 flex flex-col gap-3">
+    {#each dimensionRows as panel (panel.kind)}
+      <div class="flex flex-col gap-1">
+        <p class="text-[11px] font-semibold text-ink">{panel.label}</p>
+        {#if !panel.available}
+          <p class="text-[11px] text-ink-faint italic">
+            Unavailable — no provider in this view is corroborated to supply this dimension.
+          </p>
+        {:else if panel.rows.length === 0}
+          <p class="text-[11px] text-ink-faint">No {panel.label.toLowerCase()} data in this view.</p>
+        {:else}
+          <div class="overflow-x-auto">
+            <table class="w-full text-[11px] font-mono">
+              <thead class="text-ink-muted">
+                <tr>
+                  <th class="text-left py-0.5">Value</th>
+                  <th class="text-right">{panel.unit === 'tokens' ? 'Tokens' : 'Calls'}</th>
+                  {#if panel.unit === 'calls'}
+                    <th class="text-right">Failures</th>
+                    <th class="text-right">Output bytes</th>
+                  {/if}
+                </tr>
+              </thead>
+              <tbody>
+                {#each panel.rows as row (row.value)}
+                  <tr class="border-t border-edgerow">
+                    <td class="py-1 text-ink">{dimensionValueLabel(panel.kind, row.value)}</td>
+                    <td class="text-right font-semibold">
+                      {compactNumber(panel.unit === 'tokens' ? row.metrics.tokens : row.metrics.calls)}
+                    </td>
+                    {#if panel.unit === 'calls'}
+                      <td class="text-right">{compactNumber(row.metrics.failures)}</td>
+                      <td class="text-right">{compactNumber(row.metrics.output_bytes)}</td>
+                    {/if}
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </div>
+    {/each}
+    <p class="text-[10px] text-ink-faint">
+      MCP server identity and shell command family are privacy-bounded: MCP server names come from the tool call itself, and shell families are matched against a fixed allowlist (unmatched commands appear as "other") — raw command arguments are never retained. Context source is derived from token accounting and reconciles to the provider-reported cache dimensions where available; "unattributed" covers system instructions, tool schemas, file reads, and new conversation content, which cannot be told apart from token totals alone.
+    </p>
   </div>
 </details>

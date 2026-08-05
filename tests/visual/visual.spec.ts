@@ -242,6 +242,27 @@ visualTest('sessions-availability-fallback', 'session availability, fallback, an
   await expectSessionRollup(page, 8);
 });
 
+visualTest('tool-dimensions', 'issue #44 tool, MCP, shell, and context attribution', async (page) => {
+  // Issue #44's aggregate panel (ToolImpact.svelte) had zero visual coverage
+  // before this test — the fixtures never rendered it. Claude Code's view is
+  // used deliberately: the 'tool-dimensions' fixture scenario marks Claude
+  // Code's mcp/shell dimensions unavailable (a fixture-only demonstration,
+  // not real capability — see dev-mock.ts), so with only Claude Code
+  // sessions in view, the panel must render "Unavailable" for those two
+  // dimensions while still showing real language and context-source data —
+  // the exact unavailable-vs-zero distinction this issue exists to capture.
+  await visit(page, { scenario: 'tool-dimensions', view: 'claude' });
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const dimensionSummary = page
+    .getByText('Tool, MCP, shell & context attribution', { exact: false })
+    .filter({ visible: true });
+  await expect(dimensionSummary).toBeVisible();
+  await dimensionSummary.click();
+  await expect(page.getByText(/Unavailable — no provider/).filter({ visible: true }).first()).toBeVisible();
+  await expect(page.getByText('svelte', { exact: true }).filter({ visible: true })).toBeVisible();
+  await expect(page.getByText('Conversation / cache reuse').filter({ visible: true })).toBeVisible();
+});
+
 test.describe('narrow session drawer', () => {
   test.use({ viewport: { width: 800, height: 600 } });
 

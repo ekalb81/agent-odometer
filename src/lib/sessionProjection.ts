@@ -99,11 +99,17 @@ export function addTotals(target: TokenTotals, value: TokenTotals): void {
 export function zeroToolMetrics(): ToolMetrics {
   return { calls: 0, reads: 0, searches: 0, mutations: 0, commands: 0, other: 0,
     successes: 0, failures: 0, unknown: 0, mutation_targets: 0, one_shot_mutations: 0,
-    retry_count: 0, duration_ms: 0, output_bytes: 0 };
+    retry_count: 0, duration_ms: 0, output_bytes: 0,
+    core_origin_calls: 0, mcp_origin_calls: 0, provider_origin_calls: 0, unknown_origin_calls: 0 };
 }
 
 function addToolMetrics(target: ToolMetrics, value: ToolMetrics): void {
-  for (const key of Object.keys(target) as (keyof ToolMetrics)[]) target[key] += value[key];
+  // The issue #44 origin-breakdown fields are optional on ToolMetrics (older
+  // fixtures and historical data may omit them), so fall back to 0 rather
+  // than propagating `undefined` into the running total.
+  for (const key of Object.keys(target) as (keyof ToolMetrics)[]) {
+    target[key] = (target[key] ?? 0) + (value[key] ?? 0);
+  }
 }
 
 export function toUtcIso(local: string): string | null {

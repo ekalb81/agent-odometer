@@ -8,6 +8,7 @@ export const VISUAL_SCENARIOS = [
   'sessions-empty',
   'sessions-scanning',
   'sessions-availability-fallback',
+  'tool-dimensions',
   'instructions-empty',
   'instructions-loading',
   'instructions-error',

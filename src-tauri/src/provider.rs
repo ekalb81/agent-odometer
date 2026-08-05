@@ -119,6 +119,36 @@ pub struct ProviderCapabilities {
     /// Distinct from `diagnostics::QuotaHealth`, which reports on a live
     /// polled quota API that no provider implements yet.
     pub quota_source: bool,
+    /// Issue #44 open-set tool/context dimensions. `false` means this
+    /// provider's transcript shape is not corroborated to support that
+    /// dimension in this codebase — the UI must render it as
+    /// "unavailable", never a fabricated zero. All four dimensions are
+    /// computed generically in `telemetry.rs` from data every provider's
+    /// tool-call arguments already carry (name, `providers`, `command`,
+    /// `path`/`file_path` keys, token totals); a `false` flag here means
+    /// this provider's real tool-name/argument shape for that mechanism is
+    /// unverified against real transcripts, not that the code path is
+    /// provider-specific.
+    ///
+    /// Whether MCP server identity (`mcp__<server>__<tool>` naming or an
+    /// orchestration payload referencing it) is corroborated for this
+    /// provider.
+    pub mcp_dimension: bool,
+    /// Whether safe shell-command-family classification (a `command`
+    /// string argument on a `Command`-kind tool) is corroborated for this
+    /// provider.
+    pub shell_dimension: bool,
+    /// Whether language classification (a `path`/`file_path` argument key)
+    /// is corroborated for this provider. Low-risk and provider-agnostic —
+    /// worst case is more `None`s, never a wrong label — so this is `true`
+    /// for every current provider.
+    pub language_dimension: bool,
+    /// Whether context-source breakdown (derived from `TokenTotals`, which
+    /// every provider populates) is available. `true` for every current
+    /// provider; a provider without a cache-write concept (e.g. Codex,
+    /// Gemini CLI) simply always reports 0 for `newly_cached_context` — a
+    /// real zero, not "unavailable".
+    pub context_dimension: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -339,6 +369,15 @@ static CODEX_DESCRIPTOR: LazyLock<ProviderDescriptor> = LazyLock::new(|| Provide
         currency: "credits",
         deep_link: true,
         quota_source: true,
+        // Corroborated by `parser_tests.rs`'s
+        // `parses_custom_tool_calls_and_tags_nested_mcp_providers`: Codex
+        // tags MCP calls via an orchestration payload referencing
+        // `tools.mcp__<server>__<tool>`, and `shell_command`'s `command`
+        // argument is a plain string (see the same test fixtures).
+        mcp_dimension: true,
+        shell_dimension: true,
+        language_dimension: true,
+        context_dimension: true,
     },
 });
 
@@ -352,6 +391,14 @@ static CLAUDE_CODE_DESCRIPTOR: LazyLock<ProviderDescriptor> =
             currency: "USD",
             deep_link: false,
             quota_source: false,
+            // Corroborated by `claude_parser_tests.rs` and this crate's own
+            // `mcp__<server>__<tool>` tool-name convention (direct, not via
+            // an orchestration wrapper like Codex) and `Bash`'s `command`
+            // string argument.
+            mcp_dimension: true,
+            shell_dimension: true,
+            language_dimension: true,
+            context_dimension: true,
         },
     });
 
@@ -374,6 +421,19 @@ static GEMINI_CLI_DESCRIPTOR: LazyLock<ProviderDescriptor> = LazyLock::new(|| Pr
         currency: "USD",
         deep_link: false,
         quota_source: false,
+        // Unlike Codex/Claude Code, this module's own doc comment states
+        // Gemini CLI's on-disk shape is reconstructed from docs and two
+        // third-party tools, not a real transcript corroborating tool-call
+        // argument shapes — there is no test in this codebase confirming
+        // Gemini CLI's MCP tool-naming convention or that its shell tool's
+        // arguments carry a `command` string the same way. Render as
+        // unavailable rather than guess.
+        mcp_dimension: false,
+        shell_dimension: false,
+        // Low-risk, generic path-key heuristic (see the capability's own
+        // doc comment) — kept available.
+        language_dimension: true,
+        context_dimension: true,
     },
 });
 

@@ -23,6 +23,9 @@ export interface TokenTotals {
 export type ToolKind = 'read' | 'search' | 'mutation' | 'command' | 'other';
 export type ToolOutcome = 'pending' | 'success' | 'failure' | 'unknown';
 export type TaskCategory = 'planning' | 'exploration' | 'coding' | 'debugging' | 'testing' | 'review' | 'other';
+/** Normalized tool-origin dimension (issue #44). `unknown` means the
+ * dimension was recorded before this field existed, never a real zero. */
+export type ToolOrigin = 'core' | 'mcp' | 'provider' | 'unknown';
 
 export interface ToolMetrics {
   calls: number;
@@ -39,6 +42,14 @@ export interface ToolMetrics {
   retry_count: number;
   duration_ms: number;
   output_bytes: number;
+  /** Origin-dimension breakdown (issue #44): always sums to `calls`.
+   * Optional here (mirroring `resource_id` above) so existing fixtures and
+   * historical serialized data need not populate it; real backend responses
+   * always include it. */
+  core_origin_calls?: number;
+  mcp_origin_calls?: number;
+  provider_origin_calls?: number;
+  unknown_origin_calls?: number;
 }
 
 export interface ToolObservation {
@@ -53,6 +64,7 @@ export interface ToolObservation {
   effective_tools: string[];
   target: string | null;
   resource_id?: string | null;
+  origin: ToolOrigin;
   outcome: ToolOutcome;
   duration_ms: number | null;
   output_bytes: number;
@@ -216,6 +228,21 @@ export interface TierBucket {
   tokens: TokenTotals;
 }
 
+/** One (dimension_kind, dimension_value) entry's additive counters (issue
+ * #44). `tokens` is populated only for `context_source` values; every other
+ * dimension kind populates `calls`/`failures`/`output_bytes`/`duration_ms`
+ * and leaves `tokens` at 0. */
+export interface ToolDimensionMetrics {
+  calls: number;
+  failures: number;
+  output_bytes: number;
+  duration_ms: number;
+  tokens: number;
+}
+
+/** Issue #44 open-set dimension kind. */
+export type ToolDimensionKind = 'mcp_server' | 'shell_family' | 'language' | 'context_source';
+
 /** Date-scoped rollup returned by sessions_in_ranges. */
 export interface RangeTotals {
   tokens: TokenTotals;
@@ -224,6 +251,11 @@ export interface RangeTotals {
   tool_metrics_by_model: Record<string, ToolMetrics>;
   optimization_findings_count: number;
   optimization_summary?: OptimizationSummary;
+  /** Outer key is the dimension kind, inner key the dimension value. A
+   *  missing kind means no ledger-durable data for this window — consult
+   *  `ProviderDescriptor`'s matching `*_dimension` flag to tell a real zero
+   *  from a provider that cannot supply the dimension at all. */
+  tool_dimensions?: Partial<Record<ToolDimensionKind, Record<string, ToolDimensionMetrics>>>;
 }
 
 export interface ToolImpactCohort {
@@ -463,6 +495,14 @@ export interface ProviderDescriptor {
   /** Whether this provider's local transcripts carry account-wide
    *  rate-limit/quota snapshots usable by the Subscription Usage view. */
   quota_source: boolean;
+  /** Issue #44 open-set tool/context dimension availability. `false` means
+   *  this provider's transcript shape is not corroborated to support the
+   *  dimension — the panel must render "unavailable", never a fabricated
+   *  zero, for a session from this provider. */
+  mcp_dimension: boolean;
+  shell_dimension: boolean;
+  language_dimension: boolean;
+  context_dimension: boolean;
 }
 
 export interface HarnessIntegrationStatus {

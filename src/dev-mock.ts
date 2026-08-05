@@ -48,7 +48,9 @@ document.documentElement.dataset.visualScenario = visualScenario;
 function tok(total: number, harness: Harness): TokenTotals {
   const input = Math.round(total * 0.62);
   const cached = Math.round(total * 0.24);
-  const cacheCreation = harness === 'codex' ? 0 : Math.round(total * 0.08);
+  // Only Claude Code reports a cache-creation ("cache write") dimension;
+  // Codex and Gemini CLI always report 0 (AGENTS.md).
+  const cacheCreation = harness === 'claude_code' ? Math.round(total * 0.08) : 0;
   const output = total - input;
   const reasoning = Math.round(output * 0.3);
   return {
@@ -410,6 +412,54 @@ function subscriptionUsage(): SubscriptionUsageEntry[] {
   ];
 }
 
+// Issue #44: only populated for the 'tool-dimensions' visual scenario, so
+// every other baseline is byte-for-byte unaffected. Codex sessions get MCP
+// server, shell family, and language data; Claude Code sessions get
+// language and context-source data only — the 'tool-dimensions' scenario's
+// `list_providers` response below marks Claude Code's mcp/shell dimensions
+// unavailable as a fixture-only demonstration of the unavailable-vs-zero
+// distinction (not a claim about Claude Code's real capability, which is
+// mcp_dimension/shell_dimension: true — see `provider.rs`).
+function dimensionTotalsFor(f: Fixture): RangeTotals['tool_dimensions'] {
+  if (visualScenario !== 'tool-dimensions') return undefined;
+  const dim = (calls: number, failures: number, outputBytes: number, durationMs: number) =>
+    ({ calls, failures, output_bytes: outputBytes, duration_ms: durationMs, tokens: 0 });
+  const tokenDim = (tokens: number) => ({ calls: 0, failures: 0, output_bytes: 0, duration_ms: 0, tokens });
+  const contextSource = {
+    conversation_cache: tokenDim(Math.round(f.total * 0.24)),
+    ...(f.harness === 'claude_code' ? { newly_cached_context: tokenDim(Math.round(f.total * 0.08)) } : {}),
+    unknown: tokenDim(Math.round(f.total * 0.1)),
+  };
+  if (f.harness === 'codex') {
+    return {
+      mcp_server: {
+        code_search: dim(18, 1, 42_000, 7_200),
+        repo_index: dim(6, 0, 9_500, 2_100),
+      },
+      shell_family: {
+        git: dim(9, 0, 3_200, 1_800),
+        npm: dim(5, 1, 61_000, 42_000),
+        other: dim(2, 0, 800, 400),
+      },
+      language: {
+        typescript: dim(14, 0, 88_000, 0),
+        rust: dim(6, 1, 31_000, 0),
+      },
+      context_source: contextSource,
+    };
+  }
+  // Claude Code: mcp_server/shell_family omitted entirely — the panel must
+  // render "unavailable" from the capability flag, not an absent-vs-zero
+  // guess from missing keys here.
+  return {
+    language: {
+      svelte: dim(11, 0, 54_000, 0),
+      typescript: dim(9, 0, 47_000, 0),
+    },
+    context_source: contextSource,
+  };
+}
+
 function rangeTotals(
   from: string | null,
   to: string | null,
@@ -435,6 +485,7 @@ function rangeTotals(
       tool_metrics_by_model: { [fixtureModel(f)]: toolMetrics(Math.round(f.turns * 3 * fraction)) },
       optimization_findings_count: 0,
       optimization_summary: { findings: 0, warnings: 0, likely_avoidable_calls: 0, by_rule: {} },
+      tool_dimensions: dimensionTotalsFor(f),
     };
   }
   return out;
@@ -662,8 +713,16 @@ mockIPC((cmd, payload) => {
       // is registered but intentionally left out of this dev fixture so it
       // does not shift tab counts in the Playwright visual suite.
       return [
-        { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true },
-        { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false },
+        { id: 'codex', display_name: 'Codex', archived_sources: true, session_index: true, currency: 'credits', deep_link: true, quota_source: true, mcp_dimension: true, shell_dimension: true, language_dimension: true, context_dimension: true },
+        {
+          id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false,
+          // Fixture-only override for the 'tool-dimensions' visual scenario,
+          // to demonstrate the unavailable-vs-zero distinction in a
+          // baseline — Claude Code's real capability is
+          // mcp_dimension/shell_dimension: true (provider.rs).
+          mcp_dimension: visualScenario !== 'tool-dimensions', shell_dimension: visualScenario !== 'tool-dimensions',
+          language_dimension: true, context_dimension: true,
+        },
       ];
     case 'get_provider_diagnostics':
       return providerDiagnostics();
