@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { compareToolImpact, listToolImpactTargets } from '../lib/ipc';
+  import { compareToolImpact, listToolImpactTargets, writeExport } from '../lib/ipc';
   import type { ToolDimensionKind, ToolImpactCohort, ToolImpactResult, ToolImpactTarget } from '../lib/types';
   import { topDimensionValues, type DimensionTotals } from '../lib/toolDimensions';
+  import { dimensionExportRows, rowsToCsv } from '../lib/sessionProjection';
 
   interface Props {
     active?: boolean;
@@ -60,6 +61,30 @@
   function compactNumber(value: number): string {
     return Math.round(value).toLocaleString();
   }
+
+  // Export wiring for the dimension-attribution panel (issue #44). Exports
+  // exactly what is rendered above: one row per (dimension_kind,
+  // dimension_value) pair, currently in view — no raw arguments, tool
+  // output, prompts, or unrestricted paths ever enter `dimensionTotals` in
+  // the first place (see `dimensionExportRows`'s doc comment), so there is
+  // nothing additional to redact on the way out.
+  let dimensionExportBusy = $state(false);
+  let dimensionExportError = $state<string | null>(null);
+
+  async function exportDimensions(format: 'csv' | 'json') {
+    dimensionExportBusy = true;
+    dimensionExportError = null;
+    try {
+      const rows = dimensionExportRows(dimensionTotals);
+      const content = format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows);
+      await writeExport(`odometer-tool-dimensions-${new Date().toISOString().slice(0, 10)}.${format}`, format, content);
+    } catch (error) {
+      dimensionExportError = String(error);
+    } finally {
+      dimensionExportBusy = false;
+    }
+  }
+
   let targets = $state<ToolImpactTarget[]>([]);
   let selectedTargetId = $state('');
   let result = $state<ToolImpactResult | null>(null);
@@ -284,6 +309,24 @@
     Tool, MCP, shell &amp; context attribution · {windowLabel}
   </summary>
   <div class="mt-2 flex flex-col gap-3">
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <span class="text-[10px] text-ink-faint">Export the rows below — one row per dimension value currently in view.</span>
+      <div class="flex items-center gap-2">
+        <button
+          class="px-2 py-1 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50 text-[11px]"
+          disabled={dimensionExportBusy || Object.keys(dimensionTotals).length === 0}
+          onclick={() => exportDimensions('csv')}
+        >Export CSV</button>
+        <button
+          class="px-2 py-1 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50 text-[11px]"
+          disabled={dimensionExportBusy || Object.keys(dimensionTotals).length === 0}
+          onclick={() => exportDimensions('json')}
+        >Export JSON</button>
+      </div>
+    </div>
+    {#if dimensionExportError}
+      <p class="text-[11px] text-neg" role="alert">{dimensionExportError}</p>
+    {/if}
     {#each dimensionRows as panel (panel.kind)}
       <div class="flex flex-col gap-1">
         <p class="text-[11px] font-semibold text-ink">{panel.label}</p>
