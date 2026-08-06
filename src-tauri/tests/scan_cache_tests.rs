@@ -27,7 +27,12 @@ fn scan_ids(
     let report = scanner::scan_all(
         &sources,
         cache,
-        |_path, s| sessions.lock().unwrap().push(s.id.clone()),
+        |batch| {
+            let mut sessions = sessions.lock().unwrap();
+            for (_path, s) in batch {
+                sessions.push(s.id.clone());
+            }
+        },
         |done, total| progress.lock().unwrap().push((done, total)),
     );
     let sessions = sessions.into_inner().unwrap();
@@ -144,7 +149,12 @@ fn cache_hit_with_a_stale_archive_classification_is_reparsed() {
     let report = scanner::scan_all(
         &sources,
         Some(ScanCache::load(&cache_path)),
-        |_path, session| archived.lock().unwrap().push(session.archived),
+        |batch| {
+            let mut archived = archived.lock().unwrap();
+            for (_path, session) in batch {
+                archived.push(session.archived);
+            }
+        },
         |_done, _total| {},
     );
 

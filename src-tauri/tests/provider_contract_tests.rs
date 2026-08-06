@@ -320,8 +320,11 @@ fn mixed_provider_scan_uses_adapters_and_keeps_progress_monotonic() {
     let report = scanner::scan_all(
         &sources,
         None,
-        |_path, session| {
-            sessions.lock().unwrap().push((session.harness, session.id));
+        |batch| {
+            let mut sessions = sessions.lock().unwrap();
+            for (_path, session) in batch {
+                sessions.push((session.harness.clone(), session.id.clone()));
+            }
         },
         |done, total| progress.lock().unwrap().push((done, total)),
     );

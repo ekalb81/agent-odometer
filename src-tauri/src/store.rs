@@ -177,6 +177,19 @@ pub struct AppState {
     /// compute exactly these sessions from in-memory history instead.
     /// Cleared per id on the next successful persist.
     ledger_stale: DashMap<String, ()>,
+    /// Storage ids a bulk scan durably persisted via
+    /// [`HistoryStore::observe_bulk`] (issue #132) without also updating
+    /// their `rollup_*` rows — the facts are correct and committed, but the
+    /// ledger's rollup-backed range aggregation for exactly these sessions
+    /// would under-report until the deferred rebuild runs. Distinct from
+    /// `ledger_stale` (a genuine persist *failure*, cleared only by a
+    /// successful re-persist): this set is cleared wholesale by
+    /// [`Self::mark_rollups_rebuilt`] once `rebuild_rollups_if_stale`
+    /// completes, and never needs to survive a restart — a crash before that
+    /// rebuild is instead caught by `HistoryStore::open`'s own durable
+    /// `rollups_stale` marker, which rebuilds before this process can ever
+    /// read a rollup row again. See [`Self::ledger_is_stale`].
+    rollup_deferred_stale: DashMap<String, ()>,
     pub external_events: Mutex<ExternalEventStore>,
     pub performance: crate::performance::PerformanceRecorder,
     pub tray: Mutex<Option<crate::tray::TrayState>>,
@@ -223,6 +236,7 @@ impl AppState {
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
             ledger_stale: DashMap::new(),
+            rollup_deferred_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(
                 crate::config_events::load_events(),
             )),
@@ -374,7 +388,7 @@ impl AppState {
         let generation = self
             .history_scan_generation
             .load(std::sync::atomic::Ordering::Acquire);
-        self.reconcile_session_at_generation(path, session, generation)
+        self.reconcile_session_at_generation(path, session, generation, false)
     }
 
     /// Variant for bulk scans. The generation belongs to that scan rather
@@ -415,17 +429,29 @@ impl AppState {
         {
             return None;
         }
-        let reconciled =
-            self.reconcile_session_at_generation(path, session, history_generation.unwrap_or(0));
+        let reconciled = self.reconcile_session_at_generation(
+            path,
+            session,
+            history_generation.unwrap_or(0),
+            true,
+        );
         drop(path_state);
         Some(reconciled)
     }
 
+    /// `bulk` selects [`HistoryStore::observe_bulk`] (deferred rollup
+    /// maintenance, issue #132) over [`HistoryStore::observe_with_displaced`]
+    /// (immediate per-session rollup maintenance). Only
+    /// `reconcile_scanned_session_if_current` — the bulk-scan path — passes
+    /// `true`; the live watcher path (`reconcile_observed_session`) touches
+    /// at most one session at a time, where per-session rollup maintenance
+    /// was never the cost problem.
     fn reconcile_session_at_generation(
         &self,
         path: &Path,
         session: Session,
         generation: i64,
+        bulk: bool,
     ) -> ReconciledSession {
         let Some(history) = self.history_ready() else {
             return ReconciledSession {
@@ -433,39 +459,239 @@ impl AppState {
                 displaced: None,
             };
         };
-        match history.observe_with_displaced(path, &session, generation) {
-            Ok((stored, displaced)) => {
-                self.ledger_stale.remove(&stored.key);
-                let displaced = displaced.map(|stored| {
-                    self.sessions
-                        .insert(stored.key, Arc::new(stored.session.clone()));
-                    self.touch_sessions_generation();
-                    stored.session
-                });
-                ReconciledSession {
-                    session: stored.session,
-                    displaced,
+        if bulk {
+            match history.observe_bulk(path, &session, generation) {
+                Ok(outcome) => self.apply_bulk_outcome(outcome),
+                Err(error) => {
+                    tracing::warn!(
+                        "could not persist session history for {:?}: {}",
+                        path,
+                        error
+                    );
+                    self.ledger_stale.insert(session.effective_storage_id(), ());
+                    ReconciledSession {
+                        session,
+                        displaced: None,
+                    }
                 }
             }
-            Err(error) => {
-                tracing::warn!(
-                    "could not persist session history for {:?}: {}",
-                    path,
-                    error
-                );
-                self.ledger_stale.insert(session.effective_storage_id(), ());
-                ReconciledSession {
-                    session,
-                    displaced: None,
+        } else {
+            match history.observe_with_displaced(path, &session, generation) {
+                Ok((stored, displaced)) => {
+                    self.ledger_stale.remove(&stored.key);
+                    // A non-bulk observe always maintains rollups
+                    // immediately, so this session's rollups are correct
+                    // regardless of any earlier bulk scan that had not yet
+                    // rebuilt them.
+                    self.rollup_deferred_stale.remove(&stored.key);
+                    let displaced = displaced.map(|stored| {
+                        self.sessions
+                            .insert(stored.key, Arc::new(stored.session.clone()));
+                        self.touch_sessions_generation();
+                        stored.session
+                    });
+                    ReconciledSession {
+                        session: stored.session,
+                        displaced,
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "could not persist session history for {:?}: {}",
+                        path,
+                        error
+                    );
+                    self.ledger_stale.insert(session.effective_storage_id(), ());
+                    ReconciledSession {
+                        session,
+                        displaced: None,
+                    }
                 }
             }
         }
     }
 
-    /// True when this session's ledger rows cannot be trusted for
-    /// aggregation because its latest persist failed.
+    /// Shared tail of a successful [`HistoryStore::observe_bulk`]/
+    /// [`HistoryStore::observe_bulk_batch`] item: updates the two staleness
+    /// sets and publishes a displaced session exactly as the single-item
+    /// bulk branch of [`Self::reconcile_session_at_generation`] always has.
+    fn apply_bulk_outcome(
+        &self,
+        outcome: crate::history_store::BulkObserveOutcome,
+    ) -> ReconciledSession {
+        self.ledger_stale.remove(&outcome.stored.key);
+        if outcome.rollups_deferred {
+            self.rollup_deferred_stale
+                .insert(outcome.stored.key.clone(), ());
+        } else {
+            self.rollup_deferred_stale.remove(&outcome.stored.key);
+        }
+        let displaced = outcome.displaced.map(|stored| {
+            self.sessions
+                .insert(stored.key, Arc::new(stored.session.clone()));
+            self.touch_sessions_generation();
+            stored.session
+        });
+        ReconciledSession {
+            session: outcome.stored.session,
+            displaced,
+        }
+    }
+
+    /// Batched variant of [`Self::reconcile_scanned_session_if_current`]
+    /// (issue #132): every item in `items` shares one durable-write
+    /// transaction ([`HistoryStore::observe_bulk_batch`]) instead of one
+    /// transaction each — the actual fix for the scan-write serialization
+    /// this issue names. `scanner::scan_all` is this method's only caller
+    /// path (via `commands::spawn_scan`'s batch closure), handing it one
+    /// [`crate::scanner::SCAN_WRITE_BATCH_SIZE`]-sized chunk at a time.
+    ///
+    /// Each item's `session_paths` eligibility (a same-generation watcher
+    /// touch or removal tombstone must win) is still checked and reserved
+    /// per item, exactly like the single-item path — but only for the
+    /// duration of that check, not held across the shared durable write the
+    /// way the single-item path holds its one entry across its one write.
+    /// Holding many `session_paths` entries open at once around one shared
+    /// transaction risks a same-shard DashMap write-lock re-entry — a real
+    /// deadlock, not merely a slower path — the moment two of this batch's
+    /// distinct paths happen to hash into the same internal shard, which at
+    /// a batch size in the tens is the expected case, not an edge case.
+    ///
+    /// The practical effect of releasing the reservation before the write:
+    /// if a watcher-driven removal for one of this batch's paths lands in
+    /// the narrow window between this reservation and the batch's commit,
+    /// the batch's write can still durably mark that path `present` after
+    /// the removal already marked it `missing`. This is self-healing and
+    /// scoped to the durable row only: `state.sessions` (what the UI reads)
+    /// is unaffected, because `publish_scanned_session` independently
+    /// re-checks the same tombstone immediately before publishing; and the
+    /// durable row heals at the *next* full scan, when the already-deleted
+    /// file is no longer discovered and `finish_scan`'s unseen-location
+    /// sweep marks it missing again. The single-item watcher-append path
+    /// (`reconcile_observed_session`) does not go through this method at
+    /// all and keeps its existing, stronger guarantee.
+    ///
+    /// On a durable-write failure for the whole batch (`observe_bulk_batch`
+    /// rolls the whole shared transaction back on any single item's error —
+    /// see its own doc comment), falls back to writing this batch one
+    /// session at a time via the single-item bulk path, preserving today's
+    /// per-session failure isolation rather than losing an entire batch to
+    /// one malformed session.
+    pub fn reconcile_scanned_batch_if_current(
+        &self,
+        app_generation: u64,
+        history_generation: Option<i64>,
+        items: Vec<(std::path::PathBuf, Session)>,
+    ) -> Vec<(std::path::PathBuf, ReconciledSession)> {
+        // Mirrors the single-item path: holding this for the whole call
+        // closes the same race with `set_config`'s generation bump.
+        let _transition = self.config_transition.lock().unwrap();
+        if self.current_scan_generation() != app_generation {
+            return Vec::new();
+        }
+
+        let mut eligible: Vec<(std::path::PathBuf, Session)> = Vec::with_capacity(items.len());
+        for (path, session) in items {
+            let key = path_key(&path);
+            let path_state = self
+                .session_paths
+                .entry(key)
+                .or_insert_with(|| PathSessionState {
+                    generation: app_generation,
+                    storage_id: String::new(),
+                    watcher_touched: false,
+                    removed: false,
+                });
+            let ineligible = path_state.generation == app_generation
+                && (path_state.watcher_touched || path_state.removed);
+            drop(path_state);
+            if !ineligible {
+                eligible.push((path, session));
+            }
+        }
+        if eligible.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(history) = self.history_ready() else {
+            return eligible
+                .into_iter()
+                .map(|(path, session)| {
+                    (
+                        path,
+                        ReconciledSession {
+                            session,
+                            displaced: None,
+                        },
+                    )
+                })
+                .collect();
+        };
+
+        let generation = history_generation.unwrap_or(0);
+        let batch: Vec<(&Path, &Session, i64)> = eligible
+            .iter()
+            .map(|(path, session)| (path.as_path(), session, generation))
+            .collect();
+
+        match history.observe_bulk_batch(&batch) {
+            Ok(outcomes) => eligible
+                .into_iter()
+                .zip(outcomes)
+                .map(|((path, _session), outcome)| (path, self.apply_bulk_outcome(outcome)))
+                .collect(),
+            Err(error) => {
+                tracing::warn!(
+                    "could not persist session history batch of {} session(s) as one \
+                     transaction, retrying one at a time: {}",
+                    eligible.len(),
+                    error
+                );
+                eligible
+                    .into_iter()
+                    .map(|(path, session)| {
+                        let reconciled =
+                            self.reconcile_session_at_generation(&path, session, generation, true);
+                        (path, reconciled)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// True when this session's ledger rows cannot be trusted for rollup-
+    /// backed aggregation: either its latest persist failed (`ledger_stale`),
+    /// or a bulk scan durably wrote its facts but has not yet rebuilt
+    /// `rollup_*` for it (`rollup_deferred_stale`, issue #132). Either way
+    /// the caller (`commands::sessions_in_ranges`) must compute this session
+    /// from in-memory history instead of the ledger's rollup fast path.
     pub fn ledger_is_stale(&self, storage_id: &str) -> bool {
         self.ledger_stale.contains_key(storage_id)
+            || self.rollup_deferred_stale.contains_key(storage_id)
+    }
+
+    /// Runs `HistoryStore::rebuild_rollups_if_stale` and, if it actually
+    /// rebuilt, clears every session this process had marked
+    /// `rollup_deferred_stale` — a full rebuild is global, so it resolves
+    /// every session's deferred rollup regardless of which bulk-scan
+    /// generation deferred it. The only caller is `commands::spawn_scan`,
+    /// once per completed (non-superseded) scan, unconditionally — whether
+    /// or not the scan reported parse failures, since a deferred rollup is
+    /// orthogonal to whether source availability could be finalized.
+    pub fn finalize_bulk_scan_rollups(&self) {
+        let Some(history) = self.history_ready() else {
+            return;
+        };
+        match history.rebuild_rollups_if_stale() {
+            Ok(true) => self.rollup_deferred_stale.clear(),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "could not rebuild durable history rollups after scan: {}",
+                    error
+                );
+            }
+        }
     }
 
     /// Completes an error-free current scan and rehydrates the archive so
@@ -838,6 +1064,7 @@ mod tests {
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
             ledger_stale: DashMap::new(),
+            rollup_deferred_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(Vec::new())),
             performance: crate::performance::PerformanceRecorder::default(),
             tray: Mutex::new(None),
@@ -1027,6 +1254,83 @@ mod tests {
 
         assert_eq!(state.history_readiness(), HistoryReadinessKind::Ready);
         assert!(state.history_ready().is_some());
+    }
+
+    #[test]
+    fn reconcile_scanned_batch_if_current_persists_every_item_in_one_transaction() {
+        // Issue #132: the batch write path. Every item that passes the
+        // eligibility check must come back reconciled, and — since this is
+        // the bulk-scan path — routed to in-memory aggregation
+        // (`ledger_is_stale`) until the scan's rollup rebuild runs.
+        let state = AppState::new();
+        let directory = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        state.set_history_ready(Some(Arc::new(store)));
+
+        let generation = state.current_scan_generation();
+        let items = vec![
+            (PathBuf::from("C:/sessions/a.jsonl"), session("a", 1)),
+            (PathBuf::from("C:/sessions/b.jsonl"), session("b", 2)),
+        ];
+        let results = state.reconcile_scanned_batch_if_current(generation, Some(1), items);
+        assert_eq!(results.len(), 2);
+        for (_path, reconciled) in &results {
+            assert!(
+                state.ledger_is_stale(&reconciled.session.storage_id),
+                "a freshly bulk-written session must be ledger-stale (rollup-deferred) \
+                 until the scan rebuilds rollups"
+            );
+        }
+    }
+
+    #[test]
+    fn reconcile_scanned_batch_if_current_drops_everything_for_a_stale_generation() {
+        let state = AppState::new();
+        let stale = state.current_scan_generation();
+        state.advance_scan_generation();
+        let items = vec![(PathBuf::from("C:/sessions/a.jsonl"), session("a", 1))];
+        let results = state.reconcile_scanned_batch_if_current(stale, None, items);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn reconcile_scanned_batch_if_current_skips_an_item_the_watcher_already_touched() {
+        // Mirrors `watcher_touch_prevents_older_bulk_scan_overwrite`'s intent
+        // for the batch path: a same-generation watcher touch wins over a
+        // batched scan result for the same path, exactly like the
+        // single-item path.
+        let state = state();
+        let path = PathBuf::from("C:/sessions/a.jsonl");
+        state.publish_watched_session(&path, session("a", 5));
+        let generation = state.current_scan_generation();
+        let items = vec![(path, session("a", 1))];
+        let results = state.reconcile_scanned_batch_if_current(generation, None, items);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn ledger_is_stale_reflects_a_deferred_rollup_until_the_scan_finalizes_it() {
+        // Issue #132's crash-safety-adjacent correctness property: between a
+        // bulk write and the scan's rollup rebuild, `sessions_in_ranges`
+        // must not serve a rollup-backed answer for a session whose rollups
+        // are known to be behind its facts — `ledger_is_stale` is what
+        // routes it to the always-accurate in-memory fallback instead.
+        // `finalize_bulk_scan_rollups` (the scan-completion call) must clear
+        // that once the rebuild actually runs.
+        let state = AppState::new();
+        let directory = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        state.set_history_ready(Some(Arc::new(store)));
+
+        let generation = state.current_scan_generation();
+        let items = vec![(PathBuf::from("C:/sessions/a.jsonl"), session("a", 1))];
+        let results = state.reconcile_scanned_batch_if_current(generation, Some(1), items);
+        assert_eq!(results.len(), 1);
+        let key = results[0].1.session.storage_id.clone();
+        assert!(state.ledger_is_stale(&key));
+
+        state.finalize_bulk_scan_rollups();
+        assert!(!state.ledger_is_stale(&key));
     }
 
     #[test]

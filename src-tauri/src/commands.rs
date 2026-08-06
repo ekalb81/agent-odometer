@@ -1192,27 +1192,31 @@ pub fn spawn_scan(
         let report = crate::scanner::scan_all(
             &provider_sources,
             cache,
-            |path, session| {
+            |batch| {
                 if state.current_scan_generation() != generation {
                     return;
                 }
-                let Some(reconciled) = state.reconcile_scanned_session_if_current(
+                // One durable-write transaction for the whole batch
+                // (issue #132), instead of one per session; everything
+                // downstream — in-memory publication, event emission — stays
+                // per-session, unchanged from before batching.
+                let reconciled = state.reconcile_scanned_batch_if_current(
                     generation,
-                    path,
-                    session,
                     history_generation,
-                ) else {
-                    return;
-                };
-                let summary = SessionSummary::of(&reconciled.session);
-                if state.publish_scanned_session(generation, path, reconciled.session) {
-                    if let Err(e) = app.emit("session-updated", &summary) {
-                        tracing::warn!("emit session-updated failed: {}", e);
+                    batch.to_vec(),
+                );
+                for (path, reconciled) in reconciled {
+                    let summary = SessionSummary::of(&reconciled.session);
+                    if state.publish_scanned_session(generation, &path, reconciled.session) {
+                        if let Err(e) = app.emit("session-updated", &summary) {
+                            tracing::warn!("emit session-updated failed: {}", e);
+                        }
                     }
-                }
-                if let Some(displaced) = reconciled.displaced {
-                    if let Err(e) = app.emit("session-updated", &SessionSummary::of(&displaced)) {
-                        tracing::warn!("emit displaced session-updated failed: {}", e);
+                    if let Some(displaced) = reconciled.displaced {
+                        if let Err(e) = app.emit("session-updated", &SessionSummary::of(&displaced))
+                        {
+                            tracing::warn!("emit displaced session-updated failed: {}", e);
+                        }
                     }
                 }
             },
@@ -1245,6 +1249,19 @@ pub fn spawn_scan(
         if state.current_scan_generation() != generation {
             return;
         }
+
+        // Rebuilds every `rollup_*` table once, in a single pass, if the
+        // scan just run deferred any per-session rollup maintenance
+        // (issue #132). Unconditional — unlike the source-availability
+        // finalization below, this does not depend on
+        // `source_configuration_valid` or `report.parse_failures`: a
+        // deferred rollup is a property of what `observe_bulk` durably wrote
+        // during this scan, not of whether the scan's overall result can be
+        // trusted enough to mark missing sources. Skipping it on a
+        // parse-failure scan would leave sessions_in_ranges routing those
+        // sessions through the slower in-memory fallback for the rest of
+        // this process's lifetime, not just until the next scan.
+        state.finalize_bulk_scan_rollups();
 
         // Retained for the on-demand provider diagnostics report (issue #39).
         // Only the newest still-current scan's counters are kept.
@@ -1407,9 +1424,22 @@ pub fn get_scan_status(state: State<'_, Arc<AppState>>) -> ScanStatus {
 /// `spawn_scan` and every IPC command that needs the ledger wait on or check
 /// that readiness rather than treating `Pending` like a permanently
 /// unavailable archive.
+///
+/// Records two separate performance metrics rather than one combined
+/// `startup.history_open` (issue #132): `HistoryStore::open_default_with_progress`
+/// (`Connection::open`, pragmas, `migrate()`) is one phase; `AppState::
+/// set_history_ready` — which synchronously calls `hydrate_history`,
+/// deserializing every archived session's snapshot to populate
+/// `state.sessions` — is a second, separately-timed phase. A v0.8.7 field
+/// recording showed 16,794ms for `startup.history_open` with no migration to
+/// run between v0.8.6 and v0.8.7; that number was this whole function, not
+/// just opening the file, and conflating the two made a hydration-dominated
+/// cost look like an open/migration cost. `startup.history_open` is kept as
+/// the open/migrate phase alone so it means what its name says; the new
+/// `startup.history_hydrate` names the rest.
 pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
     std::thread::spawn(move || {
-        let started = Instant::now();
+        let open_started = Instant::now();
         let progress_app = app.clone();
         let progress_state = state.clone();
         let result = crate::history_store::HistoryStore::open_default_with_progress(move |event| {
@@ -1447,6 +1477,22 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
             );
         });
         let success = result.is_ok();
+        // Phase 1 ends here: `Connection::open`, pragmas, and `migrate()`
+        // (plus, since this change, a rebuild if #132's crash-safety check
+        // found stale rollups from an interrupted prior scan) are done.
+        state.performance.record_backend(
+            "startup.history_open",
+            open_started,
+            success,
+            BTreeMap::from([("available".into(), success.to_string())]),
+        );
+        // Phase 2: `set_history_ready` synchronously calls `hydrate_history`,
+        // which deserializes every archived session's snapshot to populate
+        // `state.sessions` — this is what a v0.8.7 field recording's
+        // 16,794ms `startup.history_open` (with no migration to run) was
+        // actually measuring, per this function's un-split shape before this
+        // change.
+        let hydrate_started = Instant::now();
         match result {
             Ok(store) => state.set_history_ready(Some(Arc::new(store))),
             Err(error) => {
@@ -1454,13 +1500,13 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
                 state.set_history_ready(None);
             }
         }
-        let total_elapsed_ms = started.elapsed().as_millis() as u64;
         state.performance.record_backend(
-            "startup.history_open",
-            started,
+            "startup.history_hydrate",
+            hydrate_started,
             success,
-            BTreeMap::from([("available".into(), success.to_string())]),
+            BTreeMap::from([("sessions".into(), state.sessions.len().to_string())]),
         );
+        let total_elapsed_ms = open_started.elapsed().as_millis() as u64;
         let last_step = state.last_history_step();
         let _ = app.emit(
             "history-progress",
