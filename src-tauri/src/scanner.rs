@@ -12,6 +12,19 @@ use crate::provider::{
 };
 use crate::scan_cache::{self, ScanCache};
 
+/// How many sessions `scan_all` hands to `on_session_batch` at a time
+/// (issue #132). Read+parse stay per-file and fully parallel; only the
+/// durable-write callback is batched, so this bounds how many sessions one
+/// `AppState::reconcile_scanned_batch_if_current` call (and, downstream, one
+/// `HistoryStore::observe_bulk_batch` transaction) covers. A measured
+/// isolated probe of the store's write path
+/// (`history_store::tests::diagnostic_probe_commit_count_vs_row_count`)
+/// found WAL commit overhead — not row/statement volume — dominates a
+/// one-transaction-per-session write pattern by roughly two orders of
+/// magnitude; batching amortizes that fixed per-commit cost across this many
+/// sessions instead of paying it once per session.
+pub(crate) const SCAN_WRITE_BATCH_SIZE: usize = 64;
+
 pub fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
     scan_files(root, |path| {
         path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
@@ -76,9 +89,14 @@ struct ProviderAtomics {
     cache_misses: AtomicU64,
 }
 
-/// Scans all roots in parallel, invoking `on_session(path, session)` from
-/// worker threads as each file finishes. Progress callbacks are serialized
-/// and monotonic.
+/// Scans all roots in parallel, invoking `on_session_batch(&[(path,
+/// session), ..])` from worker threads once per completed batch of up to
+/// [`SCAN_WRITE_BATCH_SIZE`] files (issue #132; before that change this
+/// called back once per file). Reading and parsing stay per-file and fully
+/// parallel — this only changes how many sessions accumulate before the
+/// durable-write callback fires, so a bulk scan's writer can batch them into
+/// one transaction instead of one per session. Progress callbacks still fire
+/// once per file, serialized and monotonic, independent of batch boundaries.
 /// When `cache` is `Some`, files whose (size, mtime) match the cache are
 /// served from it without being read or parsed, and cache rows are updated
 /// individually. The cache must already be open: opening it is the caller's
@@ -92,11 +110,11 @@ struct ProviderAtomics {
 pub fn scan_all<F, P>(
     sources: &ProviderSourceSet,
     cache: Option<ScanCache>,
-    on_session: F,
+    on_session_batch: F,
     on_progress: P,
 ) -> ScanReport
 where
-    F: Fn(&Path, crate::model::Session) + Send + Sync,
+    F: Fn(&[(PathBuf, crate::model::Session)]) + Send + Sync,
     P: Fn(usize, usize) + Send + Sync,
 {
     let discovery_started = Instant::now();
@@ -151,79 +169,85 @@ where
     let cache_lookup_total_ns = AtomicU64::new(0);
     let processing_started = Instant::now();
 
-    work.par_iter().for_each(|(path, adapter, kind)| {
-        let provider_counters = provider_atomics.get(&adapter.descriptor().id);
-        let key = path.to_string_lossy().into_owned();
-        // The stamp is taken BEFORE parsing so a file that grows mid-parse
-        // looks changed on the next launch rather than serving stale data.
-        let stamp = scan_cache::file_stamp(path);
-        let cache_started = Instant::now();
-        let cached = stamp
-            .and_then(|(size, mtime_ms)| {
-                cache
-                    .as_ref()
-                    .and_then(|cache| cache.lookup(&key, size, mtime_ms))
-            })
-            .filter(|session| adapter.accepts_cached_session(session, *kind));
-        if cache.as_ref().is_some_and(ScanCache::is_enabled) {
-            cache_lookup_total_ns.fetch_add(elapsed_ns(cache_started), Ordering::Relaxed);
-            if cached.is_some() {
-                cache_hits.fetch_add(1, Ordering::Relaxed);
-                if let Some(counters) = provider_counters {
-                    counters.cache_hits.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                cache_misses.fetch_add(1, Ordering::Relaxed);
-                if let Some(counters) = provider_counters {
-                    counters.cache_misses.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        let session = match cached {
-            Some(session) => Some(session),
-            None => {
-                let parse_started = Instant::now();
-                let result = adapter.parse_file(path, *kind);
-                let parse_ns = elapsed_ns(parse_started);
-                parsed_files.fetch_add(1, Ordering::Relaxed);
-                parse_total_ns.fetch_add(parse_ns, Ordering::Relaxed);
-                parse_max_ns.fetch_max(parse_ns, Ordering::Relaxed);
-                if let Some(counters) = provider_counters {
-                    counters.parsed.fetch_add(1, Ordering::Relaxed);
-                }
-                match result {
-                    Ok(Some(session)) => {
-                        if let (Some(cache), Some((size, mtime_ms))) = (&cache, stamp) {
-                            cache.store(&key, size, mtime_ms, &session);
-                        }
-                        Some(session)
+    work.par_chunks(SCAN_WRITE_BATCH_SIZE).for_each(|chunk| {
+        let mut batch: Vec<(PathBuf, crate::model::Session)> = Vec::with_capacity(chunk.len());
+        for (path, adapter, kind) in chunk {
+            let provider_counters = provider_atomics.get(&adapter.descriptor().id);
+            let key = path.to_string_lossy().into_owned();
+            // The stamp is taken BEFORE parsing so a file that grows mid-parse
+            // looks changed on the next launch rather than serving stale data.
+            let stamp = scan_cache::file_stamp(path);
+            let cache_started = Instant::now();
+            let cached = stamp
+                .and_then(|(size, mtime_ms)| {
+                    cache
+                        .as_ref()
+                        .and_then(|cache| cache.lookup(&key, size, mtime_ms))
+                })
+                .filter(|session| adapter.accepts_cached_session(session, *kind));
+            if cache.as_ref().is_some_and(ScanCache::is_enabled) {
+                cache_lookup_total_ns.fetch_add(elapsed_ns(cache_started), Ordering::Relaxed);
+                if cached.is_some() {
+                    cache_hits.fetch_add(1, Ordering::Relaxed);
+                    if let Some(counters) = provider_counters {
+                        counters.cache_hits.fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(None) => {
-                        if let Some(counters) = provider_counters {
-                            counters.skipped.fetch_add(1, Ordering::Relaxed);
-                        }
-                        None
-                    }
-                    Err(e) => {
-                        parse_failures.fetch_add(1, Ordering::Relaxed);
-                        if let Some(counters) = provider_counters {
-                            counters.parse_failures.fetch_add(1, Ordering::Relaxed);
-                        }
-                        tracing::warn!("failed to parse {:?}: {}", path, e);
-                        None
+                } else {
+                    cache_misses.fetch_add(1, Ordering::Relaxed);
+                    if let Some(counters) = provider_counters {
+                        counters.cache_misses.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-        };
 
-        if let Some(session) = session {
-            on_session(path.as_path(), session);
+            let session = match cached {
+                Some(session) => Some(session),
+                None => {
+                    let parse_started = Instant::now();
+                    let result = adapter.parse_file(path, *kind);
+                    let parse_ns = elapsed_ns(parse_started);
+                    parsed_files.fetch_add(1, Ordering::Relaxed);
+                    parse_total_ns.fetch_add(parse_ns, Ordering::Relaxed);
+                    parse_max_ns.fetch_max(parse_ns, Ordering::Relaxed);
+                    if let Some(counters) = provider_counters {
+                        counters.parsed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    match result {
+                        Ok(Some(session)) => {
+                            if let (Some(cache), Some((size, mtime_ms))) = (&cache, stamp) {
+                                cache.store(&key, size, mtime_ms, &session);
+                            }
+                            Some(session)
+                        }
+                        Ok(None) => {
+                            if let Some(counters) = provider_counters {
+                                counters.skipped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            None
+                        }
+                        Err(e) => {
+                            parse_failures.fetch_add(1, Ordering::Relaxed);
+                            if let Some(counters) = provider_counters {
+                                counters.parse_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                            tracing::warn!("failed to parse {:?}: {}", path, e);
+                            None
+                        }
+                    }
+                }
+            };
+
+            if let Some(session) = session {
+                batch.push((path.clone(), session));
+            }
+
+            let mut done = progress_done.lock().unwrap();
+            *done += 1;
+            on_progress(*done, total);
         }
-
-        let mut done = progress_done.lock().unwrap();
-        *done += 1;
-        on_progress(*done, total);
+        if !batch.is_empty() {
+            on_session_batch(&batch);
+        }
     });
 
     if let Some(cache) = cache {

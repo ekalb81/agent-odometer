@@ -38,6 +38,21 @@ pub struct SourceLocation {
     pub last_seen_at_ms: i64,
 }
 
+/// Result of [`HistoryStore::observe_bulk`]: like [`StoredSession`] plus
+/// [`Option<StoredSession>`] for a displaced in-place replacement, plus
+/// whether this call deferred rollup maintenance for the session it wrote
+/// (issue #132). `rollups_deferred` is true exactly when this call changed
+/// the session's durable facts (a real snapshot change, not a no-op observe
+/// of unchanged data) without also updating `rollup_*` for it — the caller
+/// must treat that session's ledger-backed range aggregation as untrustworthy
+/// until [`HistoryStore::rebuild_rollups_if_stale`] runs.
+#[derive(Debug, Clone)]
+pub struct BulkObserveOutcome {
+    pub stored: StoredSession,
+    pub displaced: Option<StoredSession>,
+    pub rollups_deferred: bool,
+}
+
 /// A materialized durable session together with source availability metadata.
 #[derive(Debug, Clone)]
 pub struct StoredSession {
@@ -135,6 +150,26 @@ impl HistoryStore {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
         migrate(&mut connection, &mut on_progress)?;
+        // Crash-safety net for issue #132's deferred-rollup bulk scan: a
+        // process that was killed after a bulk `observe_bulk` write
+        // committed facts but before the scan's completion rebuilt rollups
+        // leaves `rollups_stale` set durably in `history_meta`. Checking it
+        // here — before this store is ever handed to a caller — guarantees
+        // no read can observe a rollup row that is missing or behind its
+        // facts; it is a plain full-table rebuild, not a schema migration,
+        // so it deliberately is not counted in `migration_step_count`.
+        if rollups_are_stale(&connection)? {
+            tracing::warn!(
+                "durable history rollups were left stale by an interrupted scan; rebuilding \
+                 before opening {}",
+                path.display()
+            );
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            rebuild_rollups_in_transaction(&transaction)?;
+            clear_rollups_stale(&transaction)?;
+            transaction.commit()?;
+        }
         Ok(Self {
             connection: Mutex::new(connection),
             path: path.to_path_buf(),
@@ -181,90 +216,172 @@ impl HistoryStore {
         session: &Session,
         generation: i64,
     ) -> Result<(StoredSession, Option<StoredSession>)> {
-        let path = source_path_key(source_path);
-        let identity = provider_identity(session)?;
-        let fingerprint = first_event_fingerprint(session);
-        let lineage = history_lineage(session);
-        let fingerprint_is_final = !session.tokens_history.is_empty();
-        let now = now_ms();
+        let (stored, displaced, _rollups_deferred) =
+            self.observe_internal(source_path, session, generation, true)?;
+        Ok((stored, displaced))
+    }
 
+    /// Bulk-scan variant of [`Self::observe_with_displaced`] (issue #132): the
+    /// fact tables (`durable_token_events`, `durable_tool_events`,
+    /// `durable_tool_dimension_events`, `durable_finding_events`) are written
+    /// exactly as before, but the per-session `rollup_*` upserts are skipped.
+    /// A bulk scan touches most of the corpus in one pass, so maintaining
+    /// hour-bucket rollups session-by-session is pure overhead; the caller is
+    /// expected to run [`Self::rebuild_rollups_if_stale`] once after the scan
+    /// completes, which recomputes every `rollup_*` table from the fact
+    /// tables with the same SQL `GROUP BY` the schema migrations use.
+    ///
+    /// A durable `rollups_stale` marker in `history_meta` is set, in the same
+    /// transaction as the fact write, whenever this call actually changes a
+    /// session's facts. That marker is checked on the next
+    /// [`Self::open`]/[`Self::open_with_progress`], so a process that
+    /// crashes mid-scan rebuilds rollups before ever serving a read from
+    /// them, rather than silently under-reporting from stale/missing rollup
+    /// rows.
+    pub fn observe_bulk(
+        &self,
+        source_path: &Path,
+        session: &Session,
+        generation: i64,
+    ) -> Result<BulkObserveOutcome> {
+        let (stored, displaced, rollups_deferred) =
+            self.observe_internal(source_path, session, generation, false)?;
+        Ok(BulkObserveOutcome {
+            stored,
+            displaced,
+            rollups_deferred,
+        })
+    }
+
+    /// Shared implementation for [`Self::observe_with_displaced`] and
+    /// [`Self::observe_bulk`]. `maintain_rollups` is true for every caller
+    /// except the bulk-scan path; see [`Self::observe_bulk`]'s doc comment.
+    /// Returns `(stored, displaced, rollups_deferred)`, where
+    /// `rollups_deferred` is only ever true when `maintain_rollups` is false
+    /// AND this call actually rewrote the session's facts.
+    fn observe_internal(
+        &self,
+        source_path: &Path,
+        session: &Session,
+        generation: i64,
+        maintain_rollups: bool,
+    ) -> Result<(StoredSession, Option<StoredSession>, bool)> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let displaced_key: Option<String> = transaction
-            .query_row(
-                "SELECT session_key FROM source_locations WHERE path = ?1",
-                [path.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let key = reconcile_session(
+        let (key, displaced_key, rollups_deferred) = observe_one_in_transaction(
             &transaction,
-            &path,
-            &identity,
-            &fingerprint,
-            fingerprint_is_final,
+            source_path,
             session,
-            now,
+            generation,
+            maintain_rollups,
         )?;
-        let mut archived_session = session.clone();
-        archived_session.storage_id = key.clone();
-        archived_session.source_availability = SourceAvailability::Present;
-        archived_session.file_path = path.clone();
-        apply_project_identity(&transaction, &key, &mut archived_session)?;
-        let raw_snapshot =
-            serde_json::to_vec(&archived_session).context("could not encode session snapshot")?;
-        let snapshot_hash = stable_hash_bytes(&raw_snapshot);
-        let artifact_key = format!(
-            "artifact-{}",
-            stable_hash(&format!("{identity}\u{1f}{lineage}"))
-        );
-        transaction.execute(
-            "INSERT INTO source_artifacts(artifact_key, identity_key, first_event_fingerprint, session_key, created_at_ms, last_seen_at_ms)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?5)
-             ON CONFLICT(artifact_key) DO UPDATE SET last_seen_at_ms = excluded.last_seen_at_ms",
-            params![artifact_key, identity, fingerprint, key, now],
-        )?;
-        transaction.execute(
-            "INSERT INTO source_locations(path, artifact_key, session_key, present, first_seen_at_ms, last_seen_at_ms, seen_generation)
-             VALUES(?1, ?2, ?3, 1, ?4, ?4, ?5)
-             ON CONFLICT(path) DO UPDATE SET artifact_key = excluded.artifact_key,
-                 session_key = excluded.session_key, present = 1,
-                 last_seen_at_ms = excluded.last_seen_at_ms,
-                 seen_generation = MAX(source_locations.seen_generation, excluded.seen_generation)",
-            params![path, artifact_key, key, now, generation],
-        )?;
-        // Most scans see an unchanged, fully parsed snapshot. Its stable hash
-        // makes it safe to skip walking/re-inserting the complete history;
-        // appends and resumes necessarily change the snapshot and still take
-        // the idempotent normalized-event path below.
-        if store_snapshot(
-            &transaction,
-            &key,
-            &archived_session,
-            &raw_snapshot,
-            &snapshot_hash,
-            now,
-            SnapshotPolicy::Source,
-        )? {
-            store_token_events(&transaction, &key, &session.tokens_history)?;
-            store_tool_events(&transaction, &key, &session.tool_observations)?;
-            store_finding_events(&transaction, &key, &session.optimization_findings)?;
-        }
-        // A successful observe realigns snapshot and facts; any overlay-set
-        // dirty marking is resolved.
-        transaction.execute(
-            "UPDATE durable_sessions SET ledger_dirty = 0 WHERE session_key = ?1",
-            [key.as_str()],
-        )?;
-        refresh_collision_flags(&transaction, &identity)?;
         transaction.commit()?;
         drop(connection);
         let current = self.load_one(&key)?;
         let displaced = displaced_key
-            .filter(|previous| previous != &key)
             .map(|previous| self.load_one(&previous))
             .transpose()?;
-        Ok((current, displaced))
+        Ok((current, displaced, rollups_deferred))
+    }
+
+    /// Batched variant of [`Self::observe_bulk`] (issue #132): every item
+    /// is written to the fact tables — with rollup maintenance deferred, the
+    /// same as `observe_bulk` — inside **one** shared transaction instead of
+    /// one transaction per session. This is the batching direction the issue
+    /// names alongside deferred rollups: an isolated measurement of this
+    /// store's write path (`diagnostic_probe_commit_count_vs_row_count`)
+    /// found a single-row-per-transaction pattern costs ~160x a single
+    /// transaction holding the same rows, dwarfing the row-count-dependent
+    /// cost the deferred-rollup change alone reduces — WAL commit overhead,
+    /// not statement volume, is what one flush amortizes across `items.len()`
+    /// sessions.
+    ///
+    /// On any single item's error the whole transaction rolls back (nothing
+    /// in this batch is partially persisted) and the error is returned;
+    /// callers are expected to fall back to the single-item
+    /// [`Self::observe_bulk`] to retry the batch one session at a time,
+    /// preserving the same per-session failure isolation the non-batched
+    /// path has always had (`AppState::reconcile_scanned_batch_if_current`
+    /// is the only caller and does exactly this).
+    pub fn observe_bulk_batch(
+        &self,
+        items: &[(&Path, &Session, i64)],
+    ) -> Result<Vec<BulkObserveOutcome>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut written = Vec::with_capacity(items.len());
+        for (source_path, session, generation) in items {
+            written.push(observe_one_in_transaction(
+                &transaction,
+                source_path,
+                session,
+                *generation,
+                false,
+            )?);
+        }
+        transaction.commit()?;
+        drop(connection);
+        let mut outcomes = Vec::with_capacity(written.len());
+        for (key, displaced_key, rollups_deferred) in written {
+            let stored = self.load_one(&key)?;
+            let displaced = displaced_key
+                .map(|previous| self.load_one(&previous))
+                .transpose()?;
+            outcomes.push(BulkObserveOutcome {
+                stored,
+                displaced,
+                rollups_deferred,
+            });
+        }
+        Ok(outcomes)
+    }
+
+    /// True when a bulk scan deferred rollup maintenance ([`Self::observe_bulk`])
+    /// and no [`Self::rebuild_rollups`] has run since. Checked on every
+    /// [`Self::open`]/[`Self::open_with_progress`] as the crash-safety net
+    /// for an interrupted scan (issue #132): the read path serves whole-hour
+    /// buckets straight from `rollup_*`, so a stale/missing rollup row would
+    /// otherwise silently under-report rather than fail.
+    pub fn rollups_are_stale(&self) -> Result<bool> {
+        let connection = self.connection()?;
+        rollups_are_stale(&connection)
+    }
+
+    /// Recomputes every `rollup_*` table from the fact tables it is derived
+    /// from, using the same SQL `GROUP BY` shape the schema migrations use to
+    /// backfill rollups (see `migrate()`'s `v3_to_v4_rollup_backfill` and
+    /// later steps). This is a full, deterministic rebuild — not an
+    /// incremental patch — so it produces bit-identical rows to what
+    /// per-session incremental upserts would have produced, regardless of
+    /// how many [`Self::observe_bulk`] calls deferred rollup maintenance
+    /// since the last rebuild. Clears the `rollups_stale` marker in the same
+    /// transaction as the rebuild, so a crash between the two can never leave
+    /// the marker cleared while rollups are still wrong.
+    pub fn rebuild_rollups(&self) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rebuild_rollups_in_transaction(&transaction)?;
+        clear_rollups_stale(&transaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Runs [`Self::rebuild_rollups`] only if the `rollups_stale` marker is
+    /// set, returning whether it did. The only callers are the bulk-scan
+    /// completion path (`store::AppState::finish_history_scan`, whether or
+    /// not the scan reported parse failures) and [`Self::open_with_progress`]'s
+    /// crash-safety check; both treat "nothing was ever deferred" as a cheap
+    /// no-op rather than an unconditional full-table rebuild every time.
+    pub fn rebuild_rollups_if_stale(&self) -> Result<bool> {
+        if self.rollups_are_stale()? {
+            self.rebuild_rollups()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Marks locations not seen in this completed, newest scan as missing.
@@ -380,7 +497,13 @@ impl HistoryStore {
     /// the auto-computed `durable_sessions.project_*` columns or a source
     /// transcript.
     pub fn list_project_overrides(&self) -> Result<Vec<ProjectOverrideRow>> {
-        let connection = self.connection()?;
+        // Dedicated read connection (issue #132), not `self.connection()`:
+        // this is on `ipc.resolve_projects`'s hot path, which must not queue
+        // behind a bulk scan's writer-mutex transactions the way it did
+        // before this change (WAL allows a fresh reader connection to
+        // proceed concurrently with an in-progress writer transaction).
+        // Mirrors `range_totals_multi`'s existing pattern.
+        let connection = self.open_reader()?;
         load_project_overrides(&connection).map(|map| map.into_values().collect())
     }
 
@@ -494,7 +617,8 @@ impl HistoryStore {
     /// Every session-level manual project reassignment (#41 "split"), keyed
     /// by durable session key.
     pub fn list_session_project_overrides(&self) -> Result<HashMap<String, String>> {
-        let connection = self.connection()?;
+        // Dedicated read connection; see `list_project_overrides` (issue #132).
+        let connection = self.open_reader()?;
         let mut statement =
             connection.prepare("SELECT session_key, project_key FROM project_session_overrides")?;
         let rows = statement
@@ -541,9 +665,7 @@ impl HistoryStore {
         session_keys: &[String],
         windows: &[RangeWindow],
     ) -> Result<Vec<HashMap<String, RangeTotals>>> {
-        let connection = Connection::open(&self.path)
-            .with_context(|| format!("could not open history reader {}", self.path.display()))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        let connection = self.open_reader()?;
         let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); windows.len()];
 
         let window_ms: Vec<(Option<i64>, Option<i64>)> = windows
@@ -859,17 +981,103 @@ impl HistoryStore {
         Ok(keys)
     }
 
-    /// Returns all archived sessions, including those whose sources are gone.
+    /// Returns all archived sessions, including those whose sources are
+    /// gone. Three queries total regardless of corpus size — one for the
+    /// ordered key list, one for every current snapshot, one for every
+    /// source location — rather than [`Self::load_one`]'s per-session
+    /// `SELECT`s run once per key (issue #132: this is `AppState::
+    /// hydrate_history`'s only caller, and hydration runs synchronously on
+    /// the startup critical path before a bulk scan's first write). This
+    /// does not change what gets deserialized — every archived session's
+    /// full snapshot still comes into memory, the same as before — only how
+    /// many round trips it takes to fetch the rows backing that
+    /// deserialization.
     pub fn load_sessions(&self) -> Result<Vec<StoredSession>> {
         let connection = self.connection()?;
-        let mut statement = connection.prepare(
+        let mut key_statement = connection.prepare(
             "SELECT session_key FROM durable_sessions ORDER BY last_seen_at_ms DESC, session_key",
         )?;
-        let keys = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
-        keys.iter().map(|key| load_one(&connection, key)).collect()
+        let ordered_keys: Vec<String> = key_statement
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        drop(key_statement);
+
+        let mut snapshot_statement = connection.prepare(
+            "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json
+             FROM durable_sessions d JOIN session_snapshots s
+               ON s.session_key = d.session_key AND s.version = d.current_snapshot_version",
+        )?;
+        let mut snapshots: HashMap<String, (String, String, bool, Vec<u8>)> = HashMap::new();
+        let mut rows = snapshot_statement.query([])?;
+        while let Some(row) = rows.next()? {
+            snapshots.insert(
+                row.get(0)?,
+                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+            );
+        }
+        drop(rows);
+        drop(snapshot_statement);
+
+        let mut location_statement = connection.prepare(
+            "SELECT session_key, path, present, first_seen_at_ms, last_seen_at_ms
+             FROM source_locations ORDER BY session_key, path",
+        )?;
+        let mut locations_by_key: HashMap<String, Vec<SourceLocation>> = HashMap::new();
+        let mut rows = location_statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            locations_by_key
+                .entry(key)
+                .or_default()
+                .push(SourceLocation {
+                    path: row.get(1)?,
+                    present: row.get(2)?,
+                    first_seen_at_ms: row.get(3)?,
+                    last_seen_at_ms: row.get(4)?,
+                });
+        }
+        drop(rows);
+        drop(location_statement);
+
+        ordered_keys
+            .into_iter()
+            .map(|key| {
+                let (identity_key, first_event_fingerprint, collision, raw) = snapshots
+                    .remove(&key)
+                    .ok_or_else(|| anyhow!("missing durable session snapshot for {key}"))?;
+                let mut session: Session = serde_json::from_slice(&raw)
+                    .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
+                let locations = locations_by_key.remove(&key).unwrap_or_default();
+                let available = locations.iter().any(|location| location.present);
+                session.storage_id = key.clone();
+                session.source_availability = if available {
+                    SourceAvailability::Present
+                } else {
+                    SourceAvailability::Missing
+                };
+                if let Some(location) = locations
+                    .iter()
+                    .filter(|location| location.present)
+                    .max_by_key(|location| location.last_seen_at_ms)
+                    .or_else(|| {
+                        locations
+                            .iter()
+                            .max_by_key(|location| location.last_seen_at_ms)
+                    })
+                {
+                    session.file_path = location.path.clone();
+                }
+                Ok(StoredSession {
+                    key,
+                    identity_key,
+                    first_event_fingerprint,
+                    available,
+                    collision,
+                    locations,
+                    session,
+                })
+            })
+            .collect()
     }
 
     pub fn stats(&self) -> Result<HistoryStats> {
@@ -903,6 +1111,18 @@ impl HistoryStore {
         self.connection
             .lock()
             .map_err(|_| anyhow!("history-store connection lock poisoned"))
+    }
+
+    /// A fresh, independent connection to the same WAL-mode database file,
+    /// for read-only call sites that must not queue behind the shared writer
+    /// mutex (issue #132; `range_totals_multi` established this pattern
+    /// before this change). WAL permits a reader connection to proceed
+    /// concurrently with an in-progress writer transaction on `self.connection`.
+    fn open_reader(&self) -> Result<Connection> {
+        let connection = Connection::open(&self.path)
+            .with_context(|| format!("could not open history reader {}", self.path.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(connection)
     }
 }
 
@@ -2533,6 +2753,217 @@ enum SnapshotPolicy {
     MetadataOverlay,
 }
 
+/// Core per-session write, extracted so both [`HistoryStore::observe_internal`]
+/// (one session, its own transaction) and [`HistoryStore::observe_bulk_batch`]
+/// (many sessions, one shared transaction) run identical logic — the only
+/// difference between a session written singly and one written as part of a
+/// batch is where the surrounding `BEGIN`/`COMMIT` falls. Returns
+/// `(key, displaced_key, rollups_deferred)`; `displaced_key` is already
+/// filtered to exclude the case where the previous occupant of this source
+/// path *is* this same durable session (an unchanged/appended observation,
+/// not a displacement).
+fn observe_one_in_transaction(
+    transaction: &Transaction<'_>,
+    source_path: &Path,
+    session: &Session,
+    generation: i64,
+    maintain_rollups: bool,
+) -> Result<(String, Option<String>, bool)> {
+    let path = source_path_key(source_path);
+    let identity = provider_identity(session)?;
+    let fingerprint = first_event_fingerprint(session);
+    let lineage = history_lineage(session);
+    let fingerprint_is_final = !session.tokens_history.is_empty();
+    let now = now_ms();
+
+    let displaced_key: Option<String> = transaction
+        .query_row(
+            "SELECT session_key FROM source_locations WHERE path = ?1",
+            [path.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let key = reconcile_session(
+        transaction,
+        &path,
+        &identity,
+        &fingerprint,
+        fingerprint_is_final,
+        session,
+        now,
+    )?;
+    let mut archived_session = session.clone();
+    archived_session.storage_id = key.clone();
+    archived_session.source_availability = SourceAvailability::Present;
+    archived_session.file_path = path.clone();
+    apply_project_identity(transaction, &key, &mut archived_session)?;
+    let raw_snapshot =
+        serde_json::to_vec(&archived_session).context("could not encode session snapshot")?;
+    let snapshot_hash = stable_hash_bytes(&raw_snapshot);
+    let artifact_key = format!(
+        "artifact-{}",
+        stable_hash(&format!("{identity}\u{1f}{lineage}"))
+    );
+    transaction.execute(
+        "INSERT INTO source_artifacts(artifact_key, identity_key, first_event_fingerprint, session_key, created_at_ms, last_seen_at_ms)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?5)
+         ON CONFLICT(artifact_key) DO UPDATE SET last_seen_at_ms = excluded.last_seen_at_ms",
+        params![artifact_key, identity, fingerprint, key, now],
+    )?;
+    transaction.execute(
+        "INSERT INTO source_locations(path, artifact_key, session_key, present, first_seen_at_ms, last_seen_at_ms, seen_generation)
+         VALUES(?1, ?2, ?3, 1, ?4, ?4, ?5)
+         ON CONFLICT(path) DO UPDATE SET artifact_key = excluded.artifact_key,
+             session_key = excluded.session_key, present = 1,
+             last_seen_at_ms = excluded.last_seen_at_ms,
+             seen_generation = MAX(source_locations.seen_generation, excluded.seen_generation)",
+        params![path, artifact_key, key, now, generation],
+    )?;
+    // Most scans see an unchanged, fully parsed snapshot. Its stable hash
+    // makes it safe to skip walking/re-inserting the complete history;
+    // appends and resumes necessarily change the snapshot and still take
+    // the idempotent normalized-event path below.
+    let facts_changed = store_snapshot(
+        transaction,
+        &key,
+        &archived_session,
+        &raw_snapshot,
+        &snapshot_hash,
+        now,
+        SnapshotPolicy::Source,
+    )?;
+    if facts_changed {
+        store_token_events(transaction, &key, &session.tokens_history, maintain_rollups)?;
+        store_tool_events(
+            transaction,
+            &key,
+            &session.tool_observations,
+            maintain_rollups,
+        )?;
+        store_finding_events(transaction, &key, &session.optimization_findings)?;
+    }
+    let rollups_deferred = !maintain_rollups && facts_changed;
+    if rollups_deferred {
+        mark_rollups_stale(transaction)?;
+    }
+    // A successful observe realigns snapshot and facts; any overlay-set
+    // dirty marking is resolved.
+    transaction.execute(
+        "UPDATE durable_sessions SET ledger_dirty = 0 WHERE session_key = ?1",
+        [key.as_str()],
+    )?;
+    refresh_collision_flags(transaction, &identity)?;
+    let displaced_key = displaced_key.filter(|previous| previous != &key);
+    Ok((key, displaced_key, rollups_deferred))
+}
+
+/// `history_meta` key marking whether `rollup_*` is behind the fact tables
+/// (issue #132). `history_meta` is a pre-existing generic key/value table —
+/// adding this key is not a schema change, so it does not move
+/// `SCHEMA_VERSION` or the committed schema fingerprint.
+const ROLLUPS_STALE_META_KEY: &str = "rollups_stale";
+
+fn mark_rollups_stale(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO history_meta(key, value) VALUES(?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = '1'",
+        [ROLLUPS_STALE_META_KEY],
+    )?;
+    Ok(())
+}
+
+fn clear_rollups_stale(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO history_meta(key, value) VALUES(?1, '0')
+         ON CONFLICT(key) DO UPDATE SET value = '0'",
+        [ROLLUPS_STALE_META_KEY],
+    )?;
+    Ok(())
+}
+
+fn rollups_are_stale(connection: &Connection) -> Result<bool> {
+    let value: Option<String> = connection
+        .query_row(
+            "SELECT value FROM history_meta WHERE key = ?1",
+            [ROLLUPS_STALE_META_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(value.as_deref() == Some("1"))
+}
+
+/// Full, deterministic rebuild of every `rollup_*` table from the fact
+/// tables it derives from — the same SQL `GROUP BY` shape `migrate()` uses
+/// to backfill rollups (`v3_to_v4_rollup_backfill`), extended with the
+/// `cache_creation_input_tokens` column the v4->v5 step adds and the
+/// `origin`-derived columns the v6->v7 step adds, since both columns exist
+/// unconditionally on any store new enough to reach this code path. `SUM`
+/// over the complete fact set is exactly equivalent to the additive
+/// per-event upserts `store_token_events`/`store_tool_events` perform when
+/// `maintain_rollups` is true — same operation, applied once instead of
+/// incrementally — so this reproduces bit-identical rollup rows regardless
+/// of how many `observe_bulk` calls deferred rollup maintenance since the
+/// last rebuild. Never touches a session snapshot or re-parses a transcript.
+fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        "DELETE FROM rollup_token_totals;
+         DELETE FROM rollup_tool_metrics;
+         DELETE FROM rollup_mutation_chains;
+         DELETE FROM rollup_tool_dimensions;",
+    )?;
+    transaction.execute_batch(
+        "INSERT INTO rollup_token_totals(
+           session_key, hour_bucket, model, service_tier,
+           input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+           cache_creation_input_tokens)
+         SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, ''),
+           SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
+           SUM(reasoning_output_tokens), SUM(total_tokens), SUM(cache_creation_input_tokens)
+         FROM durable_token_events
+         GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, '');
+
+         INSERT INTO rollup_tool_metrics(
+           session_key, hour_bucket, model, calls, reads, searches, mutations, commands, other,
+           successes, failures, unknown, duration_ms, output_bytes,
+           core_origin_calls, mcp_origin_calls, provider_origin_calls, unknown_origin_calls)
+         SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''),
+           COUNT(*),
+           SUM(CASE WHEN kind = 'read' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN kind = 'search' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN kind = 'mutation' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN kind = 'command' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN kind = 'other' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN outcome NOT IN ('success', 'failure') THEN 1 ELSE 0 END),
+           SUM(COALESCE(duration_ms, 0)),
+           SUM(output_bytes),
+           SUM(CASE WHEN origin = 'core' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN origin = 'mcp' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN origin = 'provider' THEN 1 ELSE 0 END),
+           SUM(CASE WHEN origin NOT IN ('core', 'mcp', 'provider') THEN 1 ELSE 0 END)
+         FROM durable_tool_events
+         GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, '');
+
+         INSERT INTO rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target, mutation_count)
+         SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(turn_id, ''), COALESCE(target, ''), COUNT(*)
+         FROM durable_tool_events
+         WHERE kind = 'mutation'
+         GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(turn_id, ''), COALESCE(target, '');
+
+         INSERT INTO rollup_tool_dimensions(
+           session_key, hour_bucket, dimension_kind, dimension_value, calls, failures, output_bytes, duration_ms)
+         SELECT session_key, timestamp_ms / 3600000, dimension_kind, dimension_value,
+           COUNT(*),
+           SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END),
+           SUM(output_bytes),
+           SUM(COALESCE(duration_ms, 0))
+         FROM durable_tool_dimension_events
+         GROUP BY session_key, timestamp_ms / 3600000, dimension_kind, dimension_value;",
+    )?;
+    Ok(())
+}
+
 fn store_snapshot(
     transaction: &Transaction<'_>,
     key: &str,
@@ -2588,6 +3019,7 @@ fn store_token_events(
     transaction: &Transaction<'_>,
     key: &str,
     events: &[TokenHistoryPoint],
+    maintain_rollups: bool,
 ) -> Result<()> {
     let next_event_index: usize = transaction
         .query_row(
@@ -2658,8 +3090,11 @@ fn store_token_events(
     // Maintain the #107 hour-bucket token rollup incrementally: token events
     // are append-only (the same new-suffix slice inserted above), so each
     // event needs to contribute its delta exactly once, additively, to keep
-    // read-path reconstruction exact.
-    if next_event_index < events.len() {
+    // read-path reconstruction exact. Skipped entirely in bulk-scan mode
+    // (issue #132) — `maintain_rollups` is false only for `observe_bulk`,
+    // whose caller runs `rebuild_rollups_if_stale` once after the scan
+    // instead of paying this per-session upsert cost thousands of times.
+    if maintain_rollups && next_event_index < events.len() {
         let mut upsert = transaction.prepare(
             "INSERT INTO rollup_token_totals(
                session_key, hour_bucket, model, service_tier,
@@ -2826,9 +3261,17 @@ fn store_tool_events(
     transaction: &Transaction<'_>,
     key: &str,
     observations: &[ToolObservation],
+    maintain_rollups: bool,
 ) -> Result<()> {
     store_tool_event_facts(transaction, key, observations)?;
     store_tool_dimension_facts(transaction, key, observations)?;
+    // Skipped entirely in bulk-scan mode (issue #132): see the comment on
+    // `store_token_events`'s equivalent guard. The four `rollup_*` tables
+    // this would maintain are exactly what `rebuild_rollups_in_transaction`
+    // recomputes wholesale once the scan completes.
+    if !maintain_rollups {
+        return Ok(());
+    }
     transaction.execute(
         "DELETE FROM rollup_tool_metrics WHERE session_key = ?1",
         [key],
@@ -3603,6 +4046,241 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_scan_deferred_rollups_rebuild_matches_in_memory_oracle() {
+        // Issue #132: `observe_bulk` writes facts but skips the per-session
+        // rollup upserts `observe` performs. This is the golden-equality
+        // proof that deferring is a performance shortcut and never a
+        // correctness one: after `rebuild_rollups`, the ledger must match
+        // exactly the same in-memory oracle
+        // `ledger_range_totals_match_in_memory_rollups` compares against.
+        let (_directory, store) = store();
+        let sessions = [rich_session("bulk-a"), rich_session("bulk-b")];
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut keys = Vec::new();
+        for (index, fixture) in sessions.iter().enumerate() {
+            let outcome = store
+                .observe_bulk(
+                    Path::new(&format!("bulk-{index}.jsonl")),
+                    fixture,
+                    generation,
+                )
+                .unwrap();
+            assert!(
+                outcome.rollups_deferred,
+                "a brand new session's facts changed, so rollups must have been deferred"
+            );
+            keys.push(outcome.stored.key);
+        }
+
+        // Before the rebuild, rollups are genuinely absent for these
+        // sessions — not merely stale — proving `observe_bulk` actually
+        // skipped the upserts rather than just reporting a misleading flag,
+        // while the facts themselves are already durable.
+        {
+            let connection = store.connection().unwrap();
+            for key in &keys {
+                let rollup_rows: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM rollup_token_totals WHERE session_key = ?1",
+                        [key.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    rollup_rows, 0,
+                    "rollup_token_totals for {key} must be empty before rebuild"
+                );
+                let fact_rows: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM durable_token_events WHERE session_key = ?1",
+                        [key.as_str()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(
+                    fact_rows > 0,
+                    "facts for {key} must already be durable before rebuild"
+                );
+            }
+        }
+        assert!(store.rollups_are_stale().unwrap());
+
+        assert!(store.rebuild_rollups_if_stale().unwrap());
+        assert!(!store.rollups_are_stale().unwrap());
+        // A second call is a no-op: nothing deferred since the last rebuild.
+        assert!(!store.rebuild_rollups_if_stale().unwrap());
+
+        let bound = |value: &str| Some(timestamp(value));
+        let windows: Vec<RangeWindow> = vec![
+            (None, None),
+            (bound("2026-01-01T00:00:00Z"), bound("2026-01-02T00:00:00Z")),
+            (bound("2026-01-02T00:00:01Z"), None),
+        ];
+        let from_ledger = store.range_totals_multi(&keys, &windows).unwrap();
+        for (window_index, window) in windows.iter().enumerate() {
+            for (fixture, key) in sessions.iter().zip(&keys) {
+                let expected = fixture.range_totals_multi(std::slice::from_ref(window));
+                let expected = &expected[0];
+                match from_ledger[window_index].get(key) {
+                    Some(actual) => {
+                        assert_eq!(
+                            &actual.tokens, &expected.tokens,
+                            "tokens window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            &actual.buckets, &expected.buckets,
+                            "buckets window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            &actual.tool_metrics, &expected.tool_metrics,
+                            "tool_metrics window {window_index} {key}"
+                        );
+                        assert_eq!(
+                            &actual.tool_metrics_by_model, &expected.tool_metrics_by_model,
+                            "tool_metrics_by_model window {window_index} {key}"
+                        );
+                    }
+                    None => {
+                        assert!(
+                            !crate::commands::range_has_data(expected),
+                            "ledger omitted a window with data: window {window_index} {key}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observe_bulk_batch_writes_many_sessions_in_one_transaction_matching_oracle() {
+        // Issue #132: `observe_bulk_batch` is the actual write-count
+        // reduction — one COMMIT for the whole batch instead of one per
+        // session. Proves it produces the same materialized sessions and
+        // (after rebuild) the same ledger totals as one-session-at-a-time
+        // `observe_bulk`, and that the batch really did share one
+        // transaction (only one `source_locations` write per row regardless
+        // of batch size is implicit; here we check the observable output).
+        let (_directory, store) = store();
+        let sessions = [
+            rich_session("batch-a"),
+            rich_session("batch-b"),
+            rich_session("batch-c"),
+        ];
+        let generation = store.begin_scan().unwrap().max(1);
+        let paths: Vec<PathBuf> = (0..sessions.len())
+            .map(|index| PathBuf::from(format!("batch-{index}.jsonl")))
+            .collect();
+        let items: Vec<(&Path, &Session, i64)> = paths
+            .iter()
+            .zip(&sessions)
+            .map(|(path, session)| (path.as_path(), session, generation))
+            .collect();
+
+        let outcomes = store.observe_bulk_batch(&items).unwrap();
+        assert_eq!(outcomes.len(), sessions.len());
+        for outcome in &outcomes {
+            assert!(outcome.rollups_deferred);
+        }
+        assert!(store.rollups_are_stale().unwrap());
+        assert!(store.rebuild_rollups_if_stale().unwrap());
+
+        let keys: Vec<String> = outcomes.iter().map(|o| o.stored.key.clone()).collect();
+        let windows: Vec<RangeWindow> = vec![(None, None)];
+        let from_ledger = store.range_totals_multi(&keys, &windows).unwrap();
+        for (fixture, key) in sessions.iter().zip(&keys) {
+            let expected = fixture.range_totals_multi(&windows);
+            let actual = from_ledger[0]
+                .get(key)
+                .expect("batch-written session must be queryable after rebuild");
+            assert_eq!(&actual.tokens, &expected[0].tokens);
+            assert_eq!(&actual.tool_metrics, &expected[0].tool_metrics);
+        }
+    }
+
+    #[test]
+    fn observe_bulk_batch_rolls_back_the_whole_batch_on_one_bad_item() {
+        // Documents and locks in `observe_bulk_batch`'s failure contract: one
+        // item's error must not leave the rest of the batch half-written,
+        // because the caller's fallback (`AppState::reconcile_scanned_batch_if_current`
+        // retrying the batch one session at a time via `observe_bulk`)
+        // depends on nothing from the failed attempt being durable.
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let good = rich_session("good");
+        let mut bad = rich_session("bad");
+        bad.id = String::new(); // `provider_identity` rejects an empty id.
+        let good_path = PathBuf::from("good.jsonl");
+        let bad_path = PathBuf::from("bad.jsonl");
+        let items: Vec<(&Path, &Session, i64)> = vec![
+            (good_path.as_path(), &good, generation),
+            (bad_path.as_path(), &bad, generation),
+        ];
+
+        assert!(store.observe_bulk_batch(&items).is_err());
+
+        let connection = store.connection().unwrap();
+        let sessions: i64 = connection
+            .query_row("SELECT COUNT(*) FROM durable_sessions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            sessions, 0,
+            "a failed batch must roll back every item, including ones that individually succeeded"
+        );
+    }
+
+    #[test]
+    fn interrupted_bulk_scan_rebuilds_stale_rollups_on_next_open() {
+        // Crash-safety net for issue #132: simulates a process killed after
+        // `observe_bulk` committed facts (and the durable `rollups_stale`
+        // marker) in the same transaction, but before the scan's completion
+        // ever called `rebuild_rollups`. The read path serves whole-hour
+        // buckets straight from `rollup_*`, so the next `HistoryStore::open`
+        // must detect the marker and rebuild before returning — never hand
+        // back a store whose rollups are missing or behind its facts.
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let fixture = rich_session("interrupted");
+        let key;
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            let outcome = store
+                .observe_bulk(Path::new("interrupted.jsonl"), &fixture, generation)
+                .unwrap();
+            assert!(outcome.rollups_deferred);
+            key = outcome.stored.key;
+            assert!(store.rollups_are_stale().unwrap());
+            // Dropped here without ever calling `rebuild_rollups` — the
+            // simulated crash. `store` (and its connection) goes out of
+            // scope; nothing further is written to this database file.
+        }
+
+        let reopened = HistoryStore::open(&path).unwrap();
+        assert!(
+            !reopened.rollups_are_stale().unwrap(),
+            "reopening an archive with a stale marker must rebuild before returning"
+        );
+
+        let windows: Vec<RangeWindow> = vec![(None, None)];
+        let from_ledger = reopened
+            .range_totals_multi(std::slice::from_ref(&key), &windows)
+            .unwrap();
+        let expected = fixture.range_totals_multi(&windows);
+        let expected = &expected[0];
+        match from_ledger[0].get(&key) {
+            Some(actual) => {
+                assert_eq!(&actual.tokens, &expected.tokens);
+                assert_eq!(&actual.tool_metrics, &expected.tool_metrics);
+            }
+            None => {
+                panic!("rebuilt rollups must still serve this session's data, not silently omit it")
             }
         }
     }
@@ -6116,6 +6794,252 @@ mod tests {
             )
             .unwrap();
         assert_eq!(projects, COLD_SESSIONS as i64);
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn probe_bulk_scan_write_serialization_before_and_after() {
+        // Issue #132: the field regression (55s -> 142s warm scan, all of it
+        // in `processing_ms`) is not in parsing — the recording shows that
+        // fell to 385ms. It is that `scanner::scan_all` reads and parses in
+        // parallel but every session's durable write serialized on one
+        // connection mutex, one transaction (and WAL commit) per session.
+        //
+        // This isolates that write path from real file I/O and parsing by
+        // driving `HistoryStore` directly from several threads, mirroring
+        // `scan_all`'s parallel-workers shape, against a corpus at the scale
+        // the issue's acceptance criterion names (~4,000 sessions). Three
+        // scenarios:
+        //   - "before": today's shape — `observe`, one transaction per
+        //     session, immediate per-session rollup maintenance.
+        //   - "deferred rollups only": `observe_bulk`, still one transaction
+        //     per session, but rollup maintenance deferred to one rebuild at
+        //     the end. `diagnostic_probe_commit_count_vs_row_count` (this
+        //     module) found this alone barely moves the needle — WAL commit
+        //     overhead, not row/statement volume, dominates a
+        //     one-transaction-per-session pattern.
+        //   - "after": `observe_bulk_batch` in `scanner::SCAN_WRITE_BATCH_SIZE`
+        //     chunks (the shape `scanner::scan_all` + `AppState::
+        //     reconcile_scanned_batch_if_current` actually run), plus one
+        //     rebuild — the real fix, combining both directions the issue
+        //     names.
+        use crate::model::ToolKind;
+
+        // A uniform light corpus (20 token / 30 tool events per session)
+        // measured only a 1.73x speedup — real corpora are not uniform.
+        // `performance_v3_to_v6_chained_migration_large_ledger` (this
+        // module) models the same shape for a different migration: a
+        // minority of "hot" sessions carrying most of a corpus's total
+        // event volume, alongside many short "cold" ones. The field
+        // recording's arithmetic supports that shape here too: (142.4s -
+        // 55.0s) / ~4,094 sessions is ~21ms/session of average growth
+        // attributable to rollup maintenance, far more than a uniform
+        // 20/30-event session's own measured 0.16ms/session rollup delta —
+        // consistent with that growth concentrating in a subset of
+        // long-running, high-activity sessions rather than spreading evenly.
+        const SESSIONS: usize = 4_000;
+        const WORKERS: usize = 8;
+        const HOT_SESSIONS: usize = 100;
+        const HOT_TOKEN_EVENTS: i64 = 150;
+        const HOT_TOOL_EVENTS: i64 = 300;
+        const COLD_TOKEN_EVENTS: i64 = 20;
+        const COLD_TOOL_EVENTS: i64 = 30;
+
+        fn synthetic_session(id: &str, token_events: i64, tool_events: i64) -> Session {
+            let mut fixture = rich_session(id);
+            let base = timestamp("2026-01-01T00:00:00Z");
+            for n in 0..token_events {
+                let input = 10 + n as u64;
+                fixture.tokens_history.push(TokenHistoryPoint {
+                    timestamp: base + chrono::Duration::minutes(n),
+                    model: Some(if n % 2 == 0 { "gpt-a" } else { "gpt-b" }.into()),
+                    service_tier: None,
+                    request_input_tokens: Some(input),
+                    total_tokens: 0,
+                    delta: totals(input),
+                });
+            }
+            for n in 0..tool_events {
+                fixture.tool_observations.push(ToolObservation {
+                    call_id: format!("call-probe-{n}"),
+                    turn_id: Some("t1".into()),
+                    harness: codex_provider_id(),
+                    model: Some("gpt-a".into()),
+                    timestamp: base + chrono::Duration::minutes(n),
+                    kind: if n % 3 == 0 {
+                        ToolKind::Mutation
+                    } else {
+                        ToolKind::Read
+                    },
+                    name: "tool".into(),
+                    providers: Vec::new(),
+                    effective_tools: Vec::new(),
+                    target: Some("target".into()),
+                    resource_id: None,
+                    origin: ToolOrigin::Core,
+                    shell_family: None,
+                    language: None,
+                    outcome: ToolOutcome::Success,
+                    duration_ms: Some(40),
+                    output_bytes: 128,
+                });
+            }
+            fixture
+        }
+
+        let sessions: Vec<Session> = (0..SESSIONS)
+            .map(|index| {
+                if index < HOT_SESSIONS {
+                    synthetic_session(
+                        &format!("probe-hot-{index}"),
+                        HOT_TOKEN_EVENTS,
+                        HOT_TOOL_EVENTS,
+                    )
+                } else {
+                    synthetic_session(
+                        &format!("probe-cold-{index}"),
+                        COLD_TOKEN_EVENTS,
+                        COLD_TOOL_EVENTS,
+                    )
+                }
+            })
+            .collect();
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mode {
+            Before,
+            DeferredOnly,
+            Batched,
+        }
+
+        let run = |label: &str, mode: Mode| -> std::time::Duration {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("history.sqlite3");
+            let store = std::sync::Arc::new(HistoryStore::open(&path).unwrap());
+            let generation = store.begin_scan().unwrap().max(1);
+
+            let started = Instant::now();
+            std::thread::scope(|scope| {
+                for chunk in sessions.chunks(SESSIONS.div_ceil(WORKERS)) {
+                    let store = store.clone();
+                    scope.spawn(move || match mode {
+                        Mode::Before => {
+                            for fixture in chunk {
+                                let path = Path::new(&fixture.id).with_extension("jsonl");
+                                store.observe(&path, fixture, generation).unwrap();
+                            }
+                        }
+                        Mode::DeferredOnly => {
+                            for fixture in chunk {
+                                let path = Path::new(&fixture.id).with_extension("jsonl");
+                                store.observe_bulk(&path, fixture, generation).unwrap();
+                            }
+                        }
+                        Mode::Batched => {
+                            for write_batch in chunk.chunks(crate::scanner::SCAN_WRITE_BATCH_SIZE) {
+                                let paths: Vec<PathBuf> = write_batch
+                                    .iter()
+                                    .map(|fixture| Path::new(&fixture.id).with_extension("jsonl"))
+                                    .collect();
+                                let items: Vec<(&Path, &Session, i64)> = paths
+                                    .iter()
+                                    .zip(write_batch)
+                                    .map(|(path, fixture)| (path.as_path(), fixture, generation))
+                                    .collect();
+                                store.observe_bulk_batch(&items).unwrap();
+                            }
+                        }
+                    });
+                }
+            });
+            if mode != Mode::Before {
+                store.rebuild_rollups_if_stale().unwrap();
+            }
+            let elapsed = started.elapsed();
+            assert!(!store.rollups_are_stale().unwrap());
+            assert_eq!(store.stats().unwrap().sessions, SESSIONS);
+            eprintln!("{label}: {SESSIONS} sessions / {WORKERS} workers in {elapsed:?}");
+            elapsed
+        };
+
+        let before = run(
+            "before (observe: one transaction per session, immediate rollups)",
+            Mode::Before,
+        );
+        let deferred_only = run(
+            "deferred rollups only (observe_bulk: still one transaction per session)",
+            Mode::DeferredOnly,
+        );
+        let after = run(
+            "after (observe_bulk_batch, batches of SCAN_WRITE_BATCH_SIZE, + one rebuild)",
+            Mode::Batched,
+        );
+
+        eprintln!(
+            "probe summary: before={before:?} deferred_only={deferred_only:?} after={after:?} \
+             speedup(before/after)={:.2}x",
+            before.as_secs_f64() / after.as_secs_f64().max(0.000_001)
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic probe; run with --release --ignored --nocapture"]
+    fn diagnostic_probe_commit_count_vs_row_count() {
+        // Not a golden test — a throwaway diagnostic to isolate whether the
+        // #132 write cost is dominated by per-COMMIT overhead (WAL fsync) or
+        // by row/statement volume. Compares N single-row transactions
+        // against 1 transaction holding all N rows, on the same connection
+        // settings this store actually uses.
+        const N: usize = 4000;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("probe.sqlite3");
+        let mut connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(Duration::from_secs(5)).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE probe(id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+
+        let started = Instant::now();
+        for n in 0..N {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO probe(id, value) VALUES (?1, ?2)",
+                    params![n as i64, format!("value-{n}")],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let many_commits = started.elapsed();
+        eprintln!("{N} single-row transactions (N commits): {many_commits:?}");
+
+        connection.execute("DELETE FROM probe", []).unwrap();
+        let started = Instant::now();
+        {
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            for n in 0..N {
+                transaction
+                    .execute(
+                        "INSERT INTO probe(id, value) VALUES (?1, ?2)",
+                        params![n as i64, format!("value-{n}")],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        let one_commit = started.elapsed();
+        eprintln!("{N} rows in 1 transaction (1 commit): {one_commit:?}");
+        eprintln!(
+            "ratio: {:.1}x",
+            many_commits.as_secs_f64() / one_commit.as_secs_f64().max(0.000_001)
+        );
     }
 
     /// Builds a `Session` whose every `TokenTotals` field and every
