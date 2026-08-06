@@ -557,19 +557,30 @@ impl AppState {
     /// distinct paths happen to hash into the same internal shard, which at
     /// a batch size in the tens is the expected case, not an edge case.
     ///
-    /// The practical effect of releasing the reservation before the write:
-    /// if a watcher-driven removal for one of this batch's paths lands in
-    /// the narrow window between this reservation and the batch's commit,
-    /// the batch's write can still durably mark that path `present` after
-    /// the removal already marked it `missing`. This is self-healing and
-    /// scoped to the durable row only: `state.sessions` (what the UI reads)
-    /// is unaffected, because `publish_scanned_session` independently
-    /// re-checks the same tombstone immediately before publishing; and the
-    /// durable row heals at the *next* full scan, when the already-deleted
-    /// file is no longer discovered and `finish_scan`'s unseen-location
-    /// sweep marks it missing again. The single-item watcher-append path
-    /// (`reconcile_observed_session`) does not go through this method at
-    /// all and keeps its existing, stronger guarantee.
+    /// Releasing the reservation before the write opens a window: a
+    /// watcher-driven removal for one of this batch's paths can land
+    /// between this reservation and the batch's commit, and the batch's
+    /// write can durably mark that path `present` after the removal already
+    /// marked it `missing`. Unlike an in-place session-content race (which
+    /// `history_store::store_snapshot`'s monotonicity check already resolves regardless
+    /// of commit order — a stale write to `session_snapshots` simply loses,
+    /// whichever transaction commits last), there is no such ordering-
+    /// independent guard on `source_locations.present`; a plain last-write-
+    /// wins column needs an explicit correction pass instead. That pass is
+    /// [`Self::reconcile_removals_racing_batch_commit`], run unconditionally
+    /// after the durable write below (batched or, on failure, the per-item
+    /// fallback) for every path this call touched: it re-checks
+    /// `session_paths` for a same-generation removal and, if one raced,
+    /// durably corrects it via the same [`HistoryStore::mark_path_missing`]
+    /// a live removal would have taken and republishes the corrected
+    /// `Missing` session into `state.sessions` immediately — restoring the
+    /// single-item path's guarantee ("a late scan result cannot resurrect a
+    /// removed source in either the archive or the live projection")
+    /// without holding any lock across the write, and converging
+    /// immediately rather than only self-healing at the next full scan. The
+    /// single-item watcher-append path (`reconcile_observed_session`) does
+    /// not go through this method at all and keeps its existing, stronger
+    /// guarantee (it never needed this correction pass to begin with).
     ///
     /// On a durable-write failure for the whole batch (`observe_bulk_batch`
     /// rolls the whole shared transaction back on any single item's error —
@@ -629,12 +640,16 @@ impl AppState {
         };
 
         let generation = history_generation.unwrap_or(0);
+        let paths: Vec<std::path::PathBuf> = eligible
+            .iter()
+            .map(|(path, _session)| path.clone())
+            .collect();
         let batch: Vec<(&Path, &Session, i64)> = eligible
             .iter()
             .map(|(path, session)| (path.as_path(), session, generation))
             .collect();
 
-        match history.observe_bulk_batch(&batch) {
+        let reconciled = match history.observe_bulk_batch(&batch) {
             Ok(outcomes) => eligible
                 .into_iter()
                 .zip(outcomes)
@@ -655,6 +670,69 @@ impl AppState {
                         (path, reconciled)
                     })
                     .collect()
+            }
+        };
+        // Runs regardless of which branch above wrote the durable rows:
+        // both drop `session_paths` reservations before their write, so
+        // both are exposed to the same removal-race window.
+        self.reconcile_removals_racing_batch_commit(app_generation, &history, &paths);
+        reconciled
+    }
+
+    /// Post-commit half of the removal-race correction
+    /// [`Self::reconcile_scanned_batch_if_current`] documents on itself: for
+    /// every path that call just durably wrote, re-checks `session_paths`
+    /// for a same-generation removal tombstone. `mark_source_missing` always
+    /// sets `removed` and `watcher_touched` together for a real removal, so
+    /// checking `removed` alone is precise — nothing else in this module
+    /// sets it. A hit means a watcher-driven removal landed in the window
+    /// between this path's eligibility reservation and the batch's commit;
+    /// this durably corrects it via the exact `HistoryStore::mark_path_missing`
+    /// call a live removal takes, and republishes the corrected `Missing`
+    /// session into `state.sessions` so the live projection converges
+    /// immediately too, not just the archive.
+    ///
+    /// Idempotent and safe regardless of ordering against a concurrent
+    /// `mark_source_missing`'s own durable write: both agree on
+    /// `present = 0`, so whichever actually commits last does not matter,
+    /// and calling `mark_path_missing` again when it already ran is a
+    /// harmless no-op update. A path with no removal (the overwhelmingly
+    /// common case) costs one DashMap lookup and nothing else.
+    fn reconcile_removals_racing_batch_commit(
+        &self,
+        app_generation: u64,
+        history: &crate::history_store::HistoryStore,
+        paths: &[std::path::PathBuf],
+    ) {
+        for path in paths {
+            let key = path_key(path);
+            let raced = self
+                .session_paths
+                .get(&key)
+                .is_some_and(|state| state.generation == app_generation && state.removed);
+            if !raced {
+                continue;
+            }
+            match history.mark_path_missing(path) {
+                Ok(Some(stored)) => {
+                    tracing::debug!(
+                        "corrected a durable resurrection for {:?}: a watcher removal raced \
+                         its batch write",
+                        path
+                    );
+                    self.sessions
+                        .insert(stored.key, Arc::new(stored.session.clone()));
+                    self.touch_sessions_generation();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "could not correct durable source availability for {:?} after a \
+                         removal raced its batch write: {}",
+                        path,
+                        error
+                    );
+                }
             }
         }
     }
@@ -1284,6 +1362,76 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_scanned_batch_if_current_corrects_a_removal_that_raced_the_batch_commit() {
+        // Issue #132: `reconcile_scanned_batch_if_current`'s doc comment
+        // describes a real race — a watcher removal landing between a
+        // path's eligibility reservation and the batch's commit — and the
+        // post-commit correction pass (`reconcile_removals_racing_batch_commit`)
+        // that closes it. A unit test cannot inject a genuinely concurrent
+        // watcher thread mid-transaction, so this drives the same two
+        // halves in sequence: write the batch (establishing a durable
+        // `Present` row), simulate the watcher's tombstone exactly as
+        // `mark_source_missing` sets it, then invoke the same correction
+        // pass the batch path always runs and assert it restores `Missing`
+        // both durably and in `state.sessions`.
+        let state = AppState::new();
+        let directory = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        state.set_history_ready(Some(Arc::new(store)));
+
+        let generation = state.current_scan_generation();
+        let path = PathBuf::from("C:/sessions/a.jsonl");
+        let items = vec![(path.clone(), session("a", 1))];
+        let results = state.reconcile_scanned_batch_if_current(generation, Some(1), items);
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].1.session.source_availability,
+            SourceAvailability::Present
+        );
+        let key_for_lookup = results[0].1.session.storage_id.clone();
+
+        // Simulate the watcher's tombstone landing in the race window —
+        // the same mutation `mark_source_missing` performs to
+        // `session_paths`, without separately duplicating its own durable
+        // write here (that write is exactly what this test proves the
+        // correction pass substitutes for).
+        let tombstone_key = path_key(&path);
+        state
+            .session_paths
+            .entry(tombstone_key)
+            .and_modify(|entry| {
+                entry.generation = generation;
+                entry.watcher_touched = true;
+                entry.removed = true;
+            });
+
+        let history = state.history_ready().unwrap();
+        state.reconcile_removals_racing_batch_commit(
+            generation,
+            &history,
+            std::slice::from_ref(&path),
+        );
+
+        assert!(
+            !state
+                .sessions
+                .get(&key_for_lookup)
+                .is_some_and(|entry| entry.source_availability == SourceAvailability::Present),
+            "the corrected session must not still read Present in the live projection"
+        );
+        let corrected = history
+            .load_sessions()
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.session.id == "a")
+            .expect("the durable session must still be archived, just marked missing");
+        assert_eq!(
+            corrected.session.source_availability,
+            SourceAvailability::Missing
+        );
+    }
+
+    #[test]
     fn reconcile_scanned_batch_if_current_drops_everything_for_a_stale_generation() {
         let state = AppState::new();
         let stale = state.current_scan_generation();
@@ -1331,6 +1479,96 @@ mod tests {
 
         state.finalize_bulk_scan_rollups();
         assert!(!state.ledger_is_stale(&key));
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn probe_reconcile_scanned_batch_vs_single_item_includes_config_transition() {
+        // Issue #132 follow-up: `history_store::tests::probe_bulk_scan_write_serialization_before_and_after`
+        // isolates `HistoryStore`'s write path alone (measured there:
+        // 1.70x) and does not include `config_transition`'s collapse from
+        // one process-wide mutex acquisition per session
+        // (`reconcile_scanned_session_if_current`) to one per batch
+        // (`reconcile_scanned_batch_if_current`) — both already defer
+        // rollups identically (`bulk = true` either way), so the only
+        // orchestration-layer difference this isolates is that lock-
+        // acquisition count, plus the shape of the per-item
+        // `session_paths` DashMap bookkeeping around it. Combine this
+        // number with the `HistoryStore`-level probe's for the full
+        // picture; neither one alone is "the" #132 number.
+        const SESSIONS: usize = 4_000;
+        const WORKERS: usize = 8;
+        const BATCH_SIZE: usize = 64;
+
+        let run = |label: &str, batched: bool| -> std::time::Duration {
+            let state = Arc::new(AppState::new());
+            let directory = tempfile::tempdir().unwrap();
+            let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+            state.set_history_ready(Some(Arc::new(store)));
+            let generation = state.current_scan_generation();
+            let chunk = SESSIONS.div_ceil(WORKERS);
+
+            let started = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for worker in 0..WORKERS {
+                    let state = state.clone();
+                    let start = worker * chunk;
+                    let end = ((worker + 1) * chunk).min(SESSIONS);
+                    scope.spawn(move || {
+                        if batched {
+                            let mut index = start;
+                            while index < end {
+                                let batch_end = (index + BATCH_SIZE).min(end);
+                                let items: Vec<(PathBuf, Session)> = (index..batch_end)
+                                    .map(|n| {
+                                        (
+                                            PathBuf::from(format!("C:/sessions/probe-{n}.jsonl")),
+                                            session(&format!("probe-{n}"), 5),
+                                        )
+                                    })
+                                    .collect();
+                                state.reconcile_scanned_batch_if_current(
+                                    generation,
+                                    Some(1),
+                                    items,
+                                );
+                                index = batch_end;
+                            }
+                        } else {
+                            for n in start..end {
+                                let path = PathBuf::from(format!("C:/sessions/probe-{n}.jsonl"));
+                                let fixture = session(&format!("probe-{n}"), 5);
+                                state.reconcile_scanned_session_if_current(
+                                    generation,
+                                    &path,
+                                    fixture,
+                                    Some(1),
+                                );
+                            }
+                        }
+                    });
+                }
+            });
+            let elapsed = started.elapsed();
+            eprintln!("{label}: {SESSIONS} sessions / {WORKERS} workers in {elapsed:?}");
+            elapsed
+        };
+
+        let single_item = run(
+            "single-item (reconcile_scanned_session_if_current: one config_transition \
+             acquisition per session)",
+            false,
+        );
+        let batched = run(
+            "batched (reconcile_scanned_batch_if_current: one config_transition \
+             acquisition per 64-session batch)",
+            true,
+        );
+
+        eprintln!(
+            "probe summary: single_item={single_item:?} batched={batched:?} speedup={:.2}x",
+            single_item.as_secs_f64() / batched.as_secs_f64().max(0.000_001)
+        );
     }
 
     #[test]
