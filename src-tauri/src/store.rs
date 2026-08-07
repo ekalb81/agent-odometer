@@ -212,6 +212,12 @@ pub struct AppState {
     /// Cached `get_quota_snapshots` output; see [`crate::quota::QuotaSnapshotCache`]
     /// (issue #128).
     quota_snapshot_cache: crate::quota::QuotaSnapshotCache,
+    /// Incrementally maintained per-provider rate-limit points/credit
+    /// observations feeding [`Self::quota_snapshots`]'s recompute path
+    /// (issue #131); see [`crate::quota::QuotaPointsIndex`]. Every
+    /// `sessions`-mutation site in this file calls `update_session`
+    /// alongside `touch_sessions_generation`.
+    quota_points_index: crate::quota::QuotaPointsIndex,
 }
 
 impl AppState {
@@ -247,6 +253,7 @@ impl AppState {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
     }
 
@@ -485,6 +492,8 @@ impl AppState {
                     // rebuilt them.
                     self.rollup_deferred_stale.remove(&stored.key);
                     let displaced = displaced.map(|stored| {
+                        self.quota_points_index
+                            .update_session(&stored.key, &stored.session);
                         self.sessions
                             .insert(stored.key, Arc::new(stored.session.clone()));
                         self.touch_sessions_generation();
@@ -527,6 +536,8 @@ impl AppState {
             self.rollup_deferred_stale.remove(&outcome.stored.key);
         }
         let displaced = outcome.displaced.map(|stored| {
+            self.quota_points_index
+                .update_session(&stored.key, &stored.session);
             self.sessions
                 .insert(stored.key, Arc::new(stored.session.clone()));
             self.touch_sessions_generation();
@@ -720,6 +731,8 @@ impl AppState {
                          its batch write",
                         path
                     );
+                    self.quota_points_index
+                        .update_session(&stored.key, &stored.session);
                     self.sessions
                         .insert(stored.key, Arc::new(stored.session.clone()));
                     self.touch_sessions_generation();
@@ -823,6 +836,7 @@ impl AppState {
                 existing.source_availability != session.source_availability
                     || existing.file_path != session.file_path
             });
+            self.quota_points_index.update_session(&key, &session);
             self.sessions.insert(key, Arc::new(session.clone()));
             self.touch_sessions_generation();
             if is_changed {
@@ -892,6 +906,8 @@ impl AppState {
             }
         }
         if let Some(stored) = persisted {
+            self.quota_points_index
+                .update_session(&stored.key, &stored.session);
             self.sessions
                 .insert(stored.key, Arc::new(stored.session.clone()));
             self.touch_sessions_generation();
@@ -912,6 +928,8 @@ impl AppState {
         let session = std::sync::Arc::make_mut(session.value_mut());
         session.source_availability = SourceAvailability::Missing;
         let session = session.clone();
+        self.quota_points_index
+            .update_session(&storage_id, &session);
         self.touch_sessions_generation();
         Some(session)
     }
@@ -970,6 +988,8 @@ impl AppState {
             watcher_touched: false,
             removed: false,
         };
+        self.quota_points_index
+            .update_session(&storage_id, &session);
         self.sessions.insert(storage_id, Arc::new(session));
         self.touch_sessions_generation();
         drop(path_state);
@@ -999,6 +1019,8 @@ impl AppState {
             watcher_touched: true,
             removed: false,
         };
+        self.quota_points_index
+            .update_session(&storage_id, &session);
         self.sessions.insert(storage_id, Arc::new(session));
         self.touch_sessions_generation();
         drop(path_state);
@@ -1057,7 +1079,8 @@ impl AppState {
     }
 
     /// The cached quota-config file, loading it from disk on first access.
-    /// Only [`Self::set_quota_store`] replaces it thereafter (issue #128).
+    /// Only [`Self::set_quota_store`] and [`Self::persist_quota_notification_log`]
+    /// replace it thereafter (issues #128, #131).
     pub fn quota_store(&self) -> Arc<crate::quota_store::QuotaStoreFile> {
         let mut cache = self.quota_store_cache.lock().unwrap();
         if let Some(store) = cache.as_ref() {
@@ -1077,9 +1100,45 @@ impl AppState {
         self.quota_snapshot_cache.invalidate();
     }
 
+    /// Prunes and persists an updated notification dedup log, keeping the
+    /// cached quota-config file in sync — deliberately *not* through
+    /// [`Self::set_quota_store`], because that also invalidates the quota
+    /// snapshot cache. The notification log never feeds
+    /// `QuotaPointsIndex`/`quota_snapshots_from_sessions` (only
+    /// `max_cache_age_secs` does, and this method never touches that
+    /// field), so forcing a recompute here would have nothing new to pick
+    /// up. The only caller is `commands::check_quota_alerts` (issue #131):
+    /// routing its write through the shared cached store here, instead of
+    /// loading and saving its own copy of `quota-v1.json` on every poll, is
+    /// what lets that command reuse [`Self::quota_snapshots`] instead of
+    /// re-walking the corpus on its own independent polling interval.
+    ///
+    /// Fails closed like [`commands::set_quota_config`]'s write path: the
+    /// in-memory cache is only replaced once the write to disk succeeds, so
+    /// a failed save never leaves the cache claiming a log state that was
+    /// never actually persisted.
+    pub fn persist_quota_notification_log(
+        &self,
+        notification_log: Vec<crate::quota_store::NotificationLogEntry>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<()> {
+        let mut cache = self.quota_store_cache.lock().unwrap();
+        let mut store = match cache.as_ref() {
+            Some(existing) => (**existing).clone(),
+            None => crate::quota_store::QuotaStoreFile::load(),
+        };
+        store.notification_log = notification_log;
+        store.prune_log(now, chrono::Duration::days(30));
+        store.save()?;
+        *cache = Some(Arc::new(store));
+        Ok(())
+    }
+
     /// Returns every provider's quota snapshot, recomputing from the
-    /// current session projection only when warranted; see
-    /// [`crate::quota::QuotaSnapshotCache`] (issue #128).
+    /// incrementally maintained points index only when warranted; see
+    /// [`crate::quota::QuotaSnapshotCache`] (issue #128) for the recompute
+    /// gate and [`crate::quota::QuotaPointsIndex`] (issue #131) for why this
+    /// recompute no longer walks `sessions`.
     pub fn quota_snapshots(
         &self,
         max_cache_age: chrono::Duration,
@@ -1088,13 +1147,7 @@ impl AppState {
         let generation = self.sessions_generation();
         self.quota_snapshot_cache
             .get_or_recompute(generation, std::time::Instant::now(), || {
-                let sessions: Vec<Arc<Session>> =
-                    self.sessions.iter().map(|e| e.value().clone()).collect();
-                crate::quota::quota_snapshots_from_sessions(
-                    sessions.iter().map(Arc::as_ref),
-                    now,
-                    max_cache_age,
-                )
+                self.quota_points_index.snapshots(now, max_cache_age)
             })
     }
 }
@@ -1151,6 +1204,7 @@ mod tests {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
     }
 
@@ -1606,5 +1660,71 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         state.set_history_ready(None);
         assert_eq!(waiter.join().unwrap(), HistoryReadinessKind::Unavailable);
+    }
+
+    // -- check_quota_alerts no longer re-walks the corpus (issue #131,
+    //    round two) ------------------------------------------------------
+
+    #[test]
+    fn check_quota_alerts_with_a_configured_budget_reads_the_points_index_not_the_corpus() {
+        // `check_quota_alerts` used to build `Vec<QuotaSnapshot>` by walking
+        // every session directly and independently of
+        // `get_quota_snapshots`'s cache/index — invisible in a recording
+        // taken with no budgets configured, live the moment a budget is.
+        //
+        // This is the "counting stand-in" equivalent for a function that
+        // does not take an injectable compute closure: insert sessions
+        // carrying real rate-limit data straight into `state.sessions`,
+        // deliberately bypassing `publish_watched_session` (and therefore
+        // `QuotaPointsIndex::update_session`) the way every real call site
+        // in this file no longer does. The old, buggy implementation read
+        // `state.sessions` directly and would have picked this data up
+        // regardless. The current one reads only
+        // `AppState::quota_snapshots`, which is backed by the points index
+        // — so a budget evaluated against data that only ever landed in
+        // `state.sessions` must see nothing, proving the corpus itself was
+        // never walked.
+        let state = state();
+        let now = Utc::now();
+        for i in 0..50 {
+            let mut session = session(&format!("s{i}"), 1);
+            session.last_event_at = now;
+            session.rate_limits_history = vec![crate::model::RateLimitSnapshotPoint {
+                timestamp: now,
+                turn_id: None,
+                limit_id: None,
+                primary: Some(crate::model::RateLimitWindow {
+                    used_percent: 90.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(now + chrono::Duration::hours(5)),
+                }),
+                secondary: None,
+            }];
+            state
+                .sessions
+                .insert(session.effective_storage_id(), Arc::new(session));
+        }
+
+        let mut store = crate::quota_store::QuotaStoreFile::default();
+        store.budgets.push(crate::quota_store::QuotaBudget {
+            id: "b1".to_string(),
+            provider: codex_provider_id(),
+            project_key: None,
+            unit: crate::quota_store::BudgetUnit::PercentOfWindow,
+            window_kind: Some("burst".to_string()),
+            period_hours: None,
+            threshold: 50.0,
+            enabled: true,
+        });
+        store.notifications.enabled = true;
+        state.set_quota_store(store);
+
+        let alerts = crate::commands::check_quota_alerts_impl(&state);
+        assert!(
+            alerts.is_empty(),
+            "an alert here would mean check_quota_alerts saw the 90%-used data that only ever \
+             landed in state.sessions, i.e. it walked the corpus directly again instead of \
+             reading the points index"
+        );
     }
 }

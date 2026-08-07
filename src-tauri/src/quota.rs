@@ -42,7 +42,8 @@ use crate::provider::ProviderId;
 use crate::quota_store::{BudgetUnit, NotificationLogEntry, NotificationSettings, QuotaBudget};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Mutex;
 
 /// Caps how many rate-limit observations are merged per provider so a
 /// pathological corpus (thousands of sessions, each with a long history)
@@ -575,6 +576,266 @@ pub fn quota_snapshots_from_sessions<'a>(
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Incremental per-provider points index (issue #131)
+//
+// `quota_snapshots_from_sessions` above is still the from-scratch reference
+// implementation: the correctness oracle every equivalence test in this
+// module checks against, and what `commands::check_quota_alerts` still calls
+// directly (it already recomputes unconditionally on every poll and does not
+// route through `AppState`'s cache, so it is out of this issue's scope).
+// `QuotaPointsIndex` is a second implementation of the same aggregation,
+// maintained incrementally so `AppState::quota_snapshots`'s recompute (still
+// throttled by `QuotaSnapshotCache` below, which is unchanged) costs
+// O(a session's own point count) at update time and
+// O(min(corpus, MAX_POINTS_PER_PROVIDER)) at read time, instead of O(entire
+// corpus) on every recompute.
+//
+// ## The hard part: replacement, not just accumulation
+//
+// A session's `rate_limits_history` can be replaced wholesale — re-parse,
+// truncation, rotation, and the batched scan path (#132,
+// `AppState::reconcile_scanned_batch_if_current`) all rewrite a session's
+// full history, not just append to it. Naively `extend`-ing a maintained
+// `Vec` on every update would duplicate every point the session contributed
+// before, inflating used-percent and pace math forever. So this index
+// remembers, per session key, exactly which composite keys that session
+// last contributed (`SessionContribution`) and retracts all of them before
+// inserting the session's current content — including when the new history
+// is *shorter* than the old one, where there is no way to know how many of
+// the old points to drop by comparing lengths; the old contribution must be
+// fully retracted and the new one fully reinserted. See the
+// `index_and_from_scratch_agree_*` tests below, which exercise append,
+// grow-replace, shrink-replace, and outright removal and check each step
+// against a from-scratch computation over the same corpus.
+//
+// ## Ordering and the truncation cap
+//
+// Points are kept per provider in a `BTreeMap` ordered by
+// `(timestamp, session_key, in-session sequence)` rather than a `Vec` that
+// would need re-sorting on every update. The tie-break beyond timestamp is
+// new: the from-scratch path's tie-break for two *different* sessions
+// reporting the exact same instant was already unspecified (session
+// iteration order feeding a stable sort — never guaranteed reproducible),
+// so a deterministic one here does not change any documented behavior for
+// the realistic case (no two sessions observe a rate limit at the exact
+// same instant). `MAX_POINTS_PER_PROVIDER` truncation — keep only the most
+// recent points across the whole corpus — is applied when producing a
+// snapshot's input slice (`provider_points`), not maintained eagerly on
+// every write: trimming the maintained map itself at write time would risk
+// permanently discarding a point that a *later* removal makes relevant
+// again, silently breaking equivalence with a from-scratch computation.
+// Reading the newest N is still O(N) off a `BTreeMap`'s tail, not O(map
+// size).
+//
+// ## Concurrency note
+//
+// Every session-mutation site in `store.rs` calls `update_session` right
+// next to the corresponding `AppState::sessions` write, but the two are not
+// one atomic operation — this index has its own `Mutex`, separate from
+// `DashMap`'s per-shard locking on `sessions`. Two source paths racing to
+// publish the *same* session key at the same instant (the "displaced" case)
+// could theoretically leave this index and `AppState::sessions` briefly
+// disagreeing about which of the two contents is current — exactly as
+// `AppState::sessions` itself already offers no stronger guarantee than
+// "whichever insert lands last, for that key, wins" once outside the
+// `session_paths` bookkeeping (see `store.rs`'s own doc comments on the
+// scan/watcher and removal races it already accepts and self-heals). Any
+// later update for that key — and there is always a later one, since
+// sessions are continuously re-observed — re-synchronizes it, matching that
+// existing eventual-consistency posture rather than introducing a new one.
+// ---------------------------------------------------------------------------
+
+/// One rate-limit point's position inside a provider's maintained,
+/// timestamp-ordered index. `session_key` and `seq` only break ties among
+/// otherwise-equal timestamps (see the module note above); they are never
+/// used to look a point up any other way.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PointKey {
+    timestamp: DateTime<Utc>,
+    session_key: String,
+    seq: u32,
+}
+
+#[derive(Default)]
+struct ProviderPoints {
+    by_key: BTreeMap<PointKey, RateLimitSnapshotPoint>,
+}
+
+#[derive(Default)]
+struct ProviderAccounts {
+    by_key: BTreeMap<(DateTime<Utc>, String), QuotaAccountInfo>,
+}
+
+/// What one session last contributed, so [`QuotaPointsIndex::update_session`]
+/// can retract exactly that (not merely "the first N points") before
+/// inserting whatever the session reports now.
+struct SessionContribution {
+    provider: ProviderId,
+    point_keys: Vec<PointKey>,
+    account_key: Option<(DateTime<Utc>, String)>,
+}
+
+#[derive(Default)]
+struct QuotaPointsIndexState {
+    points: HashMap<ProviderId, ProviderPoints>,
+    accounts: HashMap<ProviderId, ProviderAccounts>,
+    contributions: HashMap<String, SessionContribution>,
+}
+
+/// Incrementally maintained per-provider rate-limit points and credit-
+/// balance observations, keyed by session storage id. See the module
+/// section above for the design and the concurrency trade-off.
+#[derive(Default)]
+pub struct QuotaPointsIndex {
+    state: Mutex<QuotaPointsIndexState>,
+}
+
+impl QuotaPointsIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Folds `session`'s current rate-limit history and credit info into
+    /// the index under `session_key`, first retracting whatever this
+    /// session contributed previously (if anything). Cost is O(the
+    /// session's old point count + its new point count), never the corpus.
+    pub fn update_session(&self, session_key: &str, session: &Session) {
+        let mut state = self.state.lock().unwrap();
+        Self::retract(&mut state, session_key);
+
+        let provider = session.harness.clone();
+        let mut point_keys = Vec::with_capacity(session.rate_limits_history.len());
+        if !session.rate_limits_history.is_empty() {
+            let bucket = state.points.entry(provider.clone()).or_default();
+            for (seq, point) in session.rate_limits_history.iter().enumerate() {
+                let key = PointKey {
+                    timestamp: point.timestamp,
+                    session_key: session_key.to_string(),
+                    seq: seq as u32,
+                };
+                bucket.by_key.insert(key.clone(), point.clone());
+                point_keys.push(key);
+            }
+        }
+
+        let account_key =
+            if session.credits_unlimited.is_some() || session.credits_balance.is_some() {
+                let key = (session.last_event_at, session_key.to_string());
+                let account = QuotaAccountInfo {
+                    credits_unlimited: session.credits_unlimited,
+                    credits_balance: session.credits_balance,
+                    observed_at: Some(session.last_event_at),
+                };
+                state
+                    .accounts
+                    .entry(provider.clone())
+                    .or_default()
+                    .by_key
+                    .insert(key.clone(), account);
+                Some(key)
+            } else {
+                None
+            };
+
+        if point_keys.is_empty() && account_key.is_none() {
+            state.contributions.remove(session_key);
+        } else {
+            state.contributions.insert(
+                session_key.to_string(),
+                SessionContribution {
+                    provider,
+                    point_keys,
+                    account_key,
+                },
+            );
+        }
+    }
+
+    /// Retracts whatever `session_key` last contributed without inserting
+    /// anything new. No production call site removes a session from
+    /// `AppState::sessions` outright today — every mutation site replaces a
+    /// session's content or marks one `Missing` in place, which
+    /// `update_session` alone covers — but removal is the operation issue
+    /// #131 calls out as the hard case, so it is a first-class, directly
+    /// testable method here rather than only reachable by inference from
+    /// `update_session`.
+    pub fn remove_session(&self, session_key: &str) {
+        let mut state = self.state.lock().unwrap();
+        Self::retract(&mut state, session_key);
+    }
+
+    fn retract(state: &mut QuotaPointsIndexState, session_key: &str) {
+        let Some(contribution) = state.contributions.remove(session_key) else {
+            return;
+        };
+        if let Some(bucket) = state.points.get_mut(&contribution.provider) {
+            for key in &contribution.point_keys {
+                bucket.by_key.remove(key);
+            }
+        }
+        if let Some(account_key) = contribution.account_key {
+            if let Some(bucket) = state.accounts.get_mut(&contribution.provider) {
+                bucket.by_key.remove(&account_key);
+            }
+        }
+    }
+
+    /// Builds every registered provider's `QuotaSnapshot` from the
+    /// currently maintained state. This is `AppState::quota_snapshots`'s
+    /// recompute path, replacing the O(corpus) walk in
+    /// `quota_snapshots_from_sessions` with a read bounded by
+    /// `MAX_POINTS_PER_PROVIDER` (issue #131).
+    pub fn snapshots(&self, now: DateTime<Utc>, max_cache_age: Duration) -> Vec<QuotaSnapshot> {
+        let registry = crate::provider::ProviderRegistry::builtin();
+        let state = self.state.lock().unwrap();
+        registry
+            .descriptors()
+            .map(|descriptor| {
+                let points = Self::provider_points(&state, &descriptor.id);
+                let account = state
+                    .accounts
+                    .get(&descriptor.id)
+                    .and_then(|bucket| bucket.by_key.values().next_back().cloned())
+                    .unwrap_or_default();
+                build_quota_snapshot(
+                    descriptor.id.clone(),
+                    descriptor.capabilities.quota_source,
+                    &points,
+                    account,
+                    now,
+                    max_cache_age,
+                )
+            })
+            .collect()
+    }
+
+    /// The provider's points in ascending timestamp order, capped to the
+    /// most recent `MAX_POINTS_PER_PROVIDER` exactly like
+    /// `quota_snapshots_from_sessions`'s own truncation. Cost is bounded by
+    /// the cap, not by how many points the provider has accumulated.
+    fn provider_points(
+        state: &QuotaPointsIndexState,
+        provider: &ProviderId,
+    ) -> Vec<RateLimitSnapshotPoint> {
+        let Some(bucket) = state.points.get(provider) else {
+            return Vec::new();
+        };
+        if bucket.by_key.len() <= MAX_POINTS_PER_PROVIDER {
+            return bucket.by_key.values().cloned().collect();
+        }
+        let mut points: Vec<RateLimitSnapshotPoint> = bucket
+            .by_key
+            .values()
+            .rev()
+            .take(MAX_POINTS_PER_PROVIDER)
+            .cloned()
+            .collect();
+        points.reverse();
+        points
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1354,6 +1615,406 @@ mod tests {
         assert_eq!(
             claude.unavailable,
             Some(QuotaUnavailableReason::NoQuotaSource)
+        );
+    }
+
+    // -- QuotaPointsIndex: incremental aggregation agrees with from-scratch
+    //    (issue #131) ---------------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_session(
+        key: &str,
+        harness: ProviderId,
+        last_event_at: DateTime<Utc>,
+        credits_unlimited: Option<bool>,
+        credits_balance: Option<f64>,
+        rate_limits_history: Vec<RateLimitSnapshotPoint>,
+    ) -> Session {
+        Session {
+            id: key.to_string(),
+            storage_id: key.to_string(),
+            harness,
+            thread_name: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            file_path: String::new(),
+            source_availability: crate::model::SourceAvailability::Present,
+            archived: false,
+            started_at: last_event_at,
+            last_event_at,
+            working_directory: None,
+            originator: None,
+            source: None,
+            subagent_id_is_path_fallback: false,
+            history_mode: None,
+            memory_mode: None,
+            cli_version: None,
+            model_provider: None,
+            model: None,
+            service_tier: None,
+            plan_type: None,
+            credits_unlimited,
+            credits_balance,
+            context_window: None,
+            latest_context_tokens: None,
+            total_turns: 0,
+            first_user_message: None,
+            tokens_total: crate::model::TokenTotals::default(),
+            tokens_by_model: std::collections::HashMap::new(),
+            tokens_history: Vec::new(),
+            rate_limits_history,
+            turns: Vec::new(),
+            tool_observations: Vec::new(),
+            tool_metrics: crate::model::ToolMetrics::default(),
+            tool_metrics_by_model: std::collections::BTreeMap::new(),
+            category_totals: std::collections::BTreeMap::new(),
+            optimization_findings: Vec::new(),
+            project_key: None,
+            project_label: None,
+            project_provenance: None,
+        }
+    }
+
+    fn assert_index_matches_oracle(
+        index: &QuotaPointsIndex,
+        sessions: &std::collections::HashMap<String, Session>,
+        now: DateTime<Utc>,
+    ) {
+        let oracle_sessions: Vec<Session> = sessions.values().cloned().collect();
+        let oracle = quota_snapshots_from_sessions(oracle_sessions.iter(), now, Duration::hours(6));
+        let indexed = index.snapshots(now, Duration::hours(6));
+        assert_eq!(
+            indexed, oracle,
+            "incremental index disagrees with a from-scratch computation over the same corpus"
+        );
+    }
+
+    // The duplication bug named directly in issue #131: shrinking a
+    // session's `rate_limits_history` (re-parse, truncation, rotation) must
+    // retract every point it previously contributed, not just the ones a
+    // length comparison would suggest.
+    #[test]
+    fn replacing_a_sessions_history_with_a_shorter_one_matches_a_from_scratch_computation() {
+        let long_points = evenly_spaced_points(
+            "2026-01-01T00:00:00Z",
+            12,
+            8,
+            10.0,
+            5.0,
+            300,
+            "2026-01-01T05:00:00Z",
+        );
+        let short_points = long_points[0..2].to_vec();
+
+        let index = QuotaPointsIndex::new();
+        let mut session_a = test_session(
+            "a",
+            codex_provider_id(),
+            long_points.last().unwrap().timestamp,
+            None,
+            None,
+            long_points,
+        );
+        index.update_session("a", &session_a);
+
+        // The history shrinks: only the first two of the original eight
+        // observations are current now.
+        session_a.rate_limits_history = short_points.clone();
+        session_a.last_event_at = short_points.last().unwrap().timestamp;
+        index.update_session("a", &session_a);
+
+        let now = short_points.last().unwrap().timestamp + Duration::minutes(1);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert("a".to_string(), session_a);
+        assert_index_matches_oracle(&index, &sessions, now);
+
+        // Made explicit, not just implied by the equality above: the six
+        // discarded points are all timestamped after `now` (they cover
+        // minutes 24-84; `now` is minute 13). If they had leaked through,
+        // `series.last()` would pick one of them as the "latest"
+        // observation, and a timestamp after `now` reads as clock skew
+        // (`used: None`) rather than the correct fresh `used: Some(15.0)`.
+        let indexed = index.snapshots(now, Duration::hours(6));
+        let codex_snapshot = indexed
+            .iter()
+            .find(|s| s.provider == codex_provider_id())
+            .unwrap();
+        let window = &codex_snapshot.windows[0];
+        assert_eq!(window.unavailable, None);
+        assert_eq!(
+            window.used,
+            Some(short_points[1].primary.as_ref().unwrap().used_percent)
+        );
+        assert!(window.forecast.is_none());
+    }
+
+    // Covers append, replace-with-longer, replace-with-shorter, and outright
+    // removal in one sequence, checking incremental-vs-from-scratch
+    // agreement after every step.
+    #[test]
+    fn incremental_index_matches_from_scratch_across_append_grow_shrink_and_remove() {
+        let epoch = ts("2026-01-01T00:00:00Z");
+        // A single, globally-increasing timestamp cursor for the whole test:
+        // no two points anywhere below share a timestamp, which sidesteps
+        // the tie-break ambiguity `QuotaPointsIndex`'s doc comment notes
+        // (the from-scratch path's own tie-break for two *different*
+        // sessions reporting the same instant was already unspecified).
+        let mut minute = 0i64;
+        let mut next_point = |used_percent: f64| {
+            let timestamp = epoch + Duration::minutes(minute);
+            minute += 10;
+            RateLimitSnapshotPoint {
+                timestamp,
+                turn_id: None,
+                limit_id: None,
+                primary: Some(RateLimitWindow {
+                    used_percent,
+                    window_minutes: Some(300),
+                    resets_at: Some(epoch + Duration::hours(10_000)),
+                }),
+                secondary: None,
+            }
+        };
+
+        let index = QuotaPointsIndex::new();
+        let mut sessions: std::collections::HashMap<String, Session> =
+            std::collections::HashMap::new();
+
+        // Append: s1 starts with 3 points, then a later update appends 2 more.
+        let mut s1 = test_session(
+            "s1",
+            codex_provider_id(),
+            epoch,
+            None,
+            None,
+            vec![next_point(10.0), next_point(15.0), next_point(20.0)],
+        );
+        index.update_session("s1", &s1);
+        sessions.insert("s1".to_string(), s1.clone());
+        let now = s1.rate_limits_history.last().unwrap().timestamp + Duration::minutes(1);
+        assert_index_matches_oracle(&index, &sessions, now);
+
+        s1.rate_limits_history.push(next_point(25.0));
+        s1.rate_limits_history.push(next_point(30.0));
+        s1.last_event_at = s1.rate_limits_history.last().unwrap().timestamp;
+        index.update_session("s1", &s1);
+        sessions.insert("s1".to_string(), s1.clone());
+        let now = s1.rate_limits_history.last().unwrap().timestamp + Duration::minutes(1);
+        assert_index_matches_oracle(&index, &sessions, now);
+
+        // A second session enters the corpus, with credit-balance data too.
+        let s2 = test_session(
+            "s2",
+            codex_provider_id(),
+            epoch,
+            Some(false),
+            Some(500.0),
+            vec![next_point(40.0), next_point(45.0), next_point(50.0)],
+        );
+        index.update_session("s2", &s2);
+        sessions.insert("s2".to_string(), s2.clone());
+        let now = s2.rate_limits_history.last().unwrap().timestamp + Duration::minutes(1);
+        assert_index_matches_oracle(&index, &sessions, now);
+
+        // Replace-longer: s1's history is rewritten to a longer one.
+        let mut longer = Vec::new();
+        for i in 0..8 {
+            longer.push(next_point(10.0 + i as f64 * 5.0));
+        }
+        s1.rate_limits_history = longer;
+        s1.last_event_at = s1.rate_limits_history.last().unwrap().timestamp;
+        index.update_session("s1", &s1);
+        sessions.insert("s1".to_string(), s1.clone());
+        let now = s1.rate_limits_history.last().unwrap().timestamp + Duration::minutes(1);
+        assert_index_matches_oracle(&index, &sessions, now);
+
+        // Replace-shorter: s1's history is rewritten down to 2 points,
+        // discarding the other 6 — the duplication-bug case, again, this
+        // time alongside another session with its own live contribution.
+        s1.rate_limits_history = vec![next_point(12.0), next_point(18.0)];
+        s1.last_event_at = s1.rate_limits_history.last().unwrap().timestamp;
+        index.update_session("s1", &s1);
+        sessions.insert("s1".to_string(), s1.clone());
+        let now = s1.rate_limits_history.last().unwrap().timestamp + Duration::minutes(1);
+        assert_index_matches_oracle(&index, &sessions, now);
+
+        // Remove: s2 leaves the corpus outright.
+        index.remove_session("s2");
+        sessions.remove("s2");
+        assert_index_matches_oracle(&index, &sessions, now);
+    }
+
+    // Property-style: a randomized sequence of insert/replace/remove
+    // operations against a small pool of session keys, checked against a
+    // from-scratch computation periodically through the run. A tiny
+    // deterministic xorshift PRNG keeps this reproducible without adding a
+    // `rand` dependency for one test.
+    #[test]
+    fn incremental_index_matches_from_scratch_over_a_randomized_operation_sequence() {
+        struct Xorshift64(u64);
+        impl Xorshift64 {
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn next_range(&mut self, bound: u64) -> u64 {
+                self.next_u64() % bound
+            }
+        }
+
+        let mut rng = Xorshift64(0x9E3779B97F4A7C15);
+        let epoch = ts("2026-01-01T00:00:00Z");
+        let mut minute = 0i64;
+
+        let index = QuotaPointsIndex::new();
+        let mut sessions: std::collections::HashMap<String, Session> =
+            std::collections::HashMap::new();
+        let session_keys = ["s1", "s2", "s3", "s4"];
+
+        for step in 0..300u32 {
+            let action = rng.next_range(4);
+            let key = session_keys[rng.next_range(session_keys.len() as u64) as usize];
+
+            match action {
+                0 | 1 => {
+                    // insert-new or replace-in-place with a fresh,
+                    // random-length history (also covers append/grow/shrink,
+                    // since the key may already exist with a different
+                    // length).
+                    let point_count = 1 + rng.next_range(6);
+                    let mut history = Vec::new();
+                    for _ in 0..point_count {
+                        let timestamp = epoch + Duration::minutes(minute);
+                        minute += 10;
+                        history.push(RateLimitSnapshotPoint {
+                            timestamp,
+                            turn_id: None,
+                            limit_id: None,
+                            primary: Some(RateLimitWindow {
+                                used_percent: rng.next_range(100) as f64,
+                                window_minutes: Some(300),
+                                resets_at: Some(epoch + Duration::hours(100_000)),
+                            }),
+                            secondary: None,
+                        });
+                    }
+                    let has_credits = rng.next_range(2) == 0;
+                    let session = test_session(
+                        key,
+                        codex_provider_id(),
+                        history.last().map(|p| p.timestamp).unwrap_or(epoch),
+                        has_credits.then_some(false),
+                        has_credits.then_some(100.0 + rng.next_range(900) as f64),
+                        history,
+                    );
+                    index.update_session(key, &session);
+                    sessions.insert(key.to_string(), session);
+                }
+                _ => {
+                    index.remove_session(key);
+                    sessions.remove(key);
+                }
+            }
+
+            if step % 5 == 0 {
+                let now = epoch + Duration::minutes(minute + 5);
+                assert_index_matches_oracle(&index, &sessions, now);
+            }
+        }
+
+        let now = epoch + Duration::minutes(minute + 5);
+        assert_index_matches_oracle(&index, &sessions, now);
+    }
+
+    // -- QuotaPointsIndex: per-update cost stays flat as the corpus grows
+    //    (issue #131) — manual probe, not run in CI ---------------------------
+
+    #[test]
+    #[ignore = "manual perf probe; run with `cargo test --release quota_points_index_update_cost -- --ignored --nocapture`"]
+    fn quota_points_index_update_cost_is_flat_as_corpus_grows() {
+        fn seed_session(idx: usize, epoch: DateTime<Utc>) -> Session {
+            let history: Vec<RateLimitSnapshotPoint> = (0..20)
+                .map(|i| RateLimitSnapshotPoint {
+                    timestamp: epoch + Duration::minutes((idx * 100 + i) as i64),
+                    turn_id: None,
+                    limit_id: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: (i as f64) * 2.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(epoch + Duration::hours(100_000)),
+                    }),
+                    secondary: None,
+                })
+                .collect();
+            test_session(
+                &format!("s{idx}"),
+                codex_provider_id(),
+                epoch,
+                None,
+                None,
+                history,
+            )
+        }
+
+        fn probe(corpus_size: usize) -> (f64, f64) {
+            let epoch = ts("2026-01-01T00:00:00Z");
+            let index = QuotaPointsIndex::new();
+            for i in 0..corpus_size {
+                let session = seed_session(i, epoch);
+                index.update_session(&format!("s{i}"), &session);
+            }
+
+            // Steady-state update cost: session "s0" keeps being replaced
+            // with a slightly different history, as a live session's
+            // rate-limit history changes turn to turn.
+            let mut update_samples = Vec::with_capacity(50);
+            for round in 0..50u32 {
+                let mut session = seed_session(0, epoch);
+                session.rate_limits_history.push(RateLimitSnapshotPoint {
+                    timestamp: epoch + Duration::minutes(1_000_000 + round as i64),
+                    turn_id: None,
+                    limit_id: None,
+                    primary: Some(RateLimitWindow {
+                        used_percent: 50.0,
+                        window_minutes: Some(300),
+                        resets_at: Some(epoch + Duration::hours(100_000)),
+                    }),
+                    secondary: None,
+                });
+                let started = std::time::Instant::now();
+                index.update_session("s0", &session);
+                update_samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+            }
+            update_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let update_median_us = update_samples[update_samples.len() / 2];
+
+            // Recompute (read) cost: what `AppState::quota_snapshots`'s
+            // cache-miss path now does instead of walking every session.
+            let mut read_samples = Vec::with_capacity(20);
+            for _ in 0..20 {
+                let now = epoch + Duration::hours(100_001);
+                let started = std::time::Instant::now();
+                let _ = index.snapshots(now, Duration::hours(6));
+                read_samples.push(started.elapsed().as_secs_f64() * 1_000_000.0);
+            }
+            read_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let read_median_us = read_samples[read_samples.len() / 2];
+
+            (update_median_us, read_median_us)
+        }
+
+        let (small_update, small_read) = probe(200);
+        let (large_update, large_read) = probe(8_000);
+        println!(
+            "quota_points_index probe: corpus=200 -> update {small_update:.1}us / \
+             recompute {small_read:.1}us; corpus=8000 -> update {large_update:.1}us / \
+             recompute {large_read:.1}us"
         );
     }
 

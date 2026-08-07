@@ -2998,24 +2998,58 @@ fn token_budget_current_value(
 
 /// Recomputes quota snapshots against configured soft budgets and returns
 /// any newly crossed thresholds, persisting the updated dedup log. Cheap
-/// enough to poll on the same interval as `get_subscription_usage`; a
-/// caller uninterested in alerts (or with no budgets/opted out) pays only
-/// the cost of loading the small quota config file.
+/// enough to poll on the same interval as `get_subscription_usage`.
+///
+/// Issue #131: this used to load `quota-v1.json` from disk and re-derive
+/// `Vec<QuotaSnapshot>` from every session on *every* call, unconditionally
+/// — a second, independent O(corpus) walk on top of `get_quota_snapshots`'s,
+/// invisible in a recording taken with no budgets configured (the early
+/// return below skipped instrumentation entirely) but live the moment a
+/// user configures one, on this command's own 60s poll from
+/// `SubscriptionUsage.svelte`. It now reads the cached quota-config file
+/// ([`AppState::quota_store`], issue #128) instead of re-reading
+/// `quota-v1.json` every call, and shares [`AppState::quota_snapshots`]
+/// with `get_quota_snapshots` instead of maintaining a second, ungated read
+/// path — so the two 60s-ish independent pollers (tray, alerts) collapse
+/// onto the same `QuotaSnapshotCache`-gated, `QuotaPointsIndex`-backed
+/// recompute rather than each paying their own.
 #[tauri::command]
 pub fn check_quota_alerts(state: State<'_, Arc<AppState>>) -> Vec<crate::quota::QuotaAlert> {
+    check_quota_alerts_impl(&state)
+}
+
+/// The actual body of [`check_quota_alerts`], split out to take a plain
+/// `&AppState` rather than a `tauri::State` so it is directly unit-testable
+/// (`tauri::State` cannot be constructed outside a running app without the
+/// `tauri` crate's `test` feature, which this crate does not depend on).
+/// `AppState`-owning tests live in `store.rs`'s
+/// `#[cfg(all(test, not(windows)))]` module for the same reason that module
+/// itself gives (constructing the full `AppState` links Wry/tray-icon GUI
+/// entry points in a Windows unit-test binary) —
+/// `check_quota_alerts_with_a_configured_budget_reads_the_points_index_not_the_corpus`
+/// there calls this function directly.
+pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::QuotaAlert> {
     let started = Instant::now();
-    let mut store = crate::quota_store::QuotaStoreFile::load();
+    let store = state.quota_store();
     if store.budgets.is_empty() {
+        // Recorded even though there is nothing to do: a metric that goes
+        // quiet only because the *feature* (budgets) is unconfigured, not
+        // because the work is cheap, hides exactly the cost this command
+        // pays the moment someone turns it on.
+        state.performance.record_backend(
+            "ipc.check_quota_alerts",
+            started,
+            true,
+            BTreeMap::from([
+                ("budgets".into(), "0".to_string()),
+                ("alerts".into(), "0".to_string()),
+            ]),
+        );
         return Vec::new();
     }
     let now = Utc::now();
     let max_cache_age = chrono::Duration::seconds(store.max_cache_age_secs);
-    let sessions: Vec<Arc<Session>> = state.sessions.iter().map(|e| e.value().clone()).collect();
-    let snapshots = crate::quota::quota_snapshots_from_sessions(
-        sessions.iter().map(Arc::as_ref),
-        now,
-        max_cache_age,
-    );
+    let snapshots = state.quota_snapshots(max_cache_age, now);
     let snapshot_by_provider: HashMap<&str, &crate::quota::QuotaSnapshot> = snapshots
         .iter()
         .map(|snapshot| (snapshot.provider.as_str(), snapshot))
@@ -3036,7 +3070,7 @@ pub fn check_quota_alerts(state: State<'_, Arc<AppState>>) -> Vec<crate::quota::
                     })
                     .and_then(|window| window.used),
                 crate::quota_store::BudgetUnit::Tokens => {
-                    Some(token_budget_current_value(&state, budget, now))
+                    Some(token_budget_current_value(state, budget, now))
                 }
             };
             crate::quota::BudgetEvaluation {
@@ -3054,9 +3088,7 @@ pub fn check_quota_alerts(state: State<'_, Arc<AppState>>) -> Vec<crate::quota::
         now,
         local_hour,
     );
-    store.notification_log = updated_log;
-    store.prune_log(now, chrono::Duration::days(30));
-    if let Err(error) = store.save() {
+    if let Err(error) = state.persist_quota_notification_log(updated_log, now) {
         tracing::warn!("could not persist quota notification log: {}", error);
     }
     state.performance.record_backend(
