@@ -212,6 +212,12 @@ pub struct AppState {
     /// Cached `get_quota_snapshots` output; see [`crate::quota::QuotaSnapshotCache`]
     /// (issue #128).
     quota_snapshot_cache: crate::quota::QuotaSnapshotCache,
+    /// Incrementally maintained per-provider rate-limit points/credit
+    /// observations feeding [`Self::quota_snapshots`]'s recompute path
+    /// (issue #131); see [`crate::quota::QuotaPointsIndex`]. Every
+    /// `sessions`-mutation site in this file calls `update_session`
+    /// alongside `touch_sessions_generation`.
+    quota_points_index: crate::quota::QuotaPointsIndex,
 }
 
 impl AppState {
@@ -247,6 +253,7 @@ impl AppState {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
     }
 
@@ -485,6 +492,8 @@ impl AppState {
                     // rebuilt them.
                     self.rollup_deferred_stale.remove(&stored.key);
                     let displaced = displaced.map(|stored| {
+                        self.quota_points_index
+                            .update_session(&stored.key, &stored.session);
                         self.sessions
                             .insert(stored.key, Arc::new(stored.session.clone()));
                         self.touch_sessions_generation();
@@ -527,6 +536,8 @@ impl AppState {
             self.rollup_deferred_stale.remove(&outcome.stored.key);
         }
         let displaced = outcome.displaced.map(|stored| {
+            self.quota_points_index
+                .update_session(&stored.key, &stored.session);
             self.sessions
                 .insert(stored.key, Arc::new(stored.session.clone()));
             self.touch_sessions_generation();
@@ -720,6 +731,8 @@ impl AppState {
                          its batch write",
                         path
                     );
+                    self.quota_points_index
+                        .update_session(&stored.key, &stored.session);
                     self.sessions
                         .insert(stored.key, Arc::new(stored.session.clone()));
                     self.touch_sessions_generation();
@@ -823,6 +836,7 @@ impl AppState {
                 existing.source_availability != session.source_availability
                     || existing.file_path != session.file_path
             });
+            self.quota_points_index.update_session(&key, &session);
             self.sessions.insert(key, Arc::new(session.clone()));
             self.touch_sessions_generation();
             if is_changed {
@@ -892,6 +906,8 @@ impl AppState {
             }
         }
         if let Some(stored) = persisted {
+            self.quota_points_index
+                .update_session(&stored.key, &stored.session);
             self.sessions
                 .insert(stored.key, Arc::new(stored.session.clone()));
             self.touch_sessions_generation();
@@ -912,6 +928,8 @@ impl AppState {
         let session = std::sync::Arc::make_mut(session.value_mut());
         session.source_availability = SourceAvailability::Missing;
         let session = session.clone();
+        self.quota_points_index
+            .update_session(&storage_id, &session);
         self.touch_sessions_generation();
         Some(session)
     }
@@ -970,6 +988,8 @@ impl AppState {
             watcher_touched: false,
             removed: false,
         };
+        self.quota_points_index
+            .update_session(&storage_id, &session);
         self.sessions.insert(storage_id, Arc::new(session));
         self.touch_sessions_generation();
         drop(path_state);
@@ -999,6 +1019,8 @@ impl AppState {
             watcher_touched: true,
             removed: false,
         };
+        self.quota_points_index
+            .update_session(&storage_id, &session);
         self.sessions.insert(storage_id, Arc::new(session));
         self.touch_sessions_generation();
         drop(path_state);
@@ -1078,8 +1100,10 @@ impl AppState {
     }
 
     /// Returns every provider's quota snapshot, recomputing from the
-    /// current session projection only when warranted; see
-    /// [`crate::quota::QuotaSnapshotCache`] (issue #128).
+    /// incrementally maintained points index only when warranted; see
+    /// [`crate::quota::QuotaSnapshotCache`] (issue #128) for the recompute
+    /// gate and [`crate::quota::QuotaPointsIndex`] (issue #131) for why this
+    /// recompute no longer walks `sessions`.
     pub fn quota_snapshots(
         &self,
         max_cache_age: chrono::Duration,
@@ -1088,13 +1112,7 @@ impl AppState {
         let generation = self.sessions_generation();
         self.quota_snapshot_cache
             .get_or_recompute(generation, std::time::Instant::now(), || {
-                let sessions: Vec<Arc<Session>> =
-                    self.sessions.iter().map(|e| e.value().clone()).collect();
-                crate::quota::quota_snapshots_from_sessions(
-                    sessions.iter().map(Arc::as_ref),
-                    now,
-                    max_cache_age,
-                )
+                self.quota_points_index.snapshots(now, max_cache_age)
             })
     }
 }
@@ -1151,6 +1169,7 @@ mod tests {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
     }
 
