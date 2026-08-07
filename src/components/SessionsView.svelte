@@ -228,7 +228,23 @@
     return out;
   })());
   const filteredIds = $derived(filtered.map((session) => session.storage_id));
-  const analyticsSessionIds = $derived(filteredNoDate.map((session) => session.storage_id));
+  // Store flushes rebuild `filteredNoDate` wholesale, so a plain `.map` hands
+  // out a fresh array identity every couple of seconds even when the id list is
+  // unchanged. Consumers that key `$effect`s on this prop (ToolImpact,
+  // SubscriptionUsage) would then restart their fetches on every flush and tear
+  // their rendered content down to a loading placeholder, which made the
+  // analytics sections visibly jump. Reuse the previous array while the ids
+  // match so identity only changes when the set actually does.
+  let lastAnalyticsSessionIds: string[] = [];
+  const analyticsSessionIds = $derived((() => {
+    const next = filteredNoDate.map((session) => session.storage_id);
+    const unchanged =
+      next.length === lastAnalyticsSessionIds.length &&
+      next.every((id, i) => lastAnalyticsSessionIds[i] === id);
+    if (unchanged) return lastAnalyticsSessionIds;
+    lastAnalyticsSessionIds = next;
+    return next;
+  })());
 
   // True when the user has narrowed by date — drives whether per-session
   // tokens and costs are "all-time" or scoped to the visible window.
@@ -840,7 +856,15 @@
   // Card labels echo the filter pill's wording for the same bounds.
   const windowLabel = $derived(rangeLabelFor(filters.dateFrom, filters.dateTo));
   const impactFrom = $derived(new Date(windowBounds.startMs).toISOString());
-  const impactTo = $derived(new Date(windowBounds.endMs).toISOString());
+  // An open-ended window ends at `Date.now()`, which advances on every pulse
+  // tick, so an unquantized bound restarted ToolImpact's fetches roughly every
+  // two seconds. Quantize to the minute so the derived string stays equal
+  // between minutes and the section refreshes at most once a minute; an
+  // explicit "To" filter is passed through exactly, since flooring it would
+  // silently drop the last seconds of the user's chosen range.
+  const impactTo = $derived(
+    new Date(toUtc ? windowBounds.endMs : Math.floor(windowBounds.endMs / 60_000) * 60_000).toISOString(),
+  );
 
   let configEvents = $state<ExternalEvent[]>([]);
   let configEventsGeneration = 0;
