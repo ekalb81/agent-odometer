@@ -94,6 +94,10 @@
   let comparisonError = $state<string | null>(null);
   let targetRequestGeneration = 0;
   let comparisonRequestGeneration = 0;
+  // Which target `result` describes. Deliberately not `$state`: the comparison
+  // effect both reads and writes it, and making it reactive would re-trigger
+  // that effect from its own completion handler.
+  let resultTargetId = '';
 
   const targetId = (target: ToolImpactTarget) => `${target.kind}:${target.key}`;
   const providerTargets = $derived(targets.filter((target) => target.kind === 'provider'));
@@ -111,15 +115,18 @@
       targets = [];
       selectedTargetId = '';
       result = null;
+      targetError = null;
       loadingTargets = false;
       return;
     }
     loadingTargets = true;
-    targetError = null;
+    // Cleared on success rather than at request time: a still-failing backend
+    // would otherwise blink the inline notice out and back on every retry.
     listToolImpactTargets(rangeFrom, rangeTo, ids)
       .then((value) => {
         if (!active || generation !== targetRequestGeneration) return;
         targets = value;
+        targetError = null;
         const selectionStillExists = value.some(
           (target) => targetId(target) === selectedTargetId,
         );
@@ -146,14 +153,29 @@
     const rangeTo = to;
     if (!active || !target || ids.length === 0) {
       result = null;
+      resultTargetId = '';
+      comparisonError = null;
       loadingComparison = false;
       return;
     }
+    // A background refresh keeps the previous numbers on screen while the new
+    // ones load (see the template). Switching target is different: those
+    // numbers — and any error about them — describe something else, so drop
+    // both and show the loading line.
+    if (resultTargetId !== targetId(target)) {
+      result = null;
+      resultTargetId = '';
+      comparisonError = null;
+    }
     loadingComparison = true;
-    comparisonError = null;
+    // Cleared on success, not at request time — see the targets effect above.
     compareToolImpact(target.kind, target.key, rangeFrom, rangeTo, ids)
       .then((value) => {
-        if (active && generation === comparisonRequestGeneration) result = value;
+        if (active && generation === comparisonRequestGeneration) {
+          result = value;
+          resultTargetId = targetId(target);
+          comparisonError = null;
+        }
       })
       .catch((reason) => {
         if (generation === comparisonRequestGeneration) comparisonError = String(reason);
@@ -221,10 +243,17 @@
   <summary class="cursor-pointer text-xs font-semibold text-ink">
     Tool impact comparison · observed use · {windowLabel}
   </summary>
-  <div class="mt-2 flex flex-col gap-2">
-    {#if loadingTargets}
+  <!-- Loading and error states below are gated on there being nothing to show
+       yet. Live sessions re-run both fetches in the background, and swapping
+       the rendered table for a one-line placeholder or an error each time made
+       this section — and everything under it in the scrolling analytics panel —
+       jump. Once there is content, a failed refresh reports itself inline on a
+       row that already exists, so the table neither moves nor lies about being
+       current. -->
+  <div class="mt-2 flex flex-col gap-2" aria-busy={loadingTargets || loadingComparison}>
+    {#if loadingTargets && targets.length === 0}
       <p class="text-xs text-ink-faint py-2">Finding observed tools and providers…</p>
-    {:else if targetError}
+    {:else if targetError && targets.length === 0}
       <p class="text-xs text-neg py-2" role="alert">{targetError}</p>
     {:else if targets.length === 0}
       <p class="text-xs text-ink-faint py-2">
@@ -257,11 +286,18 @@
             </optgroup>
           {/if}
         </select>
+        {#if targetError}
+          <!-- Shares the select's row, so surfacing it costs no vertical space.
+               The full message stays reachable on hover. -->
+          <span class="text-neg" role="alert" title={targetError}>
+            Target list is stale — last refresh failed
+          </span>
+        {/if}
       </label>
 
-      {#if loadingComparison}
+      {#if loadingComparison && !result}
         <p class="text-xs text-ink-faint py-2">Comparing observed and baseline turns…</p>
-      {:else if comparisonError}
+      {:else if comparisonError && !result}
         <p class="text-xs text-neg py-2" role="alert">{comparisonError}</p>
       {:else if !result || result.observed.turn_count === 0}
         <p class="text-xs text-ink-faint py-2">
@@ -275,6 +311,13 @@
         <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-[11px] text-ink-muted">
           <span class="font-semibold text-ink">{useMatched ? `${result.matched_pairs} matched pairs` : 'All observed turns'}</span>
           <span>{useMatched ? 'same harness, model, and task category; nearest in time' : `${result.observed.turn_count} observed · ${result.baseline.turn_count} not observed`}</span>
+          {#if comparisonError}
+            <!-- Shares the summary row rather than displacing the table below
+                 it. The full message stays reachable on hover. -->
+            <span class="text-neg" role="alert" title={comparisonError}>
+              Showing the last successful comparison — refresh failed
+            </span>
+          {/if}
         </div>
         <div class="overflow-x-auto">
           <table class="w-full text-[11px] font-mono">
