@@ -77,6 +77,19 @@ pub struct ScanReport {
     pub parse_total_ms: f64,
     pub parse_max_ms: f64,
     pub cache_lookup_total_ms: f64,
+    /// Sum, across every cache hit, of the SQL fetch alone (issue #140):
+    /// [`crate::scan_cache::ScanCache::connection`]'s lock plus the `UPDATE
+    /// ... RETURNING`. Compared against `cache_lookup_total_ms`, the residual
+    /// is deserialize time — this splits "hits queued behind each other on
+    /// one connection" from "hits doing more CPU-bound work each".
+    pub cache_lookup_sql_ms: f64,
+    /// Sum, across every cache hit, of the unlocked JSON deserialize alone.
+    pub cache_lookup_deserialize_ms: f64,
+    /// Sum, across every cache hit, of the fetched `session_json` blob's
+    /// byte length — lets a recording distinguish "more hits" from "the same
+    /// hits fetching/deserializing bigger cached `Session` snapshots" as an
+    /// explanation for `cache_lookup_total_ms` growth.
+    pub cache_hit_bytes_total: u64,
     pub per_provider: HashMap<ProviderId, ProviderScanCounts>,
 }
 
@@ -167,6 +180,9 @@ where
     let parse_total_ns = AtomicU64::new(0);
     let parse_max_ns = AtomicU64::new(0);
     let cache_lookup_total_ns = AtomicU64::new(0);
+    let cache_lookup_sql_ns = AtomicU64::new(0);
+    let cache_lookup_deserialize_ns = AtomicU64::new(0);
+    let cache_hit_bytes_total = AtomicU64::new(0);
     let processing_started = Instant::now();
 
     work.par_chunks(SCAN_WRITE_BATCH_SIZE).for_each(|chunk| {
@@ -178,12 +194,23 @@ where
             // looks changed on the next launch rather than serving stale data.
             let stamp = scan_cache::file_stamp(path);
             let cache_started = Instant::now();
-            let cached = stamp
-                .and_then(|(size, mtime_ms)| {
-                    cache
-                        .as_ref()
-                        .and_then(|cache| cache.lookup(&key, size, mtime_ms))
-                })
+            // Captured from every database hit, before `accepts_cached_session`
+            // can still turn it into a counted miss below (issue #140): these
+            // three totals describe the cache layer's own cost (lock + SQL
+            // fetch, unlocked deserialize, bytes fetched), not whether the
+            // scanner ultimately reused the row.
+            let cache_hit = stamp.and_then(|(size, mtime_ms)| {
+                cache
+                    .as_ref()
+                    .and_then(|cache| cache.lookup_with_stats(&key, size, mtime_ms))
+            });
+            if let Some(hit) = &cache_hit {
+                cache_lookup_sql_ns.fetch_add(hit.sql_ns, Ordering::Relaxed);
+                cache_lookup_deserialize_ns.fetch_add(hit.deserialize_ns, Ordering::Relaxed);
+                cache_hit_bytes_total.fetch_add(hit.raw_bytes as u64, Ordering::Relaxed);
+            }
+            let cached = cache_hit
+                .map(|hit| hit.session)
                 .filter(|session| adapter.accepts_cached_session(session, *kind));
             if cache.as_ref().is_some_and(ScanCache::is_enabled) {
                 cache_lookup_total_ns.fetch_add(elapsed_ns(cache_started), Ordering::Relaxed);
@@ -279,6 +306,11 @@ where
         parse_total_ms: nanos_to_ms(parse_total_ns.load(Ordering::Relaxed)),
         parse_max_ms: nanos_to_ms(parse_max_ns.load(Ordering::Relaxed)),
         cache_lookup_total_ms: nanos_to_ms(cache_lookup_total_ns.load(Ordering::Relaxed)),
+        cache_lookup_sql_ms: nanos_to_ms(cache_lookup_sql_ns.load(Ordering::Relaxed)),
+        cache_lookup_deserialize_ms: nanos_to_ms(
+            cache_lookup_deserialize_ns.load(Ordering::Relaxed),
+        ),
+        cache_hit_bytes_total: cache_hit_bytes_total.load(Ordering::Relaxed),
         per_provider,
     }
 }

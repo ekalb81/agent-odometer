@@ -39,6 +39,25 @@ pub struct CacheEntry {
     pub session: Session,
 }
 
+/// One warm-cache hit, with enough shape to distinguish contention from
+/// payload growth as an explanation for `cache_lookup_total_ms` (issue #140).
+pub struct CacheHit {
+    pub session: Session,
+    /// Length in bytes of the stored `session_json` blob this hit fetched.
+    pub raw_bytes: usize,
+    /// Time spent acquiring [`ScanCache::connection`]'s lock and running the
+    /// `UPDATE ... RETURNING` — the part that can queue behind other worker
+    /// threads sharing one connection.
+    pub sql_ns: u64,
+    /// Time spent deserializing the fetched blob into a [`Session`] — unlocked
+    /// and fully parallel, but proportional to the blob's size.
+    pub deserialize_ns: u64,
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 #[derive(Deserialize)]
 struct LegacyScanCache {
     version: String,
@@ -269,9 +288,24 @@ impl ScanCache {
     /// Returns an owned cached session when the stored stamp matches, and
     /// marks the row as seen in this scan generation.
     pub fn lookup(&self, key: &str, size: u64, mtime_ms: u64) -> Option<Session> {
+        self.lookup_with_stats(key, size, mtime_ms)
+            .map(|hit| hit.session)
+    }
+
+    /// Like [`Self::lookup`], but also reports the shape and cost of the hit
+    /// (issue #140): `scanner::scan_all` times this whole call as
+    /// `cache_lookup_total_ms`, and that total grew 21% between v0.8.7 and
+    /// v0.8.8 on a corpus that grew only ~3%. This splits the SQL fetch
+    /// (guarded by [`Self::connection`]'s lock, so it can queue behind other
+    /// worker threads) from the JSON deserialize (unlocked, CPU-bound), and
+    /// reports the fetched blob's byte length — so a recording can
+    /// distinguish "more lock contention" from "the same number of hits
+    /// each doing more work because cached `Session` snapshots got bigger".
+    pub fn lookup_with_stats(&self, key: &str, size: u64, mtime_ms: u64) -> Option<CacheHit> {
         let size = i64::try_from(size).ok()?;
         let mtime_ms = i64::try_from(mtime_ms).ok()?;
         let connection = self.connection.as_ref()?;
+        let sql_started = Instant::now();
         let raw: Vec<u8> = {
             let connection = connection.lock().ok()?;
             connection
@@ -286,8 +320,15 @@ impl ScanCache {
                 .optional()
                 .ok()??
         };
+        let sql_ns = elapsed_ns(sql_started);
+        let deserialize_started = Instant::now();
         match serde_json::from_slice(&raw) {
-            Ok(session) => Some(session),
+            Ok(session) => Some(CacheHit {
+                session,
+                raw_bytes: raw.len(),
+                sql_ns,
+                deserialize_ns: elapsed_ns(deserialize_started),
+            }),
             Err(error) => {
                 tracing::warn!("corrupt scan-cache entry {:?}: {}; discarding", key, error);
                 if let Ok(connection) = connection.lock() {
@@ -732,6 +773,153 @@ mod tests {
             "1000 incremental writes: {:?}; 1000 warm reads: {:?}",
             write_elapsed,
             started.elapsed()
+        );
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn probe_cache_lookup_cost_scales_with_session_size() {
+        // Issue #140: `cache_lookup_total_ms` rose 21% (132.7s -> 160.9s,
+        // aggregate across worker threads) between v0.8.7 and v0.8.8 on a
+        // corpus that grew only ~3%, and nobody had measured why.
+        // `scanner::scan_all` times this whole call — the SQL fetch (guarded
+        // by `ScanCache`'s shared connection mutex, so it can queue behind
+        // other worker threads) plus the JSON deserialize (unlocked,
+        // CPU-bound) — around every warm-cache hit. This isolates those two
+        // components at a realistic corpus scale and compares a "thin"
+        // session shape (no history, the smallest a `Session` can be)
+        // against a "full" one shaped like real corpora — a minority of
+        // "hot" sessions carrying most of the event volume alongside many
+        // "cold" ones, the same shape
+        // `history_store::tests::probe_hydration_and_post_scan_rehydrate_at_field_recording_scale`
+        // uses to measure hydration — to show whether bigger cached
+        // snapshots alone can account for the growth, independent of any
+        // change in hit count or lock-contention pattern.
+        use crate::model::{TokenHistoryPoint, ToolKind, ToolObservation, ToolOrigin, ToolOutcome};
+
+        const SESSIONS: usize = 4_300;
+        const HOT_SESSIONS: usize = 100;
+        const HOT_TOKEN_EVENTS: i64 = 150;
+        const HOT_TOOL_EVENTS: i64 = 300;
+        const COLD_TOKEN_EVENTS: i64 = 20;
+        const COLD_TOOL_EVENTS: i64 = 30;
+
+        fn shaped_session(id: &str, token_events: i64, tool_events: i64) -> Session {
+            let mut fixture = session(id);
+            let base: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+            for n in 0..token_events {
+                let input = 10 + n as u64;
+                fixture.tokens_history.push(TokenHistoryPoint {
+                    timestamp: base + chrono::Duration::minutes(n),
+                    model: Some(if n % 2 == 0 { "gpt-a" } else { "gpt-b" }.into()),
+                    service_tier: None,
+                    request_input_tokens: Some(input),
+                    total_tokens: 0,
+                    delta: TokenTotals {
+                        input_tokens: input,
+                        cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        output_tokens: input,
+                        reasoning_output_tokens: 0,
+                        total_tokens: input * 2,
+                    },
+                });
+            }
+            for n in 0..tool_events {
+                fixture.tool_observations.push(ToolObservation {
+                    call_id: format!("call-probe-{n}"),
+                    turn_id: Some("t1".into()),
+                    harness: codex_provider_id(),
+                    model: Some("gpt-a".into()),
+                    timestamp: base + chrono::Duration::minutes(n),
+                    kind: if n % 3 == 0 {
+                        ToolKind::Mutation
+                    } else {
+                        ToolKind::Read
+                    },
+                    name: "tool".into(),
+                    providers: Vec::new(),
+                    effective_tools: Vec::new(),
+                    target: Some("target".into()),
+                    resource_id: None,
+                    origin: ToolOrigin::Core,
+                    shell_family: None,
+                    language: None,
+                    outcome: ToolOutcome::Success,
+                    duration_ms: Some(40),
+                    output_bytes: 128,
+                });
+            }
+            fixture
+        }
+
+        fn build(sizer: impl Fn(usize) -> (i64, i64)) -> Vec<Session> {
+            (0..SESSIONS)
+                .map(|index| {
+                    let (token_events, tool_events) = sizer(index);
+                    shaped_session(&format!("probe-{index}"), token_events, tool_events)
+                })
+                .collect()
+        }
+
+        let thin = build(|_| (0, 0));
+        let full = build(|index| {
+            if index < HOT_SESSIONS {
+                (HOT_TOKEN_EVENTS, HOT_TOOL_EVENTS)
+            } else {
+                (COLD_TOKEN_EVENTS, COLD_TOOL_EVENTS)
+            }
+        });
+
+        let run = |label: &str, sessions: &[Session]| -> (u64, u64, u64) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cache.sqlite3");
+            let cache = ScanCache::load(&path);
+            for (index, fixture) in sessions.iter().enumerate() {
+                cache.store(
+                    &format!("{index}.jsonl"),
+                    index as u64,
+                    index as u64,
+                    fixture,
+                );
+            }
+            cache.finish_scan();
+
+            let mut sql_ns = 0u64;
+            let mut deserialize_ns = 0u64;
+            let mut bytes = 0u64;
+            let started = std::time::Instant::now();
+            for index in 0..sessions.len() {
+                let hit = cache
+                    .lookup_with_stats(&format!("{index}.jsonl"), index as u64, index as u64)
+                    .unwrap();
+                sql_ns += hit.sql_ns;
+                deserialize_ns += hit.deserialize_ns;
+                bytes += hit.raw_bytes as u64;
+            }
+            let elapsed = started.elapsed();
+            eprintln!(
+                "{label}: {} hits in {elapsed:?} (sql={:.1}ms deserialize={:.1}ms bytes={} \
+                 avg_bytes/hit={:.1})",
+                sessions.len(),
+                sql_ns as f64 / 1_000_000.0,
+                deserialize_ns as f64 / 1_000_000.0,
+                bytes,
+                bytes as f64 / sessions.len() as f64
+            );
+            (sql_ns, deserialize_ns, bytes)
+        };
+
+        let (thin_sql, thin_deserialize, thin_bytes) =
+            run("thin session (no history/tools)", &thin);
+        let (full_sql, full_deserialize, full_bytes) =
+            run("full session (hot/cold mix, current shape)", &full);
+
+        eprintln!(
+            "growth thin->full: bytes={:.2}x sql={:.2}x deserialize={:.2}x",
+            full_bytes as f64 / thin_bytes.max(1) as f64,
+            full_sql as f64 / thin_sql.max(1) as f64,
+            full_deserialize as f64 / thin_deserialize.max(1) as f64
         );
     }
 

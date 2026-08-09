@@ -299,7 +299,12 @@ impl AppState {
     /// run. Wakes every `wait_for_history_ready` waiter and then hydrates
     /// the in-memory projection from the now-reachable archive — the same
     /// step `AppState::new()` used to perform synchronously before #116.
-    pub fn set_history_ready(&self, store: Option<Arc<HistoryStore>>) {
+    /// Returns the hydration's shape (issue #139) so the caller can attach
+    /// it to `startup.history_hydrate` instead of discarding it.
+    pub fn set_history_ready(
+        &self,
+        store: Option<Arc<HistoryStore>>,
+    ) -> crate::history_store::HydrationStats {
         {
             let mut guard = self.history.lock().unwrap();
             *guard = match store {
@@ -308,7 +313,7 @@ impl AppState {
             };
         }
         self.history_ready_cv.notify_all();
-        self.hydrate_history();
+        self.hydrate_history().1
     }
 
     /// Records the migration's most recently reported step, for
@@ -769,47 +774,111 @@ impl AppState {
     /// once per completed (non-superseded) scan, unconditionally — whether
     /// or not the scan reported parse failures, since a deferred rollup is
     /// orthogonal to whether source availability could be finalized.
-    pub fn finalize_bulk_scan_rollups(&self) {
+    /// Returns whether a rebuild actually ran, for the caller's metric
+    /// (issue #140): "nothing was deferred" and "rebuilt" both take this
+    /// path, and only a recording can otherwise tell them apart.
+    pub fn finalize_bulk_scan_rollups(&self) -> bool {
         let Some(history) = self.history_ready() else {
-            return;
+            return false;
         };
         match history.rebuild_rollups_if_stale() {
-            Ok(true) => self.rollup_deferred_stale.clear(),
-            Ok(false) => {}
+            Ok(true) => {
+                self.rollup_deferred_stale.clear();
+                true
+            }
+            Ok(false) => false,
             Err(error) => {
                 tracing::warn!(
                     "could not rebuild durable history rollups after scan: {}",
                     error
                 );
+                false
             }
         }
     }
 
-    /// Completes an error-free current scan and rehydrates the archive so
-    /// source removals become an explicit Missing state instead of deletes.
+    /// Completes an error-free current scan: marks locations `finish_scan`
+    /// found unseen as missing, then refreshes only the in-memory sessions
+    /// that transition affected (issue #132/#139/#140).
+    ///
+    /// This used to call the same wholesale [`Self::hydrate_history`] the
+    /// true startup path uses — re-deserializing every archived session's
+    /// snapshot just to notice the handful `finish_scan`'s `UPDATE` actually
+    /// touched. On the corpus a v0.8.8 field recording measured, that made
+    /// this call's cost comparable to `startup.history_hydrate`'s ~33s, and
+    /// it ran on *every* bulk scan, not just at startup — yet it had no
+    /// metric of its own, so it was invisible inside `startup.bulk_scan`'s
+    /// unaccounted residual (issue #140). `HistoryStore::finish_scan` now
+    /// reports exactly which session keys it changed, and each is reloaded
+    /// with [`HistoryStore::load_one`] — the same per-session query
+    /// `Self::apply_loaded_session`'s other caller (`Self::hydrate_history`)
+    /// already used — instead of the whole corpus.
     pub fn finish_history_scan(&self, generation: i64) -> Vec<Session> {
         let Some(history) = self.history_ready() else {
             return Vec::new();
         };
-        if let Err(error) = history.finish_scan(generation) {
-            tracing::warn!("could not finish durable history scan: {}", error);
-            return Vec::new();
+        let affected_keys = match history.finish_scan(generation) {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::warn!("could not finish durable history scan: {}", error);
+                return Vec::new();
+            }
+        };
+        let mut changed = Vec::with_capacity(affected_keys.len());
+        for key in &affected_keys {
+            match history.load_one(key) {
+                Ok(stored) => {
+                    if let Some(session) = self.apply_loaded_session(stored) {
+                        changed.push(session);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        "could not reload session {} after finishing scan: {}",
+                        key,
+                        error
+                    );
+                }
+            }
         }
-        self.hydrate_history()
+        changed
+    }
+
+    /// Applies one freshly loaded archived session to the in-memory
+    /// projection, exactly like a single iteration of [`Self::hydrate_history`]'s
+    /// loop. Shared with [`Self::finish_history_scan`] so both call sites
+    /// publish and detect changes identically regardless of whether they
+    /// loaded the whole corpus or one session.
+    fn apply_loaded_session(&self, stored: crate::history_store::StoredSession) -> Option<Session> {
+        let session = stored.session;
+        let key = stored.key;
+        // Scan callbacks already emit fresh present snapshots. Here we only
+        // need to announce availability/path transitions caused by archive
+        // reconciliation (most notably a missing source).
+        let is_changed = self.sessions.get(&key).is_none_or(|existing| {
+            existing.source_availability != session.source_availability
+                || existing.file_path != session.file_path
+        });
+        self.quota_points_index.update_session(&key, &session);
+        self.sessions.insert(key, Arc::new(session.clone()));
+        self.touch_sessions_generation();
+        is_changed.then_some(session)
     }
 
     /// Loads every archived session into the in-memory projection. The store
     /// is authoritative for availability; caller can emit returned changed
-    /// sessions after an initial hydration or scan completion.
-    pub fn hydrate_history(&self) -> Vec<Session> {
+    /// sessions after an initial hydration. This is the true startup
+    /// hydration path — [`Self::finish_history_scan`] deliberately does not
+    /// call this anymore; see its doc comment.
+    pub fn hydrate_history(&self) -> (Vec<Session>, crate::history_store::HydrationStats) {
         let Some(history) = self.history_ready() else {
-            return Vec::new();
+            return (Vec::new(), crate::history_store::HydrationStats::default());
         };
-        let stored = match history.load_sessions() {
-            Ok(stored) => stored,
+        let (stored, stats) = match history.load_sessions_with_stats() {
+            Ok(result) => result,
             Err(error) => {
                 tracing::warn!("could not load durable session history: {}", error);
-                return Vec::new();
+                return (Vec::new(), crate::history_store::HydrationStats::default());
             }
         };
         // Dirty markings survive restarts in the store itself; rebuild the
@@ -827,23 +896,11 @@ impl AppState {
         }
         let mut changed = Vec::new();
         for stored in stored {
-            let session = stored.session;
-            let key = stored.key;
-            // Scan callbacks already emit fresh present snapshots. Here we
-            // only need to announce availability/path transitions caused by
-            // archive reconciliation (most notably a missing source).
-            let is_changed = self.sessions.get(&key).is_none_or(|existing| {
-                existing.source_availability != session.source_availability
-                    || existing.file_path != session.file_path
-            });
-            self.quota_points_index.update_session(&key, &session);
-            self.sessions.insert(key, Arc::new(session.clone()));
-            self.touch_sessions_generation();
-            if is_changed {
+            if let Some(session) = self.apply_loaded_session(stored) {
                 changed.push(session);
             }
         }
-        changed
+        (changed, stats)
     }
 
     /// Persists a metadata-only in-memory overlay (for example a thread name
