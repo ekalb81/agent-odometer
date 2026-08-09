@@ -53,6 +53,17 @@ pub struct BulkObserveOutcome {
     pub rollups_deferred: bool,
 }
 
+/// Shape of one [`HistoryStore::load_sessions_with_stats`] pass (issue #139):
+/// session count alone conflates "more sessions" with "bigger sessions" as an
+/// explanation for hydration cost. Recording deserialized bytes alongside
+/// count lets a recording tell them apart instead of inferring it from a
+/// version-over-version session-count delta.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HydrationStats {
+    pub sessions: usize,
+    pub bytes: u64,
+}
+
 /// A materialized durable session together with source availability metadata.
 #[derive(Debug, Clone)]
 pub struct StoredSession {
@@ -386,15 +397,26 @@ impl HistoryStore {
 
     /// Marks locations not seen in this completed, newest scan as missing.
     /// No session, artifact, snapshot, or normalized event is deleted.
-    pub fn finish_scan(&self, generation: i64) -> Result<usize> {
+    /// Returns the distinct session keys any changed `source_locations` row
+    /// belongs to (issue #132/#140), so a caller can refresh exactly those
+    /// sessions' in-memory availability with [`Self::load_one`] instead of
+    /// re-hydrating the whole corpus. A session can own more than one
+    /// `source_locations` row (duplicate provider IDs under multiple roots),
+    /// so the returned keys are deduplicated.
+    pub fn finish_scan(&self, generation: i64) -> Result<Vec<String>> {
         let connection = self.connection()?;
-        let changed = connection.execute(
+        let mut statement = connection.prepare(
             "UPDATE source_locations SET present = 0
              WHERE present = 1 AND seen_generation < ?1
-               AND ?1 = (SELECT CAST(value AS INTEGER) FROM history_meta WHERE key = 'scan_generation')",
-            [generation],
+               AND ?1 = (SELECT CAST(value AS INTEGER) FROM history_meta WHERE key = 'scan_generation')
+             RETURNING session_key",
         )?;
-        Ok(changed)
+        let mut keys: Vec<String> = statement
+            .query_map([generation], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
     }
 
     /// Marks a single source observation missing without touching its archive.
@@ -993,6 +1015,27 @@ impl HistoryStore {
     /// many round trips it takes to fetch the rows backing that
     /// deserialization.
     pub fn load_sessions(&self) -> Result<Vec<StoredSession>> {
+        Ok(self.load_sessions_inner()?.0)
+    }
+
+    /// Like [`Self::load_sessions`], but also reports the pass's shape
+    /// (issue #139): total sessions and total raw snapshot bytes
+    /// deserialized, so a recording can distinguish "more sessions" from
+    /// "bigger sessions" as an explanation for hydration cost.
+    pub fn load_sessions_with_stats(&self) -> Result<(Vec<StoredSession>, HydrationStats)> {
+        let (sessions, bytes) = self.load_sessions_inner()?;
+        let stats = HydrationStats {
+            sessions: sessions.len(),
+            bytes,
+        };
+        Ok((sessions, stats))
+    }
+
+    /// Shared implementation for [`Self::load_sessions`] and
+    /// [`Self::load_sessions_with_stats`]. Returns the loaded sessions
+    /// alongside the total byte length of every raw `session_json` blob
+    /// deserialized.
+    fn load_sessions_inner(&self) -> Result<(Vec<StoredSession>, u64)> {
         let connection = self.connection()?;
         let mut key_statement = connection.prepare(
             "SELECT session_key FROM durable_sessions ORDER BY last_seen_at_ms DESC, session_key",
@@ -1039,12 +1082,14 @@ impl HistoryStore {
         drop(rows);
         drop(location_statement);
 
-        ordered_keys
+        let mut total_bytes: u64 = 0;
+        let sessions = ordered_keys
             .into_iter()
             .map(|key| {
                 let (identity_key, first_event_fingerprint, collision, raw) = snapshots
                     .remove(&key)
                     .ok_or_else(|| anyhow!("missing durable session snapshot for {key}"))?;
+                total_bytes += raw.len() as u64;
                 let mut session: Session = serde_json::from_slice(&raw)
                     .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
                 let locations = locations_by_key.remove(&key).unwrap_or_default();
@@ -1077,7 +1122,8 @@ impl HistoryStore {
                     session,
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok((sessions, total_bytes))
     }
 
     pub fn stats(&self) -> Result<HistoryStats> {
@@ -1102,7 +1148,11 @@ impl HistoryStore {
         })
     }
 
-    fn load_one(&self, key: &str) -> Result<StoredSession> {
+    /// Loads one archived session by durable key. `pub(crate)` so
+    /// `AppState::finish_history_scan` (a different module) can refresh just
+    /// the sessions [`Self::finish_scan`] reports as changed, instead of
+    /// [`Self::load_sessions`]'s whole-corpus reload (issue #132/#140).
+    pub(crate) fn load_one(&self, key: &str) -> Result<StoredSession> {
         let connection = self.connection()?;
         load_one(&connection, key)
     }
@@ -5934,7 +5984,7 @@ mod tests {
                 first_generation,
             )
             .unwrap();
-        store
+        let gone = store
             .observe(
                 Path::new("gone.jsonl"),
                 &session("gone", 10),
@@ -5949,7 +5999,13 @@ mod tests {
                 second_generation,
             )
             .unwrap();
-        assert_eq!(store.finish_scan(second_generation).unwrap(), 1);
+        // Issue #132/#140: reports exactly which session key changed, not
+        // just a row count, so a caller can refresh that one session instead
+        // of re-hydrating the whole corpus.
+        assert_eq!(
+            store.finish_scan(second_generation).unwrap(),
+            vec![gone.key.clone()]
+        );
         let sessions = store.load_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions.iter().filter(|item| item.available).count(), 1);
@@ -6979,6 +7035,180 @@ mod tests {
             "probe summary: before={before:?} deferred_only={deferred_only:?} after={after:?} \
              speedup(before/after)={:.2}x",
             before.as_secs_f64() / after.as_secs_f64().max(0.000_001)
+        );
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn probe_hydration_and_post_scan_rehydrate_at_field_recording_scale() {
+        // Issues #140/#132/#139, Phase 1: a v0.8.8 field recording (~4,300
+        // files / 4,379 sessions) measured `startup.history_hydrate` at
+        // 33,191ms and a ~40-45s residual in `startup.bulk_scan` that no
+        // metric named. This probe reproduces both at the same scale against
+        // a real SQLite-backed `HistoryStore`, on a synthetic corpus (this
+        // machine has no real corpus that size) shaped like
+        // `probe_bulk_scan_write_serialization_before_and_after`: a minority
+        // of "hot" sessions carrying most of the event volume alongside many
+        // "cold" ones, with every field #41/#42/#44 added populated on every
+        // session so the serialized shape matches what a current release
+        // actually archives (see `EXPECTED_SESSION_WIRE_SHAPE` in
+        // `scan_cache.rs` for that shape's inventory).
+        use crate::model::ToolKind;
+
+        const SESSIONS: usize = 4_300;
+        const HOT_SESSIONS: usize = 100;
+        const HOT_TOKEN_EVENTS: i64 = 150;
+        const HOT_TOOL_EVENTS: i64 = 300;
+        const COLD_TOKEN_EVENTS: i64 = 20;
+        const COLD_TOOL_EVENTS: i64 = 30;
+        // A scan that finds ~1% of sources gone (moved/deleted since the
+        // last scan) is a realistic upper bound for an ordinary warm start;
+        // it is what `finish_history_scan` actually has to react to.
+        const MISSING_FRACTION: usize = 100;
+
+        fn synthetic_session(id: &str, token_events: i64, tool_events: i64) -> Session {
+            let mut fixture = rich_session(id);
+            let base = timestamp("2026-01-01T00:00:00Z");
+            for n in 0..token_events {
+                let input = 10 + n as u64;
+                fixture.tokens_history.push(TokenHistoryPoint {
+                    timestamp: base + chrono::Duration::minutes(n),
+                    model: Some(if n % 2 == 0 { "gpt-a" } else { "gpt-b" }.into()),
+                    service_tier: None,
+                    request_input_tokens: Some(input),
+                    total_tokens: 0,
+                    delta: totals(input),
+                });
+            }
+            for n in 0..tool_events {
+                fixture.tool_observations.push(ToolObservation {
+                    call_id: format!("call-probe-{n}"),
+                    turn_id: Some("t1".into()),
+                    harness: codex_provider_id(),
+                    model: Some("gpt-a".into()),
+                    timestamp: base + chrono::Duration::minutes(n),
+                    kind: if n % 3 == 0 {
+                        ToolKind::Mutation
+                    } else {
+                        ToolKind::Read
+                    },
+                    name: "tool".into(),
+                    providers: Vec::new(),
+                    effective_tools: Vec::new(),
+                    target: Some("target".into()),
+                    resource_id: None,
+                    origin: ToolOrigin::Core,
+                    shell_family: None,
+                    language: None,
+                    outcome: ToolOutcome::Success,
+                    duration_ms: Some(40),
+                    output_bytes: 128,
+                });
+            }
+            fixture
+        }
+
+        let sessions: Vec<Session> = (0..SESSIONS)
+            .map(|index| {
+                if index < HOT_SESSIONS {
+                    synthetic_session(
+                        &format!("probe-hot-{index}"),
+                        HOT_TOKEN_EVENTS,
+                        HOT_TOOL_EVENTS,
+                    )
+                } else {
+                    synthetic_session(
+                        &format!("probe-cold-{index}"),
+                        COLD_TOKEN_EVENTS,
+                        COLD_TOOL_EVENTS,
+                    )
+                }
+            })
+            .collect();
+
+        let directory = tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        let generation = store.begin_scan().unwrap().max(1);
+        for chunk in sessions.chunks(crate::scanner::SCAN_WRITE_BATCH_SIZE) {
+            let paths: Vec<PathBuf> = chunk
+                .iter()
+                .map(|fixture| Path::new(&fixture.id).with_extension("jsonl"))
+                .collect();
+            let items: Vec<(&Path, &Session, i64)> = paths
+                .iter()
+                .zip(chunk)
+                .map(|(path, fixture)| (path.as_path(), fixture, generation))
+                .collect();
+            store.observe_bulk_batch(&items).unwrap();
+        }
+        store.rebuild_rollups_if_stale().unwrap();
+        assert_eq!(store.stats().unwrap().sessions, SESSIONS);
+
+        // Phase 1a: startup hydration shape and cost — mirrors
+        // `AppState::hydrate_history`'s call to `load_sessions_with_stats`.
+        let started = Instant::now();
+        let (loaded, stats) = store.load_sessions_with_stats().unwrap();
+        let hydrate_elapsed = started.elapsed();
+        assert_eq!(loaded.len(), SESSIONS);
+        eprintln!(
+            "startup hydration: {SESSIONS} sessions / {} bytes in {hydrate_elapsed:?} \
+             ({:.1} bytes/session)",
+            stats.bytes,
+            stats.bytes as f64 / SESSIONS as f64
+        );
+
+        // Phase 1b: a second scan where the first `MISSING_FRACTION` cold
+        // sessions' sources are not re-observed (simulating moved/deleted
+        // transcripts), then finished. Compares the old "full rehydrate"
+        // shape (issue #140's discovery: `finish_history_scan` used to call
+        // the same wholesale `hydrate_history` startup uses) against the
+        // fix's surgical reload of only the sessions `finish_scan` reports
+        // as changed.
+        let second_generation = store.begin_scan().unwrap();
+        let missing_range = HOT_SESSIONS..HOT_SESSIONS + MISSING_FRACTION;
+        for (index, fixture) in sessions.iter().enumerate() {
+            if missing_range.contains(&index) {
+                continue;
+            }
+            let path = Path::new(&fixture.id).with_extension("jsonl");
+            store
+                .observe_bulk(&path, fixture, second_generation)
+                .unwrap();
+        }
+        store.rebuild_rollups_if_stale().unwrap();
+
+        let started = Instant::now();
+        let affected_keys = store.finish_scan(second_generation).unwrap();
+        let finish_scan_elapsed = started.elapsed();
+        assert_eq!(
+            affected_keys.len(),
+            MISSING_FRACTION,
+            "the sessions not re-observed in the second generation must be exactly the ones \
+             finish_scan reports as changed"
+        );
+
+        let started = Instant::now();
+        for key in &affected_keys {
+            store.load_one(key).unwrap();
+        }
+        let surgical_reload_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        let (_, full_rehydrate_stats) = store.load_sessions_with_stats().unwrap();
+        let full_rehydrate_elapsed = started.elapsed();
+        assert_eq!(full_rehydrate_stats.sessions, SESSIONS);
+
+        eprintln!(
+            "post-scan missing-path pass at {SESSIONS} sessions, {MISSING_FRACTION} newly \
+             missing: finish_scan={finish_scan_elapsed:?} \
+             surgical_reload({}session)={surgical_reload_elapsed:?} \
+             full_rehydrate(what finish_history_scan used to do)={full_rehydrate_elapsed:?} \
+             speedup={:.1}x",
+            affected_keys.len(),
+            full_rehydrate_elapsed.as_secs_f64()
+                / (finish_scan_elapsed + surgical_reload_elapsed)
+                    .as_secs_f64()
+                    .max(0.000_001)
         );
     }
 

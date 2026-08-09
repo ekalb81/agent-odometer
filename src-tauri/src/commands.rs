@@ -1261,7 +1261,19 @@ pub fn spawn_scan(
         // parse-failure scan would leave sessions_in_ranges routing those
         // sessions through the slower in-memory fallback for the rest of
         // this process's lifetime, not just until the next scan.
-        state.finalize_bulk_scan_rollups();
+        //
+        // Timed as its own operation (issue #140): before this, the rebuild
+        // was folded into `startup.bulk_scan`'s undifferentiated ~40-45s
+        // post-scan residual, so a version-over-version delta was the only
+        // evidence of its cost.
+        let rollup_rebuild_started = Instant::now();
+        let rollups_rebuilt = state.finalize_bulk_scan_rollups();
+        state.performance.record_backend(
+            "startup.bulk_scan.rollup_rebuild",
+            rollup_rebuild_started,
+            true,
+            BTreeMap::from([("rebuilt".into(), rollups_rebuilt.to_string())]),
+        );
 
         // Retained for the on-demand provider diagnostics report (issue #39).
         // Only the newest still-current scan's counters are kept.
@@ -1269,14 +1281,25 @@ pub fn spawn_scan(
 
         // A parser/read failure makes a complete source observation
         // untrustworthy. Retain stale-present history rather than incorrectly
-        // marking a transcript missing.
+        // marking a transcript missing. Timed as its own operation (issue
+        // #140): `finish_history_scan` used to also re-hydrate every
+        // archived session from the ledger just to notice the handful this
+        // scan actually marked missing — see its doc comment — so this phase
+        // could plausibly have been most of `startup.bulk_scan`'s
+        // unaccounted residual.
+        let missing_path_started = Instant::now();
+        let mut missing_path_ran = false;
+        let mut affected_sessions = 0usize;
         if !source_configuration_valid {
             tracing::warn!(
                 "durable source availability was not finalized: invalid source configuration"
             );
         } else if report.parse_failures == 0 {
             if let Some(history_generation) = history_generation {
-                for session in state.finish_history_scan(history_generation) {
+                missing_path_ran = true;
+                let changed = state.finish_history_scan(history_generation);
+                affected_sessions = changed.len();
+                for session in changed {
                     if let Err(e) = app.emit("session-updated", &SessionSummary::of(&session)) {
                         tracing::warn!("emit session-updated failed: {}", e);
                     }
@@ -1288,15 +1311,27 @@ pub fn spawn_scan(
                 report.parse_failures
             );
         }
+        state.performance.record_backend(
+            "startup.bulk_scan.missing_path_pass",
+            missing_path_started,
+            true,
+            BTreeMap::from([
+                ("ran".into(), missing_path_ran.to_string()),
+                ("affected_sessions".into(), affected_sessions.to_string()),
+            ]),
+        );
 
         if state.current_scan_generation() != generation {
             return;
         }
 
-        // Overlay thread names from the session index, if present.
+        // Overlay thread names from the session index, if present. Timed as
+        // its own operation (issue #140).
+        let session_index_started = Instant::now();
         let names = crate::session_index::read(&config.session_index_path);
-        let changed = crate::session_index::apply(&state.sessions, &names);
-        for id in changed {
+        let overlay_ids = crate::session_index::apply(&state.sessions, &names);
+        let overlay_changed = overlay_ids.len();
+        for id in overlay_ids {
             if let Some(session) = state
                 .sessions
                 .get(&id)
@@ -1308,6 +1343,12 @@ pub fn spawn_scan(
                 }
             }
         }
+        state.performance.record_backend(
+            "startup.bulk_scan.session_index_overlay",
+            session_index_started,
+            true,
+            BTreeMap::from([("changed".into(), overlay_changed.to_string())]),
+        );
 
         if state.current_scan_generation() != generation {
             return;
@@ -1381,6 +1422,18 @@ pub fn spawn_scan(
                 (
                     "cache_lookup_total_ms".into(),
                     format!("{:.3}", report.cache_lookup_total_ms),
+                ),
+                (
+                    "cache_lookup_sql_ms".into(),
+                    format!("{:.3}", report.cache_lookup_sql_ms),
+                ),
+                (
+                    "cache_lookup_deserialize_ms".into(),
+                    format!("{:.3}", report.cache_lookup_deserialize_ms),
+                ),
+                (
+                    "cache_hit_bytes_total".into(),
+                    report.cache_hit_bytes_total.to_string(),
                 ),
             ]),
         );
@@ -1493,18 +1546,25 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
         // actually measuring, per this function's un-split shape before this
         // change.
         let hydrate_started = Instant::now();
-        match result {
+        let hydration_stats = match result {
             Ok(store) => state.set_history_ready(Some(Arc::new(store))),
             Err(error) => {
                 tracing::warn!("durable history unavailable: {}", error);
-                state.set_history_ready(None);
+                state.set_history_ready(None)
             }
-        }
+        };
+        // `sessions`/`bytes` (issue #139): recording both distinguishes "more
+        // sessions" from "bigger sessions" as an explanation for this phase's
+        // cost, rather than inferring it from a version-over-version session
+        // count alone.
         state.performance.record_backend(
             "startup.history_hydrate",
             hydrate_started,
             success,
-            BTreeMap::from([("sessions".into(), state.sessions.len().to_string())]),
+            BTreeMap::from([
+                ("sessions".into(), hydration_stats.sessions.to_string()),
+                ("bytes".into(), hydration_stats.bytes.to_string()),
+            ]),
         );
         let total_elapsed_ms = open_started.elapsed().as_millis() as u64;
         let last_step = state.last_history_step();
