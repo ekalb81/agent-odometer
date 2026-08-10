@@ -89,6 +89,11 @@ pub struct ScanCache {
     /// Time spent dropping and recreating the entries table on a
     /// parse-version mismatch; 0 when no invalidation happened.
     invalidation_ms: f64,
+    /// `PRAGMA cache_size`/`PRAGMA mmap_size`, captured once at open time.
+    /// `None` when the cache is disabled (no connection ever opened) — see
+    /// `HistoryStore::pragma_snapshot` for the same investigation on the
+    /// history archive's connection.
+    pragmas: Option<crate::memory::SqlitePragmaSnapshot>,
 }
 
 /// (size, mtime in ms since epoch) for a file; None when it can't be stat'ed.
@@ -163,6 +168,7 @@ impl ScanCache {
                  seen_generation INTEGER NOT NULL
              );",
         )?;
+        let pragmas = crate::memory::query_sqlite_pragmas(&connection);
 
         // Serialize version validation and generation allocation across all
         // processes/concurrent scans using SQLite's write lock. A read followed
@@ -244,6 +250,7 @@ impl ScanCache {
             generation,
             cold_reason,
             invalidation_ms,
+            pragmas: Some(pragmas),
         })
     }
 
@@ -251,6 +258,12 @@ impl ScanCache {
     /// the stored parse version matched.
     pub fn cold_reason(&self) -> Option<ColdReason> {
         self.cold_reason
+    }
+
+    /// `PRAGMA cache_size`/`PRAGMA mmap_size` captured when this connection
+    /// was opened; `None` if the cache never opened a connection (disabled).
+    pub fn pragma_snapshot(&self) -> Option<crate::memory::SqlitePragmaSnapshot> {
+        self.pragmas
     }
 
     /// Milliseconds spent invalidating entries on a parse-version mismatch;

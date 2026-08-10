@@ -107,6 +107,11 @@ pub struct HistoryStore {
     /// Retained so aggregation can open dedicated read connections instead
     /// of serializing behind the writer mutex (WAL permits concurrent reads).
     path: PathBuf,
+    /// `PRAGMA cache_size`/`PRAGMA mmap_size`, captured once at open time —
+    /// this connection sets neither explicitly, so these are SQLite's
+    /// compiled-in defaults (see `memory.rs`'s doc comment for why that
+    /// matters to this app's memory investigation).
+    pragmas: crate::memory::SqlitePragmaSnapshot,
 }
 
 impl HistoryStore {
@@ -160,6 +165,7 @@ impl HistoryStore {
             .with_context(|| format!("could not open history store {}", path.display()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        let pragmas = crate::memory::query_sqlite_pragmas(&connection);
         migrate(&mut connection, &mut on_progress)?;
         // Crash-safety net for issue #132's deferred-rollup bulk scan: a
         // process that was killed after a bulk `observe_bulk` write
@@ -184,7 +190,14 @@ impl HistoryStore {
         Ok(Self {
             connection: Mutex::new(connection),
             path: path.to_path_buf(),
+            pragmas,
         })
+    }
+
+    /// `PRAGMA cache_size`/`PRAGMA mmap_size` captured when this connection
+    /// was opened. See [`crate::memory::SqlitePragmaSnapshot`].
+    pub fn pragma_snapshot(&self) -> crate::memory::SqlitePragmaSnapshot {
+        self.pragmas
     }
 
     /// Starts a generation used only to determine whether a *location* was
@@ -7728,6 +7741,8 @@ mod tests {
         const SESSIONS: usize = 300;
         const HOT_SESSIONS: usize = 30;
 
+        crate::memory::configure_heap_tracking(true);
+
         fn old_style_load_sessions(store: &HistoryStore) -> Result<(Vec<StoredSession>, u64)> {
             let connection = store.connection()?;
             let mut key_statement = connection.prepare(
@@ -7916,6 +7931,8 @@ mod tests {
         const SESSIONS: usize = 300;
         const HOT_SESSIONS: usize = 30;
         const CHANGED: usize = 30;
+
+        crate::memory::configure_heap_tracking(true);
 
         let sessions: Vec<Session> = (0..SESSIONS)
             .map(|index| field_scale_session(index, HOT_SESSIONS))

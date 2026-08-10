@@ -1247,60 +1247,29 @@ pub(crate) mod tests {
 
     // -- Resident heap-cost probe (issue #139 follow-up) -------------------
     //
-    // A process-wide counting allocator, active only in this test binary
-    // (`#[cfg(test)]`; the production binary is a separate compiled unit
-    // and never links this). Wraps `System` so behavior is identical to the
-    // default allocator; it tracks net bytes currently outstanding *and*
-    // the high-water mark of that value, so a probe can read an exact
-    // heap-byte delta — net or peak — around a specific region of code
-    // instead of an OS-level working-set proxy, which the PR's own attempts
-    // at a live measurement showed is easily confounded by unrelated
-    // process activity (a concurrently running production instance, a bulk
-    // scan discovering unrelated real files, and so on). Peak tracking
-    // (added for the streaming-hydration follow-up) is what tells apart "a
-    // pass that never retains much" from "a pass that never *peaks* high" —
-    // #139 fixed the former without fixing the latter, and net-bytes-only
-    // tracking could not have shown that gap.
-    struct CountingAllocator;
-
-    static ALLOCATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
-        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-            let ptr = unsafe { std::alloc::System.alloc(layout) };
-            if !ptr.is_null() {
-                let now = ALLOCATED.fetch_add(layout.size(), std::sync::atomic::Ordering::SeqCst)
-                    + layout.size();
-                PEAK.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
-            }
-            ptr
-        }
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-            unsafe { std::alloc::System.dealloc(ptr, layout) };
-            ALLOCATED.fetch_sub(layout.size(), std::sync::atomic::Ordering::SeqCst);
-        }
-        // `GlobalAlloc::realloc`'s default body calls `self.alloc`/`self.dealloc`
-        // rather than the system allocator directly, so it already routes
-        // through the two overrides above and needs no override of its own.
-    }
-
-    #[global_allocator]
-    static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-    /// Current net heap bytes outstanding under [`CountingAllocator`].
-    /// `pub(crate)` so other test modules (`history_store::tests`'s
-    /// streaming-hydration probe) can use this same process-wide allocator
-    /// instead of each defining — and failing to compile alongside — their
-    /// own `#[global_allocator]` (only one is allowed per binary).
+    // These probes used to define their own `#[cfg(test)]`-only counting
+    // `#[global_allocator]`, active only in the test binary since the
+    // production binary was a separate compiled unit that never linked it.
+    // The memory-instrumentation effort promoted that allocator to a single
+    // production-safe one (`crate::memory::TrackingAllocator`, declared once
+    // in `lib.rs`) so a real build can report allocator-tracked heap
+    // alongside OS-reported RSS — a binary can only ever have one global
+    // allocator, so the two could not coexist. These wrappers keep the exact
+    // names every probe below (and `history_store::tests`'s streaming-
+    // hydration and overlay probes) already called, delegating to that
+    // shared allocator's `pub(crate)` raw accessors instead of a private
+    // static. Unlike before, tracking is runtime-gated and off by default
+    // (`crate::memory::configure_heap_tracking`); every probe that reads
+    // these now enables it explicitly near its start.
     pub(crate) fn allocated_bytes() -> usize {
-        ALLOCATED.load(std::sync::atomic::Ordering::SeqCst)
+        crate::memory::heap_allocated_bytes_raw() as usize
     }
 
-    /// High-water mark of [`allocated_bytes`] observed since process start
-    /// or the last [`reset_peak_to_current`] call, whichever is more recent.
+    /// High-water mark of [`allocated_bytes`] observed since heap tracking
+    /// was enabled or the last [`reset_peak_to_current`] call, whichever is
+    /// more recent.
     pub(crate) fn peak_bytes() -> usize {
-        PEAK.load(std::sync::atomic::Ordering::SeqCst)
+        crate::memory::heap_peak_bytes_raw() as usize
     }
 
     /// Rebases the peak tracker to the current allocation level, so a
@@ -1309,7 +1278,7 @@ pub(crate) mod tests {
     /// (or a prior test's, if allocations from two `#[test]` functions
     /// interleave) would still be visible.
     pub(crate) fn reset_peak_to_current() {
-        PEAK.store(allocated_bytes(), std::sync::atomic::Ordering::SeqCst);
+        crate::memory::reset_heap_peak_to_current();
     }
 
     /// Builds one session shaped like real agentic-loop usage: several
@@ -1511,6 +1480,8 @@ pub(crate) mod tests {
         const SESSIONS: usize = 4_400;
         const HOT_SESSIONS: usize = 440;
 
+        crate::memory::configure_heap_tracking(true);
+
         // Measures two disjoint deltas in sequence: building `sessions`
         // (what `AppState.sessions` used to hold, in full) first, then
         // building `residents` from it (what `AppState.sessions` holds
@@ -1519,15 +1490,15 @@ pub(crate) mod tests {
         // `Vec`s on the summary side), so the second delta is exactly the
         // resident type's own additional cost — not contaminated by the
         // first.
-        let before_full = ALLOCATED.load(std::sync::atomic::Ordering::SeqCst);
+        let before_full = allocated_bytes();
         let sessions: Vec<Session> = (0..SESSIONS)
             .map(|i| realistic_session(&format!("probe-{i}"), i < HOT_SESSIONS))
             .collect();
-        let after_full = ALLOCATED.load(std::sync::atomic::Ordering::SeqCst);
+        let after_full = allocated_bytes();
         let full_bytes = after_full - before_full;
 
         let residents: Vec<ResidentSession> = sessions.iter().map(ResidentSession::of).collect();
-        let after_resident = ALLOCATED.load(std::sync::atomic::Ordering::SeqCst);
+        let after_resident = allocated_bytes();
         let resident_bytes = after_resident - after_full;
 
         let full_per_session = full_bytes as f64 / SESSIONS as f64;

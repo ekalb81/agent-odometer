@@ -79,6 +79,16 @@ pub struct Config {
     /// Per-segment limit; the recorder keeps the current and previous segment.
     #[serde(default = "default_performance_log_max_mb")]
     pub performance_log_max_mb: u64,
+    /// Allocator-tracked heap sampling (current + peak bytes), alongside the
+    /// OS-reported process memory `performance_tracking_enabled` alone
+    /// already samples. Off by default: wrapping the global allocator to
+    /// support this is unavoidable (see `memory.rs`), but the atomics that
+    /// make tracking exact only run while this is true. Independent of
+    /// `performance_tracking_enabled` in principle, but recording a sample
+    /// still requires that flag too — this only controls whether the
+    /// allocator counters are live to sample from.
+    #[serde(default)]
+    pub memory_heap_tracking_enabled: bool,
     /// Enables the read-only instruction inventory and its bounded file reads.
     #[serde(default)]
     pub instructions_enabled: bool,
@@ -166,6 +176,7 @@ impl Default for Config {
             defender_exclusion_receipt: None,
             performance_tracking_enabled: false,
             performance_log_max_mb: default_performance_log_max_mb(),
+            memory_heap_tracking_enabled: false,
             instructions_enabled: false,
             instructions_tab_visible: true,
             instruction_roots: Vec::new(),
@@ -368,6 +379,7 @@ mod tests {
             }),
             performance_tracking_enabled: true,
             performance_log_max_mb: 32,
+            memory_heap_tracking_enabled: true,
             instructions_enabled: true,
             instructions_tab_visible: false,
             instruction_roots: vec![InstructionRoot {
@@ -394,6 +406,7 @@ mod tests {
         );
         assert!(loaded.performance_tracking_enabled);
         assert_eq!(loaded.performance_log_max_mb, 32);
+        assert!(loaded.memory_heap_tracking_enabled);
         assert!(loaded.instructions_enabled);
         assert!(!loaded.instructions_tab_visible);
         assert_eq!(loaded.instruction_roots, cfg.instruction_roots);
@@ -417,6 +430,7 @@ mod tests {
         assert!(cfg.defender_exclusion_receipt.is_none());
         assert!(!cfg.performance_tracking_enabled);
         assert_eq!(cfg.performance_log_max_mb, 64);
+        assert!(!cfg.memory_heap_tracking_enabled);
         assert!(!cfg.instructions_enabled);
         assert!(cfg.instructions_tab_visible);
         assert!(cfg.instruction_roots.is_empty());
