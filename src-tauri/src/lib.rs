@@ -55,6 +55,14 @@ use tracing_subscriber::EnvFilter;
 /// identical to the default system allocator unless heap tracking is
 /// explicitly enabled via `memory::configure_heap_tracking` — off by
 /// default, matching every other opt-in in this app.
+///
+/// Do not add another `#[global_allocator]` anywhere in this crate or its
+/// tests: a binary may declare at most one, and a second one — even a
+/// `#[cfg(test)]`-only one, which is exactly how this crate had two before
+/// this instrumentation unified them — fails the build with a "duplicate
+/// lang item" error that does not point back at this line. If a probe needs
+/// exact heap-byte deltas, drive this allocator via
+/// `memory::configure_heap_tracking` and its raw accessors instead.
 #[global_allocator]
 static GLOBAL_ALLOCATOR: memory::TrackingAllocator = memory::TrackingAllocator;
 
