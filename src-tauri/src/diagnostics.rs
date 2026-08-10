@@ -426,13 +426,16 @@ struct ProviderSessionStats {
 }
 
 /// One pass over the already-loaded in-memory session projection (no new
-/// discovery or parsing). `storage_id` embeds a `:collision:` suffix exactly
-/// when the durable archive detected competing sources for one provider
-/// identity (see `history_store::reconcile_session`).
+/// discovery or parsing, no ledger read — issue #139: `state.sessions`
+/// holds the resident summary plus `rate_limits_history`, the one field
+/// beyond the wire-shape `SessionSummary` this needs). `storage_id` embeds a
+/// `:collision:` suffix exactly when the durable archive detected competing
+/// sources for one provider identity (see `history_store::reconcile_session`).
 fn collect_session_stats(state: &AppState) -> HashMap<ProviderId, ProviderSessionStats> {
     let mut stats: HashMap<ProviderId, ProviderSessionStats> = HashMap::new();
     for entry in state.sessions.iter() {
-        let session = entry.value();
+        let resident = entry.value();
+        let session = &resident.summary;
         let per_provider = stats.entry(session.harness.clone()).or_default();
         per_provider.durable_sessions += 1;
         if session.source_availability == SourceAvailability::Present {
@@ -441,7 +444,7 @@ fn collect_session_stats(state: &AppState) -> HashMap<ProviderId, ProviderSessio
         if session.storage_id.contains(":collision:") {
             per_provider.collision_sessions += 1;
         }
-        if !session.rate_limits_history.is_empty()
+        if !resident.rate_limits_history.is_empty()
             || session.credits_unlimited.is_some()
             || session.credits_balance.is_some()
         {
@@ -454,8 +457,12 @@ fn collect_session_stats(state: &AppState) -> HashMap<ProviderId, ProviderSessio
             if let Some(model) = &session.model {
                 per_provider.models_used.insert(model.clone());
             }
-            for model in session.tokens_by_model.keys() {
-                per_provider.models_used.insert(model.clone());
+            // `buckets` (grouped by (model, service_tier)) always carries
+            // the same model set `tokens_by_model` used to — both are
+            // populated by the same parser reconciliation — without needing
+            // the full `tokens_by_model` map resident here.
+            for bucket in &session.buckets {
+                per_provider.models_used.insert(bucket.model.clone());
             }
         }
     }

@@ -128,7 +128,7 @@ async fn run_instruction_scan(
         .sessions
         .iter()
         .filter_map(|entry| {
-            let session = entry.value();
+            let session = &entry.value().summary;
             session.working_directory.as_ref().map(|working_directory| {
                 crate::instructions::InstructionSessionContext {
                     working_directory: std::path::PathBuf::from(working_directory),
@@ -309,18 +309,41 @@ pub async fn correlate_events(
         return Err("correlation windows are limited to 365 days".into());
     }
     let app_state = state.inner().clone();
-    let sessions: Vec<_> = app_state
-        .sessions
-        .iter()
-        .map(|entry| entry.value().clone())
-        .collect();
-    let session_count = sessions.len();
     let event_count = query.events.len();
+    // Issue #139: `state.sessions` holds only resident summaries now, and
+    // `correlate` needs full per-turn/token history — but `correlate_events`
+    // has no session-id scoping of its own, so loading every resident
+    // session's full content on every call would turn a live in-memory
+    // clone into a whole-corpus ledger read on a hot-ish endpoint
+    // (`ConfigTimeline.svelte` re-runs this on every live session-store
+    // flush while its tab is open). `candidate_session_keys` narrows this
+    // to sessions that could actually contribute — matching the query's
+    // scope and overlapping at least one of its windows — using only the
+    // already-resident summaries, before any ledger read happens. See its
+    // doc comment for why that pre-filter cannot change the result.
+    let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::correlation::correlate(&sessions, query)
+        let summaries: Vec<(String, SessionSummary)> = blocking_state
+            .sessions
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().summary.clone()))
+            .collect();
+        let candidate_ids = crate::correlation::candidate_session_keys(
+            summaries
+                .iter()
+                .map(|(key, summary)| (key.as_str(), summary)),
+            &query,
+        );
+        let sessions = blocking_state.full_sessions(&candidate_ids)?;
+        Ok::<_, String>((
+            sessions.len(),
+            crate::correlation::correlate(&sessions, query),
+        ))
     })
     .await
-    .map_err(|error| error.to_string());
+    .map_err(|error| error.to_string())
+    .and_then(|inner| inner);
+    let session_count = result.as_ref().map(|(count, _)| *count).unwrap_or(0);
     app_state.performance.record_backend(
         "ipc.correlate_events",
         started,
@@ -330,7 +353,7 @@ pub async fn correlate_events(
             ("events".into(), event_count.to_string()),
         ]),
     );
-    result
+    result.map(|(_, correlation)| correlation)
 }
 
 /// Evaluates local, HEAD-reachable commits only. The gix repository handle is
@@ -347,11 +370,15 @@ pub async fn scan_git_outcomes(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let started = Instant::now();
-        let sessions: Vec<_> = state
+        // Issue #139: no session-id scoping here either, so this is a
+        // whole-corpus full-session load from the ledger now, same
+        // reasoning as `correlate_events`.
+        let ids: Vec<String> = state
             .sessions
             .iter()
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.key().clone())
             .collect();
+        let sessions = state.full_sessions(&ids)?;
         let (outcomes, events) = crate::git_outcomes::evaluate(&sessions, post_window_hours);
         state.extend_external_events(events);
         state.performance.record_backend(
@@ -363,10 +390,11 @@ pub async fn scan_git_outcomes(
                 ("outcomes".into(), outcomes.len().to_string()),
             ]),
         );
-        outcomes
+        Ok::<_, String>(outcomes)
     })
     .await
     .map_err(|error| error.to_string())
+    .and_then(|inner| inner)
 }
 
 #[tauri::command]
@@ -448,13 +476,16 @@ pub async fn write_export(
 /// Returns lightweight summaries of all known sessions. Full sessions
 /// (turns, token history) are fetched per-id via `get_session_details` —
 /// shipping them all here measured ~200 MB of JSON on a real corpus.
+/// Issue #139: `state.sessions` now holds the resident summary directly, so
+/// this is a cheap clone rather than a `SessionSummary::of` recompute (which
+/// used to re-derive `buckets` from the full `tokens_history` on every call).
 #[tauri::command]
 pub fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<SessionSummary> {
     let started = Instant::now();
     let result: Vec<_> = state
         .sessions
         .iter()
-        .map(|entry| SessionSummary::of(entry.value().as_ref()))
+        .map(|entry| entry.value().summary.clone())
         .collect();
     state.performance.record_backend(
         "ipc.list_sessions",
@@ -466,19 +497,26 @@ pub fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<SessionSummary> {
 }
 
 /// Returns one full session (turns and token history included), for the
-/// detail drawer.
+/// detail drawer. Issue #139: `state.sessions` holds only a resident summary,
+/// so this now loads full content on demand — from the ledger, or from the
+/// resident full-content fallback for a session the ledger cannot currently
+/// vouch for. `Ok(None)` means the id is not a session this process knows
+/// about; `Err` means the id is known but its full content could not be
+/// loaded right now (#116: never silently substituted with an empty/zero
+/// session).
 #[tauri::command]
-pub fn get_session_details(state: State<'_, Arc<AppState>>, session_id: String) -> Option<Session> {
+pub fn get_session_details(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Option<Session>, String> {
     let started = Instant::now();
-    let result = state
-        .sessions
-        .get(&session_id)
-        .map(|entry| entry.value().as_ref().clone());
+    let result = state.full_session(&session_id);
+    let found = result.as_ref().map(|s| s.is_some()).unwrap_or(false);
     state.performance.record_backend(
         "ipc.get_session_details",
         started,
-        result.is_some(),
-        BTreeMap::from([("found".into(), result.is_some().to_string())]),
+        result.is_ok(),
+        BTreeMap::from([("found".into(), found.to_string())]),
     );
     result
 }
@@ -502,11 +540,13 @@ pub struct SubscriptionUsageEntry {
 /// that recorded it. Harnesses with no snapshots — Claude Code transcripts
 /// carry none today — are omitted rather than padded with nulls.
 fn newest_subscription_usage_by_harness<'a>(
-    sessions: impl Iterator<Item = &'a Session>,
+    sessions: impl Iterator<Item = &'a crate::model::ResidentSession>,
 ) -> Vec<SubscriptionUsageEntry> {
-    let mut newest: BTreeMap<Harness, (&'a Session, &'a RateLimitSnapshotPoint)> = BTreeMap::new();
-    for session in sessions {
-        for point in &session.rate_limits_history {
+    let mut newest: BTreeMap<Harness, (&'a SessionSummary, &'a RateLimitSnapshotPoint)> =
+        BTreeMap::new();
+    for resident in sessions {
+        let session = &resident.summary;
+        for point in &resident.rate_limits_history {
             let is_newer = newest
                 .get(&session.harness)
                 .is_none_or(|(_, existing)| point.timestamp > existing.timestamp);
@@ -530,12 +570,15 @@ fn newest_subscription_usage_by_harness<'a>(
 }
 
 /// Most-recent provider-reported subscription-usage snapshot per harness.
-/// Loads full sessions just for this scan (cheap `Arc` clones) since list
-/// summaries omit `rate_limits_history`.
+/// Issue #139: `rate_limits_history` is one of the two fields the resident
+/// summary carries beyond the wire-shape `SessionSummary` specifically so
+/// this command (and `diagnostics::collect_session_stats`) never need a
+/// ledger read — cheap `Arc` clones of the already-resident projection, same
+/// as before.
 #[tauri::command]
 pub fn get_subscription_usage(state: State<'_, Arc<AppState>>) -> Vec<SubscriptionUsageEntry> {
     let started = Instant::now();
-    let sessions: Vec<Arc<Session>> = state
+    let sessions: Vec<Arc<crate::model::ResidentSession>> = state
         .sessions
         .iter()
         .map(|entry| entry.value().clone())
@@ -617,7 +660,7 @@ pub async fn sessions_in_ranges(
         return Err("durable history is still preparing; retry shortly".into());
     }
     let blocking_state = app_state.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
         // The ledger is authoritative when available; sessions whose latest
         // persist failed (plus everything, when the store never opened) fall
         // back to walking in-memory history, keeping answers complete.
@@ -653,24 +696,32 @@ pub async fn sessions_in_ranges(
                 }
             }
         }
-        for key in memory_keys {
-            let Some(session) = blocking_state
-                .sessions
-                .get(&key)
-                .map(|entry| entry.value().clone())
-            else {
-                continue;
-            };
-            for (i, rt) in session.range_totals_multi(&bounds).into_iter().enumerate() {
-                if range_has_data(&rt) {
-                    out[i].insert(key.clone(), rt);
+        if !memory_keys.is_empty() {
+            // Issue #139: `state.sessions` no longer carries full
+            // `tokens_history`, so the in-memory fallback for exactly these
+            // (expected-rare) sessions resolves full content on demand —
+            // from the resident full-content fallback for a genuinely
+            // ledger-stale session, or a ledger read for a session whose
+            // facts are correct but rollups lag. A failure here is a hard
+            // error for the whole call rather than a silent partial: a
+            // window with no entry for one of these sessions reads as zero
+            // to the frontend, which would be exactly #116's silent
+            // undercount if the miss were swallowed instead.
+            let sessions = blocking_state.full_sessions(&memory_keys)?;
+            for session in sessions {
+                let key = session.effective_storage_id();
+                for (i, rt) in session.range_totals_multi(&bounds).into_iter().enumerate() {
+                    if range_has_data(&rt) {
+                        out[i].insert(key.clone(), rt);
+                    }
                 }
             }
         }
-        (out, source)
+        Ok((out, source))
     })
     .await
-    .map_err(|e| e.to_string());
+    .map_err(|e| e.to_string())
+    .and_then(|inner| inner);
     let source = result
         .as_ref()
         .map(|(_, source)| *source)
@@ -727,26 +778,41 @@ fn parse_tool_impact_range(
     Ok((from, to))
 }
 
-fn tool_impact_sessions(
-    app_state: &Arc<AppState>,
+/// Resolves the ids in scope for a tool-impact query (issue #139 follow-up):
+/// the caller's explicit list (filtered to ids this process actually knows
+/// about, same as before #139) or the whole corpus, further narrowed by
+/// `tool_impact::candidate_session_keys` to sessions whose resident summary
+/// says they could actually contribute to `[from, to]` — see its doc
+/// comment for why that narrowing cannot change `list_targets`/`compare`'s
+/// result. Full session content is *not* resolved here: that is a possible
+/// ledger read, done inside `spawn_blocking` via `AppState::full_sessions`
+/// alongside the CPU-bound aggregation itself.
+fn tool_impact_session_ids(
+    app_state: &AppState,
     session_ids: Option<Vec<String>>,
-) -> Vec<Arc<Session>> {
-    match session_ids {
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> Vec<String> {
+    let summaries: Vec<(String, SessionSummary)> = app_state
+        .sessions
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().summary.clone()))
+        .collect();
+    let scoped: std::collections::HashSet<String> = match session_ids {
         Some(ids) => ids
             .into_iter()
-            .filter_map(|id| {
-                app_state
-                    .sessions
-                    .get(&id)
-                    .map(|entry| entry.value().clone())
-            })
+            .filter(|id| app_state.sessions.contains_key(id))
             .collect(),
-        None => app_state
-            .sessions
+        None => summaries.iter().map(|(key, _)| key.clone()).collect(),
+    };
+    crate::tool_impact::candidate_session_keys(
+        summaries
             .iter()
-            .map(|entry| entry.value().clone())
-            .collect(),
-    }
+            .filter(|(key, _)| scoped.contains(key))
+            .map(|(key, summary)| (key.as_str(), summary)),
+        from,
+        to,
+    )
 }
 
 #[tauri::command]
@@ -757,13 +823,16 @@ pub async fn list_tool_impact_targets(
     let started = Instant::now();
     let (from, to) = parse_tool_impact_range(query.from, query.to)?;
     let app_state = state.inner().clone();
-    let sessions = tool_impact_sessions(&app_state, query.session_ids);
-    let session_count = sessions.len();
+    let ids = tool_impact_session_ids(&app_state, query.session_ids, from, to);
+    let session_count = ids.len();
+    let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::tool_impact::list_targets(&sessions, from, to)
+        let sessions = blocking_state.full_sessions(&ids)?;
+        Ok::<_, String>(crate::tool_impact::list_targets(&sessions, from, to))
     })
     .await
-    .map_err(|error| error.to_string());
+    .map_err(|error| error.to_string())
+    .and_then(|inner| inner);
     app_state.performance.record_backend(
         "ipc.list_tool_impact_targets",
         started,
@@ -797,14 +866,23 @@ pub async fn compare_tool_impact(
     let (from, to) = parse_tool_impact_range(query.from, query.to)?;
 
     let app_state = state.inner().clone();
-    let sessions = tool_impact_sessions(&app_state, query.session_ids);
-    let session_count = sessions.len();
+    let ids = tool_impact_session_ids(&app_state, query.session_ids, from, to);
+    let session_count = ids.len();
     let target_kind = query.target_kind;
+    let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        crate::tool_impact::compare(&sessions, target_kind, &target_key, from, to)
+        let sessions = blocking_state.full_sessions(&ids)?;
+        Ok::<_, String>(crate::tool_impact::compare(
+            &sessions,
+            target_kind,
+            &target_key,
+            from,
+            to,
+        ))
     })
     .await
-    .map_err(|error| error.to_string());
+    .map_err(|error| error.to_string())
+    .and_then(|inner| inner);
     app_state.performance.record_backend(
         "ipc.compare_tool_impact",
         started,
@@ -1332,15 +1410,32 @@ pub fn spawn_scan(
         let overlay_ids = crate::session_index::apply(&state.sessions, &names);
         let overlay_changed = overlay_ids.len();
         for id in overlay_ids {
-            if let Some(session) = state
-                .sessions
-                .get(&id)
-                .map(|session| session.value().as_ref().clone())
-            {
-                state.persist_session_metadata(&session);
-                if let Err(e) = app.emit("session-updated", &SessionSummary::of(&session)) {
-                    tracing::warn!("emit session-updated failed: {}", e);
+            let Some(summary) = state.sessions.get(&id).map(|entry| entry.summary.clone()) else {
+                continue;
+            };
+            // Issue #139: the resident projection already has the updated
+            // `thread_name` (applied in place above), but persisting the
+            // metadata overlay durably needs the *full* session content —
+            // load it on demand and patch the one field that changed rather
+            // than writing a full snapshot straight from the resident
+            // summary, which would silently drop turns/token history from
+            // the persisted overlay.
+            match state.full_session(&id) {
+                Ok(Some(mut full)) => {
+                    full.thread_name = summary.thread_name.clone();
+                    state.persist_session_metadata(&full);
                 }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        "could not load session {} to persist its thread-name overlay: {}",
+                        id,
+                        error
+                    );
+                }
+            }
+            if let Err(e) = app.emit("session-updated", &summary) {
+                tracing::warn!("emit session-updated failed: {}", e);
             }
         }
         state.performance.record_backend(
@@ -2120,8 +2215,8 @@ mod tests {
     };
     use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
     use crate::model::{
-        Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
-        TokenTotals, ToolMetrics,
+        Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SessionSummary,
+        SourceAvailability, TokenTotals, ToolMetrics,
     };
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -2508,7 +2603,10 @@ mod tests {
             Vec::new(),
         );
 
-        let sessions = [codex_a, codex_b, claude];
+        let sessions: Vec<crate::model::ResidentSession> = [codex_a, codex_b, claude]
+            .iter()
+            .map(crate::model::ResidentSession::of)
+            .collect();
         let result = newest_subscription_usage_by_harness(sessions.iter());
 
         assert_eq!(result.len(), 1);
@@ -2529,7 +2627,7 @@ mod tests {
         id: &str,
         project_key: Option<&str>,
         project_label: Option<&str>,
-    ) -> Session {
+    ) -> SessionSummary {
         let mut session = subscription_fixture_session(
             id,
             crate::provider::codex_provider_id(),
@@ -2544,7 +2642,7 @@ mod tests {
         session.project_provenance = project_key
             .is_some()
             .then_some(crate::project_identity::ProjectProvenance::RepositoryRoot);
-        session
+        SessionSummary::of(&session)
     }
 
     #[test]
@@ -2726,7 +2824,7 @@ pub fn resolve_working_directories(state: State<'_, Arc<AppState>>) -> Vec<Worki
     let mut directories: Vec<String> = state
         .sessions
         .iter()
-        .filter_map(|entry| entry.working_directory.clone())
+        .filter_map(|entry| entry.summary.working_directory.clone())
         .collect();
     directories.sort_unstable();
     directories.dedup();
@@ -2770,8 +2868,11 @@ pub struct ProjectInfo {
 /// testable without a Tauri `State`. `session_overrides` maps a durable
 /// session key to a manually reassigned raw project key ("split", #41);
 /// `project_overrides` is every alias/merge row keyed by raw project key.
+/// Takes `&SessionSummary` rather than `&Session` (issue #139):
+/// `project_key`/`project_label`/`project_provenance`/`storage_id` are all
+/// already summary-shaped fields, so this never needs a ledger read.
 fn resolve_projects_from<'a>(
-    sessions: impl Iterator<Item = &'a Session>,
+    sessions: impl Iterator<Item = &'a SessionSummary>,
     session_overrides: &HashMap<String, String>,
     project_overrides: &HashMap<String, crate::history_store::ProjectOverrideRow>,
 ) -> Vec<ProjectInfo> {
@@ -2783,7 +2884,7 @@ fn resolve_projects_from<'a>(
     let mut raw: BTreeMap<String, RawInfo> = BTreeMap::new();
     for session in sessions {
         let effective_raw = session_overrides
-            .get(&session.effective_storage_id())
+            .get(&session.storage_id)
             .cloned()
             .or_else(|| session.project_key.clone());
         let Some(raw_key) = effective_raw else {
@@ -2871,13 +2972,13 @@ pub fn resolve_projects(state: State<'_, Arc<AppState>>) -> Result<Vec<ProjectIn
                 .collect(),
             None => HashMap::new(),
         };
-    let sessions: Vec<Arc<Session>> = state
+    let sessions: Vec<Arc<crate::model::ResidentSession>> = state
         .sessions
         .iter()
         .map(|entry| entry.value().clone())
         .collect();
     let result = resolve_projects_from(
-        sessions.iter().map(|session| session.as_ref()),
+        sessions.iter().map(|session| &session.summary),
         &session_overrides,
         &project_overrides,
     );
@@ -3031,29 +3132,44 @@ pub fn set_quota_config(
 /// period, from the in-memory session projection. Only ever called for
 /// `Tokens`-unit budgets; `PercentOfWindow` budgets read their current
 /// value directly off the matching `QuotaWindow` instead.
+/// `None` means the value could not be computed this poll (issue #139: full
+/// `tokens_history` for this budget's scoped sessions is a possible ledger
+/// read now that `state.sessions` holds only resident summaries) — the same
+/// "unavailable" signal `BudgetEvaluation::current_value` already uses for
+/// an unavailable `PercentOfWindow` snapshot, never a fabricated zero.
 fn token_budget_current_value(
     state: &AppState,
     budget: &crate::quota_store::QuotaBudget,
     now: DateTime<Utc>,
-) -> f64 {
+) -> Option<f64> {
     let period_hours = budget.period_hours.unwrap_or(24).max(1) as i64;
     let since = now - chrono::Duration::hours(period_hours);
-    state
+    let ids: Vec<String> = state
         .sessions
         .iter()
-        .filter(|entry| entry.value().harness == budget.provider)
+        .filter(|entry| entry.value().summary.harness == budget.provider)
         .filter(|entry| {
             budget.project_key.is_none()
-                || entry.value().project_key.as_deref() == budget.project_key.as_deref()
+                || entry.value().summary.project_key.as_deref() == budget.project_key.as_deref()
         })
-        .map(|entry| {
-            entry
-                .value()
-                .range_totals(Some(since), None)
-                .tokens
-                .total_tokens as f64
-        })
-        .sum()
+        .map(|entry| entry.key().clone())
+        .collect();
+    match state.full_sessions(&ids) {
+        Ok(sessions) => Some(
+            sessions
+                .iter()
+                .map(|session| session.range_totals(Some(since), None).tokens.total_tokens as f64)
+                .sum(),
+        ),
+        Err(error) => {
+            tracing::warn!(
+                "could not compute token budget current value for {:?}: {}",
+                budget.provider,
+                error
+            );
+            None
+        }
+    }
 }
 
 /// Recomputes quota snapshots against configured soft budgets and returns
@@ -3130,7 +3246,7 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
                     })
                     .and_then(|window| window.used),
                 crate::quota_store::BudgetUnit::Tokens => {
-                    Some(token_budget_current_value(state, budget, now))
+                    token_budget_current_value(state, budget, now)
                 }
             };
             crate::quota::BudgetEvaluation {

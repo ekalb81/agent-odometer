@@ -695,6 +695,37 @@ impl SessionSummary {
     }
 }
 
+/// In-memory resident projection of one session (issue #139).
+/// `AppState.sessions` holds this instead of a full [`Session`] so steady-
+/// state residency and startup hydration scale with summary size, not with
+/// turn/token-event volume — a full session measured ~1 MB resident across a
+/// real corpus; its summary well under 1% of that.
+///
+/// This is deliberately *not* the wire-shape [`SessionSummary`]: it adds
+/// `rate_limits_history`, which `SessionSummary` omits from IPC payloads on
+/// purpose (`AGENTS.md`'s `session-updated` contract). The two consumers
+/// that still need `rate_limits_history` after the resident-summary switch —
+/// `commands::get_subscription_usage` and
+/// `diagnostics::collect_session_stats` — read it from here without ever
+/// growing the wire payload.
+#[derive(Debug, Clone)]
+pub struct ResidentSession {
+    pub summary: SessionSummary,
+    /// Provider-reported account quota snapshots (see [`Session::rate_limits_history`]).
+    /// Typically a handful of points per session — bounded by turn count,
+    /// not token-event volume — so resident cost here is small.
+    pub rate_limits_history: Vec<RateLimitSnapshotPoint>,
+}
+
+impl ResidentSession {
+    pub fn of(session: &Session) -> Self {
+        Self {
+            summary: SessionSummary::of(session),
+            rate_limits_history: session.rate_limits_history.clone(),
+        }
+    }
+}
+
 pub(crate) fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
     *dst += src;
 }
@@ -1212,5 +1243,265 @@ mod tests {
         let restored: SessionSummary = serde_json::from_value(serialized).unwrap();
         assert!(restored.storage_id.is_empty());
         assert_eq!(restored.source_availability, SourceAvailability::Present);
+    }
+
+    // -- Resident heap-cost probe (issue #139 follow-up) -------------------
+    //
+    // A process-wide counting allocator, active only in this test binary
+    // (`#[cfg(test)]`; the production binary is a separate compiled unit
+    // and never links this). Wraps `System` so behavior is identical to the
+    // default allocator; it only additionally tracks net bytes currently
+    // outstanding, so the probe below can read an exact heap-byte delta
+    // around a specific region of code instead of an OS-level working-set
+    // proxy — which the PR's own attempts at a live measurement showed is
+    // easily confounded by unrelated process activity (a concurrently
+    // running production instance, a bulk scan discovering unrelated real
+    // files, and so on).
+    struct CountingAllocator;
+
+    static ALLOCATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            let ptr = unsafe { std::alloc::System.alloc(layout) };
+            if !ptr.is_null() {
+                ALLOCATED.fetch_add(layout.size(), std::sync::atomic::Ordering::SeqCst);
+            }
+            ptr
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            unsafe { std::alloc::System.dealloc(ptr, layout) };
+            ALLOCATED.fetch_sub(layout.size(), std::sync::atomic::Ordering::SeqCst);
+        }
+        // `GlobalAlloc::realloc`'s default body calls `self.alloc`/`self.dealloc`
+        // rather than the system allocator directly, so it already routes
+        // through the two overrides above and needs no override of its own.
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    /// Builds one session shaped like real agentic-loop usage: several
+    /// turns, each carrying near-the-truncation-limit `user_message`/
+    /// `last_agent_message` text (`TURN_MESSAGE_LIMIT` is 500 chars in
+    /// `parser.rs`/`claude_parser.rs`/`gemini_parser.rs`), several
+    /// `tokens_history` events, and several `tool_observations` — unlike
+    /// this crate's existing synthetic-corpus probes
+    /// (`history_store::tests::rich_session` and its
+    /// `probe_hydration_and_post_scan_rehydrate_at_field_recording_scale`
+    /// caller), which never populate `turns` at all and so understate a
+    /// real session's size. `hot` sessions get more of everything, mirroring
+    /// the hot/cold split those existing probes already use for a corpus
+    /// with a minority of large sessions and a majority of small ones.
+    fn realistic_session(id: &str, hot: bool) -> Session {
+        let turn_count = if hot { 25 } else { 6 };
+        let tokens_per_turn = if hot { 5 } else { 2 };
+        let tools_per_turn = if hot { 6 } else { 2 };
+        let base: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let user_message: String = "Please investigate why the incremental parser occasionally \
+             drops the trailing partial record when a rollout file is truncated mid-write, and \
+             fix the fast-skip path so it still advances last_event_at from the truncated line. "
+            .chars()
+            .cycle()
+            .take(450)
+            .collect();
+        let agent_message: String = "I found the issue in apply_line_without_refresh: the fast \
+             path returned before updating last_event_at when the JSON parse failed on a \
+             partial trailing line. I added a guard that still extracts the timestamp first. "
+            .chars()
+            .cycle()
+            .take(450)
+            .collect();
+
+        let mut turns = Vec::with_capacity(turn_count);
+        let mut tokens_history = Vec::with_capacity(turn_count * tokens_per_turn);
+        let mut tool_observations = Vec::with_capacity(turn_count * tools_per_turn);
+        for turn_index in 0..turn_count {
+            let turn_id = format!("turn-{id}-{turn_index}");
+            let turn_start = base + chrono::Duration::minutes(turn_index as i64 * 5);
+            for call in 0..tokens_per_turn {
+                tokens_history.push(TokenHistoryPoint {
+                    timestamp: turn_start + chrono::Duration::seconds(call as i64 * 10),
+                    model: Some("gpt-5.1-codex".into()),
+                    service_tier: Some("default".into()),
+                    request_input_tokens: Some(1_200 + call as u64 * 50),
+                    total_tokens: 0,
+                    delta: delta(600 + call as u64 * 25),
+                });
+            }
+            for call in 0..tools_per_turn {
+                tool_observations.push(ToolObservation {
+                    call_id: format!("call-{id}-{turn_index}-{call}"),
+                    turn_id: Some(turn_id.clone()),
+                    harness: codex_provider_id(),
+                    model: Some("gpt-5.1-codex".into()),
+                    timestamp: turn_start + chrono::Duration::seconds(call as i64 * 12),
+                    kind: ToolKind::Read,
+                    name: "shell".into(),
+                    providers: vec!["core".into()],
+                    effective_tools: vec!["bash".into()],
+                    target: Some(format!("target-hash-{id}-{turn_index}-{call}")),
+                    resource_id: Some(format!("resource-{id}-{turn_index}")),
+                    origin: ToolOrigin::Core,
+                    shell_family: Some("bash".into()),
+                    language: None,
+                    outcome: ToolOutcome::Success,
+                    duration_ms: Some(420),
+                    output_bytes: 2_048,
+                });
+            }
+            turns.push(TurnInfo {
+                turn_id,
+                index: turn_index as u32 + 1,
+                model: Some("gpt-5.1-codex".into()),
+                reasoning_effort: Some("medium".into()),
+                collaboration_mode: None,
+                service_tier: Some("default".into()),
+                status: TurnStatus::Completed,
+                abort_reason: None,
+                started_at: Some(turn_start),
+                completed_at: Some(turn_start + chrono::Duration::minutes(4)),
+                duration_ms: Some(240_000),
+                time_to_first_token_ms: Some(850),
+                user_message: Some(user_message.clone()),
+                last_agent_message: Some(agent_message.clone()),
+                tokens: delta(1_800),
+                tool_metrics: ToolMetrics {
+                    calls: tools_per_turn as u64,
+                    reads: tools_per_turn as u64,
+                    successes: tools_per_turn as u64,
+                    duration_ms: 420 * tools_per_turn as u64,
+                    output_bytes: 2_048 * tools_per_turn as u64,
+                    ..Default::default()
+                },
+                classification: TurnClassification {
+                    version: 1,
+                    category: TaskCategory::Debugging,
+                    confidence: 0.82,
+                    signals: vec!["error-message".into(), "stack-trace".into()],
+                },
+            });
+        }
+
+        Session {
+            id: id.into(),
+            storage_id: storage_id_for_session(&codex_provider_id(), id),
+            harness: codex_provider_id(),
+            thread_name: Some(format!("Investigate {id}")),
+            forked_from_id: None,
+            parent_thread_id: None,
+            agent_path: None,
+            agent_nickname: None,
+            file_path: format!("{id}.jsonl"),
+            source_availability: SourceAvailability::Present,
+            archived: false,
+            started_at: base,
+            last_event_at: base + chrono::Duration::minutes(turn_count as i64 * 5),
+            working_directory: Some("D:/projects/agent-odometer".into()),
+            originator: Some("cli".into()),
+            source: None,
+            subagent_id_is_path_fallback: false,
+            history_mode: Some("default".into()),
+            memory_mode: Some("default".into()),
+            cli_version: Some("0.45.0".into()),
+            model_provider: Some("openai".into()),
+            model: Some("gpt-5.1-codex".into()),
+            service_tier: Some("default".into()),
+            plan_type: Some("plus".into()),
+            credits_unlimited: Some(false),
+            credits_balance: Some(128.5),
+            context_window: Some(272_000),
+            latest_context_tokens: Some(48_000),
+            total_turns: turn_count as u32,
+            first_user_message: Some(user_message.chars().take(200).collect()),
+            tokens_total: delta(1_800 * turn_count as u64),
+            tokens_by_model: HashMap::from([(
+                "gpt-5.1-codex".to_string(),
+                delta(1_800 * turn_count as u64),
+            )]),
+            tokens_history,
+            rate_limits_history: vec![RateLimitSnapshotPoint {
+                timestamp: base,
+                turn_id: None,
+                limit_id: Some("primary".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 42.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(base + chrono::Duration::hours(5)),
+                }),
+                secondary: None,
+            }],
+            turns,
+            tool_observations,
+            tool_metrics: ToolMetrics {
+                calls: (turn_count * tools_per_turn) as u64,
+                ..Default::default()
+            },
+            tool_metrics_by_model: BTreeMap::new(),
+            category_totals: BTreeMap::from([(
+                TaskCategory::Debugging,
+                CategoryMetric {
+                    turns: turn_count as u64,
+                    tokens: delta(1_800 * turn_count as u64),
+                    tool_calls: (turn_count * tools_per_turn) as u64,
+                    buckets: Vec::new(),
+                },
+            )]),
+            optimization_findings: Vec::new(),
+            project_key: Some("repo:agent-odometer".into()),
+            project_label: Some("agent-odometer".into()),
+            project_provenance: Some(crate::project_identity::ProjectProvenance::RepositoryRoot),
+        }
+    }
+
+    #[test]
+    #[ignore = "issue #139 heap-cost probe; run with `cargo test --release --lib \
+                probe_resident_summary_vs_full_session_heap_cost -- --ignored --nocapture` \
+                (filtering to this exact test name keeps the process-wide counting allocator \
+                from also seeing another concurrently-running test's allocations)"]
+    fn probe_resident_summary_vs_full_session_heap_cost() {
+        const SESSIONS: usize = 4_400;
+        const HOT_SESSIONS: usize = 440;
+
+        // Measures two disjoint deltas in sequence: building `sessions`
+        // (what `AppState.sessions` used to hold, in full) first, then
+        // building `residents` from it (what `AppState.sessions` holds
+        // now). Building `residents` from `&sessions` never touches
+        // `sessions`' own allocations (it clones out into fresh `String`s/
+        // `Vec`s on the summary side), so the second delta is exactly the
+        // resident type's own additional cost — not contaminated by the
+        // first.
+        let before_full = ALLOCATED.load(std::sync::atomic::Ordering::SeqCst);
+        let sessions: Vec<Session> = (0..SESSIONS)
+            .map(|i| realistic_session(&format!("probe-{i}"), i < HOT_SESSIONS))
+            .collect();
+        let after_full = ALLOCATED.load(std::sync::atomic::Ordering::SeqCst);
+        let full_bytes = after_full - before_full;
+
+        let residents: Vec<ResidentSession> = sessions.iter().map(ResidentSession::of).collect();
+        let after_resident = ALLOCATED.load(std::sync::atomic::Ordering::SeqCst);
+        let resident_bytes = after_resident - after_full;
+
+        let full_per_session = full_bytes as f64 / SESSIONS as f64;
+        let resident_per_session = resident_bytes as f64 / SESSIONS as f64;
+        eprintln!(
+            "heap cost at {SESSIONS} sessions ({HOT_SESSIONS} hot / {} cold):\n\
+             \x20 Session:         {full_bytes} bytes total, {full_per_session:.0} bytes/session\n\
+             \x20 ResidentSession: {resident_bytes} bytes total, {resident_per_session:.0} bytes/session\n\
+             \x20 reduction: {:.1}x, {:.1}% smaller, {:.0} bytes/session saved",
+            SESSIONS - HOT_SESSIONS,
+            full_bytes as f64 / resident_bytes.max(1) as f64,
+            100.0 * (1.0 - resident_bytes as f64 / full_bytes.max(1) as f64),
+            full_per_session - resident_per_session,
+        );
+
+        assert!(
+            resident_bytes < full_bytes / 10,
+            "expected the resident summary to be well under 10% of the full session's heap \
+             cost; got {resident_bytes} vs {full_bytes} bytes"
+        );
+
+        drop(sessions);
+        drop(residents);
     }
 }
