@@ -50,6 +50,35 @@ use std::sync::Mutex;
 /// cannot make quota aggregation unbounded. Recent observations are kept.
 const MAX_POINTS_PER_PROVIDER: usize = 2_000;
 
+/// How many rate-limit points [`QuotaPointsIndex`] *retains* per provider,
+/// evicting the oldest at insert time once this is exceeded (issue #152).
+/// Deliberately larger than [`MAX_POINTS_PER_PROVIDER`] — the number a read
+/// actually consumes — rather than equal to it, and the margin is not
+/// cosmetic:
+///
+/// When a session is retracted (its source file is deleted, or it is
+/// re-parsed with a shorter history — see the "hard part" comment below),
+/// every point it contributed disappears from the index immediately, and
+/// any of its points that were evicted *earlier* cannot come back without a
+/// ledger read. If retention exactly matched `MAX_POINTS_PER_PROVIDER`, a
+/// single retraction could leave the read path with fewer than
+/// `MAX_POINTS_PER_PROVIDER` points even though the corpus still has
+/// plenty of older evidence elsewhere — silently degrading the pace/
+/// forecast math (`forecast_from_series` needs `MIN_EVIDENCE_POINTS`) for
+/// no reason other than an avoidable eviction policy. Retaining 4x the read
+/// cap means a retraction has to remove more than 6,000 points below the
+/// read cap's own 2,000 before the read path could possibly be shorted —
+/// far more headroom than any single session's retraction plausibly
+/// creates in isolation, and the cost of that headroom is nearly free: even
+/// at `RETAINED_POINTS_PER_PROVIDER` (8,000) points times the 3 providers
+/// observed in the field, the retained set costs single-digit MB.
+const RETAINED_POINTS_PER_PROVIDER: usize = 4 * MAX_POINTS_PER_PROVIDER;
+
+// Enforced at compile time, not just by a test: if this constant is ever
+// edited to lose the margin over the read cap, the build itself fails
+// rather than relying on a test run catching it.
+const _: () = assert!(RETAINED_POINTS_PER_PROVIDER > MAX_POINTS_PER_PROVIDER);
+
 /// A within-window used-percent drop at least this large between two
 /// consecutive observations is treated as an *observed* window rollover
 /// (the provider's counter visibly reset) rather than ordinary usage.
@@ -611,7 +640,7 @@ pub fn quota_snapshots_from_sessions<'a>(
 // grow-replace, shrink-replace, and outright removal and check each step
 // against a from-scratch computation over the same corpus.
 //
-// ## Ordering and the truncation cap
+// ## Ordering and the two-tier cap (issue #131, then #152)
 //
 // Points are kept per provider in a `BTreeMap` ordered by
 // `(timestamp, session_key, in-session sequence)` rather than a `Vec` that
@@ -621,14 +650,41 @@ pub fn quota_snapshots_from_sessions<'a>(
 // iteration order feeding a stable sort — never guaranteed reproducible),
 // so a deterministic one here does not change any documented behavior for
 // the realistic case (no two sessions observe a rate limit at the exact
-// same instant). `MAX_POINTS_PER_PROVIDER` truncation — keep only the most
-// recent points across the whole corpus — is applied when producing a
-// snapshot's input slice (`provider_points`), not maintained eagerly on
-// every write: trimming the maintained map itself at write time would risk
-// permanently discarding a point that a *later* removal makes relevant
-// again, silently breaking equivalence with a from-scratch computation.
-// Reading the newest N is still O(N) off a `BTreeMap`'s tail, not O(map
-// size).
+// same instant).
+//
+// Two caps apply, at two different times, for two different reasons:
+//
+// - `MAX_POINTS_PER_PROVIDER` (2,000) is the *read*-time cap — keep only
+//   the most recent points across the whole corpus — applied when
+//   producing a snapshot's input slice (`provider_points`). It is not
+//   maintained eagerly at write time on its own: trimming the maintained
+//   map down to exactly this many on every write would risk permanently
+//   discarding a point that a *later* retraction makes relevant again
+//   (an older point that used to sit just outside the top 2,000 can become
+//   part of it once a newer session's points are retracted), silently
+//   breaking equivalence with a from-scratch computation. Reading the
+//   newest N is still O(N) off a `BTreeMap`'s tail, not O(map size).
+// - `RETAINED_POINTS_PER_PROVIDER` (4x that; see its own doc comment for
+//   why the margin matters) *is* maintained eagerly: `update_session`
+//   evicts the globally oldest points (`BTreeMap::pop_first`) right after
+//   inserting a session's new ones, whenever the bucket exceeds this cap,
+//   regardless of which session contributed the evicted point. This is what
+//   bounds the index's memory to the retained set instead of the full
+//   corpus (issue #152 measured ~10.9M point-copies retained to serve a
+//   6,000-point read path). Its margin over the read cap is exactly why
+//   this eager trim is safe unlike the read cap would be: a retraction can
+//   only ever expose points that were already inside the retained cushion
+//   below the read cap, never points evicted outright — see
+//   `RETAINED_POINTS_PER_PROVIDER`'s doc comment.
+//
+// Eviction prunes the owning session's `SessionContribution.point_keys` in
+// the same step — falling back to trimming the *local*, not-yet-stored list
+// when a session's own just-inserted points are what gets evicted — so
+// `contributions` never keeps a key `by_key` no longer has. Without that,
+// a session with a pathological history (up to 22,395 points observed in
+// the field) would still cost `contributions` its full, unbounded point
+// count even after `by_key` itself was capped, defeating most of the
+// memory fix. See `evict_excess`.
 //
 // ## Concurrency note
 //
@@ -719,6 +775,7 @@ impl QuotaPointsIndex {
                 bucket.by_key.insert(key.clone(), point.clone());
                 point_keys.push(key);
             }
+            Self::evict_excess(&mut state, &provider, session_key, &mut point_keys);
         }
 
         let account_key =
@@ -779,6 +836,49 @@ impl QuotaPointsIndex {
         if let Some(account_key) = contribution.account_key {
             if let Some(bucket) = state.accounts.get_mut(&contribution.provider) {
                 bucket.by_key.remove(&account_key);
+            }
+        }
+    }
+
+    /// Evicts the globally oldest points in `provider`'s bucket until it is
+    /// back at [`RETAINED_POINTS_PER_PROVIDER`], after `update_session` has
+    /// just inserted `session_key`'s current points. An evicted point may
+    /// belong to *any* session, not just the one being updated — eviction
+    /// removes the oldest points across the whole provider bucket
+    /// (`BTreeMap::pop_first`), same as the read path keeps the newest
+    /// across the whole bucket.
+    ///
+    /// Whichever session owned an evicted point must stop claiming it in
+    /// `SessionContribution.point_keys`, or that field is exactly the
+    /// "replaced one unbounded Vec with another" bug: a session with a
+    /// pathological history (up to 22,395 points observed in the field)
+    /// would otherwise still cost `contributions` its full point count
+    /// forever, even though `by_key` itself is capped. Two cases:
+    /// - The evicted point belongs to `session_key` itself: its key is
+    ///   still only in the local `point_keys` accumulator passed in by
+    ///   `update_session` (that call's own `SessionContribution` has not
+    ///   been stored yet — `retract` already removed the old one), so it is
+    ///   trimmed from there directly.
+    /// - The evicted point belongs to some other, already-recorded session:
+    ///   its key is trimmed from that session's stored `SessionContribution`
+    ///   in `state.contributions`.
+    fn evict_excess(
+        state: &mut QuotaPointsIndexState,
+        provider: &ProviderId,
+        session_key: &str,
+        point_keys: &mut Vec<PointKey>,
+    ) {
+        let Some(bucket) = state.points.get_mut(provider) else {
+            return;
+        };
+        while bucket.by_key.len() > RETAINED_POINTS_PER_PROVIDER {
+            let Some((evicted, _)) = bucket.by_key.pop_first() else {
+                break;
+            };
+            if evicted.session_key.as_str() == session_key {
+                point_keys.retain(|key| *key != evicted);
+            } else if let Some(contribution) = state.contributions.get_mut(&evicted.session_key) {
+                contribution.point_keys.retain(|key| *key != evicted);
             }
         }
     }
@@ -1929,6 +2029,190 @@ mod tests {
         }
 
         let now = epoch + Duration::minutes(minute + 5);
+        assert_index_matches_oracle(&index, &sessions, now);
+    }
+
+    // -- QuotaPointsIndex: retention cap and eviction (issue #152) ----------
+
+    /// Builds a session with `count` points, one per second starting at
+    /// `epoch`, so every point has a strictly distinct timestamp — sidesteps
+    /// the tie-break ambiguity the module doc notes for two sessions
+    /// reporting the exact same instant (irrelevant here: these tests use a
+    /// single session per provider bucket).
+    fn session_with_point_count(key: &str, epoch: DateTime<Utc>, count: usize) -> Session {
+        let history: Vec<RateLimitSnapshotPoint> = (0..count)
+            .map(|i| RateLimitSnapshotPoint {
+                timestamp: epoch + Duration::seconds(i as i64),
+                turn_id: None,
+                limit_id: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: (i % 100) as f64,
+                    window_minutes: Some(300),
+                    resets_at: Some(epoch + Duration::hours(100_000)),
+                }),
+                secondary: None,
+            })
+            .collect();
+        let last_ts = history.last().map(|p| p.timestamp).unwrap_or(epoch);
+        test_session(key, codex_provider_id(), last_ts, None, None, history)
+    }
+
+    // Below the retention cap, nothing is ever evicted, so the index must
+    // still match the from-scratch oracle exactly — not just "on the final
+    // result" the way the above-cap test below has to settle for.
+    #[test]
+    fn index_matches_oracle_exactly_when_corpus_is_below_the_retention_cap() {
+        let epoch = ts("2026-01-01T00:00:00Z");
+        let index = QuotaPointsIndex::new();
+        let mut sessions: std::collections::HashMap<String, Session> =
+            std::collections::HashMap::new();
+
+        // 5 sessions x 500 points = 2,500 points total, comfortably under
+        // RETAINED_POINTS_PER_PROVIDER (8,000).
+        for s in 0..5 {
+            let key = format!("s{s}");
+            let session_epoch = epoch + Duration::hours(s as i64 * 10_000); // disjoint per session
+            let session = session_with_point_count(&key, session_epoch, 500);
+            index.update_session(&key, &session);
+            sessions.insert(key, session);
+        }
+
+        {
+            let state = index.state.lock().unwrap();
+            let retained = state
+                .points
+                .get(&codex_provider_id())
+                .map(|bucket| bucket.by_key.len())
+                .unwrap_or(0);
+            assert_eq!(
+                retained, 2_500,
+                "nothing should be evicted below the retention cap"
+            );
+        }
+
+        let now = epoch + Duration::hours(5 * 10_000) + Duration::hours(1);
+        assert_index_matches_oracle(&index, &sessions, now);
+    }
+
+    // Above the retention cap, the index's maintained set and the oracle's
+    // full view legitimately diverge — the index only remembers the newest
+    // RETAINED_POINTS_PER_PROVIDER, the oracle sees every point ever
+    // reported — but both ultimately reduce to the newest
+    // MAX_POINTS_PER_PROVIDER (2,000) when building a snapshot, and
+    // RETAINED_POINTS_PER_PROVIDER's margin over that guarantees the
+    // newest-2,000 subset is identical either way. So the snapshot *result*
+    // must still match exactly; this is not a case for relaxing the
+    // equivalence assertion.
+    #[test]
+    fn index_matches_oracle_on_the_final_result_when_corpus_exceeds_the_retention_cap() {
+        let epoch = ts("2026-01-01T00:00:00Z");
+        let session = session_with_point_count("huge", epoch, 10_000);
+        let last_ts = session.rate_limits_history.last().unwrap().timestamp;
+
+        let index = QuotaPointsIndex::new();
+        index.update_session("huge", &session);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert("huge".to_string(), session);
+
+        {
+            let state = index.state.lock().unwrap();
+            let retained = state
+                .points
+                .get(&codex_provider_id())
+                .map(|bucket| bucket.by_key.len())
+                .unwrap_or(0);
+            assert_eq!(
+                retained, RETAINED_POINTS_PER_PROVIDER,
+                "a 10,000-point corpus must be trimmed down to the retention cap"
+            );
+        }
+
+        let now = last_ts + Duration::minutes(1);
+        assert_index_matches_oracle(&index, &sessions, now);
+    }
+
+    // The regression test issue #152 asks for directly: a single session
+    // with a pathological point count (above the field-observed max of
+    // 22,395) must not grow the index without bound, and — the specific bug
+    // this issue named — `contributions` must only record keys that are
+    // actually retained rather than the session's full, unbounded history.
+    #[test]
+    fn pathological_single_session_point_count_does_not_grow_the_index_without_bound() {
+        // The margin itself (RETAINED_POINTS_PER_PROVIDER > MAX_POINTS_PER_PROVIDER)
+        // is enforced at compile time by the `const _: () = assert!(...)` next
+        // to `RETAINED_POINTS_PER_PROVIDER`'s definition, not re-checked here.
+        let epoch = ts("2026-01-01T00:00:00Z");
+        let session = session_with_point_count("huge", epoch, 25_000);
+
+        let index = QuotaPointsIndex::new();
+        index.update_session("huge", &session);
+
+        let state = index.state.lock().unwrap();
+        let retained = state
+            .points
+            .get(&codex_provider_id())
+            .map(|bucket| bucket.by_key.len())
+            .unwrap_or(0);
+        assert_eq!(
+            retained, RETAINED_POINTS_PER_PROVIDER,
+            "a 25,000-point session must still be trimmed to the retention cap"
+        );
+
+        let contribution = state
+            .contributions
+            .get("huge")
+            .expect("the session's contribution must still be tracked");
+        assert_eq!(
+            contribution.point_keys.len(),
+            retained,
+            "contributions must only record keys that are actually retained, not the \
+             session's full 25,000-point history — otherwise the unbounded Vec this issue \
+             is fixing has just moved from ResidentSession/points to contributions"
+        );
+    }
+
+    // Retracting a session that contributed points now-evicted from `by_key`
+    // (because a later session's insert pushed the bucket past the
+    // retention cap) must remain a harmless no-op for those already-gone
+    // keys — not a panic, and not a double-retraction of some other
+    // session's still-live points that happen to share a key by coincidence
+    // (they cannot, `PointKey` embeds `session_key`, but this test proves
+    // the removal path tolerates stale keys rather than assuming it).
+    #[test]
+    fn retracting_a_session_with_already_evicted_points_is_a_harmless_no_op() {
+        let epoch = ts("2026-01-01T00:00:00Z");
+        let index = QuotaPointsIndex::new();
+
+        // "old" contributes points that will all be older than anything
+        // "new" contributes.
+        let old = session_with_point_count("old", epoch, 100);
+        index.update_session("old", &old);
+
+        // "new" alone exceeds the retention cap, so every one of "old"'s
+        // points is evicted as a side effect of inserting "new"'s.
+        let new_epoch = epoch + Duration::hours(1);
+        let new = session_with_point_count("new", new_epoch, RETAINED_POINTS_PER_PROVIDER + 100);
+        index.update_session("new", &new);
+
+        {
+            let state = index.state.lock().unwrap();
+            assert!(
+                state
+                    .contributions
+                    .get("old")
+                    .is_none_or(|contribution| contribution.point_keys.is_empty()),
+                "old's points should all have been evicted and pruned from its own \
+                 contribution"
+            );
+        }
+
+        // Retracting "old" now must not panic and must not disturb "new"'s
+        // still-live points.
+        index.remove_session("old");
+
+        let now = new.rate_limits_history.last().unwrap().timestamp + Duration::minutes(1);
+        let mut sessions = std::collections::HashMap::new();
+        sessions.insert("new".to_string(), new);
         assert_index_matches_oracle(&index, &sessions, now);
     }
 

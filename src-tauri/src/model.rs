@@ -701,27 +701,54 @@ impl SessionSummary {
 /// turn/token-event volume — a full session measured ~1 MB resident across a
 /// real corpus; its summary well under 1% of that.
 ///
-/// This is deliberately *not* the wire-shape [`SessionSummary`]: it adds
-/// `rate_limits_history`, which `SessionSummary` omits from IPC payloads on
-/// purpose (`AGENTS.md`'s `session-updated` contract). The two consumers
-/// that still need `rate_limits_history` after the resident-summary switch —
-/// `commands::get_subscription_usage` and
+/// This is deliberately *not* the wire-shape [`SessionSummary`]: it adds a
+/// little quota-related state, beyond `SessionSummary`, that
+/// `session-updated`'s IPC payload omits on purpose (`AGENTS.md`'s
+/// contract). The two consumers that need it after the resident-summary
+/// switch — `commands::get_subscription_usage` and
 /// `diagnostics::collect_session_stats` — read it from here without ever
 /// growing the wire payload.
+///
+/// Issue #152: this used to hold the session's *entire*
+/// `rate_limits_history: Vec<RateLimitSnapshotPoint>`, on the claim (now
+/// known false) that it was "typically a handful of points per session —
+/// bounded by turn count, not token-event volume". `parser.rs` actually
+/// pushes one point per rate-limit-bearing *event*, not per turn: a real
+/// session can carry up to 22,395 points, and cloning that whole `Vec` into
+/// every resident session was ~0.7 GB of a 3.4 GB process, retained to serve
+/// two consumers that only ever look at the newest point (or whether any
+/// point exists at all). Neither needs the series, so only the newest point
+/// plus a count are kept.
 #[derive(Debug, Clone)]
 pub struct ResidentSession {
     pub summary: SessionSummary,
-    /// Provider-reported account quota snapshots (see [`Session::rate_limits_history`]).
-    /// Typically a handful of points per session — bounded by turn count,
-    /// not token-event volume — so resident cost here is small.
-    pub rate_limits_history: Vec<RateLimitSnapshotPoint>,
+    /// The most recent entry of `Session::rate_limits_history` by timestamp
+    /// (not necessarily the last element — see [`ResidentSession::of`]),
+    /// or `None` if the session has never reported a rate-limit snapshot.
+    pub newest_rate_limit_point: Option<RateLimitSnapshotPoint>,
+    /// How many points `Session::rate_limits_history` held when this
+    /// resident projection was built. A count rather than a bool: it costs
+    /// nothing extra over a bool and is strictly more informative for any
+    /// future consumer (e.g. diagnostics reporting a distribution), so
+    /// there is no reason to throw the information away.
+    pub rate_limits_history_len: usize,
 }
 
 impl ResidentSession {
     pub fn of(session: &Session) -> Self {
         Self {
             summary: SessionSummary::of(session),
-            rate_limits_history: session.rate_limits_history.clone(),
+            // Matches the prior behavior of scanning every point for the
+            // max timestamp (see `commands::newest_subscription_usage_by_harness`,
+            // which used to do this across the whole `Vec` itself): points
+            // are pushed in file-parse order, which is normally
+            // chronological, but this does not assume that.
+            newest_rate_limit_point: session
+                .rate_limits_history
+                .iter()
+                .max_by_key(|point| point.timestamp)
+                .cloned(),
+            rate_limits_history_len: session.rate_limits_history.len(),
         }
     }
 }

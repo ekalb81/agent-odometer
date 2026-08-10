@@ -427,10 +427,13 @@ struct ProviderSessionStats {
 
 /// One pass over the already-loaded in-memory session projection (no new
 /// discovery or parsing, no ledger read — issue #139: `state.sessions`
-/// holds the resident summary plus `rate_limits_history`, the one field
-/// beyond the wire-shape `SessionSummary` this needs). `storage_id` embeds a
-/// `:collision:` suffix exactly when the durable archive detected competing
-/// sources for one provider identity (see `history_store::reconcile_session`).
+/// holds the resident summary plus a little quota-related state beyond the
+/// wire-shape `SessionSummary`, the field this needs; issue #152: that
+/// state is a newest-point/count pair, not the session's whole rate-limit
+/// history, since this only ever needed to know whether any point exists).
+/// `storage_id` embeds a `:collision:` suffix exactly when the durable
+/// archive detected competing sources for one provider identity (see
+/// `history_store::reconcile_session`).
 fn collect_session_stats(state: &AppState) -> HashMap<ProviderId, ProviderSessionStats> {
     let mut stats: HashMap<ProviderId, ProviderSessionStats> = HashMap::new();
     for entry in state.sessions.iter() {
@@ -444,7 +447,7 @@ fn collect_session_stats(state: &AppState) -> HashMap<ProviderId, ProviderSessio
         if session.storage_id.contains(":collision:") {
             per_provider.collision_sessions += 1;
         }
-        if !resident.rate_limits_history.is_empty()
+        if resident.rate_limits_history_len > 0
             || session.credits_unlimited.is_some()
             || session.credits_balance.is_some()
         {
