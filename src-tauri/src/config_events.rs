@@ -193,6 +193,7 @@ fn roots(state: &AppState, config: &crate::config::Config) -> Vec<ConfigRoot> {
         .filter_map(|entry| {
             entry
                 .value()
+                .summary
                 .working_directory
                 .as_deref()
                 .map(PathBuf::from)

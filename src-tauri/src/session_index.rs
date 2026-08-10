@@ -42,20 +42,26 @@ pub fn read(path: &Path) -> HashMap<String, String> {
     out
 }
 
-/// Patches `thread_name` on every Session whose provider ID appears in `names`.
-/// Returns the durable storage keys that were actually updated (so callers can
-/// emit fine-grained `session-updated` events).
+/// Patches `thread_name` on every resident session summary whose provider ID
+/// appears in `names`. Returns the durable storage keys that were actually
+/// updated, so callers can both emit fine-grained `session-updated` events
+/// and persist the corresponding full session's metadata overlay (issue
+/// #139: the resident projection no longer carries full session content, so
+/// callers must reload it — via `AppState::full_session` — to write the
+/// overlay durably).
 pub fn apply(
-    sessions: &dashmap::DashMap<String, std::sync::Arc<crate::model::Session>>,
+    sessions: &dashmap::DashMap<String, std::sync::Arc<crate::model::ResidentSession>>,
     names: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut updated = Vec::new();
     for mut entry in sessions.iter_mut() {
-        let Some(name) = names.get(&entry.value().id) else {
+        let Some(name) = names.get(&entry.value().summary.id) else {
             continue;
         };
-        if entry.value().thread_name.as_ref() != Some(name) {
-            std::sync::Arc::make_mut(entry.value_mut()).thread_name = Some(name.clone());
+        if entry.value().summary.thread_name.as_ref() != Some(name) {
+            std::sync::Arc::make_mut(entry.value_mut())
+                .summary
+                .thread_name = Some(name.clone());
             updated.push(entry.key().clone());
         }
     }

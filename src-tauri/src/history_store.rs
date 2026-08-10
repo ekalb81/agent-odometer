@@ -1151,10 +1151,42 @@ impl HistoryStore {
     /// Loads one archived session by durable key. `pub(crate)` so
     /// `AppState::finish_history_scan` (a different module) can refresh just
     /// the sessions [`Self::finish_scan`] reports as changed, instead of
-    /// [`Self::load_sessions`]'s whole-corpus reload (issue #132/#140).
+    /// [`Self::load_sessions`]'s whole-corpus reload (issue #132/#140), and
+    /// so `AppState::full_session`/`full_sessions` (issue #139) can load one
+    /// session's full content on demand for `get_session_details` and
+    /// friends now that `AppState.sessions` keeps only summaries resident.
+    /// Uses [`Self::open_reader`] rather than the shared writer mutex: this
+    /// is now on a live user-facing read path (a session-detail click) that
+    /// must not queue behind an in-progress bulk-scan write.
     pub(crate) fn load_one(&self, key: &str) -> Result<StoredSession> {
-        let connection = self.connection()?;
+        let connection = self.open_reader()?;
         load_one(&connection, key)
+    }
+
+    /// Batched variant of [`Self::load_one`] (issue #139): opens one reader
+    /// connection and reuses it across every key, instead of one connection
+    /// per key — the same reasoning [`Self::range_totals_multi`] already
+    /// established for a multi-key read path. Best-effort per key: a key
+    /// with no current row (for example a concurrent removal) is skipped
+    /// with a warning rather than failing the whole batch, mirroring
+    /// `AppState::finish_history_scan`'s existing per-key reload tolerance.
+    /// Callers that must distinguish "some keys could not be loaded" from
+    /// "nothing was asked for" compare the result's length against `keys`.
+    pub(crate) fn load_many(&self, keys: &[String]) -> Result<Vec<StoredSession>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.open_reader()?;
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            match load_one(&connection, key) {
+                Ok(stored) => out.push(stored),
+                Err(error) => {
+                    tracing::warn!("could not load durable session {} in batch: {}", key, error);
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {

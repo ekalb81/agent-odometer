@@ -92,17 +92,35 @@ pub fn start(
                             ]),
                         );
                         for id in changed {
-                            if let Some(session) = state_cb
+                            let Some(summary) = state_cb
                                 .sessions
                                 .get(&id)
-                                .map(|session| session.value().as_ref().clone())
-                            {
-                                state_cb.persist_session_metadata(&session);
-                                if let Err(e) =
-                                    app_cb.emit("session-updated", &SessionSummary::of(&session))
-                                {
-                                    tracing::warn!("emit session-updated failed: {}", e);
+                                .map(|entry| entry.summary.clone())
+                            else {
+                                continue;
+                            };
+                            // Issue #139: see the matching comment in
+                            // `commands::run_instruction_scan`'s session-index
+                            // overlay pass — the resident summary already has
+                            // the updated `thread_name`, but the durable
+                            // metadata-overlay write needs full content.
+                            match state_cb.full_session(&id) {
+                                Ok(Some(mut full)) => {
+                                    full.thread_name = summary.thread_name.clone();
+                                    state_cb.persist_session_metadata(&full);
                                 }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "could not load session {} to persist its thread-name \
+                                         overlay: {}",
+                                        id,
+                                        error
+                                    );
+                                }
+                            }
+                            if let Err(e) = app_cb.emit("session-updated", &summary) {
+                                tracing::warn!("emit session-updated failed: {}", e);
                             }
                         }
                         continue;
@@ -125,10 +143,8 @@ pub fn start(
                         // parser slot, so path ownership in AppState is the
                         // source of truth for removal.
                         let _ = parsers_cb.remove(path);
-                        if let Some(session) = state_cb.mark_source_missing(path) {
-                            if let Err(e) =
-                                app_cb.emit("session-updated", &SessionSummary::of(&session))
-                            {
+                        if let Some(summary) = state_cb.mark_source_missing(path) {
+                            if let Err(e) = app_cb.emit("session-updated", &summary) {
                                 tracing::warn!("emit session-updated failed: {}", e);
                             }
                         }

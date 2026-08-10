@@ -1,7 +1,7 @@
 use crate::config_events::ConfigWatcherHandle;
 use crate::correlation::ExternalEvent;
 use crate::history_store::HistoryStore;
-use crate::model::{Session, SourceAvailability};
+use crate::model::{ResidentSession, Session, SessionSummary, SourceAvailability};
 use crate::scanner::ScanReport;
 use crate::watcher::WatcherHandle;
 use chrono::{DateTime, Utc};
@@ -134,8 +134,26 @@ impl ExternalEventStore {
 
 pub struct AppState {
     /// Sessions are keyed by their local durable storage ID, never by a
-    /// provider's mutable/reused transcript ID.
-    pub sessions: DashMap<String, Arc<Session>>,
+    /// provider's mutable/reused transcript ID. Holds a resident *summary*
+    /// of each session (issue #139), not the full content — full sessions
+    /// are loaded on demand from the ledger via [`Self::full_session`]/
+    /// [`Self::full_sessions`]. Full sessions used to be kept resident here
+    /// permanently, which is what drove startup hydration time and steady-
+    /// state memory before this change.
+    pub sessions: DashMap<String, Arc<ResidentSession>>,
+    /// Full session content for exactly the sessions that cannot be trusted
+    /// to come back correctly from a fresh ledger read on demand (issue
+    /// #139): either this specific session's last durable persist failed
+    /// (mirrors `ledger_stale`), or the durable archive is not `Ready` at
+    /// all (`Pending`/`Unavailable`) so there is no ledger to read from in
+    /// the first place. Both are expected-rare in the `Ready` steady state;
+    /// `Unavailable` is the one case where this can grow to the whole
+    /// corpus — the same full-residency cost this issue removes from the
+    /// common case, kept only because there is genuinely no other durable
+    /// source of full content once the archive can never open this run.
+    /// Cleared per key the moment a subsequent durable write for that key
+    /// succeeds; see [`Self::resident_from_live_parse`].
+    full_session_fallback: DashMap<String, Arc<Session>>,
     /// Long-lived local archive lifecycle (#116): `Pending` until
     /// `commands::spawn_history_open` resolves it. A failure to open it
     /// leaves live parsing available, but is logged rather than silently
@@ -224,6 +242,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             sessions: DashMap::new(),
+            full_session_fallback: DashMap::new(),
             history: Mutex::new(HistoryReadiness::Pending),
             history_ready_cv: Condvar::new(),
             last_history_step: Mutex::new(None),
@@ -313,7 +332,7 @@ impl AppState {
             };
         }
         self.history_ready_cv.notify_all();
-        self.hydrate_history().1
+        self.hydrate_history()
     }
 
     /// Records the migration's most recently reported step, for
@@ -391,6 +410,112 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// True when `storage_id`'s full content cannot be trusted to come back
+    /// correctly from a fresh ledger read right now (issue #139): either the
+    /// archive is not `Ready` at all, or this specific session's most recent
+    /// durable persist attempt failed (`ledger_stale`). Distinct from
+    /// [`Self::ledger_is_stale`], which also includes `rollup_deferred_stale`
+    /// — a session whose *rollup* tables lag but whose row-level
+    /// `session_json` (what [`HistoryStore::load_one`] reads) is perfectly
+    /// current, so it needs no full-residency fallback at all.
+    fn needs_full_residency(&self, storage_id: &str) -> bool {
+        self.history_ready().is_none() || self.ledger_stale.contains_key(storage_id)
+    }
+
+    /// Builds the resident summary for a session whose content is freshly,
+    /// authoritatively sourced from the ledger itself — a hydration load, a
+    /// successful durable write's own round-tripped result, or a durable
+    /// availability correction. These are always trustworthy regardless of
+    /// this session's `ledger_stale`/`rollup_deferred_stale` marking (that
+    /// marking is about *rollup* aggregation being behind, never about
+    /// `session_json` itself), so this unconditionally clears any stale
+    /// full-content fallback entry rather than consulting
+    /// [`Self::needs_full_residency`].
+    fn resident_from_ledger(&self, session: &Session) -> Arc<ResidentSession> {
+        self.full_session_fallback
+            .remove(&session.effective_storage_id());
+        Arc::new(ResidentSession::of(session))
+    }
+
+    /// Builds the resident summary for a session that just came from a live
+    /// parse (watcher append or bulk scan) and may or may not have been
+    /// durably persisted successfully yet. When
+    /// [`Self::needs_full_residency`] says the ledger cannot currently
+    /// vouch for this session, the full content is kept in
+    /// `full_session_fallback` alongside the summary so
+    /// [`Self::full_session`]/[`Self::full_sessions`] and the
+    /// `sessions_in_ranges` in-memory fallback keep working without it —
+    /// otherwise any stale fallback entry is cleared, since a subsequent
+    /// successful write means the ledger is trustworthy again.
+    fn resident_from_live_parse(&self, session: &Session) -> Arc<ResidentSession> {
+        let storage_id = session.effective_storage_id();
+        if self.needs_full_residency(&storage_id) {
+            self.full_session_fallback
+                .insert(storage_id, Arc::new(session.clone()));
+        } else {
+            self.full_session_fallback.remove(&storage_id);
+        }
+        Arc::new(ResidentSession::of(session))
+    }
+
+    /// Resolves one session's full content (issue #139): from the resident
+    /// full-content fallback if it is there, otherwise a fresh ledger read.
+    /// `Ok(None)` means `session_id` is not a session this process knows
+    /// about at all — the pre-#139 meaning of `get_session_details`
+    /// returning nothing. Once a session *is* known, this never silently
+    /// substitutes an empty/zero-usage `Session` for one it could not load
+    /// (#116's honesty property) — a load failure is always `Err`.
+    pub fn full_session(&self, session_id: &str) -> Result<Option<Session>, String> {
+        if !self.sessions.contains_key(session_id) {
+            return Ok(None);
+        }
+        Ok(self
+            .full_sessions(std::slice::from_ref(&session_id.to_string()))?
+            .pop()
+            .map(|session| (*session).clone()))
+    }
+
+    /// Batched variant of [`Self::full_session`], for callers that need full
+    /// content for many sessions at once (`sessions_in_ranges`'s in-memory
+    /// fallback, `tool_impact`, `correlate_events`, `scan_git_outcomes`,
+    /// token-budget quota evaluation). `ids` should already be filtered to
+    /// keys the caller knows are current `sessions` entries — an id this
+    /// process has never observed is simply not resolvable and is not
+    /// treated as an error here (mirrors this method's pre-#139 callers,
+    /// which already silently skipped an id absent from `state.sessions`).
+    /// What *is* an error: an id that is known but cannot be resolved —
+    /// the ledger is not ready, or a load failed — rather than silently
+    /// returning fewer sessions than requested and letting an aggregate look
+    /// complete when it is not (#116).
+    pub fn full_sessions(&self, ids: &[String]) -> Result<Vec<Arc<Session>>, String> {
+        let mut out = Vec::with_capacity(ids.len());
+        let mut to_load: Vec<String> = Vec::new();
+        for id in ids {
+            match self.full_session_fallback.get(id) {
+                Some(full) => out.push(full.value().clone()),
+                None => to_load.push(id.clone()),
+            }
+        }
+        if !to_load.is_empty() {
+            let history = self.history_ready().ok_or_else(|| {
+                "durable history is not available; full session content cannot be loaded"
+                    .to_string()
+            })?;
+            let loaded = history
+                .load_many(&to_load)
+                .map_err(|error| format!("could not load session content: {error}"))?;
+            if loaded.len() != to_load.len() {
+                return Err(format!(
+                    "could not load {} of {} requested session(s) from durable history",
+                    to_load.len() - loaded.len(),
+                    to_load.len()
+                ));
+            }
+            out.extend(loaded.into_iter().map(|stored| Arc::new(stored.session)));
+        }
+        Ok(out)
     }
 
     /// Reconciles a freshly parsed source with the durable archive before it
@@ -500,7 +625,7 @@ impl AppState {
                         self.quota_points_index
                             .update_session(&stored.key, &stored.session);
                         self.sessions
-                            .insert(stored.key, Arc::new(stored.session.clone()));
+                            .insert(stored.key, self.resident_from_ledger(&stored.session));
                         self.touch_sessions_generation();
                         stored.session
                     });
@@ -544,7 +669,7 @@ impl AppState {
             self.quota_points_index
                 .update_session(&stored.key, &stored.session);
             self.sessions
-                .insert(stored.key, Arc::new(stored.session.clone()));
+                .insert(stored.key, self.resident_from_ledger(&stored.session));
             self.touch_sessions_generation();
             stored.session
         });
@@ -739,7 +864,7 @@ impl AppState {
                     self.quota_points_index
                         .update_session(&stored.key, &stored.session);
                     self.sessions
-                        .insert(stored.key, Arc::new(stored.session.clone()));
+                        .insert(stored.key, self.resident_from_ledger(&stored.session));
                     self.touch_sessions_generation();
                 }
                 Ok(None) => {}
@@ -856,29 +981,40 @@ impl AppState {
         // need to announce availability/path transitions caused by archive
         // reconciliation (most notably a missing source).
         let is_changed = self.sessions.get(&key).is_none_or(|existing| {
-            existing.source_availability != session.source_availability
-                || existing.file_path != session.file_path
+            existing.summary.source_availability != session.source_availability
+                || existing.summary.file_path != session.file_path
         });
         self.quota_points_index.update_session(&key, &session);
-        self.sessions.insert(key, Arc::new(session.clone()));
+        self.sessions
+            .insert(key, self.resident_from_ledger(&session));
         self.touch_sessions_generation();
         is_changed.then_some(session)
     }
 
     /// Loads every archived session into the in-memory projection. The store
-    /// is authoritative for availability; caller can emit returned changed
-    /// sessions after an initial hydration. This is the true startup
-    /// hydration path — [`Self::finish_history_scan`] deliberately does not
-    /// call this anymore; see its doc comment.
-    pub fn hydrate_history(&self) -> (Vec<Session>, crate::history_store::HydrationStats) {
+    /// is authoritative for availability; this is the true startup hydration
+    /// path — [`Self::finish_history_scan`] deliberately does not call this
+    /// anymore; see its doc comment.
+    ///
+    /// Deliberately does not return the loaded sessions (issue #139): the
+    /// only caller, [`Self::set_history_ready`], always discarded them, so
+    /// collecting them into a `Vec<Session>` was a second, transient
+    /// full-corpus duplicate held in memory for the whole hydration pass, on
+    /// top of [`HistoryStore::load_sessions_with_stats`]'s own
+    /// `Vec<StoredSession>` and whatever `self.sessions` now retains for
+    /// each session as it is visited. `Self::apply_loaded_session` still
+    /// returns the loaded `Session` for [`Self::finish_history_scan`], whose
+    /// affected-key set is small enough that collecting it costs nothing
+    /// comparable.
+    pub fn hydrate_history(&self) -> crate::history_store::HydrationStats {
         let Some(history) = self.history_ready() else {
-            return (Vec::new(), crate::history_store::HydrationStats::default());
+            return crate::history_store::HydrationStats::default();
         };
         let (stored, stats) = match history.load_sessions_with_stats() {
             Ok(result) => result,
             Err(error) => {
                 tracing::warn!("could not load durable session history: {}", error);
-                return (Vec::new(), crate::history_store::HydrationStats::default());
+                return crate::history_store::HydrationStats::default();
             }
         };
         // Dirty markings survive restarts in the store itself; rebuild the
@@ -894,13 +1030,10 @@ impl AppState {
                 tracing::warn!("could not load ledger-dirty markings: {}", error);
             }
         }
-        let mut changed = Vec::new();
         for stored in stored {
-            if let Some(session) = self.apply_loaded_session(stored) {
-                changed.push(session);
-            }
+            self.apply_loaded_session(stored);
         }
-        (changed, stats)
+        stats
     }
 
     /// Persists a metadata-only in-memory overlay (for example a thread name
@@ -920,7 +1053,10 @@ impl AppState {
 
     /// Converts a physical source deletion into a retained, availability-
     /// marked session. It never removes the logical session from memory.
-    pub fn mark_source_missing(&self, path: &Path) -> Option<Session> {
+    /// Returns the resident summary (issue #139) rather than a full
+    /// `Session` — every caller only ever needed it to build the
+    /// `session-updated` event payload, which is summary-shaped already.
+    pub fn mark_source_missing(&self, path: &Path) -> Option<SessionSummary> {
         // Write the tombstone before touching SQLite. A bulk worker that has
         // already parsed this path must see it before it can observe/publish
         // stale Present state.
@@ -965,10 +1101,11 @@ impl AppState {
         if let Some(stored) = persisted {
             self.quota_points_index
                 .update_session(&stored.key, &stored.session);
+            let summary = SessionSummary::of(&stored.session);
             self.sessions
-                .insert(stored.key, Arc::new(stored.session.clone()));
+                .insert(stored.key, self.resident_from_ledger(&stored.session));
             self.touch_sessions_generation();
-            return Some(stored.session);
+            return Some(summary);
         }
         let storage_id = storage_id?;
         let still_present_elsewhere = self
@@ -979,16 +1116,28 @@ impl AppState {
             return self
                 .sessions
                 .get(&storage_id)
-                .map(|session| session.as_ref().clone());
+                .map(|resident| resident.summary.clone());
         }
-        let mut session = self.sessions.get_mut(&storage_id)?;
-        let session = std::sync::Arc::make_mut(session.value_mut());
-        session.source_availability = SourceAvailability::Missing;
-        let session = session.clone();
-        self.quota_points_index
-            .update_session(&storage_id, &session);
+        let mut resident = self.sessions.get_mut(&storage_id)?;
+        let resident = std::sync::Arc::make_mut(resident.value_mut());
+        resident.summary.source_availability = SourceAvailability::Missing;
+        // A companion full-content fallback entry (kept only when the
+        // ledger could not vouch for this session) must stay consistent
+        // too, since `Self::full_session`/`full_sessions` hand its
+        // `source_availability` straight to callers.
+        if let Some(mut full) = self.full_session_fallback.get_mut(&storage_id) {
+            std::sync::Arc::make_mut(&mut full).source_availability = SourceAvailability::Missing;
+        }
+        // Deliberately does not call `quota_points_index.update_session`
+        // here: the only field this branch changes is
+        // `source_availability`, which `QuotaPointsIndex` never reads (it
+        // only folds in `rate_limits_history`/`credits_*`/`harness`/
+        // `last_event_at`, none of which moved), so retracting and
+        // re-adding this session's points would be a same-result, wasted
+        // O(points) pass rather than a correctness requirement — and doing
+        // it would need a full `Session` this branch no longer has on hand.
         self.touch_sessions_generation();
-        Some(session)
+        Some(resident.summary.clone())
     }
 
     pub fn publish_instruction_paths_if_current(
@@ -1047,7 +1196,8 @@ impl AppState {
         };
         self.quota_points_index
             .update_session(&storage_id, &session);
-        self.sessions.insert(storage_id, Arc::new(session));
+        self.sessions
+            .insert(storage_id, self.resident_from_live_parse(&session));
         self.touch_sessions_generation();
         drop(path_state);
         let _ = replaced;
@@ -1078,7 +1228,8 @@ impl AppState {
         };
         self.quota_points_index
             .update_session(&storage_id, &session);
-        self.sessions.insert(storage_id, Arc::new(session));
+        self.sessions
+            .insert(storage_id, self.resident_from_live_parse(&session));
         self.touch_sessions_generation();
         drop(path_state);
         let _ = replaced;
@@ -1235,6 +1386,7 @@ mod tests {
     fn state() -> AppState {
         AppState {
             sessions: DashMap::new(),
+            full_session_fallback: DashMap::new(),
             history: Mutex::new(HistoryReadiness::Unavailable),
             history_ready_cv: Condvar::new(),
             last_history_step: Mutex::new(None),
@@ -1319,7 +1471,15 @@ mod tests {
         let path = PathBuf::from("C:/sessions/a.jsonl");
         state.publish_watched_session(&path, session("a", 2));
         assert!(!state.publish_scanned_session(1, &path, session("a", 1)));
-        assert_eq!(state.sessions.get("codex:thread:a").unwrap().total_turns, 2);
+        assert_eq!(
+            state
+                .sessions
+                .get("codex:thread:a")
+                .unwrap()
+                .summary
+                .total_turns,
+            2
+        );
     }
 
     #[test]
@@ -1390,6 +1550,7 @@ mod tests {
                 .sessions
                 .get("codex:thread:a")
                 .unwrap()
+                .summary
                 .source_availability,
             SourceAvailability::Missing
         );
@@ -1527,7 +1688,9 @@ mod tests {
             !state
                 .sessions
                 .get(&key_for_lookup)
-                .is_some_and(|entry| entry.source_availability == SourceAvailability::Present),
+                .is_some_and(
+                    |entry| entry.summary.source_availability == SourceAvailability::Present
+                ),
             "the corrected session must not still read Present in the live projection"
         );
         let corrected = history
@@ -1757,9 +1920,10 @@ mod tests {
                 }),
                 secondary: None,
             }];
-            state
-                .sessions
-                .insert(session.effective_storage_id(), Arc::new(session));
+            state.sessions.insert(
+                session.effective_storage_id(),
+                Arc::new(crate::model::ResidentSession::of(&session)),
+            );
         }
 
         let mut store = crate::quota_store::QuotaStoreFile::default();

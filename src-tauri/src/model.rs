@@ -695,6 +695,37 @@ impl SessionSummary {
     }
 }
 
+/// In-memory resident projection of one session (issue #139).
+/// `AppState.sessions` holds this instead of a full [`Session`] so steady-
+/// state residency and startup hydration scale with summary size, not with
+/// turn/token-event volume — a full session measured ~1 MB resident across a
+/// real corpus; its summary well under 1% of that.
+///
+/// This is deliberately *not* the wire-shape [`SessionSummary`]: it adds
+/// `rate_limits_history`, which `SessionSummary` omits from IPC payloads on
+/// purpose (`AGENTS.md`'s `session-updated` contract). The two consumers
+/// that still need `rate_limits_history` after the resident-summary switch —
+/// `commands::get_subscription_usage` and
+/// `diagnostics::collect_session_stats` — read it from here without ever
+/// growing the wire payload.
+#[derive(Debug, Clone)]
+pub struct ResidentSession {
+    pub summary: SessionSummary,
+    /// Provider-reported account quota snapshots (see [`Session::rate_limits_history`]).
+    /// Typically a handful of points per session — bounded by turn count,
+    /// not token-event volume — so resident cost here is small.
+    pub rate_limits_history: Vec<RateLimitSnapshotPoint>,
+}
+
+impl ResidentSession {
+    pub fn of(session: &Session) -> Self {
+        Self {
+            summary: SessionSummary::of(session),
+            rate_limits_history: session.rate_limits_history.clone(),
+        }
+    }
+}
+
 pub(crate) fn add_totals(dst: &mut TokenTotals, src: &TokenTotals) {
     *dst += src;
 }
