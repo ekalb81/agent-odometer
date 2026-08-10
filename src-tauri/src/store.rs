@@ -1051,6 +1051,35 @@ impl AppState {
         }
     }
 
+    /// Batched variant of [`Self::persist_session_metadata`] (issue #141):
+    /// every session in `sessions` shares one durable-write transaction
+    /// ([`HistoryStore::update_snapshot_batch`]) instead of one transaction
+    /// per session — the same shape [`Self::reconcile_scanned_batch_if_current`]
+    /// uses for the scan's own write path. On a whole-batch failure, falls
+    /// back to writing each session individually via
+    /// [`Self::persist_session_metadata`], preserving today's per-session
+    /// failure isolation rather than silently dropping the rest of the
+    /// batch's metadata updates.
+    pub fn persist_session_metadata_batch(&self, sessions: &[Session]) {
+        if sessions.is_empty() {
+            return;
+        }
+        let Some(history) = self.history_ready() else {
+            return;
+        };
+        if let Err(error) = history.update_snapshot_batch(sessions) {
+            tracing::warn!(
+                "could not persist metadata-only session snapshot batch of {} session(s) as \
+                 one transaction, retrying one at a time: {}",
+                sessions.len(),
+                error
+            );
+            for session in sessions {
+                self.persist_session_metadata(session);
+            }
+        }
+    }
+
     /// Converts a physical source deletion into a retained, availability-
     /// marked session. It never removes the logical session from memory.
     /// Returns the resident summary (issue #139) rather than a full
