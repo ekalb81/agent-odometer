@@ -9,6 +9,7 @@ pub mod git_outcomes;
 pub mod harness_integration;
 pub mod history_store;
 pub mod instructions;
+pub mod memory;
 pub mod model;
 pub mod parser;
 pub mod paths;
@@ -47,6 +48,15 @@ use std::time::Instant;
 use store::AppState;
 use tauri::Manager;
 use tracing_subscriber::EnvFilter;
+
+/// This crate's sole global allocator (see `memory.rs`'s doc comment for why
+/// there can only be one, and why this replaces the `#[cfg(test)]`-only
+/// counting allocator earlier probes used to define locally). Behavior is
+/// identical to the default system allocator unless heap tracking is
+/// explicitly enabled via `memory::configure_heap_tracking` — off by
+/// default, matching every other opt-in in this app.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: memory::TrackingAllocator = memory::TrackingAllocator;
 
 pub fn run() {
     // Init tracing once. A second call would panic, so guard against hot-reload.
@@ -121,6 +131,7 @@ pub fn run() {
                 config.performance_tracking_enabled,
                 config.performance_log_max_mb,
             );
+            memory::configure_heap_tracking(config.memory_heap_tracking_enabled);
             state_for_setup.performance.record_backend(
                 "startup.config_load",
                 config_started,

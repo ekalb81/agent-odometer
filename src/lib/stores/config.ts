@@ -12,6 +12,7 @@ export const config = writable<Config>({
   defender_exclusion_receipt: null,
   performance_tracking_enabled: false,
   performance_log_max_mb: 64,
+  memory_heap_tracking_enabled: false,
   instructions_enabled: false,
   instructions_tab_visible: true,
   instruction_roots: [],

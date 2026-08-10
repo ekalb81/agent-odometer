@@ -1006,6 +1006,7 @@ pub fn set_config(
             config.performance_tracking_enabled,
             config.performance_log_max_mb,
         );
+        crate::memory::configure_heap_tracking(config.memory_heap_tracking_enabled);
         if let Err(error) = app.emit("config-updated", &config) {
             let error = error.to_string();
             return Err(match integration_error.as_deref() {
@@ -1072,6 +1073,7 @@ pub fn set_config(
         config.performance_tracking_enabled,
         config.performance_log_max_mb,
     );
+    crate::memory::configure_heap_tracking(config.memory_heap_tracking_enabled);
 
     // Invalidate every prior scan before swapping watchers. Dropping the old
     // handle waits out any in-flight callback; clearing then removes all data
@@ -1266,7 +1268,14 @@ pub fn spawn_scan(
             .map(scan_cache::ScanCache::invalidation_ms)
             .unwrap_or(0.0);
         *state.cold_reason.lock().unwrap() = cold_reason;
+        if let Some(pragmas) = cache
+            .as_ref()
+            .and_then(scan_cache::ScanCache::pragma_snapshot)
+        {
+            crate::memory::record_sqlite_pragmas(&state.performance, "scan_cache", pragmas);
+        }
 
+        crate::memory::record_phase_sample(&state.performance, "bulk_scan_parallel", "before");
         let report = crate::scanner::scan_all(
             &provider_sources,
             cache,
@@ -1323,6 +1332,7 @@ pub fn spawn_scan(
                 }
             },
         );
+        crate::memory::record_phase_sample(&state.performance, "bulk_scan_parallel", "after");
 
         if state.current_scan_generation() != generation {
             return;
@@ -1344,6 +1354,7 @@ pub fn spawn_scan(
         // was folded into `startup.bulk_scan`'s undifferentiated ~40-45s
         // post-scan residual, so a version-over-version delta was the only
         // evidence of its cost.
+        crate::memory::record_phase_sample(&state.performance, "rollup_rebuild", "before");
         let rollup_rebuild_started = Instant::now();
         let rollups_rebuilt = state.finalize_bulk_scan_rollups();
         state.performance.record_backend(
@@ -1352,6 +1363,7 @@ pub fn spawn_scan(
             true,
             BTreeMap::from([("rebuilt".into(), rollups_rebuilt.to_string())]),
         );
+        crate::memory::record_phase_sample(&state.performance, "rollup_rebuild", "after");
 
         // Retained for the on-demand provider diagnostics report (issue #39).
         // Only the newest still-current scan's counters are kept.
@@ -1405,6 +1417,7 @@ pub fn spawn_scan(
 
         // Overlay thread names from the session index, if present. Timed as
         // its own operation (issue #140).
+        crate::memory::record_phase_sample(&state.performance, "session_index_overlay", "before");
         let session_index_started = Instant::now();
         let names = crate::session_index::read(&config.session_index_path);
         let overlay_ids = crate::session_index::apply(&state.sessions, &names);
@@ -1443,6 +1456,7 @@ pub fn spawn_scan(
             true,
             BTreeMap::from([("changed".into(), overlay_changed.to_string())]),
         );
+        crate::memory::record_phase_sample(&state.performance, "session_index_overlay", "after");
 
         if state.current_scan_generation() != generation {
             return;
@@ -1531,6 +1545,11 @@ pub fn spawn_scan(
                 ),
             ]),
         );
+        // Startup's background work (history open/hydrate, this bulk scan,
+        // rollup rebuild, session-index overlay, config watcher refresh) is
+        // now done, so this is the app's first opportunity to look like it
+        // will at steady state — a single sample, not a before/after pair.
+        crate::memory::record_phase_sample(&state.performance, "idle", "point");
     });
 }
 
@@ -1586,6 +1605,7 @@ pub fn get_scan_status(state: State<'_, Arc<AppState>>) -> ScanStatus {
 /// `startup.history_hydrate` names the rest.
 pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
     std::thread::spawn(move || {
+        crate::memory::record_phase_sample(&state.performance, "history_open", "before");
         let open_started = Instant::now();
         let progress_app = app.clone();
         let progress_state = state.clone();
@@ -1633,15 +1653,24 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
             success,
             BTreeMap::from([("available".into(), success.to_string())]),
         );
+        crate::memory::record_phase_sample(&state.performance, "history_open", "after");
         // Phase 2: `set_history_ready` synchronously calls `hydrate_history`,
         // which deserializes every archived session's snapshot to populate
         // `state.sessions` — this is what a v0.8.7 field recording's
         // 16,794ms `startup.history_open` (with no migration to run) was
         // actually measuring, per this function's un-split shape before this
         // change.
+        crate::memory::record_phase_sample(&state.performance, "history_hydrate", "before");
         let hydrate_started = Instant::now();
         let hydration_stats = match result {
-            Ok(store) => state.set_history_ready(Some(Arc::new(store))),
+            Ok(store) => {
+                crate::memory::record_sqlite_pragmas(
+                    &state.performance,
+                    "history_store",
+                    store.pragma_snapshot(),
+                );
+                state.set_history_ready(Some(Arc::new(store)))
+            }
             Err(error) => {
                 tracing::warn!("durable history unavailable: {}", error);
                 state.set_history_ready(None)
@@ -1660,6 +1689,7 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
                 ("bytes".into(), hydration_stats.bytes.to_string()),
             ]),
         );
+        crate::memory::record_phase_sample(&state.performance, "history_hydrate", "after");
         let total_elapsed_ms = open_started.elapsed().as_millis() as u64;
         let last_step = state.last_history_step();
         let _ = app.emit(

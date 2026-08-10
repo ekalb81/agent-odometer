@@ -401,6 +401,7 @@ export interface Config {
   defender_exclusion_receipt: DefenderExclusionReceipt | null;
   performance_tracking_enabled: boolean;
   performance_log_max_mb: number;
+  memory_heap_tracking_enabled: boolean;
   instructions_enabled: boolean;
   instructions_tab_visible: boolean;
   instruction_roots: InstructionRoot[];

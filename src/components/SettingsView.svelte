@@ -383,6 +383,7 @@
   // ---------------------------------------------------------------------------
   let performanceEnabled = $state(false);
   let performanceMaxMb = $state(64);
+  let heapTrackingEnabled = $state(false);
   let performanceDirty = $state(false);
   let performanceSaving = $state(false);
   let performanceSavedAt = $state<string | null>(null);
@@ -395,6 +396,7 @@
     if (!performanceDirty) {
       performanceEnabled = current.performance_tracking_enabled ?? false;
       performanceMaxMb = current.performance_log_max_mb ?? 64;
+      heapTrackingEnabled = current.memory_heap_tracking_enabled ?? false;
     }
   });
 
@@ -425,6 +427,7 @@
         ...$config,
         performance_tracking_enabled: performanceEnabled,
         performance_log_max_mb: maxMb,
+        memory_heap_tracking_enabled: heapTrackingEnabled,
       };
       await setConfig(updatedConfig);
       config.set(updatedConfig);
@@ -1199,6 +1202,9 @@
       Records local timings and aggregate counts for startup, scans, cache behavior, parsing,
       watchers, analytics IPC, exports, and UI loading/rendering. It never stores prompts, tool
       arguments, session IDs, repository paths, or command output. Recording is off by default.
+      Also records process memory (OS-reported working set) at a handful of startup phase
+      boundaries while enabled. Heap tracking below adds allocator-tracked byte counts alongside
+      that; it is a separate, also off-by-default toggle because it costs a little more.
     </p>
     <div class="bg-card border border-edge rounded-lg px-4 py-3 max-w-3xl">
       <div class="flex items-center gap-4 flex-wrap">
@@ -1222,6 +1228,14 @@
             class="w-20 text-right bg-app border border-edge rounded-sm px-2 py-1 text-ink font-mono"
           />
           MiB
+        </label>
+        <label class="flex items-center gap-2 text-xs text-ink-2">
+          <input
+            type="checkbox"
+            bind:checked={heapTrackingEnabled}
+            onchange={markPerformanceDirty}
+          />
+          Track allocator heap (current + peak)
         </label>
         <button
           onclick={savePerformanceSettings}
