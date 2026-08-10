@@ -94,6 +94,10 @@ pub struct ScanCache {
     /// `HistoryStore::pragma_snapshot` for the same investigation on the
     /// history archive's connection.
     pragmas: Option<crate::memory::SqlitePragmaSnapshot>,
+    /// Where this cache lives, retained only so its on-disk size and the
+    /// holding volume's headroom can be sampled (issue #158). `None` when the
+    /// cache is disabled, same as `pragmas`.
+    path: Option<PathBuf>,
 }
 
 /// (size, mtime in ms since epoch) for a file; None when it can't be stat'ed.
@@ -251,6 +255,7 @@ impl ScanCache {
             cold_reason,
             invalidation_ms,
             pragmas: Some(pragmas),
+            path: Some(path.to_path_buf()),
         })
     }
 
@@ -264,6 +269,15 @@ impl ScanCache {
     /// was opened; `None` if the cache never opened a connection (disabled).
     pub fn pragma_snapshot(&self) -> Option<crate::memory::SqlitePragmaSnapshot> {
         self.pragmas
+    }
+
+    /// On-disk size of this cache and the holding volume's headroom (issue
+    /// #158); `None` when the cache is disabled. See
+    /// `HistoryStore::database_footprint` for why this is sampled live.
+    pub fn database_footprint(&self) -> Option<crate::memory::DatabaseFootprint> {
+        self.path
+            .as_deref()
+            .map(crate::memory::sample_database_footprint)
     }
 
     /// Milliseconds spent invalidating entries on a parse-version mismatch;
