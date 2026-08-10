@@ -1,4 +1,6 @@
-use crate::model::{Harness, RangeTotals, Session, TierBucket, TokenTotals, ToolMetrics};
+use crate::model::{
+    Harness, RangeTotals, Session, SessionSummary, TierBucket, TokenTotals, ToolMetrics,
+};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -69,10 +71,61 @@ pub struct CorrelationResult {
     pub results: Vec<EventCorrelation>,
 }
 
-fn is_subagent(session: &Session) -> bool {
-    session.parent_thread_id.is_some()
-        || session.agent_path.is_some()
-        || session.source.as_deref() == Some("subagent")
+/// Fields `is_subagent`/`scope_matches` need, present identically on both
+/// full `Session` and its resident `SessionSummary` (issue #139 follow-up).
+/// One implementation shared by both means the summary-level pre-filter in
+/// [`candidate_session_keys`] can never drift from what [`correlate_at`]
+/// itself decides once it has full content — the pre-filter can only ever
+/// be a superset of what the final pass keeps, never a stricter, possibly
+/// wrong, second opinion.
+trait SessionScope {
+    fn harness(&self) -> &Harness;
+    fn working_directory(&self) -> Option<&str>;
+    fn parent_thread_id(&self) -> Option<&str>;
+    fn agent_path(&self) -> Option<&str>;
+    fn source(&self) -> Option<&str>;
+}
+
+impl SessionScope for Session {
+    fn harness(&self) -> &Harness {
+        &self.harness
+    }
+    fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
+    }
+    fn parent_thread_id(&self) -> Option<&str> {
+        self.parent_thread_id.as_deref()
+    }
+    fn agent_path(&self) -> Option<&str> {
+        self.agent_path.as_deref()
+    }
+    fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+}
+
+impl SessionScope for SessionSummary {
+    fn harness(&self) -> &Harness {
+        &self.harness
+    }
+    fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
+    }
+    fn parent_thread_id(&self) -> Option<&str> {
+        self.parent_thread_id.as_deref()
+    }
+    fn agent_path(&self) -> Option<&str> {
+        self.agent_path.as_deref()
+    }
+    fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+}
+
+fn is_subagent<T: SessionScope>(session: &T) -> bool {
+    session.parent_thread_id().is_some()
+        || session.agent_path().is_some()
+        || session.source() == Some("subagent")
 }
 
 fn normalized_scope(value: &str) -> String {
@@ -113,21 +166,21 @@ fn redacted_scope_matches(cwd: &str, event_scope: &str) -> bool {
     }
 }
 
-fn scope_matches(session: &Session, event: &ExternalEvent) -> bool {
+fn scope_matches<T: SessionScope>(session: &T, event: &ExternalEvent) -> bool {
     // Harness is optional source metadata, not a source-specific branch. Any
     // event producer can constrain its observations to one harness while the
     // core remains agnostic to config/git event kinds. ProviderId's own
     // string form is the harness label, so no per-provider branching is
     // needed here (and unknown providers compare correctly by construction).
     if let Some(harness) = event.metadata.get("harness") {
-        if harness != session.harness.as_str() {
+        if harness != session.harness().as_str() {
             return false;
         }
     }
     let Some(event_scope) = event.scope.as_deref() else {
         return true;
     };
-    let Some(cwd) = session.working_directory.as_deref() else {
+    let Some(cwd) = session.working_directory() else {
         return false;
     };
     if event_scope.starts_with(REDACTED_PROJECT_SCOPE_PREFIX) {
@@ -211,16 +264,16 @@ fn add_range(
     out.tool_metrics.add_assign(&range.tool_metrics);
 }
 
-pub fn correlate<S: Borrow<Session>>(sessions: &[S], query: CorrelationQuery) -> CorrelationResult {
-    correlate_at(sessions, query, Utc::now())
-}
+/// One event's (before, after) window, each an inclusive `[from, to]` bound.
+type EventWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
-fn correlate_at<S: Borrow<Session>>(
-    sessions: &[S],
-    query: CorrelationQuery,
-    now: DateTime<Utc>,
-) -> CorrelationResult {
-    let windows: Vec<_> = query
+/// Computes each event's (before, after) window pair from the query's
+/// `before_days`/`after_days`. Shared by [`correlate_at`] and
+/// [`candidate_session_keys`] so both agree on exactly the same windows —
+/// the pre-filter would be unsound if it computed these independently and
+/// drifted even slightly from what the final pass uses.
+fn event_windows(query: &CorrelationQuery) -> Vec<(EventWindow, EventWindow)> {
+    query
         .events
         .iter()
         .map(|event| {
@@ -235,7 +288,16 @@ fn correlate_at<S: Borrow<Session>>(
                 ),
             )
         })
-        .collect();
+        .collect()
+}
+
+/// Computes each event's confounding-event ids and whether it is excluded,
+/// from the query's events and `exclude_confounded`. Shared for the same
+/// reason as [`event_windows`].
+fn event_exclusions(
+    query: &CorrelationQuery,
+    windows: &[(EventWindow, EventWindow)],
+) -> (Vec<Vec<String>>, Vec<bool>) {
     let confounds: Vec<Vec<String>> = query
         .events
         .iter()
@@ -262,6 +324,71 @@ fn correlate_at<S: Borrow<Session>>(
         .iter()
         .map(|items| query.exclude_confounded && !items.is_empty())
         .collect();
+    (confounds, excluded)
+}
+
+/// Durable storage keys of resident summaries that could possibly
+/// contribute to `query`'s result (issue #139 follow-up): `correlate_events`
+/// has no session-id scoping of its own, so without this, every call would
+/// load full content (turns, `tokens_history`) for the entire corpus from
+/// the ledger, on a hot-ish endpoint (`ConfigTimeline.svelte` re-runs it on
+/// every live session-store flush while its tab is open).
+///
+/// A session cannot contribute to any window it isn't [`scope_matches`]-ed
+/// for or that is [excluded](event_exclusions) — that much `correlate_at`
+/// already establishes. Beyond that: every token/tool event a session ever
+/// records happens inside `[started_at, last_event_at]` (`last_event_at`
+/// only ever advances forward to an event's own timestamp — see
+/// `parser.rs`/`claude_parser.rs`'s `if timestamp > s.last_event_at`
+/// updates; `started_at` is fixed once at session creation and never
+/// revised on a later `session_meta`/resume). So a session whose
+/// `[started_at, last_event_at]` span doesn't overlap a matched window
+/// cannot have any event inside that window either — `range_totals_multi`
+/// for it is provably all zero, and [`add_range`] would already skip it for
+/// exactly that reason once loaded. Filtering it out here first, using only
+/// the resident summary, reaches the identical answer without the ledger
+/// read: this is a pre-filter that can only ever return a superset of the
+/// sessions that end up contributing, never exclude one that would have.
+///
+/// `summaries` is `(key, &SessionSummary)` pairs, the natural shape of
+/// iterating `AppState.sessions`.
+pub fn candidate_session_keys<'a>(
+    summaries: impl Iterator<Item = (&'a str, &'a SessionSummary)>,
+    query: &CorrelationQuery,
+) -> Vec<String> {
+    let windows = event_windows(query);
+    let (_, excluded) = event_exclusions(query, &windows);
+    summaries
+        .filter(|(_, summary)| query.include_subagents || !is_subagent(*summary))
+        .filter(|(_, summary)| {
+            query.events.iter().enumerate().any(|(index, event)| {
+                if excluded[index] || !scope_matches(*summary, event) {
+                    return false;
+                }
+                let (before, after) = windows[index];
+                interval_overlaps(
+                    summary.started_at,
+                    summary.last_event_at,
+                    before.0,
+                    before.1,
+                ) || interval_overlaps(summary.started_at, summary.last_event_at, after.0, after.1)
+            })
+        })
+        .map(|(key, _)| key.to_owned())
+        .collect()
+}
+
+pub fn correlate<S: Borrow<Session>>(sessions: &[S], query: CorrelationQuery) -> CorrelationResult {
+    correlate_at(sessions, query, Utc::now())
+}
+
+fn correlate_at<S: Borrow<Session>>(
+    sessions: &[S],
+    query: CorrelationQuery,
+    now: DateTime<Utc>,
+) -> CorrelationResult {
+    let windows = event_windows(&query);
+    let (confounds, excluded) = event_exclusions(&query, &windows);
     let mut observations: Vec<(CorrelationObservation, CorrelationObservation)> =
         vec![
             (
@@ -618,5 +745,194 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("low sample")));
+    }
+
+    // -- candidate_session_keys pre-filter (issue #139 follow-up) ---------
+
+    fn candidate_ids(sessions: &[Session], query: &CorrelationQuery) -> Vec<String> {
+        let summaries: Vec<(String, SessionSummary)> = sessions
+            .iter()
+            .map(|s| (s.effective_storage_id(), SessionSummary::of(s)))
+            .collect();
+        let mut ids = candidate_session_keys(
+            summaries
+                .iter()
+                .map(|(key, summary)| (key.as_str(), summary)),
+            query,
+        );
+        ids.sort();
+        ids
+    }
+
+    /// Runs the exact two-stage pipeline `commands::correlate_events` uses:
+    /// compute candidates from summaries alone, then `correlate` only over
+    /// the sessions that made the cut.
+    fn correlate_via_prefilter(sessions: &[Session], query: CorrelationQuery) -> CorrelationResult {
+        let ids = candidate_ids(sessions, &query);
+        let filtered: Vec<&Session> = sessions
+            .iter()
+            .filter(|s| ids.contains(&s.effective_storage_id()))
+            .collect();
+        correlate(&filtered, query)
+    }
+
+    #[test]
+    fn candidate_session_keys_excludes_sessions_whose_span_never_overlaps_any_window() {
+        let overlapping = session(
+            "overlapping",
+            None,
+            &[("2026-01-01T10:00:00Z", 5), ("2026-01-01T12:00:00Z", 5)],
+            false,
+        );
+        let far_future = session(
+            "far-future",
+            None,
+            &[("2026-02-01T00:00:00Z", 9), ("2026-02-02T00:00:00Z", 9)],
+            false,
+        );
+        let far_past = session(
+            "far-past",
+            None,
+            &[("2025-11-01T00:00:00Z", 9), ("2025-11-02T00:00:00Z", 9)],
+            false,
+        );
+        let query = CorrelationQuery {
+            events: vec![event("e", "2026-01-02T00:00:00Z", None)],
+            before_days: 1,
+            after_days: 1,
+            exclude_confounded: false,
+            include_subagents: true,
+        };
+        let sessions = vec![overlapping, far_future, far_past];
+        assert_eq!(
+            candidate_ids(&sessions, &query),
+            vec!["codex:thread:overlapping"]
+        );
+    }
+
+    #[test]
+    fn candidate_session_keys_includes_sessions_overlapping_either_half_of_the_window() {
+        let overlaps_before_only =
+            session("before-only", None, &[("2026-01-01T10:00:00Z", 5)], false);
+        let overlaps_after_only =
+            session("after-only", None, &[("2026-01-02T18:00:00Z", 5)], false);
+        let query = CorrelationQuery {
+            events: vec![event("e", "2026-01-02T00:00:00Z", None)],
+            before_days: 1,
+            after_days: 1,
+            exclude_confounded: false,
+            include_subagents: true,
+        };
+        let sessions = vec![overlaps_before_only, overlaps_after_only];
+        assert_eq!(
+            candidate_ids(&sessions, &query),
+            vec!["codex:thread:after-only", "codex:thread:before-only"]
+        );
+    }
+
+    #[test]
+    fn candidate_session_keys_still_applies_scope_and_subagent_filters() {
+        let wrong_scope = session(
+            "wrong-scope",
+            Some("C:/other"),
+            &[("2026-01-02T06:00:00Z", 5)],
+            false,
+        );
+        let matching_scope = session(
+            "matching-scope",
+            Some("C:/repo"),
+            &[("2026-01-02T06:00:00Z", 5)],
+            false,
+        );
+        let excluded_subagent = session("subagent", None, &[("2026-01-02T06:00:00Z", 5)], true);
+        let query = CorrelationQuery {
+            events: vec![event("e", "2026-01-02T00:00:00Z", Some("C:/repo"))],
+            before_days: 1,
+            after_days: 1,
+            exclude_confounded: false,
+            include_subagents: false,
+        };
+        let sessions = vec![wrong_scope, matching_scope, excluded_subagent];
+        assert_eq!(
+            candidate_ids(&sessions, &query),
+            vec!["codex:thread:matching-scope"]
+        );
+    }
+
+    /// The soundness proof the pre-filter's doc comment claims: running
+    /// `correlate` through the two-stage (summary pre-filter, then load and
+    /// correlate only the candidates) pipeline must produce a byte-for-byte
+    /// identical `CorrelationResult` to running `correlate` directly over
+    /// every session, for a corpus that exercises every way a session can
+    /// be excluded from candidacy — out of time range entirely, in range but
+    /// wrong scope, in range but a subagent — alongside sessions that
+    /// genuinely contribute to two separate, non-confounding events (proving
+    /// the pre-filter's per-event `.any()` unions candidates correctly
+    /// rather than only working for a single event).
+    #[test]
+    fn prefiltering_by_time_overlap_does_not_change_the_correlation_result() {
+        let sessions = vec![
+            session(
+                "contributes-before-e1",
+                Some("C:/repo"),
+                &[("2026-01-01T08:00:00Z", 7), ("2026-01-01T20:00:00Z", 3)],
+                false,
+            ),
+            session(
+                "contributes-after-e1",
+                Some("C:/repo"),
+                &[("2026-01-02T02:00:00Z", 11)],
+                false,
+            ),
+            // Overlaps only e2's window, not e1's — proves candidacy is a
+            // union across events, not just whichever event is checked first.
+            session(
+                "contributes-e2-only",
+                None,
+                &[("2026-01-10T06:00:00Z", 17)],
+                false,
+            ),
+            session(
+                "out-of-range",
+                Some("C:/repo"),
+                &[("2026-03-01T00:00:00Z", 40)],
+                false,
+            ),
+            session(
+                "wrong-scope-in-range",
+                Some("C:/unrelated"),
+                &[("2026-01-02T04:00:00Z", 25)],
+                false,
+            ),
+            session(
+                "subagent-in-range",
+                Some("C:/repo"),
+                &[("2026-01-02T05:00:00Z", 6)],
+                true,
+            ),
+        ];
+        let query = CorrelationQuery {
+            events: vec![
+                event("e1", "2026-01-02T00:00:00Z", Some("C:/repo")),
+                // Far enough from e1 that neither confounds the other —
+                // this test is about candidacy, not confound exclusion
+                // (covered separately by `flags_and_can_exclude_confounded_low_samples`).
+                event("e2", "2026-01-10T00:00:00Z", None),
+            ],
+            before_days: 1,
+            after_days: 1,
+            exclude_confounded: true,
+            include_subagents: false,
+        };
+
+        let direct = correlate(&sessions, query.clone());
+        let via_prefilter = correlate_via_prefilter(&sessions, query.clone());
+        assert_eq!(direct, via_prefilter);
+        // Not a vacuous comparison: confirm the prefilter actually narrowed
+        // the candidate set below the full corpus, and that real data
+        // survived for both events.
+        assert!(candidate_ids(&sessions, &query).len() < sessions.len());
+        assert_ne!(direct.results[0].before, CorrelationObservation::default());
+        assert_ne!(direct.results[1].after, CorrelationObservation::default());
     }
 }

@@ -1,5 +1,6 @@
 use crate::model::{
-    Harness, Session, TaskCategory, TierBucket, TokenTotals, ToolMetrics, TurnInfo, TurnStatus,
+    Harness, Session, SessionSummary, TaskCategory, TierBucket, TokenTotals, ToolMetrics, TurnInfo,
+    TurnStatus,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -242,6 +243,33 @@ fn take_closest(pool: &mut BTreeMap<i64, Vec<TurnSample>>, target: i64) -> Optio
         pool.remove(&key);
     }
     sample
+}
+
+/// Durable storage keys among `summaries` whose `[started_at, last_event_at]`
+/// span overlaps `[from, to]` (issue #139 follow-up, same reasoning as
+/// `correlation::candidate_session_keys`). Every turn's effective bounds
+/// default to the session's own `started_at`/`last_event_at` when unset
+/// (`turn_overlaps` above), and an explicitly-timestamped turn is bounded by
+/// them too — a turn's `started_at`/`completed_at` come from events that
+/// also advance `last_event_at`, which only ever moves forward, while
+/// `started_at` is fixed at session creation. So a session whose overall
+/// span never touches `[from, to]` cannot have a turn that does either;
+/// `list_targets`/`compare` would already find nothing for it once loaded.
+/// `from`/`to` both `None` (no date scoping) returns every summary
+/// unfiltered, matching today's unscoped behavior — callers still narrow by
+/// an explicit `session_ids` list beforehand when the frontend supplied one.
+pub fn candidate_session_keys<'a>(
+    summaries: impl Iterator<Item = (&'a str, &'a SessionSummary)>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> Vec<String> {
+    summaries
+        .filter(|(_, summary)| {
+            from.is_none_or(|from| summary.last_event_at >= from)
+                && to.is_none_or(|to| summary.started_at <= to)
+        })
+        .map(|(key, _)| key.to_owned())
+        .collect()
 }
 
 pub fn list_targets<S: Borrow<Session>>(
@@ -608,5 +636,120 @@ mod tests {
         );
         assert_eq!(result.observed.turn_count, 2);
         assert_eq!(result.observed.session_count, 2);
+    }
+
+    // -- candidate_session_keys pre-filter (issue #139 follow-up) ---------
+
+    fn candidate_ids(
+        sessions: &[Session],
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Vec<String> {
+        let summaries: Vec<(String, SessionSummary)> = sessions
+            .iter()
+            .map(|s| (s.effective_storage_id(), SessionSummary::of(s)))
+            .collect();
+        let mut ids = candidate_session_keys(
+            summaries
+                .iter()
+                .map(|(key, summary)| (key.as_str(), summary)),
+            from,
+            to,
+        );
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn candidate_session_keys_excludes_sessions_outside_the_date_range() {
+        let sessions = vec![
+            session("in-range", true, 800, 10),      // 12:10:00 - 12:10:30
+            session("out-of-range", false, 900, 40), // 12:40:00 - 12:40:30
+        ];
+        let from: DateTime<Utc> = "2026-07-24T12:05:00Z".parse().unwrap();
+        let to: DateTime<Utc> = "2026-07-24T12:20:00Z".parse().unwrap();
+        assert_eq!(
+            candidate_ids(&sessions, Some(from), Some(to)),
+            vec!["codex:thread:in-range"]
+        );
+    }
+
+    #[test]
+    fn candidate_session_keys_returns_everything_when_unscoped() {
+        let sessions = vec![session("a", true, 800, 10), session("b", false, 900, 40)];
+        assert_eq!(
+            candidate_ids(&sessions, None, None),
+            vec!["codex:thread:a", "codex:thread:b"]
+        );
+    }
+
+    fn list_targets_via_prefilter(
+        sessions: &[Session],
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> Vec<ToolImpactTarget> {
+        let ids = candidate_ids(sessions, from, to);
+        let filtered: Vec<&Session> = sessions
+            .iter()
+            .filter(|s| ids.contains(&s.effective_storage_id()))
+            .collect();
+        list_targets(&filtered, from, to)
+    }
+
+    fn compare_via_prefilter(
+        sessions: &[Session],
+        kind: ToolImpactTargetKind,
+        key: &str,
+        from: Option<DateTime<Utc>>,
+        to: Option<DateTime<Utc>>,
+    ) -> ToolImpactResult {
+        let ids = candidate_ids(sessions, from, to);
+        let filtered: Vec<&Session> = sessions
+            .iter()
+            .filter(|s| ids.contains(&s.effective_storage_id()))
+            .collect();
+        compare(&filtered, kind, key, from, to)
+    }
+
+    /// Same soundness proof as `correlation`'s equivalent test: running
+    /// `list_targets`/`compare` through the two-stage (summary date
+    /// pre-filter, then load and aggregate only the candidates) pipeline
+    /// must produce a byte-for-byte identical result to running them
+    /// directly over every session.
+    #[test]
+    fn prefiltering_by_date_range_does_not_change_list_targets_or_compare_results() {
+        let sessions = vec![
+            session("alpha", true, 800, 10), // 12:10:00 - 12:10:30, in range
+            session("baseline", false, 1_000, 12), // 12:12:00 - 12:12:30, in range
+            session("out-of-range", false, 5_000, 50), // 12:50:00 - 12:50:30, outside
+        ];
+        let from: DateTime<Utc> = "2026-07-24T12:00:00Z".parse().unwrap();
+        let to: DateTime<Utc> = "2026-07-24T12:20:00Z".parse().unwrap();
+
+        let direct_targets = list_targets(&sessions, Some(from), Some(to));
+        let via_prefilter_targets = list_targets_via_prefilter(&sessions, Some(from), Some(to));
+        assert_eq!(direct_targets, via_prefilter_targets);
+
+        let direct_compare = compare(
+            &sessions,
+            ToolImpactTargetKind::Provider,
+            "alpha",
+            Some(from),
+            Some(to),
+        );
+        let via_prefilter_compare = compare_via_prefilter(
+            &sessions,
+            ToolImpactTargetKind::Provider,
+            "alpha",
+            Some(from),
+            Some(to),
+        );
+        assert_eq!(direct_compare, via_prefilter_compare);
+
+        // Not a vacuous comparison: confirm the prefilter actually narrowed
+        // the candidate set, and that real, non-default data survived.
+        assert!(candidate_ids(&sessions, Some(from), Some(to)).len() < sessions.len());
+        assert!(!direct_targets.is_empty());
+        assert_eq!(direct_compare.observed.turn_count, 1);
     }
 }

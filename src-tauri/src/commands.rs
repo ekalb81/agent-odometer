@@ -311,19 +311,30 @@ pub async fn correlate_events(
     let app_state = state.inner().clone();
     let event_count = query.events.len();
     // Issue #139: `state.sessions` holds only resident summaries now, and
-    // `correlate` needs full per-turn/token history for every session (this
-    // endpoint has no session-id scoping, so "every session" really does
-    // mean the whole corpus). Resolving full content is therefore a ledger
-    // read, moved into `spawn_blocking` alongside the CPU-bound correlation
-    // pass itself rather than run on the async command thread.
+    // `correlate` needs full per-turn/token history — but `correlate_events`
+    // has no session-id scoping of its own, so loading every resident
+    // session's full content on every call would turn a live in-memory
+    // clone into a whole-corpus ledger read on a hot-ish endpoint
+    // (`ConfigTimeline.svelte` re-runs this on every live session-store
+    // flush while its tab is open). `candidate_session_keys` narrows this
+    // to sessions that could actually contribute — matching the query's
+    // scope and overlapping at least one of its windows — using only the
+    // already-resident summaries, before any ledger read happens. See its
+    // doc comment for why that pre-filter cannot change the result.
     let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let ids: Vec<String> = blocking_state
+        let summaries: Vec<(String, SessionSummary)> = blocking_state
             .sessions
             .iter()
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), entry.value().summary.clone()))
             .collect();
-        let sessions = blocking_state.full_sessions(&ids)?;
+        let candidate_ids = crate::correlation::candidate_session_keys(
+            summaries
+                .iter()
+                .map(|(key, summary)| (key.as_str(), summary)),
+            &query,
+        );
+        let sessions = blocking_state.full_sessions(&candidate_ids)?;
         Ok::<_, String>((
             sessions.len(),
             crate::correlation::correlate(&sessions, query),
@@ -767,25 +778,41 @@ fn parse_tool_impact_range(
     Ok((from, to))
 }
 
-/// Resolves the ids in scope for a tool-impact query — either the caller's
-/// explicit list (filtered to ids this process actually knows about, same
-/// as before #139) or the whole corpus. Full session content is *not*
-/// resolved here: that is a possible ledger read (issue #139, `state.sessions`
-/// now holds only resident summaries), so callers do it inside
-/// `spawn_blocking` via `AppState::full_sessions`, alongside the CPU-bound
-/// aggregation itself.
-fn tool_impact_session_ids(app_state: &AppState, session_ids: Option<Vec<String>>) -> Vec<String> {
-    match session_ids {
+/// Resolves the ids in scope for a tool-impact query (issue #139 follow-up):
+/// the caller's explicit list (filtered to ids this process actually knows
+/// about, same as before #139) or the whole corpus, further narrowed by
+/// `tool_impact::candidate_session_keys` to sessions whose resident summary
+/// says they could actually contribute to `[from, to]` — see its doc
+/// comment for why that narrowing cannot change `list_targets`/`compare`'s
+/// result. Full session content is *not* resolved here: that is a possible
+/// ledger read, done inside `spawn_blocking` via `AppState::full_sessions`
+/// alongside the CPU-bound aggregation itself.
+fn tool_impact_session_ids(
+    app_state: &AppState,
+    session_ids: Option<Vec<String>>,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> Vec<String> {
+    let summaries: Vec<(String, SessionSummary)> = app_state
+        .sessions
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().summary.clone()))
+        .collect();
+    let scoped: std::collections::HashSet<String> = match session_ids {
         Some(ids) => ids
             .into_iter()
             .filter(|id| app_state.sessions.contains_key(id))
             .collect(),
-        None => app_state
-            .sessions
+        None => summaries.iter().map(|(key, _)| key.clone()).collect(),
+    };
+    crate::tool_impact::candidate_session_keys(
+        summaries
             .iter()
-            .map(|entry| entry.key().clone())
-            .collect(),
-    }
+            .filter(|(key, _)| scoped.contains(key))
+            .map(|(key, summary)| (key.as_str(), summary)),
+        from,
+        to,
+    )
 }
 
 #[tauri::command]
@@ -796,7 +823,7 @@ pub async fn list_tool_impact_targets(
     let started = Instant::now();
     let (from, to) = parse_tool_impact_range(query.from, query.to)?;
     let app_state = state.inner().clone();
-    let ids = tool_impact_session_ids(&app_state, query.session_ids);
+    let ids = tool_impact_session_ids(&app_state, query.session_ids, from, to);
     let session_count = ids.len();
     let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -839,7 +866,7 @@ pub async fn compare_tool_impact(
     let (from, to) = parse_tool_impact_range(query.from, query.to)?;
 
     let app_state = state.inner().clone();
-    let ids = tool_impact_session_ids(&app_state, query.session_ids);
+    let ids = tool_impact_session_ids(&app_state, query.session_ids, from, to);
     let session_count = ids.len();
     let target_kind = query.target_kind;
     let blocking_state = app_state.clone();
