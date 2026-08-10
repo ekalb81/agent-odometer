@@ -64,10 +64,19 @@ const MAX_GENERATION_ATTEMPTS: u32 = 3;
 /// (before RSS 25.8 MB, after RSS 2864.9 MB) — the number this run's
 /// extrapolation is compared against.
 const FIELD_RSS_GROWTH_MB: f64 = 2864.9 - 25.8;
-/// Field rate-limit point total: 2,609 real Codex transcripts, 3,634,112
-/// points, mean 1,393/session — supplied by the coordinator, not derived
-/// here.
-const FIELD_TOTAL_POINTS: f64 = 3_634_112.0;
+/// Field session count: the durable ledger holds more sessions than there
+/// are current transcript files (issue #152's report) — 4,614, not the
+/// 2,609 transcripts the point count above was counted over. Once
+/// `QuotaPointsIndex` retention is capped (issue #152's fix), retained
+/// heap for both retainers this harness measures is dominated by *session*
+/// count, not point count — `ResidentSession` holds one newest point per
+/// session regardless of that session's history length, and
+/// `QuotaPointsIndex.contributions` holds one entry per session key
+/// regardless of how many of that session's points are still in the
+/// retained set. Extrapolating by point count post-fix is exactly the
+/// mistake this constant exists to avoid: see the field-scale section in
+/// `main` for the corrected per-session extrapolation.
+const FIELD_SESSION_COUNT: f64 = 4_614.0;
 
 /// (percentile_rank, point_count) anchors from the coordinator's field
 /// measurement. Interpolated in log-space between anchors so the heavy tail
@@ -202,10 +211,16 @@ fn main() -> anyhow::Result<()> {
             ("after_drop", pass.drop_process, pass.drop_heap),
         ]);
         println!(
-            "hydration stats: sessions={} bytes_deserialized={} ({:.1} MB)",
+            "hydration stats: sessions={} bytes_deserialized={} ({:.1} MB) wall_time={:.3}s ({:.1} sessions/s)",
             pass.stats_sessions,
             commas(pass.stats_bytes),
             pass.stats_bytes as f64 / 1_048_576.0,
+            pass.hydration_wall.as_secs_f64(),
+            if pass.hydration_wall.as_secs_f64() > 0.0 {
+                pass.stats_sessions as f64 / pass.hydration_wall.as_secs_f64()
+            } else {
+                0.0
+            },
         );
         print_deltas(
             "after_hydration",
@@ -223,6 +238,26 @@ fn main() -> anyhow::Result<()> {
         );
         println!();
     }
+
+    println!("=== hydration wall time ===");
+    println!(
+        "{:<14} {:>12} {:>16}",
+        "config", "wall_time_s", "sessions/s"
+    );
+    for pass in &pass_results {
+        let sessions_per_sec = if pass.hydration_wall.as_secs_f64() > 0.0 {
+            pass.stats_sessions as f64 / pass.hydration_wall.as_secs_f64()
+        } else {
+            0.0
+        };
+        println!(
+            "{:<14} {:>12.3} {:>16.1}",
+            pass.config.label(),
+            pass.hydration_wall.as_secs_f64(),
+            sessions_per_sec,
+        );
+    }
+    println!();
 
     println!(
         "=== per-point attribution (total_points = {}) ===",
@@ -258,8 +293,64 @@ fn main() -> anyhow::Result<()> {
          the resident_only vs quota_only comparison."
     );
 
+    // Once QuotaPointsIndex retention is capped (issue #152), neither
+    // retainer this harness measures scales with total point count anymore:
+    // ResidentSession holds one newest point per session regardless of that
+    // session's history length, and QuotaPointsIndex.contributions holds one
+    // entry per session key, each now shrunk to only the points that
+    // session currently has in the (capped) retained set. bytes/point is
+    // therefore no longer the right unit to extrapolate from post-fix — it
+    // varies with this run's mean points/session, which is exactly why the
+    // same code reports a different bytes/point figure at different session
+    // counts despite unchanged per-session behavior. bytes/session is the
+    // stable unit now.
+    println!();
+    println!(
+        "=== per-session attribution (sessions = {}) ===",
+        commas(
+            pass_results
+                .first()
+                .map(|p| p.stats_sessions as u64)
+                .unwrap_or(0)
+        )
+    );
+    println!(
+        "{:<14} {:>18} {:>16} {:>18} {:>16}",
+        "config", "heap_delta_bytes", "bytes/session", "rss_delta_bytes", "bytes/session"
+    );
+    for pass in &pass_results {
+        let heap_delta = signed_delta(
+            pass.baseline_heap.current_bytes,
+            pass.after_heap.current_bytes,
+        );
+        let rss_delta = signed_delta(
+            pass.baseline_process.rss_bytes,
+            pass.after_process.rss_bytes,
+        );
+        let sessions = pass.stats_sessions as u64;
+        println!(
+            "{:<14} {:>18} {:>16} {:>18} {:>16}",
+            pass.config.label(),
+            opt_signed_commas(heap_delta),
+            fmt_per_point(heap_delta, sessions),
+            opt_signed_commas(rss_delta),
+            fmt_per_point(rss_delta, sessions),
+        );
+    }
+
     println!();
     println!("=== extrapolation to field scale ===");
+    println!(
+        "note: this is a single-run, per-session-linear projection (extrapolated_bytes = \
+         bytes_per_session x {} field sessions), not the pre-fix per-point projection this \
+         section used before issue #152's retention cap. It assumes the constant floor from \
+         the capped point buckets (bounded by RETAINED_POINTS_PER_PROVIDER x provider count, \
+         a few MB — see quota.rs) is small relative to the per-session term at field scale, \
+         which one run cannot itself verify; separating a true slope from a true intercept \
+         needs at least two runs at different session counts (see this PR's report for that \
+         cross-run fit).",
+        FIELD_SESSION_COUNT as u64
+    );
     if let Some(combined) = pass_results
         .iter()
         .find(|pass| pass.config == HydrationConfig::Combined)
@@ -268,13 +359,13 @@ fn main() -> anyhow::Result<()> {
             combined.baseline_heap.current_bytes,
             combined.after_heap.current_bytes,
         ) {
-            if total_points > 0 {
-                let per_point_heap = heap_delta as f64 / total_points as f64;
-                let extrapolated_mb = per_point_heap * FIELD_TOTAL_POINTS / 1_048_576.0;
+            if combined.stats_sessions > 0 {
+                let per_session_heap = heap_delta as f64 / combined.stats_sessions as f64;
+                let extrapolated_mb = per_session_heap * FIELD_SESSION_COUNT / 1_048_576.0;
                 println!(
-                    "combined per-point live heap = {per_point_heap:.2} bytes/point x {} field points \
-                     = {extrapolated_mb:.1} MB extrapolated",
-                    FIELD_TOTAL_POINTS as u64
+                    "combined per-session live heap = {per_session_heap:.2} bytes/session x {} field \
+                     sessions = {extrapolated_mb:.1} MB extrapolated",
+                    FIELD_SESSION_COUNT as u64
                 );
                 println!(
                     "field measured RSS growth during hydration (v0.8.12 recording, before->after): \
@@ -333,6 +424,13 @@ struct PassResult {
     drop_heap: HeapSample,
     stats_sessions: usize,
     stats_bytes: u64,
+    /// Wall-clock time spent inside `store.stream_sessions` alone — the
+    /// per-session `QuotaPointsIndex::update_session`/`ResidentSession::of`
+    /// calls this harness makes from the callback, not corpus generation or
+    /// the pre/post memory sampling around it. Reported because a memory
+    /// fix that trades retained bytes for O(n^2) eviction cost is exactly
+    /// the kind of regression a memory-only report would miss.
+    hydration_wall: std::time::Duration,
 }
 
 /// Streams the whole store once under `config`, mirroring exactly the
@@ -347,6 +445,7 @@ fn run_hydration_pass(store: &HistoryStore, config: HydrationConfig) -> anyhow::
     let resident: DashMap<String, Arc<ResidentSession>> = DashMap::new();
     let quota_points_index = QuotaPointsIndex::new();
 
+    let hydration_started = std::time::Instant::now();
     let stats = store.stream_sessions(|stored| match config {
         HydrationConfig::ResidentOnly => {
             resident.insert(
@@ -366,6 +465,7 @@ fn run_hydration_pass(store: &HistoryStore, config: HydrationConfig) -> anyhow::
             );
         }
     })?;
+    let hydration_wall = hydration_started.elapsed();
 
     let after_process = sample_process_memory();
     let after_heap = heap_sample();
@@ -382,6 +482,7 @@ fn run_hydration_pass(store: &HistoryStore, config: HydrationConfig) -> anyhow::
         baseline_heap,
         after_process,
         after_heap,
+        hydration_wall,
         drop_process,
         drop_heap,
         stats_sessions: stats.sessions,

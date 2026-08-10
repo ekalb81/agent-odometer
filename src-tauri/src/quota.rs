@@ -42,7 +42,7 @@ use crate::provider::ProviderId;
 use crate::quota_store::{BudgetUnit, NotificationLogEntry, NotificationSettings, QuotaBudget};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 /// Caps how many rate-limit observations are merged per provider so a
@@ -862,6 +862,22 @@ impl QuotaPointsIndex {
     /// - The evicted point belongs to some other, already-recorded session:
     ///   its key is trimmed from that session's stored `SessionContribution`
     ///   in `state.contributions`.
+    ///
+    /// Popping is collected first, then pruned in one pass per owning
+    /// session, rather than calling `Vec::retain` (itself O(that session's
+    /// current point count)) once per evicted point inside the pop loop. A
+    /// single session's history can be evicted many points at a time (a
+    /// large session sharing a bucket with newer ones can lose most of what
+    /// it just inserted in the very call that inserted it) — retain-per-pop
+    /// made that O(evicted²) for exactly the pathological single-session
+    /// case this cap exists to bound. Whichever `Vec` gets pruned —
+    /// `point_keys` here, or a stored `SessionContribution.point_keys` —
+    /// is also `shrink_to_fit`, not just trimmed: `Vec::retain` drops
+    /// `len()` but never `capacity()`, so a session inserted with (say)
+    /// 22,395 points and evicted back down to a few thousand would
+    /// otherwise keep an allocation sized for the point count it no longer
+    /// holds, for as long as that session's contribution exists — the same
+    /// class of bug as the unevicted `Vec` this cap was built to fix.
     fn evict_excess(
         state: &mut QuotaPointsIndexState,
         provider: &ProviderId,
@@ -871,14 +887,31 @@ impl QuotaPointsIndex {
         let Some(bucket) = state.points.get_mut(provider) else {
             return;
         };
-        while bucket.by_key.len() > RETAINED_POINTS_PER_PROVIDER {
+        if bucket.by_key.len() <= RETAINED_POINTS_PER_PROVIDER {
+            return;
+        }
+        let excess = bucket.by_key.len() - RETAINED_POINTS_PER_PROVIDER;
+        let mut evicted_by_owner: HashMap<String, Vec<PointKey>> = HashMap::new();
+        for _ in 0..excess {
             let Some((evicted, _)) = bucket.by_key.pop_first() else {
                 break;
             };
-            if evicted.session_key.as_str() == session_key {
-                point_keys.retain(|key| *key != evicted);
-            } else if let Some(contribution) = state.contributions.get_mut(&evicted.session_key) {
-                contribution.point_keys.retain(|key| *key != evicted);
+            evicted_by_owner
+                .entry(evicted.session_key.clone())
+                .or_default()
+                .push(evicted);
+        }
+
+        for (owner, evicted_keys) in evicted_by_owner {
+            let evicted_set: BTreeSet<&PointKey> = evicted_keys.iter().collect();
+            if owner == session_key {
+                point_keys.retain(|key| !evicted_set.contains(key));
+                point_keys.shrink_to_fit();
+            } else if let Some(contribution) = state.contributions.get_mut(&owner) {
+                contribution
+                    .point_keys
+                    .retain(|key| !evicted_set.contains(key));
+                contribution.point_keys.shrink_to_fit();
             }
         }
     }
@@ -2168,6 +2201,18 @@ mod tests {
             "contributions must only record keys that are actually retained, not the \
              session's full 25,000-point history — otherwise the unbounded Vec this issue \
              is fixing has just moved from ResidentSession/points to contributions"
+        );
+        // The length check above is not sufficient on its own: `Vec::retain`
+        // drops `len()` but never `capacity()`, so a `point_keys` built with
+        // `Vec::with_capacity(25_000)` and then trimmed down to `retained`
+        // elements would still hold a 25,000-entry allocation forever unless
+        // eviction also shrinks it. Same bug, one level deeper than the
+        // count check above.
+        assert!(
+            contribution.point_keys.capacity() < 25_000,
+            "a session evicted down to {retained} points must not still hold a Vec \
+             allocation sized for its original 25,000-point history (capacity = {})",
+            contribution.point_keys.capacity()
         );
     }
 
