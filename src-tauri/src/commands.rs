@@ -546,13 +546,14 @@ fn newest_subscription_usage_by_harness<'a>(
         BTreeMap::new();
     for resident in sessions {
         let session = &resident.summary;
-        for point in &resident.rate_limits_history {
-            let is_newer = newest
-                .get(&session.harness)
-                .is_none_or(|(_, existing)| point.timestamp > existing.timestamp);
-            if is_newer {
-                newest.insert(session.harness.clone(), (session, point));
-            }
+        let Some(point) = resident.newest_rate_limit_point.as_ref() else {
+            continue;
+        };
+        let is_newer = newest
+            .get(&session.harness)
+            .is_none_or(|(_, existing)| point.timestamp > existing.timestamp);
+        if is_newer {
+            newest.insert(session.harness.clone(), (session, point));
         }
     }
     newest
@@ -570,11 +571,12 @@ fn newest_subscription_usage_by_harness<'a>(
 }
 
 /// Most-recent provider-reported subscription-usage snapshot per harness.
-/// Issue #139: `rate_limits_history` is one of the two fields the resident
+/// Issue #139: `newest_rate_limit_point` is one of the fields the resident
 /// summary carries beyond the wire-shape `SessionSummary` specifically so
 /// this command (and `diagnostics::collect_session_stats`) never need a
 /// ledger read — cheap `Arc` clones of the already-resident projection, same
-/// as before.
+/// as before. Issue #152: it holds only the newest point (not the session's
+/// whole history), which is all this command ever needed.
 #[tauri::command]
 pub fn get_subscription_usage(state: State<'_, Arc<AppState>>) -> Vec<SubscriptionUsageEntry> {
     let started = Instant::now();
