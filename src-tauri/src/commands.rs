@@ -1410,78 +1410,27 @@ pub fn spawn_scan(
         let overlay_ids = crate::session_index::apply(&state.sessions, &names);
         let overlay_changed = overlay_ids.len();
 
-        // Issue #141: this pass used to call `state.full_session` (a ledger
-        // read) and `state.persist_session_metadata` (its own durable-write
-        // transaction) once per changed session — the same
-        // one-transaction-per-session anti-pattern #132 fixed for the scan's
-        // own write path, but on a path #132 never touched. Since #139
-        // rerouted this loop's persist step through the on-demand
-        // full-session loaders, it now costs a per-session ledger *read* as
-        // well. Batch both: collect every changed session's summary first,
-        // then load and persist the whole pass's full-session content
-        // together.
+        // Issue #141/field regression: this pass used to call
+        // `state.full_session`/`state.full_sessions` (a ledger read of the
+        // full session — turns, token histories, tool observations, ~1 MB
+        // each in a real corpus) purely to hand a complete `Session` back to
+        // `persist_session_metadata_batch`, which only ever needed to change
+        // one field. `persist_thread_name_overlay_batch` writes `thread_name`
+        // straight from each changed session's resident summary instead, so
+        // no full session content is loaded on this path at all — see
+        // `HistoryStore::overlay_thread_names`'s doc comment for the
+        // investigation behind that.
         let mut changed: Vec<(String, SessionSummary)> = Vec::with_capacity(overlay_ids.len());
         for id in overlay_ids {
             if let Some(summary) = state.sessions.get(&id).map(|entry| entry.summary.clone()) {
                 changed.push((id, summary));
             }
         }
-        let ids: Vec<String> = changed.iter().map(|(id, _)| id.clone()).collect();
-
-        // Batch-load full session content for the whole pass in one ledger
-        // read (`full_sessions`). Its return order does not track `ids`'s
-        // order — it interleaves resident-fallback hits with ledger-loaded
-        // ones — so sessions are looked back up by their own storage id
-        // rather than zipped positionally. On a whole-batch load failure,
-        // fall back to `full_session` one id at a time, preserving today's
-        // tolerant behavior where one session's load failure does not block
-        // the rest of the pass.
-        let mut full_by_id: HashMap<String, Session> = HashMap::with_capacity(changed.len());
-        match state.full_sessions(&ids) {
-            Ok(loaded) => {
-                for session in loaded {
-                    full_by_id.insert(session.effective_storage_id(), (*session).clone());
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "could not batch-load {} session(s) to persist their thread-name overlay, \
-                     retrying one at a time: {}",
-                    ids.len(),
-                    error
-                );
-                for (id, _) in &changed {
-                    match state.full_session(id) {
-                        Ok(Some(full)) => {
-                            full_by_id.insert(id.clone(), full);
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                "could not load session {} to persist its thread-name overlay: {}",
-                                id,
-                                error
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Patch the one field the overlay changed on each session that
-        // loaded, then batch-write the durable metadata overlay for the
-        // whole pass in one shared transaction (mirrors
-        // `observe_bulk_batch`'s shape). `persist_session_metadata_batch`
-        // falls back to per-session writes on a batch failure, preserving
-        // today's per-session failure isolation.
-        let mut to_persist: Vec<Session> = Vec::with_capacity(full_by_id.len());
-        for (id, summary) in &changed {
-            if let Some(mut full) = full_by_id.remove(id) {
-                full.thread_name = summary.thread_name.clone();
-                to_persist.push(full);
-            }
-        }
-        state.persist_session_metadata_batch(&to_persist);
+        let updates: Vec<(String, Option<String>)> = changed
+            .iter()
+            .map(|(id, summary)| (id.clone(), summary.thread_name.clone()))
+            .collect();
+        state.persist_thread_name_overlay_batch(&updates);
 
         for (_, summary) in &changed {
             if let Err(e) = app.emit("session-updated", summary) {

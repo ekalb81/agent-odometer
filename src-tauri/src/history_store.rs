@@ -486,6 +486,58 @@ impl HistoryStore {
         Ok(out)
     }
 
+    /// Targeted metadata-only write for the session-index overlay (issue
+    /// #141 field regression): `updates` is `(durable key, new thread_name)`
+    /// pairs, sourced directly from the just-patched `ResidentSession`
+    /// summaries.
+    ///
+    /// Investigation: [`Self::update_snapshot`]/[`Self::update_snapshot_batch`]
+    /// are the general-purpose metadata-overlay write — they accept a full
+    /// caller-supplied `Session` because a caller's in-memory copy can
+    /// legitimately diverge from the ledger's own facts (a failed observe
+    /// leaves the caller ahead or behind), so `update_snapshot_in_transaction`
+    /// must reload the current durable snapshot a *second* time to detect
+    /// that divergence and mark `ledger_dirty` accordingly. The session-index
+    /// overlay never has that problem — it only ever changes `thread_name`
+    /// — but the old call site (`commands::spawn_scan`) still had to go
+    /// through `AppState::full_sessions` first (a ledger read of the full
+    /// content, ~367 sessions × ~1 MB in the field recording that flagged
+    /// this) purely to hand a complete `Session` back to the generic write
+    /// path, which then read the same content again internally for the
+    /// divergence check it does not need here.
+    ///
+    /// This function reads the current durable snapshot exactly once (there
+    /// is no way to avoid that read at all: `session_json` is the *only*
+    /// place `thread_name` is durably stored — there is no separate metadata
+    /// column, so any write, however small the change, must read-and-rewrite
+    /// the full blob; that part is schema-inherent, not something this
+    /// change can eliminate), patches `thread_name` on that copy, and writes
+    /// it straight back. Because the content this writes back is exactly
+    /// what the ledger already had except for the one field, it cannot
+    /// diverge from the ledger's own fact tables the way a caller-supplied
+    /// `Session` could — so the divergence check and its `ledger_dirty`
+    /// marking do not apply and are skipped entirely. Net effect versus the
+    /// old path: one read and one write per changed session, not three reads
+    /// and one write, and zero full session content ever crosses into
+    /// `AppState`.
+    ///
+    /// Same batching/failure shape as [`Self::update_snapshot_batch`]: one
+    /// shared transaction, whole-batch rollback on any single item's error,
+    /// and the caller (`AppState::persist_thread_name_overlay_batch`) falls
+    /// back to one-at-a-time retries on a batch failure.
+    pub fn overlay_thread_names(&self, updates: &[(String, Option<String>)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (key, thread_name) in updates {
+            overlay_thread_name_in_transaction(&transaction, key, thread_name.as_deref())?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Every project-identity override row (local aliases and/or merges,
     /// #41). Both are reversible: deleting or clearing a row never touches
     /// the auto-computed `durable_sessions.project_*` columns or a source
@@ -975,63 +1027,35 @@ impl HistoryStore {
         Ok(keys)
     }
 
-    /// Returns all archived sessions, including those whose sources are
-    /// gone. Three queries total regardless of corpus size — one for the
-    /// ordered key list, one for every current snapshot, one for every
-    /// source location — rather than [`Self::load_one`]'s per-session
-    /// `SELECT`s run once per key (issue #132: this is `AppState::
-    /// hydrate_history`'s only caller, and hydration runs synchronously on
-    /// the startup critical path before a bulk scan's first write). This
-    /// does not change what gets deserialized — every archived session's
-    /// full snapshot still comes into memory, the same as before — only how
-    /// many round trips it takes to fetch the rows backing that
-    /// deserialization.
-    pub fn load_sessions(&self) -> Result<Vec<StoredSession>> {
-        Ok(self.load_sessions_inner()?.0)
-    }
-
-    /// Like [`Self::load_sessions`], but also reports the pass's shape
-    /// (issue #139): total sessions and total raw snapshot bytes
-    /// deserialized, so a recording can distinguish "more sessions" from
-    /// "bigger sessions" as an explanation for hydration cost.
-    pub fn load_sessions_with_stats(&self) -> Result<(Vec<StoredSession>, HydrationStats)> {
-        let (sessions, bytes) = self.load_sessions_inner()?;
-        let stats = HydrationStats {
-            sessions: sessions.len(),
-            bytes,
-        };
-        Ok((sessions, stats))
-    }
-
-    /// Shared implementation for [`Self::load_sessions`] and
-    /// [`Self::load_sessions_with_stats`]. Returns the loaded sessions
-    /// alongside the total byte length of every raw `session_json` blob
-    /// deserialized.
-    fn load_sessions_inner(&self) -> Result<(Vec<StoredSession>, u64)> {
+    /// Streams every archived session to `on_session`, one at a time,
+    /// instead of materializing the whole corpus into a `Vec<StoredSession>`
+    /// first. This is what [`AppState::hydrate_history`] uses (a field
+    /// recording found #139's fix changed what stayed *resident* after
+    /// hydration but not what got *allocated* during it: the pre-#139-shape
+    /// intermediate `Vec<StoredSession>` this function used to build still
+    /// peaked at O(corpus) — every session's full content, deserialized,
+    /// live at once — before a caller could drop any of it; on a 2+ GB real
+    /// corpus that single peak is enough that Windows never gives the
+    /// working set back). `on_session` is called once per session, in the
+    /// same `last_seen_at_ms DESC, session_key` order [`Self::load_sessions`]
+    /// returns; the caller decides what to keep (`AppState` projects each
+    /// one to a `ResidentSession` and drops the full `Session` before the
+    /// next row is even fetched), so peak allocation here is O(one session)
+    /// rather than O(corpus).
+    ///
+    /// Locations are still batched into one map for the whole corpus up
+    /// front: unlike `session_json`, `source_locations` rows are small
+    /// (paths and timestamps, no session content), so holding all of them
+    /// at once does not reproduce the problem above. The snapshot walk is a
+    /// single `LEFT JOIN` query ordered the same way the old two-query
+    /// (keys, then snapshots-by-key) shape produced, so a `durable_sessions`
+    /// row with no matching current snapshot — an invariant violation — is
+    /// still a loud per-key error instead of a silently skipped row.
+    pub fn stream_sessions(
+        &self,
+        mut on_session: impl FnMut(StoredSession),
+    ) -> Result<HydrationStats> {
         let connection = self.connection()?;
-        let mut key_statement = connection.prepare(
-            "SELECT session_key FROM durable_sessions ORDER BY last_seen_at_ms DESC, session_key",
-        )?;
-        let ordered_keys: Vec<String> = key_statement
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<_, _>>()?;
-        drop(key_statement);
-
-        let mut snapshot_statement = connection.prepare(
-            "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json
-             FROM durable_sessions d JOIN session_snapshots s
-               ON s.session_key = d.session_key AND s.version = d.current_snapshot_version",
-        )?;
-        let mut snapshots: HashMap<String, (String, String, bool, Vec<u8>)> = HashMap::new();
-        let mut rows = snapshot_statement.query([])?;
-        while let Some(row) = rows.next()? {
-            snapshots.insert(
-                row.get(0)?,
-                (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
-            );
-        }
-        drop(rows);
-        drop(snapshot_statement);
 
         let mut location_statement = connection.prepare(
             "SELECT session_key, path, present, first_seen_at_ms, last_seen_at_ms
@@ -1054,48 +1078,86 @@ impl HistoryStore {
         drop(rows);
         drop(location_statement);
 
-        let mut total_bytes: u64 = 0;
-        let sessions = ordered_keys
-            .into_iter()
-            .map(|key| {
-                let (identity_key, first_event_fingerprint, collision, raw) = snapshots
-                    .remove(&key)
-                    .ok_or_else(|| anyhow!("missing durable session snapshot for {key}"))?;
-                total_bytes += raw.len() as u64;
-                let mut session: Session = serde_json::from_slice(&raw)
-                    .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
-                let locations = locations_by_key.remove(&key).unwrap_or_default();
-                let available = locations.iter().any(|location| location.present);
-                session.storage_id = key.clone();
-                session.source_availability = if available {
-                    SourceAvailability::Present
-                } else {
-                    SourceAvailability::Missing
-                };
-                if let Some(location) = locations
-                    .iter()
-                    .filter(|location| location.present)
-                    .max_by_key(|location| location.last_seen_at_ms)
-                    .or_else(|| {
-                        locations
-                            .iter()
-                            .max_by_key(|location| location.last_seen_at_ms)
-                    })
-                {
-                    session.file_path = location.path.clone();
-                }
-                Ok(StoredSession {
-                    key,
-                    identity_key,
-                    first_event_fingerprint,
-                    available,
-                    collision,
-                    locations,
-                    session,
+        let mut snapshot_statement = connection.prepare(
+            "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json
+             FROM durable_sessions d
+             LEFT JOIN session_snapshots s
+               ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+             ORDER BY d.last_seen_at_ms DESC, d.session_key",
+        )?;
+        let mut rows = snapshot_statement.query([])?;
+        let mut stats = HydrationStats::default();
+        while let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let identity_key: String = row.get(1)?;
+            let first_event_fingerprint: String = row.get(2)?;
+            let collision: bool = row.get(3)?;
+            let raw: Option<Vec<u8>> = row.get(4)?;
+            let raw = raw.ok_or_else(|| anyhow!("missing durable session snapshot for {key}"))?;
+            stats.bytes += raw.len() as u64;
+            let mut session: Session = serde_json::from_slice(&raw)
+                .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
+            drop(raw);
+            let locations = locations_by_key.remove(&key).unwrap_or_default();
+            let available = locations.iter().any(|location| location.present);
+            session.storage_id = key.clone();
+            session.source_availability = if available {
+                SourceAvailability::Present
+            } else {
+                SourceAvailability::Missing
+            };
+            if let Some(location) = locations
+                .iter()
+                .filter(|location| location.present)
+                .max_by_key(|location| location.last_seen_at_ms)
+                .or_else(|| {
+                    locations
+                        .iter()
+                        .max_by_key(|location| location.last_seen_at_ms)
                 })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok((sessions, total_bytes))
+            {
+                session.file_path = location.path.clone();
+            }
+            stats.sessions += 1;
+            on_session(StoredSession {
+                key,
+                identity_key,
+                first_event_fingerprint,
+                available,
+                collision,
+                locations,
+                session,
+            });
+        }
+        Ok(stats)
+    }
+
+    /// Collects [`Self::stream_sessions`] into a `Vec<StoredSession>` —
+    /// reintroducing the O(corpus) peak allocation `stream_sessions` exists
+    /// to avoid. Kept only for tests that need to inspect every archived
+    /// session's content at once (golden-ledger equality, structural
+    /// invariants); production code must not add a new caller of this —
+    /// [`AppState::hydrate_history`] uses `stream_sessions` directly for
+    /// exactly this reason.
+    #[cfg(test)]
+    pub fn load_sessions(&self) -> Result<Vec<StoredSession>> {
+        let mut out = Vec::new();
+        self.stream_sessions(|session| out.push(session))?;
+        Ok(out)
+    }
+
+    /// Like [`Self::load_sessions`], but also reports the pass's shape
+    /// (issue #139): total sessions and total raw snapshot bytes
+    /// deserialized, so a recording can distinguish "more sessions" from
+    /// "bigger sessions" as an explanation for hydration cost. Test-only for
+    /// the same reason as `load_sessions`; production hydration reads
+    /// `HydrationStats` off `stream_sessions`'s own return value instead of
+    /// collecting a `Vec` to measure it.
+    #[cfg(test)]
+    pub fn load_sessions_with_stats(&self) -> Result<(Vec<StoredSession>, HydrationStats)> {
+        let mut out = Vec::new();
+        let stats = self.stream_sessions(|session| out.push(session))?;
+        Ok((out, stats))
     }
 
     pub fn stats(&self) -> Result<HistoryStats> {
@@ -2984,6 +3046,72 @@ fn update_snapshot_in_transaction(
         params![key, now, !history_matches_durable],
     )?;
     Ok(key)
+}
+
+/// Core per-session write for [`HistoryStore::overlay_thread_names`]. Reads
+/// the current durable snapshot exactly once, patches only `thread_name` on
+/// that copy, and writes it straight back — see `overlay_thread_names`'s doc
+/// comment for why this can skip both the second reload
+/// [`update_snapshot_in_transaction`] does for its divergence check and the
+/// `ledger_dirty` marking that check would otherwise produce: the content
+/// this writes back came from the ledger itself, moments earlier, in the
+/// same transaction, so it cannot have diverged from the ledger's own fact
+/// tables.
+fn overlay_thread_name_in_transaction(
+    transaction: &Transaction<'_>,
+    key: &str,
+    thread_name: Option<&str>,
+) -> Result<()> {
+    let now = now_ms();
+    let current: Option<(i64, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT d.current_snapshot_version, s.session_json
+             FROM durable_sessions d
+             JOIN session_snapshots s
+               ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+             WHERE d.session_key = ?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((version, raw)) = current else {
+        bail!("cannot update snapshot for unknown durable session {key}");
+    };
+    let mut session: Session = serde_json::from_slice(&raw)
+        .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
+    drop(raw);
+    if session.thread_name.as_deref() == thread_name {
+        // Already current: nothing to write. Avoids a no-op snapshot
+        // version and its accompanying `last_seen_at_ms` bump for a session
+        // the caller merely re-confirmed rather than actually changed.
+        return Ok(());
+    }
+    session.thread_name = thread_name.map(str::to_owned);
+    session.storage_id = key.to_owned();
+    // Reused for parity with `update_snapshot_in_transaction`: the fast path
+    // (unchanged `working_directory`) is one cheap `SELECT` against
+    // `durable_sessions`, not a filesystem/git probe, so this does not
+    // reintroduce the cost this function exists to avoid.
+    apply_project_identity(transaction, key, &mut session)?;
+    let raw_snapshot =
+        serde_json::to_vec(&session).context("could not encode metadata-only session snapshot")?;
+    let snapshot_hash = stable_hash_bytes(&raw_snapshot);
+    let next_version = version + 1;
+    transaction.execute(
+        "INSERT INTO session_snapshots(session_key, version, format_version, snapshot_hash, captured_at_ms, session_json)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![key, next_version, SNAPSHOT_FORMAT_VERSION, snapshot_hash, now, raw_snapshot],
+    )?;
+    transaction.execute(
+        "UPDATE durable_sessions SET current_snapshot_version = ?2, current_snapshot_hash = ?3, last_seen_at_ms = ?4
+         WHERE session_key = ?1",
+        params![key, next_version, snapshot_hash, now],
+    )?;
+    transaction.execute(
+        "DELETE FROM session_snapshots WHERE session_key = ?1 AND version <> ?2",
+        params![key, next_version],
+    )?;
+    Ok(())
 }
 
 /// `history_meta` key marking whether `rollup_*` is behind the fact tables
@@ -4961,6 +5089,190 @@ mod tests {
             Some("Should Not Persist"),
             "a failed batch must roll back every item, including ones that individually succeeded"
         );
+    }
+
+    #[test]
+    fn overlay_thread_names_patches_only_the_one_field_and_preserves_everything_else() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let fixture = rich_session("overlay-name-only");
+        let key = store
+            .observe(Path::new("overlay-name-only.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        store
+            .overlay_thread_names(&[(key.clone(), Some("Renamed via overlay".into()))])
+            .unwrap();
+
+        let reloaded = store.load_one(&key).unwrap();
+        assert_eq!(
+            reloaded.session.thread_name.as_deref(),
+            Some("Renamed via overlay")
+        );
+        // Every field this pass never touches must survive byte-for-byte.
+        let mut expected = fixture.clone();
+        expected.thread_name = Some("Renamed via overlay".into());
+        expected.storage_id = key.clone();
+        assert_eq!(reloaded.session.tokens_history, expected.tokens_history);
+        assert_eq!(
+            reloaded.session.tool_observations,
+            expected.tool_observations
+        );
+        assert_eq!(
+            reloaded.session.optimization_findings,
+            expected.optimization_findings
+        );
+        assert_eq!(reloaded.session.tokens_total, expected.tokens_total);
+    }
+
+    #[test]
+    fn overlay_thread_names_never_marks_the_session_dirty() {
+        // Unlike `update_snapshot`/`update_snapshot_batch` (see
+        // `metadata_overlay_marks_diverged_history_dirty_and_observe_clears_it`),
+        // `overlay_thread_names` reads its content straight from the ledger
+        // rather than accepting a caller-supplied `Session`, so it cannot
+        // introduce the divergence `ledger_dirty` exists to flag — this
+        // locks in that it never does, however many times it runs.
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let fixture = rich_session("overlay-never-dirty");
+        let key = store
+            .observe(Path::new("overlay-never-dirty.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        for name in ["First", "Second", "Third"] {
+            store
+                .overlay_thread_names(&[(key.clone(), Some(name.into()))])
+                .unwrap();
+            assert!(store.dirty_session_keys().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn overlay_thread_names_batch_rolls_back_on_one_unknown_session() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let good = rich_session("overlay-name-good");
+        let good_key = store
+            .observe(Path::new("overlay-name-good.jsonl"), &good, generation)
+            .unwrap()
+            .key;
+        let unknown_key =
+            crate::model::storage_id_for_session(&codex_provider_id(), "overlay-name-unknown");
+
+        assert!(store
+            .overlay_thread_names(&[
+                (good_key.clone(), Some("Should Not Persist".into())),
+                (unknown_key, Some("Ignored".into())),
+            ])
+            .is_err());
+
+        let reloaded = store.load_one(&good_key).unwrap();
+        assert_ne!(
+            reloaded.session.thread_name.as_deref(),
+            Some("Should Not Persist"),
+            "a failed batch must roll back every item, including ones that individually succeeded"
+        );
+    }
+
+    #[test]
+    fn overlay_thread_names_is_a_no_op_when_the_name_is_already_current() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut fixture = rich_session("overlay-already-current");
+        fixture.thread_name = Some("Already Current".into());
+        let key = store
+            .observe(
+                Path::new("overlay-already-current.jsonl"),
+                &fixture,
+                generation,
+            )
+            .unwrap()
+            .key;
+
+        let snapshot_version = |store: &HistoryStore| -> i64 {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT current_snapshot_version FROM durable_sessions WHERE session_key = ?1",
+                    [key.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        let version_before = snapshot_version(&store);
+
+        store
+            .overlay_thread_names(&[(key.clone(), Some("Already Current".into()))])
+            .unwrap();
+
+        // No-op means no new snapshot version was inserted at all — the
+        // strongest available proof that the write path was skipped
+        // entirely rather than just producing an identical row.
+        assert_eq!(
+            snapshot_version(&store),
+            version_before,
+            "an unchanged thread_name must not create a new snapshot version"
+        );
+        let reloaded = store.load_one(&key).unwrap();
+        assert_eq!(
+            reloaded.session.thread_name.as_deref(),
+            Some("Already Current")
+        );
+    }
+
+    #[test]
+    fn stream_sessions_matches_load_sessions_content_order_and_stats() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        for id in ["stream-a", "stream-b", "stream-c"] {
+            let fixture = rich_session(id);
+            let path = Path::new(id).with_extension("jsonl");
+            store.observe(&path, &fixture, generation).unwrap();
+        }
+
+        let (collected, collected_stats) = store.load_sessions_with_stats().unwrap();
+
+        let mut streamed = Vec::new();
+        let streamed_stats = store
+            .stream_sessions(|session| streamed.push(session))
+            .unwrap();
+
+        assert_eq!(streamed_stats.sessions, collected_stats.sessions);
+        assert_eq!(streamed_stats.bytes, collected_stats.bytes);
+        assert_eq!(streamed.len(), collected.len());
+        for (streamed, collected) in streamed.iter().zip(&collected) {
+            assert_eq!(streamed.key, collected.key);
+            assert_eq!(streamed.session.id, collected.session.id);
+            assert_eq!(streamed.session.thread_name, collected.session.thread_name);
+        }
+    }
+
+    #[test]
+    fn stream_sessions_calls_the_callback_once_per_session_even_when_it_drops_each_one() {
+        // Directly exercises the shape `AppState::hydrate_history` relies on
+        // for O(one session) peak allocation: the callback receiving and
+        // dropping each `StoredSession` before the next row is fetched must
+        // still see every session, exactly once.
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        for id in 0..25 {
+            let fixture = rich_session(&format!("stream-drop-{id}"));
+            let path = Path::new(&fixture.id).with_extension("jsonl");
+            store.observe(&path, &fixture, generation).unwrap();
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let stats = store
+            .stream_sessions(|session| {
+                seen.insert(session.key.clone());
+                drop(session);
+            })
+            .unwrap();
+        assert_eq!(stats.sessions, 25);
+        assert_eq!(seen.len(), 25);
     }
 
     #[test]
@@ -7364,6 +7676,324 @@ mod tests {
         eprintln!(
             "probe summary: before={before:?} after={after:?} speedup(before/after)={:.2}x",
             before.as_secs_f64() / after.as_secs_f64().max(0.000_001)
+        );
+    }
+
+    /// Builds a corpus whose average serialized session size lands near the
+    /// v0.8.10 field recording's own ratio (2,151,487,813 bytes / 4,463
+    /// sessions ≈ 482 KB/session), unlike `rich_session`/`synthetic_session`
+    /// (~31 KB, no `turns` populated at all — both shipped fixes measured
+    /// well against sessions that size and did essentially nothing in the
+    /// field). Reuses `model.rs`'s `realistic_session_with_shape` so every
+    /// probe measures the same session shape. A 10%-hot / 90%-cold split at
+    /// 180/5/6 (~1.0 MB) and 90/3/3 (~349 KB) turns/tokens-per-turn/tools-
+    /// per-turn averages ~415 KB/session — the right order of magnitude,
+    /// without the >4 GB a session-for-session field-scale corpus would put
+    /// on disk for a probe that only needs to be run locally.
+    fn field_scale_session(index: usize, hot_count: usize) -> Session {
+        if index < hot_count {
+            crate::model::tests::realistic_session_with_shape(
+                &format!("field-hot-{index}"),
+                180,
+                5,
+                6,
+            )
+        } else {
+            crate::model::tests::realistic_session_with_shape(
+                &format!("field-cold-{index}"),
+                90,
+                3,
+                3,
+            )
+        }
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with `cargo test --release --lib \
+                probe_streaming_hydration_peak_allocation_at_realistic_session_size -- \
+                --ignored --nocapture` (filtering to this exact test name keeps the \
+                process-wide counting allocator from also seeing another concurrently-running \
+                test's allocations)"]
+    fn probe_streaming_hydration_peak_allocation_at_realistic_session_size() {
+        // Streaming-hydration follow-up to #139/#145: reproduces the
+        // pre-this-change `load_sessions_inner` shape verbatim (fetch every
+        // key, then *every* current snapshot's raw JSON into one
+        // process-wide `HashMap` before deserializing any of them, then
+        // deserialize while draining that map) as `old_style_load_sessions`
+        // below, and compares its peak heap-byte delta against
+        // `HistoryStore::stream_sessions`'s — at realistic per-session size,
+        // where #139's own ~31 KB-session probe could not have shown the
+        // gap this change targets: peak allocation, not steady-state
+        // residency.
+        const SESSIONS: usize = 300;
+        const HOT_SESSIONS: usize = 30;
+
+        fn old_style_load_sessions(store: &HistoryStore) -> Result<(Vec<StoredSession>, u64)> {
+            let connection = store.connection()?;
+            let mut key_statement = connection.prepare(
+                "SELECT session_key FROM durable_sessions ORDER BY last_seen_at_ms DESC, session_key",
+            )?;
+            let ordered_keys: Vec<String> = key_statement
+                .query_map([], |row| row.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(key_statement);
+
+            let mut snapshot_statement = connection.prepare(
+                "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json
+                 FROM durable_sessions d JOIN session_snapshots s
+                   ON s.session_key = d.session_key AND s.version = d.current_snapshot_version",
+            )?;
+            let mut snapshots: HashMap<String, (String, String, bool, Vec<u8>)> = HashMap::new();
+            let mut rows = snapshot_statement.query([])?;
+            while let Some(row) = rows.next()? {
+                snapshots.insert(
+                    row.get(0)?,
+                    (row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?),
+                );
+            }
+            drop(rows);
+            drop(snapshot_statement);
+
+            let mut location_statement = connection.prepare(
+                "SELECT session_key, path, present, first_seen_at_ms, last_seen_at_ms
+                 FROM source_locations ORDER BY session_key, path",
+            )?;
+            let mut locations_by_key: HashMap<String, Vec<SourceLocation>> = HashMap::new();
+            let mut rows = location_statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let key: String = row.get(0)?;
+                locations_by_key
+                    .entry(key)
+                    .or_default()
+                    .push(SourceLocation {
+                        path: row.get(1)?,
+                        present: row.get(2)?,
+                        first_seen_at_ms: row.get(3)?,
+                        last_seen_at_ms: row.get(4)?,
+                    });
+            }
+            drop(rows);
+            drop(location_statement);
+
+            let mut total_bytes: u64 = 0;
+            let sessions = ordered_keys
+                .into_iter()
+                .map(|key| {
+                    let (identity_key, first_event_fingerprint, collision, raw) = snapshots
+                        .remove(&key)
+                        .ok_or_else(|| anyhow!("missing durable session snapshot for {key}"))?;
+                    total_bytes += raw.len() as u64;
+                    let mut session: Session = serde_json::from_slice(&raw)
+                        .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
+                    let locations = locations_by_key.remove(&key).unwrap_or_default();
+                    let available = locations.iter().any(|location| location.present);
+                    session.storage_id = key.clone();
+                    session.source_availability = if available {
+                        SourceAvailability::Present
+                    } else {
+                        SourceAvailability::Missing
+                    };
+                    if let Some(location) = locations
+                        .iter()
+                        .filter(|location| location.present)
+                        .max_by_key(|location| location.last_seen_at_ms)
+                        .or_else(|| {
+                            locations
+                                .iter()
+                                .max_by_key(|location| location.last_seen_at_ms)
+                        })
+                    {
+                        session.file_path = location.path.clone();
+                    }
+                    Ok(StoredSession {
+                        key,
+                        identity_key,
+                        first_event_fingerprint,
+                        available,
+                        collision,
+                        locations,
+                        session,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((sessions, total_bytes))
+        }
+
+        let sessions: Vec<Session> = (0..SESSIONS)
+            .map(|index| field_scale_session(index, HOT_SESSIONS))
+            .collect();
+
+        let directory = tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        let generation = store.begin_scan().unwrap().max(1);
+        for chunk in sessions.chunks(crate::scanner::SCAN_WRITE_BATCH_SIZE) {
+            let paths: Vec<PathBuf> = chunk
+                .iter()
+                .map(|fixture| Path::new(&fixture.id).with_extension("jsonl"))
+                .collect();
+            let items: Vec<(&Path, &Session, i64)> = paths
+                .iter()
+                .zip(chunk)
+                .map(|(path, fixture)| (path.as_path(), fixture, generation))
+                .collect();
+            store.observe_bulk_batch(&items).unwrap();
+        }
+        store.rebuild_rollups_if_stale().unwrap();
+        assert_eq!(store.stats().unwrap().sessions, SESSIONS);
+        drop(sessions);
+
+        let baseline = crate::model::tests::allocated_bytes();
+        crate::model::tests::reset_peak_to_current();
+        let old_started = Instant::now();
+        let (old_sessions, old_bytes) = old_style_load_sessions(&store).unwrap();
+        let old_elapsed = old_started.elapsed();
+        let old_peak = crate::model::tests::peak_bytes() - baseline;
+        let old_net_while_resident = crate::model::tests::allocated_bytes() - baseline;
+        assert_eq!(old_sessions.len(), SESSIONS);
+        drop(old_sessions);
+
+        // Let the allocator settle back to baseline between the two probes
+        // so the "after" peak is not measured against an inflated floor
+        // left over from the "before" run's own residual fragmentation.
+        let baseline = crate::model::tests::allocated_bytes();
+        crate::model::tests::reset_peak_to_current();
+        let mut streamed_count = 0usize;
+        let new_started = Instant::now();
+        let stats = store
+            .stream_sessions(|session| {
+                streamed_count += 1;
+                std::hint::black_box(&session);
+                drop(session);
+            })
+            .unwrap();
+        let new_elapsed = new_started.elapsed();
+        let new_peak = crate::model::tests::peak_bytes() - baseline;
+        let new_net_after = crate::model::tests::allocated_bytes().saturating_sub(baseline);
+        assert_eq!(streamed_count, SESSIONS);
+        assert_eq!(stats.sessions, SESSIONS);
+        assert_eq!(stats.bytes, old_bytes);
+
+        eprintln!(
+            "streaming hydration peak allocation at {SESSIONS} sessions \
+             ({HOT_SESSIONS} hot / {} cold), {} total corpus bytes:\n\
+             \x20 before (Vec<StoredSession>, all raw snapshots in one HashMap first): \
+             peak={old_peak} bytes, net-while-resident={old_net_while_resident} bytes, \
+             {old_elapsed:?}\n\
+             \x20 after  (stream_sessions, one session live at a time):                 \
+             peak={new_peak} bytes, net-after={new_net_after} bytes, {new_elapsed:?}\n\
+             \x20 peak reduction: {:.1}x, {:.1}% smaller",
+            SESSIONS - HOT_SESSIONS,
+            old_bytes,
+            old_peak as f64 / new_peak.max(1) as f64,
+            100.0 * (1.0 - new_peak as f64 / old_peak.max(1) as f64),
+        );
+
+        assert!(
+            new_peak < old_peak / 4,
+            "expected streaming to peak at well under a quarter of the whole-corpus-at-once \
+             shape's peak; got {new_peak} vs {old_peak} bytes"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with `cargo test --release --lib \
+                probe_overlay_targeted_update_at_realistic_session_size -- --ignored \
+                --nocapture` (filtering to this exact test name keeps the process-wide \
+                counting allocator from also seeing another concurrently-running test's \
+                allocations)"]
+    fn probe_overlay_targeted_update_at_realistic_session_size() {
+        // Follow-up to #141's `probe_session_index_overlay_batching_before_and_after`,
+        // at realistic per-session size instead of that probe's ~31 KB
+        // `synthetic_session`/`rich_session` shape (#141 measured well
+        // against that shape and did essentially nothing in the v0.8.10
+        // field recording). Compares the shipped #141 shape — one ledger
+        // read of the whole changed-session content (`load_many`) plus the
+        // general metadata-overlay write, which itself reloads the current
+        // snapshot a second time for its divergence check
+        // (`update_snapshot_batch`) — against `overlay_thread_names`, which
+        // reads the current snapshot exactly once and never accepts (or
+        // needs) the full `Session` from the caller at all.
+        const SESSIONS: usize = 300;
+        const HOT_SESSIONS: usize = 30;
+        const CHANGED: usize = 30;
+
+        let sessions: Vec<Session> = (0..SESSIONS)
+            .map(|index| field_scale_session(index, HOT_SESSIONS))
+            .collect();
+
+        let directory = tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        let generation = store.begin_scan().unwrap().max(1);
+        for chunk in sessions.chunks(crate::scanner::SCAN_WRITE_BATCH_SIZE) {
+            let paths: Vec<PathBuf> = chunk
+                .iter()
+                .map(|fixture| Path::new(&fixture.id).with_extension("jsonl"))
+                .collect();
+            let items: Vec<(&Path, &Session, i64)> = paths
+                .iter()
+                .zip(chunk)
+                .map(|(path, fixture)| (path.as_path(), fixture, generation))
+                .collect();
+            store.observe_bulk_batch(&items).unwrap();
+        }
+        store.rebuild_rollups_if_stale().unwrap();
+        assert_eq!(store.stats().unwrap().sessions, SESSIONS);
+
+        let ids: Vec<String> = sessions
+            .iter()
+            .take(CHANGED)
+            .map(|fixture| fixture.effective_storage_id())
+            .collect();
+        assert_eq!(ids.len(), CHANGED);
+        drop(sessions);
+
+        let baseline = crate::model::tests::allocated_bytes();
+        crate::model::tests::reset_peak_to_current();
+        let old_started = Instant::now();
+        let mut loaded = store.load_many(&ids).unwrap();
+        for stored in &mut loaded {
+            stored.session.thread_name = Some("Overlay".into());
+        }
+        let patched: Vec<Session> = loaded.into_iter().map(|stored| stored.session).collect();
+        store.update_snapshot_batch(&patched).unwrap();
+        let old_elapsed = old_started.elapsed();
+        let old_peak = crate::model::tests::peak_bytes() - baseline;
+
+        let baseline = crate::model::tests::allocated_bytes();
+        crate::model::tests::reset_peak_to_current();
+        let updates: Vec<(String, Option<String>)> = ids
+            .iter()
+            .map(|id| (id.clone(), Some("Overlay (targeted)".into())))
+            .collect();
+        let new_started = Instant::now();
+        store.overlay_thread_names(&updates).unwrap();
+        let new_elapsed = new_started.elapsed();
+        let new_peak = crate::model::tests::peak_bytes() - baseline;
+
+        for id in &ids {
+            assert_eq!(
+                store.load_one(id).unwrap().session.thread_name.as_deref(),
+                Some("Overlay (targeted)")
+            );
+        }
+
+        eprintln!(
+            "overlay targeted update at {SESSIONS} archived / {CHANGED} changed \
+             ({HOT_SESSIONS} hot / {} cold):\n\
+             \x20 before (full_sessions-equivalent load_many + update_snapshot_batch): \
+             peak={old_peak} bytes, {old_elapsed:?}\n\
+             \x20 after  (overlay_thread_names, one read + one write per session):     \
+             peak={new_peak} bytes, {new_elapsed:?}\n\
+             \x20 speedup(before/after)={:.2}x, peak reduction={:.1}x",
+            SESSIONS - HOT_SESSIONS,
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64().max(0.000_001),
+            old_peak as f64 / new_peak.max(1) as f64,
+        );
+
+        assert!(
+            new_peak < old_peak / 2,
+            "expected the targeted overlay update to peak at well under half of the \
+             full-session-load shape's peak; got {new_peak} vs {old_peak} bytes"
         );
     }
 
