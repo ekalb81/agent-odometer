@@ -445,73 +445,45 @@ impl HistoryStore {
     /// transcript has already been observed; it deliberately does not create
     /// or alter source locations.
     pub fn update_snapshot(&self, session: &Session) -> Result<StoredSession> {
-        let key = session.effective_storage_id();
-        let mut archived = session.clone();
-        archived.storage_id = key.clone();
-        let now = now_ms();
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: Option<i64> = transaction
-            .query_row(
-                "SELECT 1 FROM durable_sessions WHERE session_key = ?1",
-                [key.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if exists.is_none() {
-            bail!("cannot update snapshot for unknown durable session {key}");
-        }
-        apply_project_identity(&transaction, &key, &mut archived)?;
-        let raw_snapshot = serde_json::to_vec(&archived)
-            .context("could not encode metadata-only session snapshot")?;
-        let snapshot_hash = stable_hash_bytes(&raw_snapshot);
-        // A metadata overlay may legitimately carry history that differs from
-        // the durable snapshot (its caller's in-memory copy can be ahead when
-        // an observe failed, or behind by design). Fact tables are only ever
-        // written by the observe path's monotonic flow — an overlay that
-        // advances the snapshot past the facts marks the session dirty so
-        // aggregation computes it from memory, durably, until the next
-        // successful observe realigns everything and clears the flag.
-        let history_matches_durable = {
-            let current: Option<Vec<u8>> = transaction
-                .query_row(
-                    "SELECT s.session_json FROM durable_sessions d
-                     JOIN session_snapshots s
-                       ON s.session_key = d.session_key
-                      AND s.version = d.current_snapshot_version
-                     WHERE d.session_key = ?1",
-                    [key.as_str()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match current.and_then(|raw| serde_json::from_slice::<Session>(&raw).ok()) {
-                Some(durable) => {
-                    durable.tokens_history.len() == archived.tokens_history.len()
-                        && durable.tokens_history.last().map(|point| point.timestamp)
-                            == archived.tokens_history.last().map(|point| point.timestamp)
-                        && durable.tool_observations.len() == archived.tool_observations.len()
-                        && durable.optimization_findings.len()
-                            == archived.optimization_findings.len()
-                }
-                None => false,
-            }
-        };
-        store_snapshot(
-            &transaction,
-            &key,
-            &archived,
-            &raw_snapshot,
-            &snapshot_hash,
-            now,
-            SnapshotPolicy::MetadataOverlay,
-        )?;
-        transaction.execute(
-            "UPDATE durable_sessions SET last_seen_at_ms = ?2, ledger_dirty = ?3 WHERE session_key = ?1",
-            params![key, now, !history_matches_durable],
-        )?;
+        let key = update_snapshot_in_transaction(&transaction, session)?;
         transaction.commit()?;
         drop(connection);
         self.load_one(&key)
+    }
+
+    /// Batched variant of [`Self::update_snapshot`] (issue #141): every
+    /// session in `sessions` is written inside **one** shared transaction
+    /// instead of one transaction per session — the same batching direction
+    /// [`Self::observe_bulk_batch`] took for the scan's own write path (issue
+    /// #132), applied here to the session-index overlay's metadata-only
+    /// write path, which #132 never touched.
+    ///
+    /// On any single item's error the whole transaction rolls back (nothing
+    /// in this batch is partially persisted) and the error is returned;
+    /// callers are expected to fall back to [`Self::update_snapshot`] to
+    /// retry the batch one session at a time
+    /// (`AppState::persist_session_metadata_batch` is the only caller and
+    /// does exactly this), preserving the same per-session failure isolation
+    /// the non-batched path has always had.
+    pub fn update_snapshot_batch(&self, sessions: &[Session]) -> Result<Vec<StoredSession>> {
+        if sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut keys = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            keys.push(update_snapshot_in_transaction(&transaction, session)?);
+        }
+        transaction.commit()?;
+        drop(connection);
+        let mut out = Vec::with_capacity(keys.len());
+        for key in &keys {
+            out.push(self.load_one(key)?);
+        }
+        Ok(out)
     }
 
     /// Every project-identity override row (local aliases and/or merges,
@@ -2939,6 +2911,81 @@ fn observe_one_in_transaction(
     Ok((key, displaced_key, rollups_deferred))
 }
 
+/// Core per-session write shared by [`HistoryStore::update_snapshot`] (one
+/// session, its own transaction) and [`HistoryStore::update_snapshot_batch`]
+/// (many sessions, one shared transaction) — mirrors how
+/// [`observe_one_in_transaction`] is shared between `observe`/`observe_bulk`
+/// and `observe_bulk_batch`. Returns the durable storage key so the caller
+/// can reload it with `load_one` once the surrounding transaction has
+/// committed.
+fn update_snapshot_in_transaction(
+    transaction: &Transaction<'_>,
+    session: &Session,
+) -> Result<String> {
+    let key = session.effective_storage_id();
+    let mut archived = session.clone();
+    archived.storage_id = key.clone();
+    let now = now_ms();
+    let exists: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM durable_sessions WHERE session_key = ?1",
+            [key.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        bail!("cannot update snapshot for unknown durable session {key}");
+    }
+    apply_project_identity(transaction, &key, &mut archived)?;
+    let raw_snapshot =
+        serde_json::to_vec(&archived).context("could not encode metadata-only session snapshot")?;
+    let snapshot_hash = stable_hash_bytes(&raw_snapshot);
+    // A metadata overlay may legitimately carry history that differs from
+    // the durable snapshot (its caller's in-memory copy can be ahead when
+    // an observe failed, or behind by design). Fact tables are only ever
+    // written by the observe path's monotonic flow — an overlay that
+    // advances the snapshot past the facts marks the session dirty so
+    // aggregation computes it from memory, durably, until the next
+    // successful observe realigns everything and clears the flag.
+    let history_matches_durable = {
+        let current: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT s.session_json FROM durable_sessions d
+                 JOIN session_snapshots s
+                   ON s.session_key = d.session_key
+                  AND s.version = d.current_snapshot_version
+                 WHERE d.session_key = ?1",
+                [key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match current.and_then(|raw| serde_json::from_slice::<Session>(&raw).ok()) {
+            Some(durable) => {
+                durable.tokens_history.len() == archived.tokens_history.len()
+                    && durable.tokens_history.last().map(|point| point.timestamp)
+                        == archived.tokens_history.last().map(|point| point.timestamp)
+                    && durable.tool_observations.len() == archived.tool_observations.len()
+                    && durable.optimization_findings.len() == archived.optimization_findings.len()
+            }
+            None => false,
+        }
+    };
+    store_snapshot(
+        transaction,
+        &key,
+        &archived,
+        &raw_snapshot,
+        &snapshot_hash,
+        now,
+        SnapshotPolicy::MetadataOverlay,
+    )?;
+    transaction.execute(
+        "UPDATE durable_sessions SET last_seen_at_ms = ?2, ledger_dirty = ?3 WHERE session_key = ?1",
+        params![key, now, !history_matches_durable],
+    )?;
+    Ok(key)
+}
+
 /// `history_meta` key marking whether `rollup_*` is behind the fact tables
 /// (issue #132). `history_meta` is a pre-existing generic key/value table —
 /// adding this key is not a schema change, so it does not move
@@ -4833,6 +4880,87 @@ mod tests {
             .unwrap();
         let expected = &fixture.range_totals_multi(&windows)[0];
         assert_eq!(&from_ledger[0][&key].tokens, &expected.tokens);
+    }
+
+    #[test]
+    fn update_snapshot_batch_writes_many_sessions_in_one_transaction_matching_individual_calls() {
+        // Issue #141: `update_snapshot_batch` is the actual write-count
+        // reduction for the session-index overlay's metadata-only write
+        // path — one COMMIT for the whole batch instead of one per session,
+        // mirroring what `observe_bulk_batch` already proved for the scan's
+        // own write path. Proves the batched call produces the same
+        // materialized snapshots (and the same dirty-marking outcome) as
+        // calling `update_snapshot` once per session.
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut fixtures = [
+            rich_session("overlay-batch-a"),
+            rich_session("overlay-batch-b"),
+            rich_session("overlay-batch-c"),
+        ];
+        let mut keys = Vec::with_capacity(fixtures.len());
+        for (index, fixture) in fixtures.iter().enumerate() {
+            let path = PathBuf::from(format!("overlay-batch-{index}.jsonl"));
+            keys.push(store.observe(&path, fixture, generation).unwrap().key);
+        }
+        for fixture in &mut fixtures {
+            fixture.thread_name = Some("Batched Overlay".into());
+        }
+
+        let outcomes = store.update_snapshot_batch(&fixtures).unwrap();
+        assert_eq!(outcomes.len(), fixtures.len());
+        for (outcome, key) in outcomes.iter().zip(&keys) {
+            assert_eq!(&outcome.key, key);
+            assert_eq!(
+                outcome.session.thread_name.as_deref(),
+                Some("Batched Overlay")
+            );
+        }
+        // Same history, new display name only: none of these are dirty.
+        assert!(store.dirty_session_keys().unwrap().is_empty());
+
+        for key in &keys {
+            let reloaded = store.load_one(key).unwrap();
+            assert_eq!(
+                reloaded.session.thread_name.as_deref(),
+                Some("Batched Overlay"),
+                "batched write for {key} must be durable"
+            );
+        }
+    }
+
+    #[test]
+    fn update_snapshot_batch_rolls_back_the_whole_batch_on_one_unknown_session() {
+        // Documents and locks in `update_snapshot_batch`'s failure contract,
+        // mirroring `observe_bulk_batch_rolls_back_the_whole_batch_on_one_bad_item`:
+        // one item's error must not leave the rest of the batch half-written,
+        // because the caller's fallback (`AppState::persist_session_metadata_batch`
+        // retrying the batch one session at a time via `update_snapshot`)
+        // depends on nothing from the failed attempt being durable.
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut good = rich_session("overlay-good");
+        store
+            .observe(Path::new("overlay-good.jsonl"), &good, generation)
+            .unwrap();
+        good.thread_name = Some("Should Not Persist".into());
+        // Never observed, so `update_snapshot_in_transaction` bails on its
+        // "unknown durable session" check.
+        let unknown = rich_session("overlay-unknown");
+
+        assert!(store.update_snapshot_batch(&[good, unknown]).is_err());
+
+        let reloaded = store
+            .load_one(&crate::model::storage_id_for_session(
+                &codex_provider_id(),
+                "overlay-good",
+            ))
+            .unwrap();
+        assert_ne!(
+            reloaded.session.thread_name.as_deref(),
+            Some("Should Not Persist"),
+            "a failed batch must roll back every item, including ones that individually succeeded"
+        );
     }
 
     #[test]
@@ -7066,6 +7194,175 @@ mod tests {
         eprintln!(
             "probe summary: before={before:?} deferred_only={deferred_only:?} after={after:?} \
              speedup(before/after)={:.2}x",
+            before.as_secs_f64() / after.as_secs_f64().max(0.000_001)
+        );
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn probe_session_index_overlay_batching_before_and_after() {
+        // Issue #141: `commands::spawn_scan`'s session-index thread-name
+        // overlay pass used to call `AppState::full_session` (a ledger read,
+        // `HistoryStore::load_one` under the hood) and
+        // `AppState::persist_session_metadata` (its own durable-write
+        // transaction, `HistoryStore::update_snapshot`) once per changed
+        // session — the same one-transaction-per-session anti-pattern #132
+        // fixed for the scan's own write path, but on a path #132 never
+        // touched. Issue #139 then rerouted the persist step through the
+        // on-demand full-session loaders, adding a per-session ledger *read*
+        // on top of the existing per-session write.
+        //
+        // This isolates that combined read+write cost from real file I/O by
+        // driving `HistoryStore` directly (mirroring
+        // `probe_bulk_scan_write_serialization_before_and_after`'s shape),
+        // at the scale a real field recording measured: ~4,400 archived
+        // sessions, 370 of which the session index changed. "before" is
+        // `load_one` + `update_snapshot` per changed session; "after" is one
+        // `load_many` plus one `update_snapshot_batch` for the whole pass —
+        // exactly what `AppState::full_sessions`/`persist_session_metadata_batch`
+        // do over a resident `HistoryStore` with no live-parse fallback
+        // (the common post-scan case this pass actually runs in).
+        const SESSIONS: usize = 4_400;
+        const CHANGED: usize = 370;
+        const HOT_SESSIONS: usize = 100;
+        const HOT_TOKEN_EVENTS: i64 = 150;
+        const HOT_TOOL_EVENTS: i64 = 300;
+        const COLD_TOKEN_EVENTS: i64 = 20;
+        const COLD_TOOL_EVENTS: i64 = 30;
+
+        fn synthetic_session(id: &str, token_events: i64, tool_events: i64) -> Session {
+            use crate::model::ToolKind;
+            let mut fixture = rich_session(id);
+            let base = timestamp("2026-01-01T00:00:00Z");
+            fixture.tokens_history.clear();
+            for n in 0..token_events {
+                let input = 10 + n as u64;
+                fixture.tokens_history.push(TokenHistoryPoint {
+                    timestamp: base + chrono::Duration::minutes(n),
+                    model: Some(if n % 2 == 0 { "gpt-a" } else { "gpt-b" }.into()),
+                    service_tier: None,
+                    request_input_tokens: Some(input),
+                    total_tokens: 0,
+                    delta: totals(input),
+                });
+            }
+            fixture.tool_observations.clear();
+            for n in 0..tool_events {
+                fixture.tool_observations.push(ToolObservation {
+                    call_id: format!("call-overlay-probe-{n}"),
+                    turn_id: Some("t1".into()),
+                    harness: codex_provider_id(),
+                    model: Some("gpt-a".into()),
+                    timestamp: base + chrono::Duration::minutes(n),
+                    kind: if n % 3 == 0 {
+                        ToolKind::Mutation
+                    } else {
+                        ToolKind::Read
+                    },
+                    name: "tool".into(),
+                    providers: Vec::new(),
+                    effective_tools: Vec::new(),
+                    target: Some("target".into()),
+                    resource_id: None,
+                    origin: ToolOrigin::Core,
+                    shell_family: None,
+                    language: None,
+                    outcome: ToolOutcome::Success,
+                    duration_ms: Some(40),
+                    output_bytes: 128,
+                });
+            }
+            fixture
+        }
+
+        let sessions: Vec<Session> = (0..SESSIONS)
+            .map(|index| {
+                if index < HOT_SESSIONS {
+                    synthetic_session(
+                        &format!("overlay-hot-{index}"),
+                        HOT_TOKEN_EVENTS,
+                        HOT_TOOL_EVENTS,
+                    )
+                } else {
+                    synthetic_session(
+                        &format!("overlay-cold-{index}"),
+                        COLD_TOKEN_EVENTS,
+                        COLD_TOOL_EVENTS,
+                    )
+                }
+            })
+            .collect();
+
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mode {
+            Before,
+            Batched,
+        }
+
+        let run = |label: &str, mode: Mode| -> std::time::Duration {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("history.sqlite3");
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            for chunk in sessions.chunks(crate::scanner::SCAN_WRITE_BATCH_SIZE) {
+                let paths: Vec<PathBuf> = chunk
+                    .iter()
+                    .map(|fixture| Path::new(&fixture.id).with_extension("jsonl"))
+                    .collect();
+                let items: Vec<(&Path, &Session, i64)> = paths
+                    .iter()
+                    .zip(chunk)
+                    .map(|(path, fixture)| (path.as_path(), fixture, generation))
+                    .collect();
+                store.observe_bulk_batch(&items).unwrap();
+            }
+            store.rebuild_rollups_if_stale().unwrap();
+            assert_eq!(store.stats().unwrap().sessions, SESSIONS);
+
+            // Stand-in for `session_index::apply`'s output: an arbitrary
+            // `CHANGED`-sized subset of the archived sessions.
+            let ids: Vec<String> = sessions
+                .iter()
+                .take(CHANGED)
+                .map(|fixture| fixture.effective_storage_id())
+                .collect();
+            assert_eq!(ids.len(), CHANGED);
+
+            let started = Instant::now();
+            match mode {
+                Mode::Before => {
+                    for id in &ids {
+                        let mut loaded = store.load_one(id).unwrap().session;
+                        loaded.thread_name = Some("Overlay".into());
+                        store.update_snapshot(&loaded).unwrap();
+                    }
+                }
+                Mode::Batched => {
+                    let mut loaded = store.load_many(&ids).unwrap();
+                    for stored in &mut loaded {
+                        stored.session.thread_name = Some("Overlay".into());
+                    }
+                    let patched: Vec<Session> =
+                        loaded.into_iter().map(|stored| stored.session).collect();
+                    store.update_snapshot_batch(&patched).unwrap();
+                }
+            }
+            let elapsed = started.elapsed();
+            eprintln!("{label}: {CHANGED} changed / {SESSIONS} archived in {elapsed:?}");
+            elapsed
+        };
+
+        let before = run(
+            "before (load_one + update_snapshot, one read+write transaction pair per session)",
+            Mode::Before,
+        );
+        let after = run(
+            "after (load_many + update_snapshot_batch, one read + one transaction for the whole pass)",
+            Mode::Batched,
+        );
+
+        eprintln!(
+            "probe summary: before={before:?} after={after:?} speedup(before/after)={:.2}x",
             before.as_secs_f64() / after.as_secs_f64().max(0.000_001)
         );
     }
