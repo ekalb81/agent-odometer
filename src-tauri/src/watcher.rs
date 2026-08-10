@@ -99,26 +99,21 @@ pub fn start(
                             else {
                                 continue;
                             };
-                            // Issue #139: see the matching comment in
-                            // `commands::run_instruction_scan`'s session-index
-                            // overlay pass — the resident summary already has
-                            // the updated `thread_name`, but the durable
-                            // metadata-overlay write needs full content.
-                            match state_cb.full_session(&id) {
-                                Ok(Some(mut full)) => {
-                                    full.thread_name = summary.thread_name.clone();
-                                    state_cb.persist_session_metadata(&full);
-                                }
-                                Ok(None) => {}
-                                Err(error) => {
-                                    tracing::warn!(
-                                        "could not load session {} to persist its thread-name \
-                                         overlay: {}",
-                                        id,
-                                        error
-                                    );
-                                }
-                            }
+                            // Issue #141 field regression: this used to load
+                            // the full session (`full_session`, a ledger
+                            // read of turns/token histories/tool
+                            // observations) purely to hand it back to
+                            // `persist_session_metadata` for a one-field
+                            // change. `persist_thread_name_overlay_batch`
+                            // writes `thread_name` straight from the resident
+                            // summary instead — see the matching comment on
+                            // `commands::spawn_scan`'s session-index overlay
+                            // pass and `HistoryStore::overlay_thread_names`'s
+                            // doc comment for the investigation behind that.
+                            state_cb.persist_thread_name_overlay_batch(std::slice::from_ref(&(
+                                id.clone(),
+                                summary.thread_name.clone(),
+                            )));
                             if let Err(e) = app_cb.emit("session-updated", &summary) {
                                 tracing::warn!("emit session-updated failed: {}", e);
                             }

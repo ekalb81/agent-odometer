@@ -961,7 +961,7 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn delta(n: u64) -> TokenTotals {
@@ -1250,22 +1250,29 @@ mod tests {
     // A process-wide counting allocator, active only in this test binary
     // (`#[cfg(test)]`; the production binary is a separate compiled unit
     // and never links this). Wraps `System` so behavior is identical to the
-    // default allocator; it only additionally tracks net bytes currently
-    // outstanding, so the probe below can read an exact heap-byte delta
-    // around a specific region of code instead of an OS-level working-set
-    // proxy — which the PR's own attempts at a live measurement showed is
-    // easily confounded by unrelated process activity (a concurrently
-    // running production instance, a bulk scan discovering unrelated real
-    // files, and so on).
+    // default allocator; it tracks net bytes currently outstanding *and*
+    // the high-water mark of that value, so a probe can read an exact
+    // heap-byte delta — net or peak — around a specific region of code
+    // instead of an OS-level working-set proxy, which the PR's own attempts
+    // at a live measurement showed is easily confounded by unrelated
+    // process activity (a concurrently running production instance, a bulk
+    // scan discovering unrelated real files, and so on). Peak tracking
+    // (added for the streaming-hydration follow-up) is what tells apart "a
+    // pass that never retains much" from "a pass that never *peaks* high" —
+    // #139 fixed the former without fixing the latter, and net-bytes-only
+    // tracking could not have shown that gap.
     struct CountingAllocator;
 
     static ALLOCATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     unsafe impl std::alloc::GlobalAlloc for CountingAllocator {
         unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
             let ptr = unsafe { std::alloc::System.alloc(layout) };
             if !ptr.is_null() {
-                ALLOCATED.fetch_add(layout.size(), std::sync::atomic::Ordering::SeqCst);
+                let now = ALLOCATED.fetch_add(layout.size(), std::sync::atomic::Ordering::SeqCst)
+                    + layout.size();
+                PEAK.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
             }
             ptr
         }
@@ -1281,6 +1288,30 @@ mod tests {
     #[global_allocator]
     static ALLOCATOR: CountingAllocator = CountingAllocator;
 
+    /// Current net heap bytes outstanding under [`CountingAllocator`].
+    /// `pub(crate)` so other test modules (`history_store::tests`'s
+    /// streaming-hydration probe) can use this same process-wide allocator
+    /// instead of each defining — and failing to compile alongside — their
+    /// own `#[global_allocator]` (only one is allowed per binary).
+    pub(crate) fn allocated_bytes() -> usize {
+        ALLOCATED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// High-water mark of [`allocated_bytes`] observed since process start
+    /// or the last [`reset_peak_to_current`] call, whichever is more recent.
+    pub(crate) fn peak_bytes() -> usize {
+        PEAK.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Rebases the peak tracker to the current allocation level, so a
+    /// subsequent [`peak_bytes`] read reflects only growth from this point
+    /// forward — otherwise an earlier, unrelated region's high-water mark
+    /// (or a prior test's, if allocations from two `#[test]` functions
+    /// interleave) would still be visible.
+    pub(crate) fn reset_peak_to_current() {
+        PEAK.store(allocated_bytes(), std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Builds one session shaped like real agentic-loop usage: several
     /// turns, each carrying near-the-truncation-limit `user_message`/
     /// `last_agent_message` text (`TURN_MESSAGE_LIMIT` is 500 chars in
@@ -1294,9 +1325,26 @@ mod tests {
     /// the hot/cold split those existing probes already use for a corpus
     /// with a minority of large sessions and a majority of small ones.
     fn realistic_session(id: &str, hot: bool) -> Session {
-        let turn_count = if hot { 25 } else { 6 };
-        let tokens_per_turn = if hot { 5 } else { 2 };
-        let tools_per_turn = if hot { 6 } else { 2 };
+        let (turn_count, tokens_per_turn, tools_per_turn) =
+            if hot { (25, 5, 6) } else { (6, 2, 2) };
+        realistic_session_with_shape(id, turn_count, tokens_per_turn, tools_per_turn)
+    }
+
+    /// Generalized [`realistic_session`], parameterized on shape rather than
+    /// a fixed hot/cold split, so other probes (`history_store::tests`'s
+    /// streaming-hydration and thread-name-overlay probes) can dial the
+    /// per-session turn/event volume up to field-recording scale — a real
+    /// corpus averaged ~482 KB/session (2,151,487,813 bytes / 4,463
+    /// sessions) — without duplicating this builder or perturbing
+    /// `realistic_session`'s own fixed shape, which
+    /// `probe_resident_summary_vs_full_session_heap_cost` is calibrated
+    /// against. `pub(crate)` for that cross-module reuse.
+    pub(crate) fn realistic_session_with_shape(
+        id: &str,
+        turn_count: usize,
+        tokens_per_turn: usize,
+        tools_per_turn: usize,
+    ) -> Session {
         let base: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         let user_message: String = "Please investigate why the incremental parser occasionally \
              drops the trailing partial record when a rollout file is truncated mid-write, and \

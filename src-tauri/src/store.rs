@@ -996,30 +996,25 @@ impl AppState {
     /// path — [`Self::finish_history_scan`] deliberately does not call this
     /// anymore; see its doc comment.
     ///
-    /// Deliberately does not return the loaded sessions (issue #139): the
-    /// only caller, [`Self::set_history_ready`], always discarded them, so
-    /// collecting them into a `Vec<Session>` was a second, transient
-    /// full-corpus duplicate held in memory for the whole hydration pass, on
-    /// top of [`HistoryStore::load_sessions_with_stats`]'s own
-    /// `Vec<StoredSession>` and whatever `self.sessions` now retains for
-    /// each session as it is visited. `Self::apply_loaded_session` still
-    /// returns the loaded `Session` for [`Self::finish_history_scan`], whose
-    /// affected-key set is small enough that collecting it costs nothing
-    /// comparable.
+    /// Streams via [`HistoryStore::stream_sessions`] rather than collecting
+    /// a `Vec<StoredSession>` first (field regression on #139: what stayed
+    /// *resident* after hydration shrank, but what got *allocated* during it
+    /// did not — the old `Vec<StoredSession>` still peaked at the whole
+    /// corpus's full content, deserialized, live at once, before this loop
+    /// could drop any of it one at a time). Each `StoredSession` is applied
+    /// and dropped before the next one is even read off the connection, so
+    /// peak allocation here is O(one session) rather than O(corpus); this is
+    /// still a streaming change, not a semantic one — `state.sessions` and
+    /// `ledger_stale` end up populated exactly as before.
     pub fn hydrate_history(&self) -> crate::history_store::HydrationStats {
         let Some(history) = self.history_ready() else {
             return crate::history_store::HydrationStats::default();
         };
-        let (stored, stats) = match history.load_sessions_with_stats() {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::warn!("could not load durable session history: {}", error);
-                return crate::history_store::HydrationStats::default();
-            }
-        };
         // Dirty markings survive restarts in the store itself; rebuild the
         // in-process stale set so ledger-backed aggregation keeps routing
-        // these sessions through in-memory history.
+        // these sessions through in-memory history. Populated before the
+        // session stream below, same relative order as when this collected
+        // a `Vec` first and applied it afterward.
         match history.dirty_session_keys() {
             Ok(keys) => {
                 for key in keys {
@@ -1030,14 +1025,28 @@ impl AppState {
                 tracing::warn!("could not load ledger-dirty markings: {}", error);
             }
         }
-        for stored in stored {
+        match history.stream_sessions(|stored| {
             self.apply_loaded_session(stored);
+        }) {
+            Ok(stats) => stats,
+            Err(error) => {
+                tracing::warn!("could not load durable session history: {}", error);
+                crate::history_store::HydrationStats::default()
+            }
         }
-        stats
     }
 
-    /// Persists a metadata-only in-memory overlay (for example a thread name
-    /// from the Codex session index) without changing source ownership.
+    /// Persists a metadata-only in-memory overlay (a caller-supplied full
+    /// `Session`) without changing source ownership. General-purpose: unlike
+    /// [`Self::persist_thread_name_overlay_batch`], this accepts arbitrary
+    /// caller-side content and so still needs [`HistoryStore::update_snapshot`]'s
+    /// divergence detection against the ledger's own facts. The session-index
+    /// thread-name overlay — this method's original and, as of the field
+    /// regression on issues #139/#141, only in-tree caller — has moved to
+    /// `persist_thread_name_overlay_batch` instead, since it only ever
+    /// changes one field and never needs full session content at all. Kept
+    /// as the general primitive for a future overlay that does need to
+    /// write arbitrary caller-supplied content.
     pub fn persist_session_metadata(&self, session: &Session) {
         let Some(history) = self.history_ready() else {
             return;
@@ -1059,7 +1068,9 @@ impl AppState {
     /// back to writing each session individually via
     /// [`Self::persist_session_metadata`], preserving today's per-session
     /// failure isolation rather than silently dropping the rest of the
-    /// batch's metadata updates.
+    /// batch's metadata updates. See `persist_session_metadata`'s doc
+    /// comment: also general-purpose, also with no in-tree caller as of the
+    /// #139/#141 field regression's fix, for the same reason.
     pub fn persist_session_metadata_batch(&self, sessions: &[Session]) {
         if sessions.is_empty() {
             return;
@@ -1076,6 +1087,43 @@ impl AppState {
             );
             for session in sessions {
                 self.persist_session_metadata(session);
+            }
+        }
+    }
+
+    /// Targeted metadata-only durable write for the session-index overlay
+    /// (issue #141 field regression): `updates` is `(storage key, new
+    /// thread_name)` pairs read straight off the just-patched
+    /// `ResidentSession` summaries. Unlike [`Self::persist_session_metadata_batch`],
+    /// this never needs this pass's full session content — no
+    /// `AppState::full_sessions` ledger read of turns/token histories/tool
+    /// observations happens on this path at all; see
+    /// [`crate::history_store::HistoryStore::overlay_thread_names`]'s doc
+    /// comment for the investigation behind that. Falls back to one-at-a-
+    /// time retries on a whole-batch failure, mirroring
+    /// `persist_session_metadata_batch`.
+    pub fn persist_thread_name_overlay_batch(&self, updates: &[(String, Option<String>)]) {
+        if updates.is_empty() {
+            return;
+        }
+        let Some(history) = self.history_ready() else {
+            return;
+        };
+        if let Err(error) = history.overlay_thread_names(updates) {
+            tracing::warn!(
+                "could not persist thread-name overlay batch of {} session(s) as one \
+                 transaction, retrying one at a time: {}",
+                updates.len(),
+                error
+            );
+            for update in updates {
+                if let Err(error) = history.overlay_thread_names(std::slice::from_ref(update)) {
+                    tracing::warn!(
+                        "could not persist thread-name overlay for {}: {}",
+                        update.0,
+                        error
+                    );
+                }
             }
         }
     }
