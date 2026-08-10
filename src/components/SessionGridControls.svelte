@@ -1,5 +1,15 @@
 <script lang="ts">
   import { SESSION_GRID_COLUMNS, sessionGridStore } from '../lib/stores/sessionGrid.svelte';
+  import { sessionDetailPaneStore } from '../lib/stores/sessionDetailPane.svelte';
+
+  interface Props {
+    /** Whether the wide-layout persistent detail pane applies. Narrow
+     *  layouts fall back to an overlay drawer that isn't collapsible, so the
+     *  toggle has nothing to control there and stays hidden. */
+    isWide?: boolean;
+  }
+
+  let { isWide = false }: Props = $props();
 
   const controlColumns = $derived([
     ...sessionGridStore.columns,
@@ -63,4 +73,16 @@
       <p class="pt-1 text-[10px] text-ink-faint">Directories inside a git repository show the repository name and the path within it. Everything else shows a shortened path, with your home folder as <code>~</code>.</p>
     </div>
   </details>
+  {#if isWide}
+    <button
+      type="button"
+      class="ml-auto flex items-center gap-1.5 rounded-md border border-edge bg-card px-2 py-1 text-ink-muted hover:text-ink focus:outline-hidden focus:ring-1 focus:ring-accent"
+      aria-expanded={sessionDetailPaneStore.open}
+      aria-controls="session-detail-pane"
+      onclick={() => sessionDetailPaneStore.toggle()}
+    >
+      <span aria-hidden="true">{sessionDetailPaneStore.open ? '◂' : '▸'}</span>
+      {sessionDetailPaneStore.open ? 'Hide details' : 'Show details'}
+    </button>
+  {/if}
 </div>

@@ -14,6 +14,7 @@ export const COVERAGE_SLICE = [
   'src/lib/sessionExport.ts',
   'src/lib/sessionGrid.ts',
   'src/lib/stores/defender.svelte.ts',
+  'src/lib/stores/sessionDetailPane.svelte.ts',
   'src/lib/stores/sessionGrid.svelte.ts',
   'src/lib/trayTotals.ts',
 ];

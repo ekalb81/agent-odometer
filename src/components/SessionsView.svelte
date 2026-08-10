@@ -2,6 +2,7 @@
   import { onDestroy, onMount, untrack } from 'svelte';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
+  import { sessionDetailPaneStore } from '../lib/stores/sessionDetailPane.svelte';
   import { projectStore } from '../lib/stores/projects.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
@@ -1572,6 +1573,11 @@
 
   function selectSession(id: string) {
     selectedSessionId = id;
+    // Selecting a session is the obvious moment to reveal the wide-layout
+    // pane: left closed, a click on a row would otherwise do nothing
+    // visible. Narrow layouts ignore this (their drawer keys off selection
+    // directly), so setting it unconditionally here is harmless there too.
+    sessionDetailPaneStore.setOpen(true);
   }
 
   function reviewFindingSession(id: string) {
@@ -1876,11 +1882,11 @@
     </div>
   </details>
 
-  <SessionGridControls />
+  <SessionGridControls {isWide} />
 
   <!-- Main split: table + detail pane -->
   <div class="flex-1 flex min-h-48 border-t border-edge" data-testid="session-grid-region">
-    <div class="flex-1 min-w-0 flex flex-col bg-tablebg {isWide ? 'border-r border-edge' : ''}">
+    <div class="flex-1 min-w-0 flex flex-col bg-tablebg {isWide && sessionDetailPaneStore.open ? 'border-r border-edge' : ''}">
       {#if allSessions.length === 0}
         <div class="flex flex-col items-center justify-center h-full gap-3 text-ink-faint px-6 text-center">
           {#if !scanStore.status.complete}
@@ -2051,14 +2057,27 @@
       {/if}
     </div>
 
-    <!-- Persistent detail pane (wide layouts) -->
+    <!-- Persistent detail pane (wide layouts). Collapsible, closed by default:
+         width itself animates (rather than e.g. a translateX slide) so the
+         table actually reclaims the 410px when the pane is shut. The inner
+         410px-wide layer stays a constant size and is only clipped by the
+         outer `overflow-hidden`, so DetailPane's own contents never reflow
+         during the transition — the table beside it is virtualized and
+         height-only, so this stays smooth even with a large session list. -->
     {#if isWide}
-      <div class="w-[410px] shrink-0 min-h-0">
-        <DetailPane
-          session={selectedSession}
-          childCount={selectedSessionId ? (childCounts.get(selectedSessionId) ?? 0) : 0}
-          onclose={deselect}
-        />
+      <div
+        id="session-detail-pane"
+        class="shrink-0 min-h-0 overflow-hidden transition-[width] duration-200 ease-out motion-reduce:transition-none"
+        style:width={sessionDetailPaneStore.open ? '410px' : '0px'}
+        inert={!sessionDetailPaneStore.open}
+      >
+        <div class="w-[410px] h-full">
+          <DetailPane
+            session={selectedSession}
+            childCount={selectedSessionId ? (childCounts.get(selectedSessionId) ?? 0) : 0}
+            onclose={() => sessionDetailPaneStore.setOpen(false)}
+          />
+        </div>
       </div>
     {/if}
   </div>
