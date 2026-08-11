@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agent-odometer"
-version = "0.8.14"
+version = "0.8.15"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
