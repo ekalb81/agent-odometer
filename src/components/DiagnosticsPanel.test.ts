@@ -1,15 +1,69 @@
 import { render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { DiagnosticsReport, ProviderDiagnostic } from '../lib/types';
+import type { Config, DiagnosticsReport, PerformanceLiveStatus, ProviderDiagnostic } from '../lib/types';
 import DiagnosticsPanel from './DiagnosticsPanel.svelte';
 
-const { getProviderDiagnostics, writeExport } = vi.hoisted(() => ({
+const { getProviderDiagnostics, writeExport, getConfig, setConfig, getPerformanceLiveStatus } = vi.hoisted(() => ({
   getProviderDiagnostics: vi.fn(),
   writeExport: vi.fn(),
+  getConfig: vi.fn(),
+  setConfig: vi.fn(),
+  getPerformanceLiveStatus: vi.fn(),
 }));
 
-vi.mock('../lib/ipc', () => ({ getProviderDiagnostics, writeExport }));
+vi.mock('../lib/ipc', () => ({
+  getProviderDiagnostics,
+  writeExport,
+  getConfig,
+  setConfig,
+  getPerformanceLiveStatus,
+}));
+
+function config(overrides: Partial<Config> = {}): Config {
+  return {
+    config_version: 1,
+    providers: {},
+    session_roots: [],
+    archive_roots: [],
+    session_index_path: '',
+    claude_session_roots: [],
+    defender_exclusion_receipt: null,
+    performance_tracking_enabled: false,
+    performance_log_max_mb: 64,
+    memory_heap_tracking_enabled: false,
+    instructions_enabled: false,
+    instructions_tab_visible: true,
+    instruction_roots: [],
+    turn_receipts_enabled: false,
+    turn_receipts_codex: true,
+    turn_receipts_claude: true,
+    ...overrides,
+  };
+}
+
+function liveStatus(overrides: Partial<PerformanceLiveStatus> = {}): PerformanceLiveStatus {
+  return {
+    enabled: true,
+    process: { rss_bytes: 104_857_600, peak_rss_bytes: 209_715_200, private_bytes: 52_428_800 },
+    heap: { current_bytes: 10_485_760, peak_bytes: 20_971_520 },
+    active_phase: 'bulk_scan_parallel',
+    active_phase_elapsed_ms: 4_200,
+    progress_done: 40,
+    progress_total: 100,
+    recent_samples: [
+      { phase: 'bulk_scan_parallel', sample_index: 0, elapsed_ms: 0, rss_bytes: 100_000_000, peak_rss_bytes: 100_000_000, private_bytes: null, heap_bytes: null, heap_peak_bytes: null, progress_done: 0, progress_total: 100, capped: false },
+      { phase: 'bulk_scan_parallel', sample_index: 1, elapsed_ms: 500, rss_bytes: 104_857_600, peak_rss_bytes: 104_857_600, private_bytes: null, heap_bytes: null, heap_peak_bytes: null, progress_done: 40, progress_total: 100, capped: false },
+    ],
+    database_footprints: [
+      { connection: 'history_store', db_bytes: 3_435_134_976, wal_bytes: null, volume_free_bytes: 73_859_072_000, volume_total_bytes: 976_762_888_192 },
+    ],
+    recent_operations: [
+      { operation: 'startup.bulk_scan', duration_ms: 118_400, success: true, timestamp: '2026-08-03T00:00:01Z' },
+    ],
+    ...overrides,
+  };
+}
 
 function provider(overrides: Partial<ProviderDiagnostic> = {}): ProviderDiagnostic {
   return {
@@ -55,6 +109,9 @@ function stubClipboard(writeText: ReturnType<typeof vi.fn>) {
 beforeEach(() => {
   getProviderDiagnostics.mockReset();
   writeExport.mockReset();
+  getConfig.mockReset().mockResolvedValue(config());
+  setConfig.mockReset().mockResolvedValue(undefined);
+  getPerformanceLiveStatus.mockReset().mockResolvedValue(liveStatus());
   stubClipboard(vi.fn().mockResolvedValue(undefined));
 });
 
@@ -175,5 +232,59 @@ describe('DiagnosticsPanel', () => {
     writeExport.mockRejectedValueOnce(new Error('dialog cancelled'));
     await user.click(screen.getByRole('button', { name: 'Export JSON…' }));
     expect(await screen.findByText(/dialog cancelled/)).toBeInTheDocument();
+  });
+
+  describe('live performance telemetry', () => {
+    it('says tracking is off and offers a toggle, without rendering zeros or a chart', async () => {
+      getConfig.mockResolvedValue(config({ performance_tracking_enabled: false }));
+      render(DiagnosticsPanel);
+
+      expect(await screen.findByText(/Performance tracking is off/)).toBeInTheDocument();
+      // Honest about being off (issue #163): no live values, no sparkline,
+      // and the poll must never have been reached.
+      expect(screen.queryByText('Show live view')).not.toBeInTheDocument();
+      expect(getPerformanceLiveStatus).not.toHaveBeenCalled();
+
+      const user = userEvent.setup();
+      await user.click(screen.getByRole('button', { name: 'Enable performance tracking' }));
+
+      expect(setConfig).toHaveBeenCalledWith(expect.objectContaining({ performance_tracking_enabled: true }));
+      expect(await screen.findByText('Show live view')).toBeInTheDocument();
+    });
+
+    it('does not poll live status while the disclosure is closed', async () => {
+      getConfig.mockResolvedValue(config({ performance_tracking_enabled: true }));
+      render(DiagnosticsPanel);
+
+      await screen.findByText('Show live view');
+      expect(getPerformanceLiveStatus).not.toHaveBeenCalled();
+    });
+
+    it('shows current memory, active phase, database footprints, and recent timings once opened', async () => {
+      getConfig.mockResolvedValue(config({ performance_tracking_enabled: true }));
+      getPerformanceLiveStatus.mockResolvedValue(liveStatus());
+      const user = userEvent.setup();
+      render(DiagnosticsPanel);
+
+      await user.click(await screen.findByText('Show live view'));
+
+      expect(await screen.findByText(/RSS: 100\.0 MB/)).toBeInTheDocument();
+      const activePhase = await screen.findByTestId('active-phase');
+      expect(activePhase).toHaveTextContent('bulk_scan_parallel');
+      expect(activePhase).toHaveTextContent('40 / 100 processed');
+      expect(screen.getByText(/history_store: 3.2 GB/)).toBeInTheDocument();
+      await user.click(screen.getByText('Recent phase timings'));
+      expect(screen.getByText(/startup.bulk_scan: 118400ms/)).toBeInTheDocument();
+    });
+
+    it('surfaces a live-status fetch error', async () => {
+      getConfig.mockResolvedValue(config({ performance_tracking_enabled: true }));
+      getPerformanceLiveStatus.mockRejectedValue(new Error('backend unavailable'));
+      const user = userEvent.setup();
+      render(DiagnosticsPanel);
+
+      await user.click(await screen.findByText('Show live view'));
+      expect(await screen.findByText(/backend unavailable/)).toBeInTheDocument();
+    });
   });
 });
