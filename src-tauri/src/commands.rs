@@ -1276,6 +1276,12 @@ pub fn spawn_scan(
         {
             crate::memory::record_sqlite_pragmas(&state.performance, "scan_cache", pragmas);
         }
+        if let Some(footprint) = cache
+            .as_ref()
+            .and_then(scan_cache::ScanCache::database_footprint)
+        {
+            crate::memory::record_database_footprint(&state.performance, "scan_cache", footprint);
+        }
 
         crate::memory::record_phase_sample(&state.performance, "bulk_scan_parallel", "before");
         let report = crate::scanner::scan_all(
@@ -1670,6 +1676,11 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
                     &state.performance,
                     "history_store",
                     store.pragma_snapshot(),
+                );
+                crate::memory::record_database_footprint(
+                    &state.performance,
+                    "history_store",
+                    store.database_footprint(),
                 );
                 state.set_history_ready(Some(Arc::new(store)))
             }

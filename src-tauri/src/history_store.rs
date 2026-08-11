@@ -200,6 +200,15 @@ impl HistoryStore {
         self.pragmas
     }
 
+    /// On-disk size of this database and the headroom of the volume holding
+    /// it (issue #158). Sampled live rather than cached at open, because the
+    /// interesting quantity is how it grows: a `stat` and a free-space query,
+    /// never a database read, so this is safe to call at any point including
+    /// while the writer mutex is held.
+    pub fn database_footprint(&self) -> crate::memory::DatabaseFootprint {
+        crate::memory::sample_database_footprint(&self.path)
+    }
+
     /// Starts a generation used only to determine whether a *location* was
     /// seen. Finishing a scan can mark paths missing but never purges history.
     pub fn begin_scan(&self) -> Result<i64> {

@@ -277,6 +277,145 @@ pub fn record_sqlite_pragmas(
     performance.record_backend_duration_ms("memory.sqlite_pragmas", 0.0, true, metadata);
 }
 
+/// On-disk size of one SQLite database plus the headroom of the volume
+/// holding it (issue #158). Fields are `None` where the query is unavailable
+/// or fails — never a fabricated zero.
+///
+/// This exists because startup time tracks neither code nor data volume. The
+/// v0.8.10–v0.8.13 recordings show `cache_lookup_sql_ms` moving between
+/// 12,003 ms and 134,276 ms for a constant ~2.14 GB of cache hits, while
+/// `cache_lookup_deserialize_ms` stays flat near 8,000 ms — CPU work per byte
+/// unchanged, time to fetch the bytes an order of magnitude apart. The 8.9x
+/// step landed on v0.8.12, a release that added only this module and two
+/// `PRAGMA` reads, so no code change explains it. The standing hypothesis is
+/// a large incrementally-grown database on a filling volume, which nothing
+/// recorded today can confirm or refute. These two numbers are what turns
+/// that inference into a measurement.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DatabaseFootprint {
+    /// The database file itself.
+    pub db_bytes: Option<u64>,
+    /// Its `-wal` sidecar, if present. Absent (rather than zero) when the
+    /// database is not in WAL mode or the file does not exist yet.
+    pub wal_bytes: Option<u64>,
+    /// Free and total bytes on the volume holding the database. A nearly-full
+    /// volume is the condition under which large-file reads degrade, so the
+    /// pair is only meaningful together.
+    pub volume_free_bytes: Option<u64>,
+    pub volume_total_bytes: Option<u64>,
+}
+
+/// Samples [`DatabaseFootprint`] for the database at `path`. Pure `stat` and
+/// a free-space query — it never opens the database, so it is safe to call
+/// while the connection is in use and costs nothing measurable.
+pub fn sample_database_footprint(path: &std::path::Path) -> DatabaseFootprint {
+    let file_len = |p: std::path::PathBuf| std::fs::metadata(p).ok().map(|m| m.len());
+    let (volume_free_bytes, volume_total_bytes) =
+        path.parent().map(volume_space).unwrap_or((None, None));
+    // SQLite's sidecar is the database's full filename plus `-wal`, not a
+    // replaced extension — `with_extension` would turn `history-v1.sqlite3`
+    // into the right thing by luck and a dotless filename into the wrong one.
+    let mut wal_name = path.as_os_str().to_os_string();
+    wal_name.push("-wal");
+    DatabaseFootprint {
+        db_bytes: file_len(path.to_path_buf()),
+        wal_bytes: file_len(wal_name.into()),
+        volume_free_bytes,
+        volume_total_bytes,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn volume_space(dir: &std::path::Path) -> (Option<u64>, Option<u64>) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free: u64 = 0;
+    let mut total: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::addr_of_mut!(total),
+            std::ptr::addr_of_mut!(free),
+        )
+    };
+    if ok == 0 {
+        return (None, None);
+    }
+    (Some(free), Some(total))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn volume_space(dir: &std::path::Path) -> (Option<u64>, Option<u64>) {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return (None, None);
+    };
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
+        return (None, None);
+    }
+    let block = stat.f_frsize as u64;
+    (
+        Some(block * stat.f_bavail as u64),
+        Some(block * stat.f_blocks as u64),
+    )
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+fn volume_space(_dir: &std::path::Path) -> (Option<u64>, Option<u64>) {
+    (None, None)
+}
+
+/// Records one `memory.database_footprint` event per connection open. Like
+/// [`record_sqlite_pragmas`], `connection_label` names which of the app's two
+/// databases this is (`"history_store"` or `"scan_cache"`) and **never a
+/// path** — sizes and volume headroom are not identifying, a filesystem
+/// location is.
+pub fn record_database_footprint(
+    performance: &PerformanceRecorder,
+    connection_label: &str,
+    footprint: DatabaseFootprint,
+) {
+    if !performance.is_enabled() {
+        return;
+    }
+    performance.record_backend_duration_ms(
+        "memory.database_footprint",
+        0.0,
+        true,
+        database_footprint_metadata(connection_label, footprint),
+    );
+}
+
+fn database_footprint_metadata(
+    connection_label: &str,
+    footprint: DatabaseFootprint,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert("connection".to_string(), connection_label.to_string());
+    insert_optional_bytes(&mut metadata, "db_bytes", footprint.db_bytes);
+    insert_optional_bytes(&mut metadata, "wal_bytes", footprint.wal_bytes);
+    insert_optional_bytes(
+        &mut metadata,
+        "volume_free_bytes",
+        footprint.volume_free_bytes,
+    );
+    insert_optional_bytes(
+        &mut metadata,
+        "volume_total_bytes",
+        footprint.volume_total_bytes,
+    );
+    metadata
+}
+
 /// Records one memory sample as a `memory.<phase>` performance event —
 /// its own operation family, distinct from and additive to the existing
 /// `startup.*` timing metrics (never changes their name, meaning, or
@@ -342,6 +481,45 @@ mod tests {
     // filtered to a single test name).
 
     #[test]
+    fn database_footprint_reports_sizes_and_volume_headroom() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history-v1.sqlite3");
+        std::fs::write(&db, vec![0u8; 4096]).unwrap();
+        // SQLite's sidecar is the full filename plus `-wal`, not a replaced
+        // extension; a `with_extension`-based sampler would miss it here.
+        std::fs::write(dir.path().join("history-v1.sqlite3-wal"), vec![0u8; 1024]).unwrap();
+
+        let footprint = sample_database_footprint(&db);
+
+        assert_eq!(footprint.db_bytes, Some(4096));
+        assert_eq!(footprint.wal_bytes, Some(1024));
+        // Every platform this app ships on can answer these; a `None` here
+        // means the free-space query regressed, which is the whole point of
+        // the field measurement this feeds (issue #158).
+        let free = footprint.volume_free_bytes.expect("volume free bytes");
+        let total = footprint.volume_total_bytes.expect("volume total bytes");
+        assert!(total > 0, "volume total should be positive");
+        assert!(
+            free <= total,
+            "free ({free}) must not exceed total ({total})"
+        );
+    }
+
+    #[test]
+    fn database_footprint_reports_unavailable_rather_than_zero_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // A ledger that does not exist yet must not report 0 bytes — a
+        // fabricated zero would read as "empty database" in a recording
+        // rather than "not there", exactly the confusion the Option-per-field
+        // shape exists to prevent.
+        let footprint = sample_database_footprint(&dir.path().join("missing.sqlite3"));
+
+        assert_eq!(footprint.db_bytes, None);
+        assert_eq!(footprint.wal_bytes, None);
+        assert!(footprint.volume_total_bytes.is_some());
+    }
+
+    #[test]
     fn heap_tracking_is_disabled_by_default() {
         assert!(!heap_tracking_enabled());
         let sample = heap_sample();
@@ -387,6 +565,42 @@ mod tests {
             },
         );
         assert_eq!(recorder.status().recorded_this_run, 0);
+    }
+
+    #[test]
+    fn record_database_footprint_is_a_no_op_when_performance_tracking_is_disabled() {
+        let recorder = PerformanceRecorder::default();
+        record_database_footprint(&recorder, "history_store", DatabaseFootprint::default());
+        assert_eq!(recorder.status().recorded_this_run, 0);
+    }
+
+    #[test]
+    fn database_footprint_metadata_encodes_bytes_and_distinguishes_unavailable() {
+        // Exercised as a pure function rather than through an enabled
+        // `PerformanceRecorder`: enabling one writes to the user's real
+        // performance log directory, which no test in this crate does.
+        let metadata = database_footprint_metadata(
+            "history_store",
+            DatabaseFootprint {
+                db_bytes: Some(3_435_134_976),
+                wal_bytes: None,
+                volume_free_bytes: Some(73_859_072_000),
+                volume_total_bytes: Some(976_762_888_192),
+            },
+        );
+
+        assert_eq!(metadata["connection"], "history_store");
+        assert_eq!(metadata["db_bytes"], "3435134976");
+        // Absent, not zero — a `0` here would read as "empty database".
+        assert_eq!(metadata["wal_bytes"], "unavailable");
+        assert_eq!(metadata["volume_free_bytes"], "73859072000");
+        assert_eq!(metadata["volume_total_bytes"], "976762888192");
+        // `sanitize_metadata` keeps only the first 16 keys and drops any whose
+        // name is not a valid operation token, so both are worth pinning.
+        assert!(metadata.len() <= 16);
+        assert!(metadata.keys().all(|key| key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))));
     }
 
     /// Direct evidence for this PR's "what would the pragma values show"
