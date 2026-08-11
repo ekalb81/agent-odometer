@@ -2317,7 +2317,7 @@ mod tests {
         defender_verification_script, newest_subscription_usage_by_harness,
         powershell_encoded_command, powershell_encoded_path, preserve_backend_owned_config,
         range_has_data, resolve_projects_from, shorten_display_path, valid_session_id,
-        working_directory_info, write_export_file,
+        working_directory_info, write_export_file, PerformanceLiveStatus,
     };
     use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
     use crate::model::{
@@ -2838,6 +2838,33 @@ mod tests {
         assert_eq!(standalone.session_count, 1);
         let remaining = projects.iter().find(|p| p.project_key == "repo:a").unwrap();
         assert_eq!(remaining.session_count, 1);
+    }
+
+    /// `PerformanceLiveStatus` wraps `MemoryLiveStatus` behind
+    /// `#[serde(flatten)]` (issue #163) so the frontend sees one flat object
+    /// rather than a nested `memory` key; `src/lib/types.ts`'s
+    /// `PerformanceLiveStatus` interface is written against that flattened
+    /// shape, so this pins the wire contract the frontend mock in
+    /// `DiagnosticsPanel.test.ts` cannot itself catch a drift in.
+    #[test]
+    fn performance_live_status_flattens_memory_fields_to_the_top_level() {
+        let status = PerformanceLiveStatus {
+            memory: crate::memory::MemoryLiveStatus {
+                enabled: true,
+                active_phase: Some("bulk_scan_parallel".to_string()),
+                ..Default::default()
+            },
+            recent_operations: Vec::new(),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        let object = json.as_object().unwrap();
+        assert!(
+            !object.contains_key("memory"),
+            "flatten must not leave a nested \"memory\" key: {object:?}"
+        );
+        assert_eq!(object["enabled"], true);
+        assert_eq!(object["active_phase"], "bulk_scan_parallel");
+        assert!(object.contains_key("recent_operations"));
     }
 }
 
