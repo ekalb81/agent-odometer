@@ -309,6 +309,21 @@ pub struct DatabaseFootprint {
     pub volume_total_bytes: Option<u64>,
 }
 
+impl DatabaseFootprint {
+    /// The actual bytes a rebuild leaves on disk (issue #167): `db_bytes`
+    /// alone under-reports whenever the WAL is non-trivial, which is exactly
+    /// the failure mode the issue describes — a report that only counts the
+    /// main file called a rebuild successful while the WAL sidecar had
+    /// quietly made total disk usage go *up*. `None` when `db_bytes` itself
+    /// is unknown (the stat failed) rather than fabricating a partial total;
+    /// a missing `wal_bytes` is treated as 0, since "no `-wal` file" is
+    /// itself a legitimate, meaningful state (non-WAL mode, or already fully
+    /// checkpointed away) and not a measurement failure.
+    pub fn total_bytes(&self) -> Option<u64> {
+        self.db_bytes.map(|db| db + self.wal_bytes.unwrap_or(0))
+    }
+}
+
 /// Samples [`DatabaseFootprint`] for the database at `path`. Pure `stat` and
 /// a free-space query — it never opens the database, so it is safe to call
 /// while the connection is in use and costs nothing measurable.

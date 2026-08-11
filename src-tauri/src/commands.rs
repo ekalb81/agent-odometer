@@ -1978,7 +1978,7 @@ pub fn spawn_history_rebuild(app: AppHandle, state: Arc<AppState>) {
                     state.set_history_rebuild_status(vacuuming.clone());
                     let _ = app.emit("history-rebuild-progress", &vacuuming);
                     match history.vacuum() {
-                        Ok(()) => (history.database_footprint().db_bytes, None),
+                        Ok(()) => (history.database_footprint().total_bytes(), None),
                         Err(error) => (None, Some(error.to_string())),
                     }
                 };
@@ -2002,7 +2002,7 @@ pub fn spawn_history_rebuild(app: AppHandle, state: Arc<AppState>) {
                     rate_limit_points_after: Some(result.after.rate_limit_points),
                     session_json_bytes_before: Some(result.before.session_json_bytes),
                     session_json_bytes_after: Some(result.after.session_json_bytes),
-                    file_size_before: footprint_before.db_bytes,
+                    file_size_before: footprint_before.total_bytes(),
                     file_size_after,
                 }
             }
@@ -2010,7 +2010,7 @@ pub fn spawn_history_rebuild(app: AppHandle, state: Arc<AppState>) {
                 phase: HistoryRebuildPhase::Failed,
                 elapsed_ms: Some(started.elapsed().as_millis() as u64),
                 error: Some(error.to_string()),
-                file_size_before: footprint_before.db_bytes,
+                file_size_before: footprint_before.total_bytes(),
                 ..Default::default()
             },
         };

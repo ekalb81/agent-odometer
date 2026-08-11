@@ -80,8 +80,9 @@ pub enum HistoryRebuildPhase {
     #[default]
     Idle,
     Running,
-    /// Re-parsing finished; `VACUUM` is in progress. SQLite reports no
-    /// per-page progress for `VACUUM`, so this phase has no `done`/`total`
+    /// Re-parsing finished; `VACUUM` and its post-checkpoint (issue #167;
+    /// see `HistoryStore::vacuum`) are in progress. SQLite reports no
+    /// per-page progress for either, so this phase has no `done`/`total`
     /// of its own — it exists so a multi-minute silent tail on a
     /// multi-gigabyte file still reads as "working", not "hung".
     Vacuuming,
@@ -112,6 +113,11 @@ pub struct HistoryRebuildSnapshot {
     pub rate_limit_points_after: Option<usize>,
     pub session_json_bytes_before: Option<u64>,
     pub session_json_bytes_after: Option<u64>,
+    /// Total on-disk footprint — main database file **plus** its `-wal`
+    /// sidecar (issue #167), from `DatabaseFootprint::total_bytes`. Reporting
+    /// only the main file let a rebuild that grew the WAL from 156 MB to
+    /// 2.47 GB claim success while the machine was 1.4 GB worse off; this is
+    /// the number that would have shown that honestly.
     pub file_size_before: Option<u64>,
     pub file_size_after: Option<u64>,
 }

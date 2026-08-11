@@ -76,10 +76,11 @@ export function getHistoryStatus(): Promise<HistoryStatus> {
 }
 
 /** Issue #162: starts the history rebuild (re-parse every archived session
- *  from its transcript, then VACUUM) on a background thread. Rejects if one
- *  is already running. Progress arrives via getHistoryRebuildStatus /
- *  onHistoryRebuildProgress, not this call's return value — call the
- *  frontend's own confirmation before this, not after. */
+ *  from its transcript, then VACUUM and checkpoint the WAL back down —
+ *  issue #167) on a background thread. Rejects if one is already running.
+ *  Progress arrives via getHistoryRebuildStatus / onHistoryRebuildProgress,
+ *  not this call's return value — call the frontend's own confirmation
+ *  before this, not after. */
 export function rebuildHistory(): Promise<void> {
   return invoke<void>('rebuild_history');
 }

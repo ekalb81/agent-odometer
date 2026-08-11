@@ -31,6 +31,19 @@ const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// migration's SQL use identically so the two never disagree on bucketing.
 const HOUR_MS: i64 = 3_600_000;
 
+/// Caps how large the WAL is left *after* any checkpoint completes —
+/// ordinary auto-checkpoints, not just [`HistoryStore::vacuum`]'s explicit
+/// one (issue #167). SQLite's default (`-1`, "never shrink") means a WAL
+/// that grows once, for any reason, stays at that peak file size
+/// indefinitely: `journal_size_limit` only truncates the file the next time
+/// a checkpoint completes, it does not cap growth *during* one large
+/// transaction, so it is a general backstop, not a substitute for
+/// `vacuum()`'s own checkpoint. 64 MiB is comfortably above the ~4 MB
+/// default auto-checkpoint threshold (1,000 pages), so ordinary write
+/// bursts do not thrash truncation, while keeping worst-case idle WAL size
+/// two orders of magnitude below the multi-GB growth issue #167 reports.
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// One path at which an archived transcript has been observed. Paths are
 /// availability observations, not logical-session identities.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,7 +220,10 @@ impl HistoryStore {
         let mut connection = Connection::open(path)
             .with_context(|| format!("could not open history store {}", path.display()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+        connection.execute_batch(&format!(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; \
+             PRAGMA journal_size_limit = {WAL_JOURNAL_SIZE_LIMIT_BYTES};"
+        ))?;
         let pragmas = crate::memory::query_sqlite_pragmas(&connection);
         migrate(&mut connection, &mut on_progress)?;
         // Crash-safety net for issue #132's deferred-rollup bulk scan: a
@@ -675,9 +691,18 @@ impl HistoryStore {
     /// stays exactly as large until a `VACUUM` rewrites it. Must run outside
     /// any transaction; briefly holds the writer connection exclusively,
     /// like [`Self::stream_sessions`] or a bulk write.
+    ///
+    /// In WAL mode `VACUUM` itself writes the *entire* rebuilt database
+    /// through the WAL rather than in place, so without a checkpoint
+    /// afterward the WAL balloons to roughly the database's own size and
+    /// nothing folds it back — issue #167 measured this turning a 3.36 GB
+    /// ledger's rebuild into a net +1.4 GB on disk while the UI reported
+    /// success. [`checkpoint_after_vacuum`] performs that checkpoint; see
+    /// its doc comment for how a blocked checkpoint is handled.
     pub fn vacuum(&self) -> Result<()> {
         let connection = self.connection()?;
         connection.execute_batch("VACUUM;")?;
+        checkpoint_after_vacuum(&connection)?;
         Ok(())
     }
 
@@ -4315,6 +4340,73 @@ fn to_i64(value: u64) -> Result<i64> {
 fn count(connection: &Connection, query: &str) -> Result<usize> {
     let count: i64 = connection.query_row(query, [], |row| row.get(0))?;
     usize::try_from(count).context("history-store count exceeded usize")
+}
+
+/// Runs `PRAGMA wal_checkpoint(TRUNCATE)` after [`HistoryStore::vacuum`]'s
+/// `VACUUM` and handles the result deliberately (issue #167). The pragma
+/// does not error to report contention — it returns one row
+/// `(busy, log, checkpointed)` where `busy = 1` means a concurrent
+/// connection prevented the checkpoint (or its truncation) from completing.
+/// That is a real, expected condition for this app specifically:
+/// [`HistoryStore::open_reader`] deliberately opens dedicated read
+/// connections for aggregation so long scans don't queue behind the writer
+/// mutex, and any of them holding an open read transaction at the moment
+/// this runs can block a TRUNCATE checkpoint the same way a long-lived
+/// reader did on the real install that reported this issue.
+///
+/// This retries a bounded number of times with a short sleep rather than
+/// giving up immediately: an `open_reader` connection here is scoped to one
+/// query and then dropped, not held open indefinitely, so a blocking reader
+/// is expected to clear within a second or two, and a short wait converts a
+/// common transient race into a fully-completed checkpoint instead of a
+/// permanently oversized WAL. If it is still busy after retrying, this
+/// deliberately does not fail `vacuum()`: the `VACUUM` itself already
+/// committed a real, durable size reduction, and discarding that result
+/// over an incomplete checkpoint would turn one honest partial success into
+/// a reported failure of work that actually happened. Instead it is logged
+/// (so it is visible in diagnostics, not silently swallowed), and the
+/// caller's own before/after [`HistoryStore::database_footprint`] bytes
+/// (issue #167 point 3) carry the honest outcome either way: if the
+/// checkpoint did not fully complete, the WAL byte count the UI reports
+/// says so directly, rather than a success message papering over it. A
+/// later passive checkpoint — or simply quitting the app, per the issue's
+/// own documented workaround — still folds the WAL in.
+///
+/// A genuine SQL/I-O error from the pragma itself (as opposed to a reported
+/// `busy`) is different: that can indicate a real problem with the
+/// database, so it propagates like any other `rusqlite` error instead of
+/// being swallowed.
+fn checkpoint_after_vacuum(connection: &Connection) -> Result<()> {
+    const MAX_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY: Duration = Duration::from_millis(200);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            connection.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy == 0 {
+            tracing::debug!(
+                "post-VACUUM wal_checkpoint(TRUNCATE) completed on attempt {attempt}/{MAX_ATTEMPTS}: \
+                 log={log} checkpointed={checkpointed}"
+            );
+            return Ok(());
+        }
+        tracing::debug!(
+            "post-VACUUM wal_checkpoint(TRUNCATE) attempt {attempt}/{MAX_ATTEMPTS} was blocked by \
+             a concurrent reader: busy={busy} log={log} checkpointed={checkpointed}"
+        );
+        if attempt < MAX_ATTEMPTS {
+            std::thread::sleep(RETRY_DELAY);
+        }
+    }
+    tracing::warn!(
+        "post-VACUUM wal_checkpoint(TRUNCATE) did not complete after {MAX_ATTEMPTS} attempts; a \
+         concurrent reader kept blocking it. The WAL was not fully folded back into the main \
+         file — VACUUM's own size reduction is still durable, but disk usage will stay elevated \
+         until a later checkpoint or app restart reclaims it."
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -9272,13 +9364,24 @@ mod tests {
         // Total on-disk footprint (main file + WAL sidecar), not just the
         // main file. A raw `PRAGMA wal_checkpoint` from a second connection
         // (WAL mode supports concurrent connections) folds everything
-        // committed so far into the main file before either measurement, so
-        // "before" and "after" are both fully-materialized snapshots rather
-        // than one comparing against content still sitting unflushed in the
-        // WAL — otherwise a rebuild's own additional writes (new snapshots,
-        // a full rollup-table rebuild) landing in a *freshly growing* WAL
-        // could make "after" look larger even though VACUUM shrank the main
-        // file exactly as claimed.
+        // committed so far into the main file before the *before*
+        // measurement only — this is a fair, deterministic baseline (the
+        // 60-session write loop above may or may not have tripped SQLite's
+        // own opportunistic auto-checkpoint yet, and forcing one here just
+        // removes that timing flakiness; it does not hide anything, since
+        // an idle WAL is a state that can legitimately occur on its own).
+        //
+        // Issue #167: there is deliberately no matching checkpoint before
+        // the *after* measurement. Production (`spawn_history_rebuild`)
+        // never checkpoints externally either — it calls `store.vacuum()`
+        // and then reads `database_footprint()` directly, so this test must
+        // do exactly that to measure what a user actually experiences. An
+        // earlier version of this test *did* checkpoint here, which papered
+        // over the bug this issue reports: `VACUUM` in WAL mode rewrites the
+        // entire database *through* the WAL, so without `vacuum()`
+        // checkpointing itself, "after" lands in a freshly-regrown WAL and
+        // can look larger than "before" even though the main file shrank
+        // exactly as claimed — which is precisely what shipped in v0.8.15.
         let checkpoint = |path: &Path| {
             let connection = Connection::open(path).unwrap();
             connection
@@ -9298,13 +9401,13 @@ mod tests {
         assert!(outcome.after.session_json_bytes < outcome.before.session_json_bytes);
 
         store.vacuum().unwrap();
-        checkpoint(&path);
         let footprint_after = store.database_footprint();
         let total_after =
             footprint_after.db_bytes.unwrap_or(0) + footprint_after.wal_bytes.unwrap_or(0);
         assert!(
             total_after < total_before,
-            "VACUUM must shrink the on-disk footprint after a rebuild shrinks its content: \
+            "VACUUM must shrink the on-disk footprint after a rebuild shrinks its content, \
+             including checkpointing its own WAL growth back down — not just the main file: \
              before={total_before} after={total_after}"
         );
     }
