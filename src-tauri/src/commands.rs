@@ -2597,6 +2597,8 @@ mod tests {
                     resets_at: None,
                 }),
                 secondary: None,
+                run_started_at: None,
+                observation_count: 1,
             }],
         );
         // Second Codex session reports a newer snapshot with different
@@ -2621,6 +2623,8 @@ mod tests {
                     window_minutes: Some(10_080),
                     resets_at: None,
                 }),
+                run_started_at: None,
+                observation_count: 1,
             }],
         );
         // Claude Code session with no rate-limit history: harness must not

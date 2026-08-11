@@ -956,8 +956,17 @@ fn build_session(
     // Rate-limit history: shape matches parser.rs:791 (turn_id/limit_id are
     // Option<String>, primary is effectively always present, secondary is a
     // second window roughly 70% of the time — 5h + weekly dual-window plans
-    // are the common Codex case). Count is drawn from the field-measured
-    // heavy-tailed distribution, not scaled with turn_count.
+    // are the common Codex case). `rate_limit_point_count` is drawn from the
+    // field-measured heavy-tailed distribution of RAW (pre-#153) rate-limit
+    // events, not scaled with turn_count; `build_rate_limit_points` collapses
+    // that many raw observations down to what parser.rs's issue #153 change
+    // actually stores (measured 81.6% of raw events byte-identical to their
+    // predecessor), so the corpus this binary hydrates reflects real,
+    // post-#153 ledger content rather than the pre-#153 one-point-per-event
+    // shape this file originally modeled. `bytes_per_point` below is
+    // calibrated empirically against this same (collapsed) output, so the
+    // byte-budget targeting downstream stays self-consistent without any
+    // further adjustment.
     let rate_limits_history =
         build_rate_limit_points(&turns, rate_limit_point_count, base_time, rng);
     let last_event_at = rate_limits_history
@@ -1038,48 +1047,89 @@ fn build_session(
     }
 }
 
-/// Builds `point_count` rate-limit points, cycling through `turns`' turn ids
-/// (matching how the real parser stamps `turn_id` from whatever turn was
-/// active when the `rate_limits` payload arrived) and spacing timestamps a
-/// few seconds to a couple minutes apart, matching frequent quota polling.
+/// Generates `raw_point_count` raw rate-limit *observations* (the pre-#153
+/// one-per-event shape `RATE_LIMIT_PERCENTILE_ANCHORS` was measured from),
+/// then collapses them through the real issue #153 logic
+/// (`RateLimitSnapshotPoint::collapse`) to the form parser.rs actually
+/// stores today. Two things make the raw sequence a genuine witness for
+/// that collapsing rather than a no-op:
+///
+/// - **Sticky turn assignment.** `RateLimitSnapshotPoint::record` only
+///   merges observations that share `turn_id` (along with
+///   `limit_id`/`primary`/`secondary`) — matching how the real parser stamps
+///   whatever turn was active when each `rate_limits` payload arrived, i.e.
+///   many consecutive events share one turn before the next turn starts.
+///   Cycling `turn_id` round-robin per observation (the pre-#153 version of
+///   this function did that) would put a turn boundary between nearly every
+///   pair of observations and defeat collapsing by construction.
+/// - **A duplicate-heavy value walk.** Each observation has an 81.6% chance
+///   of reporting the exact same `primary`/`secondary` as the previous one —
+///   the field-measured duplicate rate from issue #153 — rather than a fresh
+///   uniform-random value every time.
 fn build_rate_limit_points(
     turns: &[TurnInfo],
-    point_count: usize,
+    raw_point_count: usize,
     base_time: DateTime<Utc>,
     rng: &mut Rng,
 ) -> Vec<RateLimitSnapshotPoint> {
-    let mut points = Vec::with_capacity(point_count);
+    const FIELD_MEASURED_DUPLICATE_CHANCE: f64 = 0.816;
+
+    let mut raw = Vec::with_capacity(raw_point_count);
     let mut cursor = base_time;
-    for point_index in 0..point_count {
+    let mut turn_index = 0usize;
+    let mut events_left_in_turn = 1 + rng.next_range(1, 15);
+    let mut primary = RateLimitWindow {
+        used_percent: rng.range_f64(0.0, 20.0),
+        window_minutes: Some(300),
+        resets_at: Some(cursor + ChronoDuration::minutes(300)),
+    };
+    let mut secondary_present = rng.gen_bool(0.7);
+    let mut secondary = RateLimitWindow {
+        used_percent: rng.range_f64(0.0, 20.0),
+        window_minutes: Some(10_080),
+        resets_at: Some(cursor + ChronoDuration::minutes(10_080)),
+    };
+
+    for _ in 0..raw_point_count {
         cursor += ChronoDuration::seconds(rng.next_range(1, 90) as i64);
+
         let turn_id = if turns.is_empty() {
             None
         } else {
-            Some(turns[point_index % turns.len()].turn_id.clone())
+            if events_left_in_turn == 0 {
+                turn_index = (turn_index + 1) % turns.len();
+                events_left_in_turn = 1 + rng.next_range(1, 15);
+            }
+            events_left_in_turn -= 1;
+            Some(turns[turn_index].turn_id.clone())
         };
-        let primary = Some(RateLimitWindow {
-            used_percent: rng.range_f64(0.0, 100.0),
-            window_minutes: Some(300),
-            resets_at: Some(cursor + ChronoDuration::minutes(300)),
-        });
-        let secondary = if rng.gen_bool(0.7) {
-            Some(RateLimitWindow {
-                used_percent: rng.range_f64(0.0, 100.0),
-                window_minutes: Some(10_080),
-                resets_at: Some(cursor + ChronoDuration::minutes(10_080)),
-            })
-        } else {
-            None
-        };
-        points.push(RateLimitSnapshotPoint {
+
+        if !rng.gen_bool(FIELD_MEASURED_DUPLICATE_CHANCE) {
+            // A genuine change: usage moves forward and the reset instants
+            // (which stay fixed for the rest of a run, same as real
+            // resets_at) track the new observation's clock.
+            primary.used_percent = (primary.used_percent + rng.range_f64(0.01, 3.0)).min(100.0);
+            primary.resets_at = Some(cursor + ChronoDuration::minutes(300));
+            secondary_present = rng.gen_bool(0.7);
+            if secondary_present {
+                secondary.used_percent =
+                    (secondary.used_percent + rng.range_f64(0.001, 0.5)).min(100.0);
+                secondary.resets_at = Some(cursor + ChronoDuration::minutes(10_080));
+            }
+        }
+
+        raw.push(RateLimitSnapshotPoint {
             timestamp: cursor,
             turn_id,
             limit_id: Some("primary".to_string()),
-            primary,
-            secondary,
+            primary: Some(primary.clone()),
+            secondary: secondary_present.then(|| secondary.clone()),
+            run_started_at: None,
+            observation_count: 1,
         });
     }
-    points
+
+    RateLimitSnapshotPoint::collapse(&raw)
 }
 
 fn accumulate_tool_metrics(metrics: &mut ToolMetrics, observation: &ToolObservation) {

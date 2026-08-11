@@ -988,9 +988,11 @@ project_key
 project_label
 project_provenance
 rate_limits_history.[].limit_id
+rate_limits_history.[].observation_count
 rate_limits_history.[].primary.resets_at
 rate_limits_history.[].primary.used_percent
 rate_limits_history.[].primary.window_minutes
+rate_limits_history.[].run_started_at
 rate_limits_history.[].secondary
 rate_limits_history.[].timestamp
 rate_limits_history.[].turn_id
@@ -1235,6 +1237,8 @@ working_directory"#;
                     resets_at: Some(now),
                 }),
                 secondary: None,
+                run_started_at: Some(now),
+                observation_count: 3,
             }],
             turns: vec![TurnInfo {
                 turn_id: "t1".into(),

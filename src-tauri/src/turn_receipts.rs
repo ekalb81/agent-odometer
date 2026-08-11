@@ -711,6 +711,8 @@ mod tests {
                     limit_id: Some("codex".into()),
                     primary: Some(window(38.17)),
                     secondary: None,
+                    run_started_at: None,
+                    observation_count: 1,
                 },
                 RateLimitSnapshotPoint {
                     timestamp: completed,
@@ -718,6 +720,8 @@ mod tests {
                     limit_id: Some("codex".into()),
                     primary: Some(window(38.21)),
                     secondary: None,
+                    run_started_at: None,
+                    observation_count: 1,
                 },
             ],
             turns: vec![turn],
@@ -1025,5 +1029,88 @@ mod tests {
                 .as_deref(),
             Some("legacy claude")
         );
+    }
+
+    // -- Issue #153: collapsing duplicate rate-limit points is lossless for
+    //    turn receipts too --------------------------------------------------
+
+    #[test]
+    fn collapsing_duplicate_rate_limit_points_never_changes_a_turn_receipt() {
+        // `quota_receipt` looks up rate-limit points by `turn_id`, not by
+        // value -- a per-point consumer issue #153's own spec did not call
+        // out. `RateLimitSnapshotPoint::record` requires `turn_id` (along
+        // with `limit_id`/`primary`/`secondary`) to match before merging two
+        // observations into one run, specifically so a run can never
+        // straddle a turn boundary and this lookup stays exact. This proves
+        // it against the case naive value-only dedup would break: turn t2's
+        // first observation reports the *same* used_percent as t1's last
+        // one, which must NOT merge across the turn boundary despite being
+        // value-identical -- same again between t2 and t3.
+        let base: DateTime<Utc> = "2026-07-25T12:00:00Z".parse().unwrap();
+        let resets_at = base + chrono::Duration::hours(5);
+        let raw_point = |minute: i64, turn_id: &str, used_percent: f64| RateLimitSnapshotPoint {
+            timestamp: base + chrono::Duration::minutes(minute),
+            turn_id: Some(turn_id.to_string()),
+            limit_id: Some("codex".into()),
+            primary: Some(RateLimitWindow {
+                used_percent,
+                window_minutes: Some(300),
+                resets_at: Some(resets_at),
+            }),
+            secondary: None,
+            run_started_at: None,
+            observation_count: 1,
+        };
+        let raw = vec![
+            raw_point(0, "t1", 10.0),
+            raw_point(1, "t1", 10.0),
+            raw_point(2, "t2", 10.0), // same value, new turn: must not merge with t1's run
+            raw_point(3, "t2", 12.0),
+            raw_point(4, "t2", 12.0),
+            raw_point(5, "t3", 12.0), // same value, new turn: must not merge with t2's run
+            raw_point(6, "t3", 12.0),
+            raw_point(7, "t3", 15.0),
+        ];
+        let collapsed = RateLimitSnapshotPoint::collapse(&raw);
+        assert_eq!(
+            collapsed.len(),
+            5,
+            "same-turn duplicates should collapse (8 raw points -> 5 runs); \
+             cross-turn duplicates must stay separate"
+        );
+
+        fn turn(id: &str, index: u32) -> TurnInfo {
+            TurnInfo {
+                turn_id: id.to_string(),
+                index,
+                ..Default::default()
+            }
+        }
+        let turns = vec![turn("t1", 1), turn("t2", 2), turn("t3", 3)];
+
+        let (mut raw_session, _) = fixture();
+        raw_session.rate_limits_history = raw;
+        raw_session.turns = turns.clone();
+        let (mut collapsed_session, _) = fixture();
+        collapsed_session.rate_limits_history = collapsed;
+        collapsed_session.turns = turns.clone();
+
+        for t in &turns {
+            let raw_receipt = quota_receipt(&raw_session, t);
+            let collapsed_receipt = quota_receipt(&collapsed_session, t);
+            assert_eq!(
+                raw_receipt, collapsed_receipt,
+                "turn {}'s quota receipt changed after collapsing duplicate points",
+                t.turn_id
+            );
+            // Not just "both None": pin down the actual observed-delta text
+            // for the turns with real predecessors, so a future regression
+            // that returns `None`/`None` in lockstep still fails loudly.
+            if t.turn_id == "t2" {
+                assert_eq!(raw_receipt.as_deref(), Some("5h +2 pp observed (12% used)"));
+            } else if t.turn_id == "t3" {
+                assert_eq!(raw_receipt.as_deref(), Some("5h +3 pp observed (15% used)"));
+            }
+        }
     }
 }
