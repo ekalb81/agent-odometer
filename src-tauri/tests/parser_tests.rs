@@ -145,6 +145,75 @@ fn captures_granular_rate_limit_snapshot_even_when_usage_info_is_null() {
 }
 
 #[test]
+fn consecutive_identical_rate_limit_events_collapse_into_one_run() {
+    // Issue #153: parser.rs pushes one RateLimitSnapshotPoint per
+    // rate-limit-bearing token_count event, which fires far more often than
+    // the window values actually change. Three token_count events in the
+    // same turn reporting byte-identical primary/secondary must collapse
+    // into a single stored point carrying the true observation count and
+    // run span, not three separate points.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rate-limits-collapse.jsonl");
+    let contents = concat!(
+        r#"{"timestamp":"2026-07-25T12:00:00Z","type":"session_meta","payload":{"id":"rate-collapse-session","timestamp":"2026-07-25T12:00:00Z"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-25T12:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-25T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":38.17,"window_minutes":300,"resets_at":1784998800},"secondary":{"used_percent":12.08,"window_minutes":10080,"resets_at":1785603600}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-25T12:00:03Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":38.17,"window_minutes":300,"resets_at":1784998800},"secondary":{"used_percent":12.08,"window_minutes":10080,"resets_at":1785603600}}}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-25T12:00:04Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":38.17,"window_minutes":300,"resets_at":1784998800},"secondary":{"used_percent":12.08,"window_minutes":10080,"resets_at":1785603600}}}}"#,
+        "\n",
+        // New turn, but the *same* rate-limit reading -- must not merge
+        // with turn-1's run despite being value-identical.
+        r#"{"timestamp":"2026-07-25T12:00:05Z","type":"turn_context","payload":{"turn_id":"turn-2","model":"gpt-5.5"}}"#,
+        "\n",
+        r#"{"timestamp":"2026-07-25T12:00:06Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":38.17,"window_minutes":300,"resets_at":1784998800},"secondary":{"used_percent":12.08,"window_minutes":10080,"resets_at":1785603600}}}}"#,
+        "\n",
+        // Same turn, a genuine value change -- must start a new run.
+        r#"{"timestamp":"2026-07-25T12:00:07Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{"limit_id":"codex","primary":{"used_percent":40.5,"window_minutes":300,"resets_at":1784998800},"secondary":{"used_percent":12.08,"window_minutes":10080,"resets_at":1785603600}}}}"#,
+        "\n",
+    );
+    std::fs::write(&path, contents).unwrap();
+
+    let session = parser::parse_file(&path, false).unwrap().unwrap();
+    assert_eq!(
+        session.rate_limits_history.len(),
+        3,
+        "turn-1's 3 identical events collapse to 1 run; turn-2's identical-but-cross-turn \
+         event starts a new run; turn-2's value change starts a third"
+    );
+
+    let run1 = &session.rate_limits_history[0];
+    assert_eq!(run1.turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(run1.observation_count, 3);
+    assert_eq!(
+        run1.run_started_at(),
+        "2026-07-25T12:00:02Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    );
+    assert_eq!(
+        run1.timestamp,
+        "2026-07-25T12:00:04Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+    );
+    assert_eq!(run1.primary.as_ref().unwrap().used_percent, 38.17);
+
+    let run2 = &session.rate_limits_history[1];
+    assert_eq!(run2.turn_id.as_deref(), Some("turn-2"));
+    assert_eq!(run2.observation_count, 1);
+    assert_eq!(run2.primary.as_ref().unwrap().used_percent, 38.17);
+
+    let run3 = &session.rate_limits_history[2];
+    assert_eq!(run3.turn_id.as_deref(), Some("turn-2"));
+    assert_eq!(run3.observation_count, 1);
+    assert_eq!(run3.primary.as_ref().unwrap().used_percent, 40.5);
+}
+
+#[test]
 fn archived_flag_is_propagated() {
     let s = parser::parse_file(&fixture(), true).unwrap().unwrap();
     assert!(s.archived);

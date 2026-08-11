@@ -137,6 +137,15 @@ export interface RateLimitSnapshotPoint {
   limit_id: string | null;
   primary: RateLimitWindow | null;
   secondary: RateLimitWindow | null;
+  /** First observation's timestamp in this point's collapsed run of
+   *  consecutive, field-identical observations (issue #153). `null` for a
+   *  run of exactly one observation and for data written before #153 --
+   *  both mean the same thing: treat `timestamp` as the run's only
+   *  observation. */
+  run_started_at: string | null;
+  /** How many consecutive raw observations this point collapses (#153).
+   *  Always 1 for pre-#153 data and single-observation runs. */
+  observation_count: number;
 }
 
 /** Most-recent provider-reported subscription-usage snapshot for one

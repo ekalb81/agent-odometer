@@ -1996,6 +1996,8 @@ mod tests {
                     resets_at: Some(now + chrono::Duration::hours(5)),
                 }),
                 secondary: None,
+                run_started_at: None,
+                observation_count: 1,
             }];
             state.sessions.insert(
                 session.effective_storage_id(),

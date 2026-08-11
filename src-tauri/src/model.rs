@@ -424,6 +424,35 @@ pub struct RateLimitWindow {
 }
 
 /// Account-wide rate-limit snapshot attached to a Codex token event.
+///
+/// Issue #153: Codex attaches `rate_limits` to every token-count event, which
+/// fires far more often than the window values actually change — a
+/// 600-transcript field measurement found 81.6% of points byte-identical to
+/// their immediate predecessor in both `primary` and `secondary`. Rather than
+/// storing one point per event, [`RateLimitSnapshotPoint::record`] collapses
+/// a run of consecutive events that report identical `turn_id`, `limit_id`,
+/// `primary`, and `secondary` into a single stored point, using
+/// `run_started_at`/`observation_count` to remember what the run covered.
+///
+/// `timestamp` keeps its pre-#153 meaning unchanged: for a collapsed run it
+/// is the run's *last* observation, which is what staleness detection and
+/// `series.last()`-style "latest observation" reads have always used. The
+/// two fields below carry exactly what `quota.rs`'s consumers need to
+/// reconstruct pre-#153 behavior even though interior duplicate points are
+/// gone:
+///
+/// - `forecast_from_series` computes pace from only the first and last
+///   in-window point, so the run's first timestamp must survive for pace-
+///   start math even though the point carrying it is no longer stored
+///   separately.
+/// - `MIN_EVIDENCE_POINTS` gates forecasting on observation *count* — if
+///   collapsing silently shrank that count, a forecast that used to clear
+///   the gate could vanish even though nothing about the underlying evidence
+///   changed.
+///
+/// Both new fields are `#[serde(default)]`, so `session_json` rows written
+/// before #153 (every point implicitly a run of one) deserialize correctly
+/// without a migration or rescan — see `run_started_at()`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RateLimitSnapshotPoint {
     pub timestamp: DateTime<Utc>,
@@ -431,6 +460,105 @@ pub struct RateLimitSnapshotPoint {
     pub limit_id: Option<String>,
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
+    /// First observation's timestamp in this point's collapsed run of
+    /// consecutive, field-identical observations (same `turn_id`,
+    /// `limit_id`, `primary`, and `secondary`). `None` for a run of exactly
+    /// one observation and for any point written before #153 — both cases
+    /// mean the same thing (`run_started_at()` below), so there is no
+    /// reason to pay the serialized-bytes cost of writing `timestamp` again
+    /// as `Some(timestamp)` for the overwhelmingly common single-point case.
+    #[serde(default)]
+    pub run_started_at: Option<DateTime<Utc>>,
+    /// How many consecutive raw observations this point collapses (#153).
+    /// Defaults to 1 both for pre-#153 data (which only ever stored one
+    /// observation per point) and for a freshly-collapsed run of exactly
+    /// one observation — in both cases the true historical count *is* 1, so
+    /// the default is exact, not a placeholder.
+    #[serde(default = "one_observation")]
+    pub observation_count: u32,
+}
+
+fn one_observation() -> u32 {
+    1
+}
+
+impl RateLimitSnapshotPoint {
+    /// This run's first observation, falling back to `timestamp` when
+    /// `run_started_at` is unset — the correct value for both a genuine
+    /// one-observation run and pre-#153 data, which are indistinguishable
+    /// and were always semantically "a run of one" (see the struct doc).
+    pub fn run_started_at(&self) -> DateTime<Utc> {
+        self.run_started_at.unwrap_or(self.timestamp)
+    }
+
+    /// Appends one raw observation to `history`, collapsing it into the
+    /// current last run when `turn_id`, `limit_id`, `primary`, and
+    /// `secondary` all match that run's — otherwise starting a new run.
+    /// `history` must already be in ascending-timestamp order (true of
+    /// every call site: `parser.rs` calls this once per event, in the
+    /// order events appear in an append-only rollout file).
+    ///
+    /// Requiring every field (not just `primary`/`secondary`) to match
+    /// before merging is deliberately conservative: it keeps
+    /// `turn_receipts.rs`'s per-turn `turn_id` lookups exact (a run can
+    /// never straddle a turn boundary, so "the last point with this
+    /// turn_id" still resolves to a single, correctly-valued point) and
+    /// keeps `limit_id` identity checks exact too, at a small cost to the
+    /// collapse ratio — measured negligible in practice, since Codex fires
+    /// far more token-count events within one turn than across turns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        history: &mut Vec<RateLimitSnapshotPoint>,
+        timestamp: DateTime<Utc>,
+        turn_id: Option<String>,
+        limit_id: Option<String>,
+        primary: Option<RateLimitWindow>,
+        secondary: Option<RateLimitWindow>,
+    ) {
+        if let Some(last) = history.last_mut() {
+            if last.turn_id == turn_id
+                && last.limit_id == limit_id
+                && last.primary == primary
+                && last.secondary == secondary
+            {
+                if last.run_started_at.is_none() {
+                    last.run_started_at = Some(last.timestamp);
+                }
+                last.timestamp = timestamp;
+                last.observation_count += 1;
+                return;
+            }
+        }
+        history.push(RateLimitSnapshotPoint {
+            timestamp,
+            turn_id,
+            limit_id,
+            primary,
+            secondary,
+            run_started_at: None,
+            observation_count: 1,
+        });
+    }
+
+    /// Folds a raw (uncollapsed) sequence of observations through
+    /// [`Self::record`], one at a time. A pure convenience for building the
+    /// collapsed equivalent of a raw history in one call — tests use this to
+    /// derive "the collapsed form of this raw fixture" for differential
+    /// comparison against `quota.rs`'s from-scratch oracle.
+    pub fn collapse(raw: &[RateLimitSnapshotPoint]) -> Vec<RateLimitSnapshotPoint> {
+        let mut collapsed = Vec::new();
+        for point in raw {
+            Self::record(
+                &mut collapsed,
+                point.timestamp,
+                point.turn_id.clone(),
+                point.limit_id.clone(),
+                point.primary.clone(),
+                point.secondary.clone(),
+            );
+        }
+        collapsed
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -1474,6 +1602,8 @@ pub(crate) mod tests {
                     resets_at: Some(base + chrono::Duration::hours(5)),
                 }),
                 secondary: None,
+                run_started_at: None,
+                observation_count: 1,
             }],
             turns,
             tool_observations,
@@ -1549,5 +1679,105 @@ pub(crate) mod tests {
 
         drop(sessions);
         drop(residents);
+    }
+
+    // -- Issue #153: RateLimitSnapshotPoint collapsing -----------------------
+
+    fn rl_window(used_percent: f64) -> RateLimitWindow {
+        RateLimitWindow {
+            used_percent,
+            window_minutes: Some(300),
+            resets_at: None,
+        }
+    }
+
+    #[test]
+    fn record_collapses_consecutive_field_identical_observations() {
+        let base: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let mut history = Vec::new();
+        for i in 0..3 {
+            RateLimitSnapshotPoint::record(
+                &mut history,
+                base + chrono::Duration::minutes(i),
+                Some("t1".into()),
+                Some("codex".into()),
+                Some(rl_window(10.0)),
+                None,
+            );
+        }
+        assert_eq!(
+            history.len(),
+            1,
+            "3 identical observations collapse to 1 run"
+        );
+        let run = &history[0];
+        assert_eq!(run.observation_count, 3);
+        assert_eq!(run.run_started_at(), base);
+        assert_eq!(run.timestamp, base + chrono::Duration::minutes(2));
+
+        // A differing field (turn_id here) must start a new run even though
+        // primary/secondary are unchanged.
+        RateLimitSnapshotPoint::record(
+            &mut history,
+            base + chrono::Duration::minutes(3),
+            Some("t2".into()),
+            Some("codex".into()),
+            Some(rl_window(10.0)),
+            None,
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].observation_count, 1);
+        assert_eq!(history[1].run_started_at(), history[1].timestamp);
+    }
+
+    #[test]
+    fn pre_153_json_without_the_new_fields_deserializes_as_a_run_of_one() {
+        // Exact `session_json` shape written before issue #153: no
+        // `run_started_at`/`observation_count` keys at all. Old ledger rows
+        // must still deserialize correctly without a migration or rescan.
+        let json = r#"{
+            "timestamp": "2026-01-01T00:00:00Z",
+            "turn_id": null,
+            "limit_id": null,
+            "primary": {"used_percent": 40.0, "window_minutes": 300, "resets_at": null},
+            "secondary": null
+        }"#;
+        let point: RateLimitSnapshotPoint = serde_json::from_str(json).unwrap();
+        assert_eq!(point.observation_count, 1);
+        assert_eq!(point.run_started_at, None);
+        assert_eq!(
+            point.run_started_at(),
+            point.timestamp,
+            "a pre-#153 point is, semantically, a run of exactly one observation"
+        );
+    }
+
+    #[test]
+    fn collapse_matches_incremental_record_over_a_raw_sequence() {
+        let base: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let raw: Vec<RateLimitSnapshotPoint> = [10.0, 10.0, 12.0, 12.0, 12.0, 15.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, used_percent)| RateLimitSnapshotPoint {
+                timestamp: base + chrono::Duration::minutes(i as i64),
+                turn_id: None,
+                limit_id: None,
+                primary: Some(rl_window(used_percent)),
+                secondary: None,
+                run_started_at: None,
+                observation_count: 1,
+            })
+            .collect();
+
+        let collapsed = RateLimitSnapshotPoint::collapse(&raw);
+        assert_eq!(collapsed.len(), 3);
+        assert_eq!(
+            collapsed.iter().map(|p| p.observation_count).sum::<u32>(),
+            raw.len() as u32,
+            "every raw observation must be accounted for in the collapsed counts"
+        );
+        assert_eq!(collapsed[0].observation_count, 2);
+        assert_eq!(collapsed[1].observation_count, 3);
+        assert_eq!(collapsed[2].observation_count, 1);
     }
 }

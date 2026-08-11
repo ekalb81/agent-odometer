@@ -295,19 +295,61 @@ pub struct QuotaAccountInfo {
     pub observed_at: Option<DateTime<Utc>>,
 }
 
-fn detect_observed_rollover(series: &[(DateTime<Utc>, RateLimitWindow)]) -> Option<DateTime<Utc>> {
+/// One `primary`/`secondary` window reading, expanded from a (possibly
+/// collapsed, issue #153) `RateLimitSnapshotPoint`. `timestamp` keeps the
+/// point's pre-#153 meaning (the run's *last* raw observation — what
+/// staleness and "latest observation" reads have always used);
+/// `run_started_at` is the run's *first* raw observation, needed only for
+/// pace-start math; `observation_count` is how many raw observations this
+/// one entry stands in for.
+///
+/// For data written before #153 (or any single-observation run),
+/// `run_started_at == timestamp` and `observation_count == 1`, which makes
+/// every function below behave byte-for-byte as it did pre-#153 — the
+/// differential tests in this module's `tests` module check that directly.
+#[derive(Debug, Clone)]
+struct WindowObservation {
+    run_started_at: DateTime<Utc>,
+    timestamp: DateTime<Utc>,
+    window: RateLimitWindow,
+    observation_count: u32,
+}
+
+fn window_series(
+    points: &[RateLimitSnapshotPoint],
+    pick: impl Fn(&RateLimitSnapshotPoint) -> Option<RateLimitWindow>,
+) -> Vec<WindowObservation> {
+    points
+        .iter()
+        .filter_map(|p| {
+            pick(p).map(|window| WindowObservation {
+                run_started_at: p.run_started_at(),
+                timestamp: p.timestamp,
+                window,
+                observation_count: p.observation_count,
+            })
+        })
+        .collect()
+}
+
+fn detect_observed_rollover(series: &[WindowObservation]) -> Option<DateTime<Utc>> {
     for pair in series.windows(2).rev() {
-        let (_, prev) = &pair[0];
-        let (cur_ts, cur) = &pair[1];
-        if prev.used_percent - cur.used_percent >= ROLLOVER_DROP_THRESHOLD_PERCENT {
-            return Some(*cur_ts);
+        let prev = &pair[0];
+        let cur = &pair[1];
+        if prev.window.used_percent - cur.window.used_percent >= ROLLOVER_DROP_THRESHOLD_PERCENT {
+            // `cur.run_started_at` is the first raw observation of the
+            // post-rollover run — exactly the timestamp pre-#153 code
+            // returned here, since a rollover is a value change and a value
+            // change is always a run boundary (never inside a collapsed
+            // run): see `rollover_never_falls_inside_a_collapsed_run` below.
+            return Some(cur.run_started_at);
         }
     }
     None
 }
 
 fn forecast_from_series(
-    series: &[(DateTime<Utc>, RateLimitWindow)],
+    series: &[WindowObservation],
     window_started_at: DateTime<Utc>,
     window_minutes: Option<u64>,
     resets_at: Option<DateTime<Utc>>,
@@ -317,16 +359,33 @@ fn forecast_from_series(
     if minutes <= 0.0 {
         return None;
     }
-    let in_window: Vec<&(DateTime<Utc>, RateLimitWindow)> = series
+    let in_window: Vec<&WindowObservation> = series
         .iter()
-        .filter(|(ts, _)| *ts >= window_started_at && *ts <= now)
+        .filter(|p| p.timestamp >= window_started_at && p.timestamp <= now)
         .collect();
-    if in_window.len() < MIN_EVIDENCE_POINTS {
+    // Sum of `observation_count`, not `in_window.len()`: a collapsed point
+    // in `in_window` can stand in for many raw observations, and the
+    // MIN_EVIDENCE_POINTS/evidence_points gate must see the same count a
+    // pre-#153, uncollapsed series would have produced.
+    let evidence_points: usize = in_window.iter().map(|p| p.observation_count as usize).sum();
+    if evidence_points < MIN_EVIDENCE_POINTS {
         return None;
     }
     let first = in_window.first().unwrap();
     let last = in_window.last().unwrap();
-    let span_minutes = last.0.signed_duration_since(first.0).num_seconds() as f64 / 60.0;
+    // `first.run_started_at` is exact whenever the first in-window run lies
+    // entirely at or after `window_started_at` (the overwhelmingly common
+    // case: a rollover-derived boundary always aligns with a run start, and
+    // an estimated boundary computed from the window's own `resets_at` only
+    // ever falls inside already-recorded history when a rolling window's
+    // estimate undershoots the window's true start). Clamping to
+    // `window_started_at` bounds the one case that is not exact — a run
+    // whose raw observations straddle the boundary — to at worst a
+    // narrower (never wider) span than the true first in-window raw
+    // timestamp, rather than letting it read as an earlier, slower pace
+    // than the data supports.
+    let first_ts = first.run_started_at.max(window_started_at);
+    let span_minutes = last.timestamp.signed_duration_since(first_ts).num_seconds() as f64 / 60.0;
     if span_minutes / minutes < MIN_EVIDENCE_SPAN_FRACTION {
         return None;
     }
@@ -334,7 +393,7 @@ fn forecast_from_series(
     if elapsed_hours <= 0.0 {
         return None;
     }
-    let used_delta = last.1.used_percent - first.1.used_percent;
+    let used_delta = last.window.used_percent - first.window.used_percent;
     if used_delta < 0.0 {
         // A decrease inside what we believe is one window means our window
         // boundary is wrong (a rollover we didn't detect, or a corrected
@@ -345,7 +404,7 @@ fn forecast_from_series(
     let pace_per_hour = used_delta / elapsed_hours;
 
     let projected_exhaustion_at = if pace_per_hour > 0.0 {
-        let remaining = (100.0 - last.1.used_percent).max(0.0);
+        let remaining = (100.0 - last.window.used_percent).max(0.0);
         let hours_to_exhaustion = remaining / pace_per_hour;
         let candidate =
             now + Duration::milliseconds((hours_to_exhaustion * 3_600_000.0).round() as i64);
@@ -361,22 +420,24 @@ fn forecast_from_series(
         / (minutes * 60.0))
         .clamp(0.0, 1.0);
     let even_pace_used = elapsed_fraction * 100.0;
-    let reserve_deficit_percent = last.1.used_percent - even_pace_used;
+    let reserve_deficit_percent = last.window.used_percent - even_pace_used;
 
     Some(QuotaForecast {
         pace_per_hour,
         projected_exhaustion_at,
         reserve_deficit_percent,
-        evidence_points: in_window.len(),
+        evidence_points,
     })
 }
 
 fn build_percent_window(
-    series: &[(DateTime<Utc>, RateLimitWindow)],
+    series: &[WindowObservation],
     now: DateTime<Utc>,
     max_cache_age: Duration,
 ) -> Option<QuotaWindow> {
-    let (latest_ts, latest) = series.last()?;
+    let latest = series.last()?;
+    let latest_ts = latest.timestamp;
+    let latest = &latest.window;
     let kind = classify_window_kind(latest.window_minutes);
     let mut window = QuotaWindow {
         kind,
@@ -389,20 +450,20 @@ fn build_percent_window(
         resets_at: latest.resets_at,
         window_started_at: None,
         window_started_at_estimated: false,
-        observed_at: *latest_ts,
+        observed_at: latest_ts,
         confidence: QuotaConfidence::High,
         stale: false,
         unavailable: None,
         forecast: None,
     };
 
-    if *latest_ts > now {
+    if latest_ts > now {
         window.unavailable = Some(QuotaUnavailableReason::ClockSkew);
         window.confidence = QuotaConfidence::Low;
         return Some(window);
     }
 
-    let age = now.signed_duration_since(*latest_ts);
+    let age = now.signed_duration_since(latest_ts);
     window.stale = age > max_cache_age;
     if window.stale {
         window.confidence = downgrade(window.confidence, QuotaConfidence::Low);
@@ -504,14 +565,8 @@ pub fn build_quota_snapshot(
         };
     }
 
-    let primary_series: Vec<(DateTime<Utc>, RateLimitWindow)> = points
-        .iter()
-        .filter_map(|p| p.primary.clone().map(|w| (p.timestamp, w)))
-        .collect();
-    let secondary_series: Vec<(DateTime<Utc>, RateLimitWindow)> = points
-        .iter()
-        .filter_map(|p| p.secondary.clone().map(|w| (p.timestamp, w)))
-        .collect();
+    let primary_series = window_series(points, |p| p.primary.clone());
+    let secondary_series = window_series(points, |p| p.secondary.clone());
 
     let mut windows = Vec::new();
     if let Some(w) = build_percent_window(&primary_series, now, max_cache_age) {
@@ -1270,6 +1325,8 @@ mod tests {
                 resets_at: Some(ts(resets_at)),
             }),
             secondary: None,
+            run_started_at: None,
+            observation_count: 1,
         }
     }
 
@@ -1538,6 +1595,8 @@ mod tests {
                     resets_at: Some(ts(resets_at)),
                 }),
                 secondary: None,
+                run_started_at: None,
+                observation_count: 1,
             })
             .collect()
     }
@@ -1908,6 +1967,8 @@ mod tests {
                     resets_at: Some(epoch + Duration::hours(10_000)),
                 }),
                 secondary: None,
+                run_started_at: None,
+                observation_count: 1,
             }
         };
 
@@ -2035,6 +2096,8 @@ mod tests {
                                 resets_at: Some(epoch + Duration::hours(100_000)),
                             }),
                             secondary: None,
+                            run_started_at: None,
+                            observation_count: 1,
                         });
                     }
                     let has_credits = rng.next_range(2) == 0;
@@ -2084,6 +2147,8 @@ mod tests {
                     resets_at: Some(epoch + Duration::hours(100_000)),
                 }),
                 secondary: None,
+                run_started_at: None,
+                observation_count: 1,
             })
             .collect();
         let last_ts = history.last().map(|p| p.timestamp).unwrap_or(epoch);
@@ -2279,6 +2344,8 @@ mod tests {
                         resets_at: Some(epoch + Duration::hours(100_000)),
                     }),
                     secondary: None,
+                    run_started_at: None,
+                    observation_count: 1,
                 })
                 .collect();
             test_session(
@@ -2315,6 +2382,8 @@ mod tests {
                         resets_at: Some(epoch + Duration::hours(100_000)),
                     }),
                     secondary: None,
+                    run_started_at: None,
+                    observation_count: 1,
                 });
                 let started = std::time::Instant::now();
                 index.update_session("s0", &session);
@@ -2674,6 +2743,621 @@ mod tests {
         assert!(
             served[0].windows[0].stale,
             "staleness must not stay frozen at 'fresh' on an idle app just because sessions never changed"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #153: collapsing consecutive duplicate rate-limit points is
+    // lossless for every quota.rs consumer.
+    //
+    // The oracle for every test below is `quota_snapshots_from_sessions`
+    // (or `build_quota_snapshot` directly) run against the RAW (uncollapsed,
+    // one point per event) history -- exactly the shape parser.rs produced
+    // before #153. Each test builds a raw history, derives its collapsed
+    // form with `RateLimitSnapshotPoint::collapse` (the same folding
+    // `record` does incrementally in parser.rs), and asserts the two
+    // produce byte-identical `QuotaSnapshot`s end to end: pace, projected
+    // exhaustion, evidence gates, staleness, and rollover handling.
+    // -------------------------------------------------------------------
+
+    /// Builds both the raw and collapsed `QuotaSnapshot` for the same raw
+    /// history through the full `quota_snapshots_from_sessions` pipeline,
+    /// asserts they are equal, and returns (raw_point_count,
+    /// collapsed_point_count) so callers can also assert on how much
+    /// collapsing actually happened.
+    fn assert_collapse_is_lossless(
+        raw: Vec<RateLimitSnapshotPoint>,
+        now: DateTime<Utc>,
+    ) -> (usize, usize) {
+        let collapsed = RateLimitSnapshotPoint::collapse(&raw);
+        let raw_len = raw.len();
+        let collapsed_len = collapsed.len();
+
+        let raw_session = test_session(
+            "raw",
+            codex_provider_id(),
+            raw.last().unwrap().timestamp,
+            None,
+            None,
+            raw,
+        );
+        let collapsed_session = test_session(
+            "collapsed",
+            codex_provider_id(),
+            collapsed.last().unwrap().timestamp,
+            None,
+            None,
+            collapsed,
+        );
+
+        let raw_snapshots =
+            quota_snapshots_from_sessions(std::iter::once(&raw_session), now, Duration::hours(6));
+        let collapsed_snapshots = quota_snapshots_from_sessions(
+            std::iter::once(&collapsed_session),
+            now,
+            Duration::hours(6),
+        );
+        assert_eq!(
+            raw_snapshots, collapsed_snapshots,
+            "collapsing duplicate rate-limit points changed the computed QuotaSnapshot"
+        );
+        (raw_len, collapsed_len)
+    }
+
+    #[test]
+    fn collapsing_a_duplicate_heavy_window_produces_an_identical_quota_snapshot() {
+        let start = ts("2026-01-01T00:00:00Z");
+        let resets_at = start + Duration::hours(5);
+        let mut raw = Vec::new();
+        let mut used = 5.0;
+        // 30 raw observations, 2 minutes apart, mostly duplicating the
+        // previous value (mirrors the field-measured 81.6% duplicate rate),
+        // occasionally stepping up -- entirely inside the window, so this
+        // exercises the common "whole run in window" case exactly.
+        let deltas = [
+            0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+        ];
+        for (i, delta) in deltas.iter().enumerate() {
+            used += delta;
+            raw.push(RateLimitSnapshotPoint {
+                timestamp: start + Duration::minutes(2 * i as i64),
+                turn_id: None,
+                limit_id: Some("codex".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent: used,
+                    window_minutes: Some(300),
+                    resets_at: Some(resets_at),
+                }),
+                secondary: None,
+                run_started_at: None,
+                observation_count: 1,
+            });
+        }
+        let now = raw.last().unwrap().timestamp;
+        let (raw_len, collapsed_len) = assert_collapse_is_lossless(raw, now);
+        assert!(
+            collapsed_len < raw_len,
+            "fixture must actually contain duplicates for this test to exercise collapsing"
+        );
+        assert!(
+            (collapsed_len as f64) < (raw_len as f64) * 0.6,
+            "expected substantial collapsing: {raw_len} raw -> {collapsed_len} collapsed"
+        );
+    }
+
+    #[test]
+    fn min_evidence_points_boundary_survives_collapsing_when_naive_dedup_would_lose_it() {
+        // Exactly MIN_EVIDENCE_POINTS (5) raw observations across only 2
+        // distinct values: a naive "collapse to distinct values" dedupe
+        // would leave 2 stored points, well under MIN_EVIDENCE_POINTS, and
+        // silently delete a forecast the raw data supports. This is the
+        // exact boundary issue #153's design must not regress.
+        let start = ts("2026-01-01T00:00:00Z");
+        let resets_at = start + Duration::hours(5);
+        let raw: Vec<RateLimitSnapshotPoint> = [10.0, 10.0, 10.0, 15.0, 15.0]
+            .into_iter()
+            .enumerate()
+            .map(|(i, used_percent)| RateLimitSnapshotPoint {
+                timestamp: start + Duration::minutes(10 * i as i64),
+                turn_id: None,
+                limit_id: None,
+                primary: Some(RateLimitWindow {
+                    used_percent,
+                    window_minutes: Some(300),
+                    resets_at: Some(resets_at),
+                }),
+                secondary: None,
+                run_started_at: None,
+                observation_count: 1,
+            })
+            .collect();
+        let now = raw.last().unwrap().timestamp;
+
+        let collapsed = RateLimitSnapshotPoint::collapse(&raw);
+        assert_eq!(
+            collapsed.len(),
+            2,
+            "2 distinct values -> naive dedupe would produce 2 stored points"
+        );
+        assert_eq!(collapsed[0].observation_count, 3);
+        assert_eq!(collapsed[1].observation_count, 2);
+
+        // The raw pipeline must actually produce a forecast here -- if it
+        // didn't, this test would prove nothing about #153's design.
+        let raw_snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &raw,
+            QuotaAccountInfo::default(),
+            now,
+            Duration::hours(6),
+        );
+        let forecast = raw_snapshot.windows[0]
+            .forecast
+            .as_ref()
+            .expect("5 raw observations, evenly spaced, must clear MIN_EVIDENCE_POINTS");
+        assert_eq!(forecast.evidence_points, 5);
+
+        let (raw_len, collapsed_len) = assert_collapse_is_lossless(raw, now);
+        assert_eq!(raw_len, 5);
+        assert_eq!(collapsed_len, 2);
+
+        // Sanity check on *why* `observation_count` exists: naive
+        // value-only dedupe (collapsing to 2 points but discarding the true
+        // per-run count, i.e. treating each as a single observation) is
+        // exactly the design #153 rejected. Prove it would have broken the
+        // gate here.
+        let naive: Vec<RateLimitSnapshotPoint> = collapsed
+            .into_iter()
+            .map(|mut p| {
+                p.observation_count = 1;
+                p.run_started_at = None;
+                p
+            })
+            .collect();
+        let naive_snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &naive,
+            QuotaAccountInfo::default(),
+            now,
+            Duration::hours(6),
+        );
+        assert!(
+            naive_snapshot.windows[0].forecast.is_none(),
+            "sanity check: naive value-only dedupe (discarding the true observation count) \
+             must fail the MIN_EVIDENCE_POINTS gate here, demonstrating why \
+             `observation_count` is required rather than optional"
+        );
+    }
+
+    #[test]
+    fn rollover_boundary_never_falls_inside_a_collapsed_run() {
+        // #153 depends on this exact fact: rollover detection compares
+        // *consecutive distinct* values, so the boundary it reports can
+        // never land strictly inside a collapsed run's [run_started_at,
+        // timestamp] span -- it always equals some run's own
+        // run_started_at. Proven here, not just asserted: the raw history
+        // has a duplicate run before the rollover and one after; collapsing
+        // must not change `window_started_at`, `window_started_at_estimated`,
+        // or the resulting QuotaSnapshot at all.
+        let start = ts("2026-01-01T00:00:00Z");
+        let mut raw = Vec::new();
+        let old_resets_at = start + Duration::minutes(10);
+        for i in 0..4 {
+            raw.push(RateLimitSnapshotPoint {
+                timestamp: start + Duration::minutes(i),
+                turn_id: None,
+                limit_id: Some("codex".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 95.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(old_resets_at),
+                }),
+                secondary: None,
+                run_started_at: None,
+                observation_count: 1,
+            });
+        }
+        let new_resets_at = start + Duration::hours(5) + Duration::minutes(10);
+        let post_rollover_start = start + Duration::minutes(20);
+        for (i, used_percent) in [5.0, 5.0, 5.0, 6.0, 6.0, 8.0].into_iter().enumerate() {
+            raw.push(RateLimitSnapshotPoint {
+                timestamp: post_rollover_start + Duration::minutes(15 * i as i64),
+                turn_id: None,
+                limit_id: Some("codex".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent,
+                    window_minutes: Some(300),
+                    resets_at: Some(new_resets_at),
+                }),
+                secondary: None,
+                run_started_at: None,
+                observation_count: 1,
+            });
+        }
+        let now = raw.last().unwrap().timestamp;
+        let expected_rollover_at = post_rollover_start; // raw's first post-rollover point
+
+        let raw_snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &raw,
+            QuotaAccountInfo::default(),
+            now,
+            Duration::hours(6),
+        );
+        assert_eq!(
+            raw_snapshot.windows[0].window_started_at,
+            Some(expected_rollover_at)
+        );
+        assert!(!raw_snapshot.windows[0].window_started_at_estimated);
+
+        let (raw_len, collapsed_len) = assert_collapse_is_lossless(raw, now);
+        assert_eq!(raw_len, 10);
+        assert_eq!(
+            collapsed_len, 4,
+            "pre-rollover run (4->1) plus three post-rollover value runs (5,5,5 / 6,6 / 8)"
+        );
+    }
+
+    #[test]
+    fn window_boundary_landing_inside_a_run_yields_a_bounded_conservative_approximation() {
+        // The one case #153's design cannot make perfectly exact: an
+        // *estimated* window_started_at (no observed rollover; computed as
+        // resets_at - window_minutes) that happens to land strictly inside
+        // a collapsed run's raw span, rather than at a run boundary.
+        // Reaching this requires a rolling window whose true start predates
+        // the first recorded observation of a long-duplicate run, or a
+        // fixed window whose estimate simply lands inside an already-long
+        // run -- possible, though narrower in practice than it sounds (see
+        // `forecast_from_series`'s doc comment). This test pins down what
+        // happens rather than leaving it unverified: `first_ts` is clamped
+        // forward to `window_started_at` (never past the true first
+        // in-window raw observation), so pace can only be *understated*,
+        // never overstated, and `evidence_points` can only be *larger* than
+        // the true count -- so a forecast the raw data supports is never
+        // silently lost by this approximation, only ever computed a little
+        // conservatively.
+        let start = ts("2026-01-01T00:00:00Z");
+        // window_started_at (estimate) = resets_at - 5h = start + 20min,
+        // which falls strictly between the run's raw observations at
+        // minute 10 and minute 25.
+        let resets_at = start + Duration::minutes(20) + Duration::hours(5);
+        let run_a_minutes: [i64; 6] = [0, 10, 25, 30, 40, 50];
+        let mut raw: Vec<RateLimitSnapshotPoint> = run_a_minutes
+            .iter()
+            .map(|&m| RateLimitSnapshotPoint {
+                timestamp: start + Duration::minutes(m),
+                turn_id: None,
+                limit_id: None,
+                primary: Some(RateLimitWindow {
+                    used_percent: 10.0,
+                    window_minutes: Some(300),
+                    resets_at: Some(resets_at),
+                }),
+                secondary: None,
+                run_started_at: None,
+                observation_count: 1,
+            })
+            .collect();
+        raw.push(RateLimitSnapshotPoint {
+            timestamp: start + Duration::minutes(60),
+            turn_id: None,
+            limit_id: None,
+            primary: Some(RateLimitWindow {
+                used_percent: 15.0,
+                window_minutes: Some(300),
+                resets_at: Some(resets_at),
+            }),
+            secondary: None,
+            run_started_at: None,
+            observation_count: 1,
+        });
+        let now = raw.last().unwrap().timestamp;
+
+        // True (raw, pre-#153) computation: only the 4 run-A observations
+        // at/after minute 20 plus the 1 post-run observation are in window.
+        let raw_snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &raw,
+            QuotaAccountInfo::default(),
+            now,
+            Duration::hours(6),
+        );
+        let raw_forecast = raw_snapshot.windows[0]
+            .forecast
+            .as_ref()
+            .expect("raw evidence clears both gates");
+        assert_eq!(raw_forecast.evidence_points, 5);
+        let true_pace = 5.0 / (35.0 / 60.0); // used_delta=5, span=(60-25)min
+        assert!((raw_forecast.pace_per_hour - true_pace).abs() < 1e-9);
+
+        let collapsed = RateLimitSnapshotPoint::collapse(&raw);
+        assert_eq!(
+            collapsed.len(),
+            2,
+            "the whole 6-point run of 10% collapses to one point"
+        );
+        assert_eq!(collapsed[0].observation_count, 6);
+        let collapsed_snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &collapsed,
+            QuotaAccountInfo::default(),
+            now,
+            Duration::hours(6),
+        );
+        let collapsed_forecast = collapsed_snapshot.windows[0].forecast.as_ref().expect(
+            "collapsing must not spuriously suppress a forecast the raw data supports here",
+        );
+
+        assert_eq!(collapsed_forecast.evidence_points, 7);
+        assert!(
+            collapsed_forecast.evidence_points >= raw_forecast.evidence_points,
+            "the approximation must only ever over-count evidence, never under-count it \
+             (an under-count is what risks silently losing a forecast)"
+        );
+        let approx_pace = 5.0 / (40.0 / 60.0); // clamped span=(60-20)min
+        assert!((collapsed_forecast.pace_per_hour - approx_pace).abs() < 1e-9);
+        assert!(
+            collapsed_forecast.pace_per_hour <= raw_forecast.pace_per_hour + 1e-9,
+            "the approximation must only ever understate pace relative to the true \
+             computation, never overstate it"
+        );
+    }
+
+    #[test]
+    fn realistic_duplicate_heavy_corpus_collapses_by_roughly_the_measured_ratio() {
+        // Mirrors the corpus shape issue #153 measured: 81.6% of points
+        // byte-identical to their predecessor, ~1,393 points/session mean,
+        // primary+secondary windows, points grouped into turns (a
+        // token-count event fires many times within one turn, per
+        // parser.rs). Not a substitute for the field measurement -- a
+        // synthetic proxy to report the reduction on data shaped like the
+        // real thing, and to guard against a future change silently
+        // degrading the collapse ratio.
+        struct Xorshift64(u64);
+        impl Xorshift64 {
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn chance_percent(&mut self, percent: u64) -> bool {
+                self.next_u64() % 1000 < percent * 10
+            }
+        }
+
+        let mut rng = Xorshift64(0x0C0F_FEE1_2345_678A);
+        let start = ts("2026-01-01T00:00:00Z");
+        let primary_resets_at = start + Duration::hours(5);
+        let secondary_resets_at = start + Duration::days(7);
+        const POINT_COUNT: usize = 1_393; // field-measured mean points/session
+
+        let mut raw = Vec::with_capacity(POINT_COUNT);
+        let mut turn_idx = 0u32;
+        let mut events_left_in_turn = 1 + rng.next_u64() % 15;
+        let mut primary_used = 0.0f64;
+        let mut secondary_used = 0.0f64;
+        for i in 0..POINT_COUNT {
+            if events_left_in_turn == 0 {
+                turn_idx += 1;
+                events_left_in_turn = 1 + rng.next_u64() % 15;
+            }
+            events_left_in_turn -= 1;
+            // 81.6% chance this event's rate-limit reading is unchanged
+            // from the previous one, matching the field measurement.
+            if !rng.chance_percent(816) {
+                primary_used = (primary_used + 0.1 + (rng.next_u64() % 5) as f64 / 10.0).min(99.0);
+                secondary_used =
+                    (secondary_used + 0.02 + (rng.next_u64() % 3) as f64 / 100.0).min(99.0);
+            }
+            raw.push(RateLimitSnapshotPoint {
+                timestamp: start + Duration::seconds(4 * i as i64),
+                turn_id: Some(format!("turn-{turn_idx}")),
+                limit_id: Some("codex".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent: primary_used,
+                    window_minutes: Some(300),
+                    resets_at: Some(primary_resets_at),
+                }),
+                secondary: Some(RateLimitWindow {
+                    used_percent: secondary_used,
+                    window_minutes: Some(10_080),
+                    resets_at: Some(secondary_resets_at),
+                }),
+                run_started_at: None,
+                observation_count: 1,
+            });
+        }
+
+        let collapsed = RateLimitSnapshotPoint::collapse(&raw);
+        let raw_bytes = serde_json::to_vec(&raw).unwrap().len();
+        let collapsed_bytes = serde_json::to_vec(&collapsed).unwrap().len();
+        let point_reduction = 1.0 - (collapsed.len() as f64 / raw.len() as f64);
+        let byte_reduction = 1.0 - (collapsed_bytes as f64 / raw_bytes as f64);
+
+        println!(
+            "issue #153 collapse measurement: {} raw points -> {} collapsed \
+             ({:.1}% fewer points); {} bytes -> {} bytes ({:.1}% fewer bytes); \
+             {:.1} bytes/point raw, {:.1} bytes/point collapsed",
+            raw.len(),
+            collapsed.len(),
+            point_reduction * 100.0,
+            raw_bytes,
+            collapsed_bytes,
+            byte_reduction * 100.0,
+            raw_bytes as f64 / raw.len() as f64,
+            collapsed_bytes as f64 / collapsed.len() as f64,
+        );
+
+        assert!(
+            point_reduction > 0.70,
+            "expected the synthetic 81.6%-duplicate corpus to collapse by at least 70%, got \
+             {:.1}% ({} -> {})",
+            point_reduction * 100.0,
+            raw.len(),
+            collapsed.len()
+        );
+
+        // Losslessness must hold at field scale too, not just in the small
+        // hand-built fixtures above.
+        let now = raw.last().unwrap().timestamp;
+        assert_collapse_is_lossless(raw, now);
+    }
+
+    // -- Issue #153: pre-#153 `session_json` rows must keep deserializing
+    //    and computing exactly as they did before this change -----------
+
+    #[test]
+    fn legacy_json_shaped_points_produce_the_same_quota_snapshot_as_pre_153_code_would_have() {
+        // The load-bearing backward-compatibility claim, proven end to end
+        // rather than only at the single-point level: `session_json` rows
+        // written before #153 have neither `run_started_at` nor
+        // `observation_count` in their JSON at all -- this builds points
+        // from literally that old shape (not from Rust struct literals that
+        // merely set the new fields to their defaults) and runs the full
+        // quota pipeline over them.
+        //
+        // A bare `#[serde(default)]` on `observation_count` (a `u32`) would
+        // default it to 0, not 1 -- silently zeroing every pre-#153 point's
+        // contribution to `evidence_points` and deleting every forecast on
+        // un-rescanned data, exactly the regression #153 exists to avoid.
+        // This test would catch that: it clears MIN_EVIDENCE_POINTS (5) only
+        // if each legacy point counts as 1 observation.
+        let legacy_point_json = |ts: &str, used_percent: f64| {
+            format!(
+                r#"{{"timestamp":"{ts}","turn_id":null,"limit_id":null,
+                    "primary":{{"used_percent":{used_percent},"window_minutes":300,"resets_at":"2026-01-01T05:00:00Z"}},
+                    "secondary":null}}"#
+            )
+        };
+        let timestamps = [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:10:00Z",
+            "2026-01-01T00:20:00Z",
+            "2026-01-01T00:30:00Z",
+            "2026-01-01T00:40:00Z",
+        ];
+        let used_percents = [10.0, 12.0, 14.0, 16.0, 18.0];
+        let legacy_points: Vec<RateLimitSnapshotPoint> = timestamps
+            .iter()
+            .zip(used_percents.iter())
+            .map(|(ts, used_percent)| {
+                serde_json::from_str(&legacy_point_json(ts, *used_percent)).unwrap()
+            })
+            .collect();
+
+        // Every deserialized legacy point must already look like a
+        // singleton run.
+        for point in &legacy_points {
+            assert_eq!(point.observation_count, 1);
+            assert_eq!(point.run_started_at, None);
+            assert_eq!(point.run_started_at(), point.timestamp);
+        }
+
+        let now = legacy_points.last().unwrap().timestamp;
+        let legacy_snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &legacy_points,
+            QuotaAccountInfo::default(),
+            now,
+            Duration::hours(6),
+        );
+
+        // What pre-#153 code produced for this exact data: constructed the
+        // same way `evenly_spaced_points` above does, with no notion of
+        // `run_started_at`/`observation_count` at all. If the JSON-restored
+        // points behave identically to this, the serde defaults are
+        // provably a faithful stand-in for "pre-#153 shape."
+        let pre_153_equivalent = evenly_spaced_points(
+            "2026-01-01T00:00:00Z",
+            10,
+            5,
+            10.0,
+            2.0,
+            300,
+            "2026-01-01T05:00:00Z",
+        );
+        let pre_153_snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &pre_153_equivalent,
+            QuotaAccountInfo::default(),
+            now,
+            Duration::hours(6),
+        );
+
+        assert_eq!(
+            legacy_snapshot, pre_153_snapshot,
+            "a session restored from pre-#153 JSON must compute an identical QuotaSnapshot to \
+             fresh pre-#153-shaped data"
+        );
+        let forecast = legacy_snapshot.windows[0].forecast.as_ref().expect(
+            "5 legacy points, each correctly defaulting to 1 observation, must clear \
+             MIN_EVIDENCE_POINTS -- if this is None, `observation_count`'s serde default is \
+             producing 0, not 1",
+        );
+        assert_eq!(forecast.evidence_points, 5);
+    }
+
+    #[test]
+    fn legacy_session_json_with_a_rate_limits_history_array_still_deserializes_correctly() {
+        // Same claim, at the `Session` level: a whole `session_json` blob
+        // (what history_store.rs and scan_cache.rs actually persist) whose
+        // `rate_limits_history` array uses the pre-#153 shape must still
+        // deserialize into a `Session` whose points behave as singleton
+        // runs -- not just a bare `RateLimitSnapshotPoint` in isolation.
+        let session = test_session(
+            "legacy",
+            codex_provider_id(),
+            ts("2026-01-01T00:10:00Z"),
+            None,
+            None,
+            vec![
+                point("2026-01-01T00:00:00Z", 10.0, 300, "2026-01-01T05:00:00Z"),
+                point("2026-01-01T00:10:00Z", 12.0, 300, "2026-01-01T05:00:00Z"),
+            ],
+        );
+        let mut serialized = serde_json::to_value(&session).unwrap();
+        let points = serialized
+            .get_mut("rate_limits_history")
+            .and_then(|v| v.as_array_mut())
+            .unwrap();
+        for point in points.iter_mut() {
+            let obj = point.as_object_mut().unwrap();
+            obj.remove("run_started_at");
+            obj.remove("observation_count");
+        }
+
+        let restored: Session = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored.rate_limits_history.len(), 2);
+        for point in &restored.rate_limits_history {
+            assert_eq!(point.observation_count, 1);
+            assert_eq!(point.run_started_at, None);
+        }
+        assert_eq!(
+            restored.rate_limits_history[0]
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            10.0
+        );
+        assert_eq!(
+            restored.rate_limits_history[1]
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            12.0
         );
     }
 }

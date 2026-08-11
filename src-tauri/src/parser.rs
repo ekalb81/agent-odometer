@@ -788,16 +788,24 @@ impl SessionParser {
                     .get("secondary")
                     .and_then(parse_rate_limit_window);
                 if primary.is_some() || secondary.is_some() {
-                    s.rate_limits_history.push(RateLimitSnapshotPoint {
-                        timestamp: event_ts,
+                    let limit_id = rate_limits
+                        .get("limit_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    // Issue #153: token-count events fire far more often than
+                    // the rate-limit window values change (81.6% of points
+                    // measured byte-identical to their predecessor across a
+                    // 600-transcript corpus). `record` collapses a run of
+                    // consecutive, field-identical observations into one
+                    // stored point instead of pushing one per event.
+                    RateLimitSnapshotPoint::record(
+                        &mut s.rate_limits_history,
+                        event_ts,
                         turn_id,
-                        limit_id: rate_limits
-                            .get("limit_id")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
+                        limit_id,
                         primary,
                         secondary,
-                    });
+                    );
                 }
             }
         }
