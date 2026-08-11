@@ -235,6 +235,33 @@ pub fn get_performance_status(
     state.performance.status()
 }
 
+/// Live view of the current process, active phase, and recent phase timings
+/// (issue #163) — `DiagnosticsPanel`'s data source. `enabled: false` (via
+/// `crate::memory::MemoryLiveStatus::default()`, with `recent_operations`
+/// left empty here to match) is the entire disabled-tracking answer; the
+/// frontend renders that as "tracking is off", never as zeros or an empty
+/// chart standing in for "measured, and it's fine".
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PerformanceLiveStatus {
+    #[serde(flatten)]
+    pub memory: crate::memory::MemoryLiveStatus,
+    pub recent_operations: Vec<crate::performance::RecentOperation>,
+}
+
+#[tauri::command]
+pub fn get_performance_live_status(state: State<'_, Arc<AppState>>) -> PerformanceLiveStatus {
+    let memory = crate::memory::live_status(&state.performance);
+    let recent_operations = if memory.enabled {
+        state.performance.recent_operations()
+    } else {
+        Vec::new()
+    };
+    PerformanceLiveStatus {
+        memory,
+        recent_operations,
+    }
+}
+
 #[tauri::command]
 pub fn record_frontend_performance(
     state: State<'_, Arc<AppState>>,
@@ -1284,6 +1311,20 @@ pub fn spawn_scan(
         }
 
         crate::memory::record_phase_sample(&state.performance, "bulk_scan_parallel", "before");
+        // Continuous sampling for this phase's duration (issue #163): a
+        // 118s scan otherwise produces only the two boundary samples above,
+        // which cannot distinguish "uniformly slower" from "stalled 60s in
+        // one place". `None` (no thread) whenever tracking is disabled.
+        let progress_state = state.clone();
+        let phase_sampler = crate::memory::PhaseSampler::start(
+            &state.performance,
+            "bulk_scan_parallel",
+            std::time::Duration::from_millis(500),
+            Box::new(move || crate::memory::PhaseProgress {
+                done: Some(progress_state.scan_done.load(Ordering::Acquire) as u64),
+                total: Some(progress_state.scan_total.load(Ordering::Acquire) as u64),
+            }),
+        );
         let report = crate::scanner::scan_all(
             &provider_sources,
             cache,
@@ -1340,6 +1381,9 @@ pub fn spawn_scan(
                 }
             },
         );
+        if let Some(phase_sampler) = phase_sampler {
+            phase_sampler.stop();
+        }
         crate::memory::record_phase_sample(&state.performance, "bulk_scan_parallel", "after");
 
         if state.current_scan_generation() != generation {
@@ -1669,6 +1713,23 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
         // actually measuring, per this function's un-split shape before this
         // change.
         crate::memory::record_phase_sample(&state.performance, "history_hydrate", "before");
+        // Continuous sampling for this phase's duration (issue #163). Progress
+        // is a proxy — `state.sessions` len — rather than an exact hydration
+        // counter: `hydrate_history` populates it one session at a time via
+        // `apply_loaded_session`, so this grows in step with hydration, but a
+        // concurrently-arriving live watcher event could also add to it. That
+        // is an acceptable imprecision for a diagnostic progress readout, not
+        // an accounting path. `None` (no thread) whenever tracking is disabled.
+        let progress_state = state.clone();
+        let hydrate_sampler = crate::memory::PhaseSampler::start(
+            &state.performance,
+            "history_hydrate",
+            std::time::Duration::from_millis(500),
+            Box::new(move || crate::memory::PhaseProgress {
+                done: Some(progress_state.sessions.len() as u64),
+                total: None,
+            }),
+        );
         let hydrate_started = Instant::now();
         let hydration_stats = match result {
             Ok(store) => {
@@ -1689,6 +1750,9 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
                 state.set_history_ready(None)
             }
         };
+        if let Some(hydrate_sampler) = hydrate_sampler {
+            hydrate_sampler.stop();
+        }
         // `sessions`/`bytes` (issue #139): recording both distinguishes "more
         // sessions" from "bigger sessions" as an explanation for this phase's
         // cost, rather than inferring it from a version-over-version session
@@ -2253,7 +2317,7 @@ mod tests {
         defender_verification_script, newest_subscription_usage_by_harness,
         powershell_encoded_command, powershell_encoded_path, preserve_backend_owned_config,
         range_has_data, resolve_projects_from, shorten_display_path, valid_session_id,
-        working_directory_info, write_export_file,
+        working_directory_info, write_export_file, PerformanceLiveStatus,
     };
     use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
     use crate::model::{
@@ -2774,6 +2838,33 @@ mod tests {
         assert_eq!(standalone.session_count, 1);
         let remaining = projects.iter().find(|p| p.project_key == "repo:a").unwrap();
         assert_eq!(remaining.session_count, 1);
+    }
+
+    /// `PerformanceLiveStatus` wraps `MemoryLiveStatus` behind
+    /// `#[serde(flatten)]` (issue #163) so the frontend sees one flat object
+    /// rather than a nested `memory` key; `src/lib/types.ts`'s
+    /// `PerformanceLiveStatus` interface is written against that flattened
+    /// shape, so this pins the wire contract the frontend mock in
+    /// `DiagnosticsPanel.test.ts` cannot itself catch a drift in.
+    #[test]
+    fn performance_live_status_flattens_memory_fields_to_the_top_level() {
+        let status = PerformanceLiveStatus {
+            memory: crate::memory::MemoryLiveStatus {
+                enabled: true,
+                active_phase: Some("bulk_scan_parallel".to_string()),
+                ..Default::default()
+            },
+            recent_operations: Vec::new(),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        let object = json.as_object().unwrap();
+        assert!(
+            !object.contains_key("memory"),
+            "flatten must not leave a nested \"memory\" key: {object:?}"
+        );
+        assert_eq!(object["enabled"], true);
+        assert_eq!(object["active_phase"], "bulk_scan_parallel");
+        assert!(object.contains_key("recent_operations"));
     }
 }
 

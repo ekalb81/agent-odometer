@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -242,6 +242,13 @@ export function setTrayTotals(totals: TrayTotals): Promise<void> {
 
 export function getPerformanceStatus(): Promise<PerformanceStatus> {
   return invoke<PerformanceStatus>('get_performance_status');
+}
+
+/** Live process/phase/database telemetry for `DiagnosticsPanel` (issue #163).
+ *  Cheap to call while tracking is disabled (returns the `enabled: false`
+ *  shape immediately, no sampling) — safe for the panel's slow poll. */
+export function getPerformanceLiveStatus(): Promise<PerformanceLiveStatus> {
+  return invoke<PerformanceLiveStatus>('get_performance_live_status');
 }
 
 export function recordFrontendPerformance(

@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,6 +22,14 @@ const MAX_LOG_MB: u64 = 1_024;
 const CURRENT_LOG: &str = "performance-events-v1.jsonl";
 const PREVIOUS_LOG: &str = "performance-events-v1.previous.jsonl";
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound on the in-memory "recent phase timings" ring (issue #163) that
+/// backs the live diagnostics view — independent of, and much smaller than,
+/// the on-disk log's own rotation. `memory.*` operations are deliberately
+/// excluded from this ring (see [`PerformanceRecorder::record`]): they carry
+/// `duration_ms == 0.0` by construction (point-in-time samples, not timed
+/// work — see `memory.rs`), and at a 500ms sampling cadence they would
+/// otherwise crowd out every real phase timing within seconds.
+const RECENT_OPERATIONS_CAP: usize = 64;
 
 enum WriterMessage {
     Event(Box<PerformanceEvent>),
@@ -53,24 +61,47 @@ pub struct PerformanceStatus {
     pub dropped_this_run: u64,
 }
 
+/// A bounded, privacy-safe echo of one recorded operation — just enough to
+/// answer "what ran recently and how long did it take" for the live
+/// diagnostics view (issue #163), never the full `PerformanceEvent`
+/// (`metadata` can carry byte counts and connection labels that are fine for
+/// the JSONL log's own audience but are not this view's concern).
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentOperation {
+    pub operation: String,
+    pub duration_ms: f64,
+    pub success: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Every field is `Arc`-wrapped so the whole recorder is cheaply `Clone`:
+/// issue #163's continuous phase sampler needs a `'static` handle it can
+/// move into its own thread without `memory.rs` reaching into `AppState`, and
+/// a clone here is an atomic refcount bump on already-shared state, not a
+/// second independent recorder.
+#[derive(Clone)]
 pub struct PerformanceRecorder {
-    enabled: AtomicBool,
+    enabled: Arc<AtomicBool>,
     max_file_bytes: Arc<AtomicU64>,
-    sender: Mutex<Option<mpsc::SyncSender<WriterMessage>>>,
-    sequence: AtomicU64,
+    sender: Arc<Mutex<Option<mpsc::SyncSender<WriterMessage>>>>,
+    sequence: Arc<AtomicU64>,
     recorded: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    /// Ring of the most recent recorded operations, for the live diagnostics
+    /// view's "recent phase timings" — see [`Self::recent_operations`].
+    recent: Arc<Mutex<VecDeque<RecentOperation>>>,
 }
 
 impl Default for PerformanceRecorder {
     fn default() -> Self {
         Self {
-            enabled: AtomicBool::new(false),
+            enabled: Arc::new(AtomicBool::new(false)),
             max_file_bytes: Arc::new(AtomicU64::new(64 * 1024 * 1024)),
-            sender: Mutex::new(None),
-            sequence: AtomicU64::new(0),
+            sender: Arc::new(Mutex::new(None)),
+            sequence: Arc::new(AtomicU64::new(0)),
             recorded: Arc::new(AtomicU64::new(0)),
             dropped: Arc::new(AtomicU64::new(0)),
+            recent: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 }
@@ -164,6 +195,33 @@ impl PerformanceRecorder {
         }
     }
 
+    /// Recent non-`memory.*` operations, oldest first, for the live
+    /// diagnostics view (issue #163). Empty whenever tracking is or was
+    /// disabled — nothing is ever pushed into the ring by [`Self::record`]
+    /// unless [`Self::is_enabled`] was true at call time.
+    pub fn recent_operations(&self) -> Vec<RecentOperation> {
+        self.recent
+            .lock()
+            .map(|recent| recent.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Test-only: marks the recorder enabled without starting the real
+    /// writer thread ([`Self::ensure_writer`]), so [`Self::record`]'s
+    /// in-memory bookkeeping (`recent`, `recorded`/`dropped` counters) runs
+    /// exactly as it would in production, but nothing touches this machine's
+    /// real performance log directory. `configure(true, ..)` is deliberately
+    /// never called from a test in this crate (see the module's existing
+    /// test comments) because it does start that writer; this gives phase
+    /// sampler lifecycle tests (`memory.rs`) an enabled recorder without that
+    /// side effect.
+    #[cfg(test)]
+    pub(crate) fn enabled_for_test() -> Self {
+        let recorder = Self::default();
+        recorder.enabled.store(true, Ordering::Release);
+        recorder
+    }
+
     fn ensure_writer(&self) -> bool {
         let Ok(mut sender) = self.sender.lock() else {
             return false;
@@ -214,6 +272,26 @@ impl PerformanceRecorder {
             success,
             metadata: sanitize_metadata(metadata),
         };
+        // In-memory only, independent of whether the writer thread/disk
+        // write below succeeds — this is what backs the live view's "recent
+        // phase timings", not the durable log. `memory.*` operations are
+        // excluded (see `RECENT_OPERATIONS_CAP`'s doc comment): they are
+        // point samples, not timings, and at their sampling cadence would
+        // otherwise flush every real phase timing out of a small ring within
+        // seconds.
+        if !event.operation.starts_with("memory.") {
+            if let Ok(mut recent) = self.recent.lock() {
+                recent.push_back(RecentOperation {
+                    operation: event.operation.clone(),
+                    duration_ms: event.duration_ms,
+                    success: event.success,
+                    timestamp: event.timestamp,
+                });
+                while recent.len() > RECENT_OPERATIONS_CAP {
+                    recent.pop_front();
+                }
+            }
+        }
         let (was_dropped, disconnected) = match self.sender.lock() {
             Ok(mut sender) => match sender
                 .as_ref()
@@ -469,6 +547,47 @@ mod tests {
     #[test]
     fn recorder_is_disabled_by_default() {
         assert!(!PerformanceRecorder::default().is_enabled());
+    }
+
+    #[test]
+    fn recent_operations_excludes_memory_operations_and_is_bounded() {
+        // `enabled_for_test` marks the recorder enabled without starting the
+        // real writer thread, so this never touches the machine's real
+        // performance log directory (see its doc comment).
+        let recorder = PerformanceRecorder::enabled_for_test();
+        recorder.record_backend_duration_ms(
+            "memory.bulk_scan_parallel",
+            0.0,
+            true,
+            BTreeMap::new(),
+        );
+        recorder.record_backend_duration_ms("startup.bulk_scan", 42.5, true, BTreeMap::new());
+        recorder.record_backend_duration_ms(
+            "startup.history_hydrate",
+            12.0,
+            false,
+            BTreeMap::new(),
+        );
+
+        let recent = recorder.recent_operations();
+        assert_eq!(recent.len(), 2, "memory.* operations must not appear here");
+        assert_eq!(recent[0].operation, "startup.bulk_scan");
+        assert_eq!(recent[0].duration_ms, 42.5);
+        assert!(recent[0].success);
+        assert_eq!(recent[1].operation, "startup.history_hydrate");
+        assert!(!recent[1].success);
+
+        for i in 0..(RECENT_OPERATIONS_CAP + 10) {
+            recorder.record_backend_duration_ms(format!("test.op{i}"), 1.0, true, BTreeMap::new());
+        }
+        assert_eq!(recorder.recent_operations().len(), RECENT_OPERATIONS_CAP);
+    }
+
+    #[test]
+    fn recent_operations_is_empty_when_tracking_never_enabled() {
+        let recorder = PerformanceRecorder::default();
+        recorder.record_backend_duration_ms("startup.bulk_scan", 1.0, true, BTreeMap::new());
+        assert!(recorder.recent_operations().is_empty());
     }
 
     #[test]

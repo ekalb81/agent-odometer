@@ -1,7 +1,25 @@
 <script lang="ts">
-  import { getProviderDiagnostics, writeExport } from '../lib/ipc';
+  import { getConfig, getPerformanceLiveStatus, getProviderDiagnostics, setConfig, writeExport } from '../lib/ipc';
   import { diagnosticsExportJson } from '../lib/diagnosticsExport';
-  import type { DiagnosticsReport, ProviderDiagnostic, ProviderHealthState } from '../lib/types';
+  import Sparkline from './Sparkline.svelte';
+  import type {
+    Config,
+    DiagnosticsReport,
+    PerformanceLiveStatus,
+    PhaseSampleEvent,
+    ProviderDiagnostic,
+    ProviderHealthState,
+  } from '../lib/types';
+
+  interface Props {
+    /** Gate on `active && telemetryOpen`, mirroring `SubscriptionUsage`'s
+     *  convention: this panel is mounted for the whole time Settings is open
+     *  (see `App.svelte`), so without the disclosure state below the live
+     *  poll would run for the lifetime of that tab even if telemetry is
+     *  never opened. */
+    active?: boolean;
+  }
+  let { active = true }: Props = $props();
 
   let report = $state<DiagnosticsReport | null>(null);
   let loading = $state(false);
@@ -10,6 +28,90 @@
   let copyStatus = $state<string | null>(null);
   let exporting = $state(false);
   let exportError = $state<string | null>(null);
+
+  // Live performance telemetry (issue #163). A one-shot config read (not a
+  // poll) tells this section whether tracking is on; the live values
+  // themselves only poll while the disclosure below is actually open.
+  const LIVE_POLL_MS = 2_000;
+  let config = $state<Config | null>(null);
+  let configError = $state<string | null>(null);
+  let enablingTracking = $state(false);
+  let telemetryOpen = $state(false);
+  let liveStatus = $state<PerformanceLiveStatus | null>(null);
+  let liveError = $state<string | null>(null);
+
+  async function loadConfig(): Promise<void> {
+    try {
+      config = await getConfig();
+      configError = null;
+    } catch (e) {
+      configError = String(e);
+    }
+  }
+
+  $effect(() => {
+    if (!active) return;
+    void loadConfig();
+  });
+
+  async function enableTracking(): Promise<void> {
+    if (!config) return;
+    enablingTracking = true;
+    try {
+      const updated: Config = { ...config, performance_tracking_enabled: true };
+      await setConfig(updated);
+      config = updated;
+      configError = null;
+    } catch (e) {
+      configError = String(e);
+    } finally {
+      enablingTracking = false;
+    }
+  }
+
+  async function refreshLiveStatus(): Promise<void> {
+    try {
+      liveStatus = await getPerformanceLiveStatus();
+      liveError = null;
+    } catch (e) {
+      liveError = String(e);
+    }
+  }
+
+  $effect(() => {
+    if (!active || !telemetryOpen || !config?.performance_tracking_enabled) return;
+    void refreshLiveStatus();
+    const interval = setInterval(() => void refreshLiveStatus(), LIVE_POLL_MS);
+    return () => clearInterval(interval);
+  });
+
+  /** Recent RSS samples reshaped for `Sparkline`, which plots a generic
+   *  `{timestamp, total_tokens}` series — reused as-is rather than adding a
+   *  second charting component. `elapsed_ms` (time since the phase started,
+   *  not a wall-clock instant) is converted to a real timestamp anchored on
+   *  "now" so the sparkline's own tooltip still reads sensibly. */
+  function memoryPoints(samples: PhaseSampleEvent[]): { timestamp: string; total_tokens: number }[] {
+    const withRss = samples.filter((s) => s.rss_bytes != null);
+    if (withRss.length === 0) return [];
+    const latestElapsed = withRss[withRss.length - 1].elapsed_ms;
+    const now = Date.now();
+    return withRss.map((s) => ({
+      timestamp: new Date(now - (latestElapsed - s.elapsed_ms)).toISOString(),
+      total_tokens: s.rss_bytes as number,
+    }));
+  }
+
+  function fmtBytes(value: number | null | undefined): string {
+    if (value == null) return 'unavailable';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let scaled = value;
+    let unit = 0;
+    while (scaled >= 1024 && unit < units.length - 1) {
+      scaled /= 1024;
+      unit++;
+    }
+    return `${scaled.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+  }
 
   async function refresh() {
     loading = true;
@@ -75,6 +177,85 @@
     Per-provider health for missing sessions, partial provider support, parse failures, stale
     pricing, and retention risk — without reading logs. Not fetched automatically; refresh below.
   </p>
+
+  <div class="bg-card border border-edge rounded-lg px-4 py-3 max-w-3xl mb-3" data-testid="performance-telemetry-panel">
+    <h3 class="text-xs font-semibold text-ink mb-1">Live performance telemetry</h3>
+    {#if configError}
+      <p class="text-xs text-red-500">{configError}</p>
+    {:else if config && !config.performance_tracking_enabled}
+      <p class="text-[11px] text-ink-faint">
+        Performance tracking is off — no sampler runs and nothing is recorded, so there is
+        nothing live to show.
+      </p>
+      <button
+        onclick={enableTracking}
+        disabled={enablingTracking}
+        class="mt-2 px-3 py-1.5 text-xs rounded-sm bg-app border border-edge hover:bg-(--row-hover) disabled:opacity-40"
+      >{enablingTracking ? 'Enabling…' : 'Enable performance tracking'}</button>
+    {:else if config}
+      <details bind:open={telemetryOpen}>
+        <summary class="text-[11px] text-accent-chipfg cursor-pointer select-none">
+          {telemetryOpen ? 'Hide live view' : 'Show live view'}
+        </summary>
+        <div class="mt-2">
+          {#if liveError}
+            <p class="text-xs text-red-500">{liveError}</p>
+          {:else if liveStatus}
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-x-4 gap-y-1 text-[11px] text-ink-faint">
+              <div>RSS: {fmtBytes(liveStatus.process?.rss_bytes)}</div>
+              <div>Peak RSS: {fmtBytes(liveStatus.process?.peak_rss_bytes)}</div>
+              <div>Private bytes: {fmtBytes(liveStatus.process?.private_bytes)}</div>
+              <div>Heap: {liveStatus.heap?.current_bytes != null ? fmtBytes(liveStatus.heap.current_bytes) : 'not tracked'}</div>
+            </div>
+
+            {#if liveStatus.active_phase}
+              <p class="mt-2 text-[11px] text-ink-2" data-testid="active-phase">
+                Active phase: <span class="font-mono">{liveStatus.active_phase}</span>
+                · {((liveStatus.active_phase_elapsed_ms ?? 0) / 1000).toFixed(1)}s elapsed
+                {#if liveStatus.progress_done != null}
+                  · {liveStatus.progress_done.toLocaleString()}{liveStatus.progress_total != null ? ` / ${liveStatus.progress_total.toLocaleString()}` : ''} processed
+                {/if}
+              </p>
+            {:else}
+              <p class="mt-2 text-[11px] text-ink-faint">No phase currently running.</p>
+            {/if}
+
+            {#if liveStatus.recent_samples.length >= 2}
+              <div class="mt-2">
+                <Sparkline points={memoryPoints(liveStatus.recent_samples)} width={320} height={48} />
+              </div>
+            {/if}
+
+            {#if liveStatus.database_footprints.length > 0}
+              <div class="mt-2 space-y-0.5">
+                {#each liveStatus.database_footprints as fp (fp.connection)}
+                  <p class="text-[11px] text-ink-faint">
+                    {fp.connection}: {fmtBytes(fp.db_bytes)}{fp.wal_bytes != null ? ` (+${fmtBytes(fp.wal_bytes)} WAL)` : ''}
+                    {#if fp.volume_free_bytes != null && fp.volume_total_bytes != null}
+                      · volume {fmtBytes(fp.volume_free_bytes)} free / {fmtBytes(fp.volume_total_bytes)} total
+                    {/if}
+                  </p>
+                {/each}
+              </div>
+            {/if}
+
+            {#if liveStatus.recent_operations.length > 0}
+              <details class="mt-2">
+                <summary class="text-[11px] text-accent-chipfg cursor-pointer">Recent phase timings</summary>
+                <ul class="mt-1 space-y-0.5">
+                  {#each liveStatus.recent_operations.slice(-15).reverse() as op (op.timestamp + op.operation)}
+                    <li class="text-[11px] font-mono text-ink-faint">{op.operation}: {op.duration_ms.toFixed(0)}ms{op.success ? '' : ' (failed)'}</li>
+                  {/each}
+                </ul>
+              </details>
+            {/if}
+          {:else}
+            <p class="text-[11px] text-ink-faint italic">Loading…</p>
+          {/if}
+        </div>
+      </details>
+    {/if}
+  </div>
 
   <div class="bg-card border border-edge rounded-lg px-4 py-3 max-w-3xl">
     <div class="flex items-center gap-3 flex-wrap">

@@ -546,6 +546,74 @@ export interface PerformanceStatus {
   dropped_this_run: number;
 }
 
+/** OS-reported process memory (see `memory.rs::ProcessMemorySample`). A
+ *  field is `null` where the platform/query is unavailable — never a
+ *  fabricated zero. */
+export interface ProcessMemorySample {
+  rss_bytes: number | null;
+  peak_rss_bytes: number | null;
+  private_bytes: number | null;
+}
+
+/** Allocator-tracked heap (see `memory.rs::HeapSample`). Both fields are
+ *  `null` when heap tracking itself is off, distinct from "0 bytes tracked". */
+export interface HeapSample {
+  current_bytes: number | null;
+  peak_bytes: number | null;
+}
+
+/** One continuous-sampler tick during a long startup phase (issue #163). */
+export interface PhaseSampleEvent {
+  phase: string;
+  sample_index: number;
+  elapsed_ms: number;
+  rss_bytes: number | null;
+  peak_rss_bytes: number | null;
+  private_bytes: number | null;
+  heap_bytes: number | null;
+  heap_peak_bytes: number | null;
+  progress_done: number | null;
+  progress_total: number | null;
+  /** True on the sample that hit the phase's sample cap — the sampler
+   *  stopped there rather than continuing silently. */
+  capped: boolean;
+}
+
+/** On-disk database size plus volume headroom for one connection
+ *  (`"history_store"` or `"scan_cache"`) — see `memory.rs::DatabaseFootprint`. */
+export interface DatabaseFootprintEntry {
+  connection: string;
+  db_bytes: number | null;
+  wal_bytes: number | null;
+  volume_free_bytes: number | null;
+  volume_total_bytes: number | null;
+}
+
+/** A recently recorded phase timing, privacy-scrubbed to just a name and a
+ *  duration (see `performance.rs::RecentOperation`). */
+export interface RecentOperation {
+  operation: string;
+  duration_ms: number;
+  success: boolean;
+  timestamp: string;
+}
+
+/** `DiagnosticsPanel`'s live-telemetry data source (issue #163). When
+ *  `enabled` is false every other field is empty/null — render that as
+ *  "tracking is off", never as zeros or an empty chart. */
+export interface PerformanceLiveStatus {
+  enabled: boolean;
+  process: ProcessMemorySample | null;
+  heap: HeapSample | null;
+  active_phase: string | null;
+  active_phase_elapsed_ms: number | null;
+  progress_done: number | null;
+  progress_total: number | null;
+  recent_samples: PhaseSampleEvent[];
+  database_footprints: DatabaseFootprintEntry[];
+  recent_operations: RecentOperation[];
+}
+
 export interface ModelRate {
   input: number;
   cached_input: number;
