@@ -463,7 +463,8 @@
 
   // ---------------------------------------------------------------------------
   // Issue #162: user-triggered history rebuild (re-parse every archived
-  // session from its source transcript, then VACUUM). Confirmation happens
+  // session from its source transcript, then VACUUM and checkpoint — issue
+  // #167). Confirmation happens
   // here, in the frontend, before rebuildHistory() is ever called — the
   // backend command does not confirm again. Progress is self-contained to
   // this component: navigating away and back re-syncs from
@@ -1773,7 +1774,7 @@
             {formatBytesLarge(rebuildStatus.session_json_bytes_after)}
           </p>
           <p>
-            File on disk: {formatBytesLarge(rebuildStatus.file_size_before)} →
+            Total on disk (database + WAL): {formatBytesLarge(rebuildStatus.file_size_before)} →
             {formatBytesLarge(rebuildStatus.file_size_after)}
           </p>
         </div>

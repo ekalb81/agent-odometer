@@ -384,6 +384,9 @@ export interface HistoryRebuildStatus {
   rate_limit_points_after: number | null;
   session_json_bytes_before: number | null;
   session_json_bytes_after: number | null;
+  /** Total on-disk footprint — main database file plus its `-wal` sidecar
+   *  (issue #167). Not the main file alone: a rebuild that shrinks the
+   *  database while leaving an oversized WAL behind must still show up here. */
   file_size_before: number | null;
   file_size_after: number | null;
 }
