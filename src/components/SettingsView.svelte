@@ -4,13 +4,13 @@
   import { rates } from '../lib/stores/rates';
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
-  import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations } from '../lib/ipc';
+  import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations, rebuildHistory, cancelHistoryRebuild, getHistoryRebuildStatus, onHistoryRebuildProgress } from '../lib/ipc';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
-  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, HarnessIntegrationStatus, TurnReceiptIntegrationStatus, PricingCatalog } from '../lib/types';
+  import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, HarnessIntegrationStatus, TurnReceiptIntegrationStatus, PricingCatalog, HistoryRebuildStatus } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
   import { defenderReceiptStatus, isWindowsDefenderSurface } from '../lib/defenderStatus';
 
@@ -460,6 +460,113 @@
     if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
     return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
   }
+
+  // ---------------------------------------------------------------------------
+  // Issue #162: user-triggered history rebuild (re-parse every archived
+  // session from its source transcript, then VACUUM). Confirmation happens
+  // here, in the frontend, before rebuildHistory() is ever called — the
+  // backend command does not confirm again. Progress is self-contained to
+  // this component: navigating away and back re-syncs from
+  // getHistoryRebuildStatus() on the next mount, the same "call once on
+  // mount, then follow events" contract get_scan_status/get_history_status
+  // already establish, rather than routing through a global store.
+  // ---------------------------------------------------------------------------
+
+  let rebuildStatus = $state<HistoryRebuildStatus>({
+    phase: 'idle',
+    done: 0,
+    total: 0,
+    elapsed_ms: null,
+    error: null,
+    sessions_reparsed: null,
+    sessions_missing_transcript: null,
+    sessions_failed: null,
+    rate_limit_points_before: null,
+    rate_limit_points_after: null,
+    session_json_bytes_before: null,
+    session_json_bytes_after: null,
+    file_size_before: null,
+    file_size_after: null,
+  });
+  let rebuildStarting = $state(false);
+  let rebuildActionError = $state<string | null>(null);
+
+  const rebuildInProgress = $derived(
+    rebuildStatus.phase === 'running' || rebuildStatus.phase === 'vacuuming',
+  );
+
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    void getHistoryRebuildStatus()
+      .then((status) => (rebuildStatus = status))
+      .catch(() => {});
+    void onHistoryRebuildProgress((status) => {
+      rebuildStatus = status;
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  });
+
+  async function confirmAndStartRebuild() {
+    rebuildActionError = null;
+    if (rebuildInProgress || rebuildStarting) return;
+    const proceed = window.confirm(
+      'Rebuild history? Every archived session is re-parsed from its original transcript, and ' +
+      'the archive file is then compacted. This rewrites the whole archive and can take several ' +
+      'minutes on a large history. It is safe to interrupt: anything already rewritten stays ' +
+      'rewritten, and a session whose source transcript no longer exists on disk keeps its ' +
+      'current stored copy rather than being touched.',
+    );
+    if (!proceed) return;
+    rebuildStarting = true;
+    try {
+      await rebuildHistory();
+    } catch (error) {
+      rebuildActionError = String(error);
+    } finally {
+      rebuildStarting = false;
+    }
+  }
+
+  async function requestCancelRebuild() {
+    try {
+      await cancelHistoryRebuild();
+    } catch (error) {
+      rebuildActionError = String(error);
+    }
+  }
+
+  function formatCount(value: number | null): string {
+    return value === null ? '—' : value.toLocaleString();
+  }
+
+  function formatBytesLarge(value: number | null): string {
+    if (value === null) return '—';
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
+    if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
+    return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  }
+
+  const rebuildPhaseLabel = $derived.by(() => {
+    switch (rebuildStatus.phase) {
+      case 'running':
+        return rebuildStatus.total > 0
+          ? `Rebuilding ${rebuildStatus.done.toLocaleString()}/${rebuildStatus.total.toLocaleString()} sessions…`
+          : 'Rebuilding…';
+      case 'vacuuming':
+        return 'Reclaiming disk space…';
+      case 'complete':
+        return 'Rebuild complete.';
+      case 'cancelled':
+        return 'Rebuild cancelled — everything already rewritten stays rewritten.';
+      case 'failed':
+        return 'Rebuild failed.';
+      default:
+        return '';
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Local editable copy of the rate card, kept in sync with the store on mount.
@@ -1607,6 +1714,72 @@
       <p class="text-xs text-ink-faint italic">Loading…</p>
     </section>
   {/if}
+
+  <!-- Issue #162: user-triggered history rebuild -->
+  <section>
+    <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">History archive</h2>
+    <p class="text-xs text-ink-faint mb-3 max-w-3xl">
+      Re-parses every archived session from its original transcript, so already-archived history
+      picks up whatever the parser does differently today — for example, de-duplicating repeated
+      rate-limit readings — then compacts the archive file to reclaim the space that frees. This
+      rewrites the whole archive and can take several minutes on a large history. It never runs
+      automatically. A session whose source transcript no longer exists on disk keeps its current
+      stored copy rather than being touched, and it is safe to interrupt: anything already
+      rewritten stays rewritten, and nothing not yet reached is changed.
+    </p>
+    <div class="bg-card border border-edge rounded-lg px-4 py-3 max-w-3xl">
+      <div class="flex items-center gap-3 flex-wrap">
+        <button
+          onclick={confirmAndStartRebuild}
+          disabled={rebuildStarting || rebuildInProgress}
+          class="px-3 py-1.5 text-xs font-medium rounded-sm bg-card border border-edge hover:bg-(--row-hover) text-ink transition-colors disabled:opacity-50"
+        >{rebuildInProgress ? 'Rebuilding…' : 'Rebuild history…'}</button>
+        {#if rebuildInProgress}
+          <button
+            onclick={requestCancelRebuild}
+            class="px-2 py-1 text-xs text-accent-chipfg hover:underline"
+          >Cancel</button>
+        {/if}
+        {#if rebuildPhaseLabel}
+          <span class="text-[11px] text-ink-faint">{rebuildPhaseLabel}</span>
+        {/if}
+      </div>
+      {#if rebuildStatus.phase === 'running' && rebuildStatus.total > 0}
+        <progress value={rebuildStatus.done} max={rebuildStatus.total} class="w-full h-1.5 mt-2"
+        ></progress>
+      {/if}
+      {#if rebuildActionError}
+        <p class="text-xs text-red-500 mt-2">{rebuildActionError}</p>
+      {/if}
+      {#if rebuildStatus.error}
+        <p class="text-xs text-red-500 mt-2">{rebuildStatus.error}</p>
+      {/if}
+      {#if rebuildStatus.phase === 'complete' || rebuildStatus.phase === 'cancelled'}
+        <div class="mt-3 pt-3 border-t border-edgerow text-[11px] text-ink-faint space-y-1">
+          <p>
+            {formatCount(rebuildStatus.sessions_reparsed)} re-parsed ·
+            {formatCount(rebuildStatus.sessions_missing_transcript)} missing transcript ·
+            {formatCount(rebuildStatus.sessions_failed)} failed
+            {#if rebuildStatus.elapsed_ms !== null}
+              · {Math.round(rebuildStatus.elapsed_ms / 1000)}s
+            {/if}
+          </p>
+          <p>
+            Rate-limit points: {formatCount(rebuildStatus.rate_limit_points_before)} →
+            {formatCount(rebuildStatus.rate_limit_points_after)}
+          </p>
+          <p>
+            Session content: {formatBytesLarge(rebuildStatus.session_json_bytes_before)} →
+            {formatBytesLarge(rebuildStatus.session_json_bytes_after)}
+          </p>
+          <p>
+            File on disk: {formatBytesLarge(rebuildStatus.file_size_before)} →
+            {formatBytesLarge(rebuildStatus.file_size_after)}
+          </p>
+        </div>
+      {/if}
+    </div>
+  </section>
 
   <DiagnosticsPanel />
 

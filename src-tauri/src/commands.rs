@@ -6,7 +6,10 @@ use crate::model::{
 };
 use crate::rates::RateCard;
 use crate::scan_cache;
-use crate::store::{AppState, HistoryReadinessKind, HistoryStepSnapshot};
+use crate::store::{
+    AppState, HistoryReadinessKind, HistoryRebuildPhase, HistoryRebuildSnapshot,
+    HistoryStepSnapshot,
+};
 #[cfg(any(windows, test))]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Local, Timelike, Utc};
@@ -1839,6 +1842,180 @@ pub fn get_history_status(state: State<'_, Arc<AppState>>) -> HistoryStatus {
         items_total: last_step.as_ref().and_then(|s| s.items_total),
         elapsed_ms: last_step.as_ref().and_then(|s| s.elapsed_ms),
     }
+}
+
+/// Issue #162: re-parses every archived session from its source transcript
+/// and `VACUUM`s the archive, on a background thread, so a stored snapshot
+/// picks up whatever the current parser now does differently (starting with
+/// #153's rate-limit point collapsing) without waiting on that session ever
+/// being scanned again. User-triggered only — never automatic on upgrade,
+/// so the cost stays opt-in and schedulable — and confirmed by the frontend
+/// before this is ever called; this command does not confirm again.
+/// Rejects a concurrent second call while one is already running rather than
+/// running two at once against the same connection.
+#[tauri::command]
+pub fn rebuild_history(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if state.rebuild_running.swap(true, Ordering::AcqRel) {
+        return Err("a history rebuild is already running".into());
+    }
+    state
+        .rebuild_cancel_requested
+        .store(false, Ordering::Release);
+    spawn_history_rebuild(app, state.inner().clone());
+    Ok(())
+}
+
+/// Requests that a running [`rebuild_history`] stop before its next session.
+/// Everything already durably written stays written — see
+/// [`crate::history_store::HistoryStore::rebuild_from_transcripts`]'s doc
+/// comment for why a partial rebuild is still a consistent one. A no-op if
+/// no rebuild is running.
+#[tauri::command]
+pub fn cancel_history_rebuild(state: State<'_, Arc<AppState>>) {
+    state
+        .rebuild_cancel_requested
+        .store(true, Ordering::Release);
+}
+
+/// Returns the current history-rebuild status. The frontend calls this once
+/// on mount (progress events may have fired before its listeners attached)
+/// and then follows "history-rebuild-progress" events — the same contract
+/// `get_scan_status`/`get_history_status` establish for their events.
+#[tauri::command]
+pub fn get_history_rebuild_status(state: State<'_, Arc<AppState>>) -> HistoryRebuildSnapshot {
+    state.history_rebuild_status()
+}
+
+/// Background half of [`rebuild_history`]. Emits "history-rebuild-progress"
+/// (throttled the same way `spawn_scan` throttles "scan-progress": every
+/// 25th session plus both endpoints) and publishes each durably-rewritten
+/// session into live state exactly as a normal bulk scan's write would, so
+/// the UI does not show pre-rebuild content until a restart.
+///
+/// Progress reporting deliberately does *not* reuse `scan_done`/`scan_total`
+/// /the "scan-progress" event: those drive `App.svelte`'s full-screen
+/// startup scanning gate (`!scanStore.status.complete`), so publishing a
+/// user-triggered Settings action through them would block the whole app
+/// behind a "Scanning…" overlay while the rebuild runs in the background.
+/// This mirrors "history-progress"'s existing precedent instead — a second
+/// event/status pair built on the *same* done/total/complete shape and
+/// throttling rule, for a concern `scan-progress` does not own.
+pub fn spawn_history_rebuild(app: AppHandle, state: Arc<AppState>) {
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        let finish = |status: HistoryRebuildSnapshot| {
+            state.set_history_rebuild_status(status.clone());
+            let _ = app.emit("history-rebuild-progress", &status);
+            state.rebuild_running.store(false, Ordering::Release);
+        };
+
+        let Some(history) = state.history_ready() else {
+            finish(HistoryRebuildSnapshot {
+                phase: HistoryRebuildPhase::Failed,
+                elapsed_ms: Some(0),
+                error: Some("durable history is not available".into()),
+                ..Default::default()
+            });
+            return;
+        };
+
+        let footprint_before = history.database_footprint();
+        let running = HistoryRebuildSnapshot {
+            phase: HistoryRebuildPhase::Running,
+            ..Default::default()
+        };
+        state.set_history_rebuild_status(running.clone());
+        let _ = app.emit("history-rebuild-progress", &running);
+
+        let progress_state = state.clone();
+        let progress_app = app.clone();
+        let publish_state = state.clone();
+        let publish_app = app.clone();
+        let cancel_state = state.clone();
+        let outcome = history.rebuild_from_transcripts(
+            move |done, total| {
+                if done == 0 || done == total || done % 25 == 0 {
+                    let status = HistoryRebuildSnapshot {
+                        phase: HistoryRebuildPhase::Running,
+                        done,
+                        total,
+                        ..Default::default()
+                    };
+                    progress_state.set_history_rebuild_status(status.clone());
+                    let _ = progress_app.emit("history-rebuild-progress", &status);
+                }
+            },
+            move |outcome| {
+                let summary = SessionSummary::of(&outcome.stored.session);
+                let displaced_summary = outcome
+                    .displaced
+                    .as_ref()
+                    .map(|displaced| SessionSummary::of(&displaced.session));
+                publish_state.publish_rebuilt_session(outcome);
+                let _ = publish_app.emit("session-updated", &summary);
+                if let Some(displaced_summary) = displaced_summary {
+                    let _ = publish_app.emit("session-updated", &displaced_summary);
+                }
+            },
+            move || {
+                cancel_state
+                    .rebuild_cancel_requested
+                    .load(Ordering::Acquire)
+            },
+        );
+
+        let status = match outcome {
+            Ok(result) => {
+                let (file_size_after, vacuum_error) = if result.cancelled {
+                    (None, None)
+                } else {
+                    let vacuuming = HistoryRebuildSnapshot {
+                        phase: HistoryRebuildPhase::Vacuuming,
+                        done: result.sessions_considered,
+                        total: result.sessions_considered,
+                        ..Default::default()
+                    };
+                    state.set_history_rebuild_status(vacuuming.clone());
+                    let _ = app.emit("history-rebuild-progress", &vacuuming);
+                    match history.vacuum() {
+                        Ok(()) => (history.database_footprint().db_bytes, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    }
+                };
+                let phase = if vacuum_error.is_some() {
+                    HistoryRebuildPhase::Failed
+                } else if result.cancelled {
+                    HistoryRebuildPhase::Cancelled
+                } else {
+                    HistoryRebuildPhase::Complete
+                };
+                HistoryRebuildSnapshot {
+                    phase,
+                    done: result.sessions_considered,
+                    total: result.sessions_considered,
+                    elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                    error: vacuum_error,
+                    sessions_reparsed: Some(result.sessions_reparsed),
+                    sessions_missing_transcript: Some(result.sessions_missing_transcript),
+                    sessions_failed: Some(result.sessions_failed),
+                    rate_limit_points_before: Some(result.before.rate_limit_points),
+                    rate_limit_points_after: Some(result.after.rate_limit_points),
+                    session_json_bytes_before: Some(result.before.session_json_bytes),
+                    session_json_bytes_after: Some(result.after.session_json_bytes),
+                    file_size_before: footprint_before.db_bytes,
+                    file_size_after,
+                }
+            }
+            Err(error) => HistoryRebuildSnapshot {
+                phase: HistoryRebuildPhase::Failed,
+                elapsed_ms: Some(started.elapsed().as_millis() as u64),
+                error: Some(error.to_string()),
+                file_size_before: footprint_before.db_bytes,
+                ..Default::default()
+            },
+        };
+        finish(status);
+    });
 }
 
 /// Returns the rate card, preferring the user's on-disk copy over the bundled defaults.

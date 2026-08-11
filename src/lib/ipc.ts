@@ -3,7 +3,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, HistoryRebuildStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -73,6 +73,27 @@ export function getScanStatus(): Promise<ScanStatus> {
 /** Current durable-history open/migration status (call once on mount, then follow events). */
 export function getHistoryStatus(): Promise<HistoryStatus> {
   return invoke<HistoryStatus>('get_history_status');
+}
+
+/** Issue #162: starts the history rebuild (re-parse every archived session
+ *  from its transcript, then VACUUM) on a background thread. Rejects if one
+ *  is already running. Progress arrives via getHistoryRebuildStatus /
+ *  onHistoryRebuildProgress, not this call's return value — call the
+ *  frontend's own confirmation before this, not after. */
+export function rebuildHistory(): Promise<void> {
+  return invoke<void>('rebuild_history');
+}
+
+/** Requests that a running rebuildHistory stop before its next session.
+ *  Everything already durably written stays written. No-op if none is
+ *  running. */
+export function cancelHistoryRebuild(): Promise<void> {
+  return invoke<void>('cancel_history_rebuild');
+}
+
+/** Current history-rebuild status (call once on mount, then follow events). */
+export function getHistoryRebuildStatus(): Promise<HistoryRebuildStatus> {
+  return invoke<HistoryRebuildStatus>('get_history_rebuild_status');
 }
 
 /** Windows only: opens the UAC flow to exclude session folders from Defender scanning. */
@@ -286,6 +307,12 @@ export function onScanProgress(cb: (status: ScanStatus) => void): Promise<Unlist
 
 export function onHistoryProgress(cb: (status: HistoryStatus) => void): Promise<UnlistenFn> {
   return listen<HistoryStatus>('history-progress', (event) => cb(event.payload));
+}
+
+export function onHistoryRebuildProgress(
+  cb: (status: HistoryRebuildStatus) => void,
+): Promise<UnlistenFn> {
+  return listen<HistoryRebuildStatus>('history-rebuild-progress', (event) => cb(event.payload));
 }
 
 export function onInstructionScanProgress(
