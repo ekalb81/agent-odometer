@@ -16,14 +16,26 @@
 //!   into every allocation/free — but the wrapper is gated by a runtime
 //!   toggle ([`configure_heap_tracking`]), off by default: disabled, it costs
 //!   one relaxed atomic load per alloc/free (and nothing else); enabled, it
-//!   additionally costs the two relaxed atomics (`fetch_add`/`fetch_sub` and
-//!   `fetch_max`) needed to track current and peak bytes.
+//!   additionally costs 2-3 relaxed atomics per call (see
+//!   [`TrackingAllocator`]'s doc comment for the exact accounting and why a
+//!   plain `fetch_add`/`fetch_sub` pair — this module's original design —
+//!   is unsound the moment tracking is enabled mid-process, which the
+//!   Settings toggle always does).
 //!
 //! Comparing the two answers the question this instrumentation exists to
 //! answer: high RSS with low tracked heap points at something outside the
 //! allocator (most plausibly SQLite's page cache or an OS-level mapping);
 //! high RSS *and* high tracked heap points at allocator retention instead.
-//! See [`SqlitePragmaSnapshot`] for the SQLite side of that comparison.
+//! See [`SqlitePragmaSnapshot`] for the SQLite side of that comparison. That
+//! comparison only holds if the tracked-heap side is trustworthy: enabling
+//! tracking (the Settings toggle) always happens mid-process, against a heap
+//! that already has live allocations `alloc` never saw. Freeing one of those
+//! later is indistinguishable, at `dealloc` time, from freeing a tracked
+//! allocation — without per-allocation provenance (which this module
+//! deliberately does not pay for; see [`HEAP_FREED_BYTES`]), the reading can
+//! only be a lower bound on bytes allocated since the last enable, not a
+//! verified live total. [`HeapSample::possibly_undercounted`] makes that
+//! distinction explicit rather than letting a delta be read as a total.
 //!
 //! Neither signal is ever recorded — sampled or not — unless
 //! `PerformanceRecorder::is_enabled` is true; the two opt-ins are
@@ -43,30 +55,76 @@ use serde::Serialize;
 use crate::performance::PerformanceRecorder;
 
 static HEAP_TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Cumulative bytes allocated while tracking has been enabled since the most
+/// recent enable ([`configure_heap_tracking`] resets this on every
+/// disabled -> enabled transition). Monotonically increasing — `alloc` only
+/// ever adds to it, never subtracts — so it can never wrap, unlike the single
+/// add/sub counter this replaced.
 static HEAP_ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Cumulative bytes freed while tracking has been enabled since the most
+/// recent enable, tracked as its own monotonically-increasing counter rather
+/// than a subtraction from [`HEAP_ALLOCATED_BYTES`]. This is the fix for the
+/// original defect: a `dealloc` for an allocation made *before* tracking was
+/// enabled has no way to tell itself apart from a tracked free (that would
+/// need per-allocation provenance — a header or side table on every
+/// allocation in the process — which this module deliberately does not pay
+/// for; see the doc comment on [`TrackingAllocator`]). So this counter still
+/// adds that free's bytes. What changes is where the subtraction happens: as
+/// a `saturating_sub` at *read* time ([`heap_allocated_bytes_raw`]), not as a
+/// live decrement of a single counter, so an untracked free can never wrap
+/// the reading — it can only push the read-time subtraction to its floor of
+/// 0, which [`HEAP_UNDERCOUNT_DETECTED`] then flags rather than hides.
+static HEAP_FREED_BYTES: AtomicU64 = AtomicU64::new(0);
 static HEAP_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+/// Sticky evidence that, at some point in the current enabled window, a
+/// `dealloc` freed more cumulative bytes than tracking had ever seen
+/// allocated — i.e. it (or an earlier free this window) freed bytes that
+/// predate the current enable. Sound rather than a fabricated 0: once this
+/// is `true`, `HEAP_ALLOCATED_BYTES.saturating_sub(HEAP_FREED_BYTES)` is
+/// known to be a floor on the true delta rather than a value that can be
+/// trusted at face value — see [`HeapSample::possibly_undercounted`], which
+/// carries this into every recorded and live-viewed reading. Reset to
+/// `false` on the same enable/disable transitions as the two byte counters
+/// above, so a fresh window starts with a clean, trusted slate.
+static HEAP_UNDERCOUNT_DETECTED: AtomicBool = AtomicBool::new(false);
 
-/// Wraps the system allocator with a runtime-toggled pair of relaxed
-/// atomics. Declared once, unconditionally, as this crate's sole
-/// `#[global_allocator]` (see `lib.rs`) — it replaces the `#[cfg(test)]`-only
-/// counting allocator earlier probes (`model.rs`, `history_store.rs`) used to
-/// define for themselves: a binary can only ever have one global allocator,
-/// so a test-only one could never coexist with a production one. Those
-/// probes now drive this same allocator through [`configure_heap_tracking`]
-/// and the raw accessors below instead of owning a private copy.
+/// Wraps the system allocator with a runtime-toggled set of relaxed atomics.
+/// Declared once, unconditionally, as this crate's sole `#[global_allocator]`
+/// (see `lib.rs`) — it replaces the `#[cfg(test)]`-only counting allocator
+/// earlier probes (`model.rs`, `history_store.rs`) used to define for
+/// themselves: a binary can only ever have one global allocator, so a
+/// test-only one could never coexist with a production one. Those probes now
+/// drive this same allocator through [`configure_heap_tracking`] and the raw
+/// accessors below instead of owning a private copy.
 ///
 /// Behavior is identical to the default system allocator whenever tracking
 /// is disabled (the default): every call still delegates to [`System`], and
 /// the only extra work is one `Ordering::Relaxed` load to check the toggle.
+///
+/// Enabled, `alloc` costs three relaxed atomics (`fetch_add` on
+/// [`HEAP_ALLOCATED_BYTES`], a `load` of [`HEAP_FREED_BYTES`] to derive the
+/// current reading, `fetch_max` on [`HEAP_PEAK_BYTES`]) and `dealloc` costs
+/// two unconditionally (`fetch_add` on [`HEAP_FREED_BYTES`], a `load` of
+/// [`HEAP_ALLOCATED_BYTES`] to detect undercounting) plus a third,
+/// conditional `store`, only on ticks that newly cross into undercounting.
+/// This is one more atomic per call than the original single-counter
+/// add/sub design paid — the cost of closing the underflow/low-bias defect
+/// documented on [`HEAP_FREED_BYTES`] without per-allocation provenance,
+/// which would cost far more (see that counter's doc comment). Measured cost
+/// for both paths: see `probe_heap_tracking_allocation_overhead`.
 pub struct TrackingAllocator;
 
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = unsafe { System.alloc(layout) };
         if !ptr.is_null() && HEAP_TRACKING_ENABLED.load(Ordering::Relaxed) {
-            let now = HEAP_ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed)
-                + layout.size() as u64;
-            HEAP_PEAK_BYTES.fetch_max(now, Ordering::Relaxed);
+            let size = layout.size() as u64;
+            let allocated_now = HEAP_ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+            let freed_so_far = HEAP_FREED_BYTES.load(Ordering::Relaxed);
+            HEAP_PEAK_BYTES.fetch_max(
+                allocated_now.saturating_sub(freed_so_far),
+                Ordering::Relaxed,
+            );
         }
         ptr
     }
@@ -74,7 +132,15 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         unsafe { System.dealloc(ptr, layout) };
         if HEAP_TRACKING_ENABLED.load(Ordering::Relaxed) {
-            HEAP_ALLOCATED_BYTES.fetch_sub(layout.size() as u64, Ordering::Relaxed);
+            let size = layout.size() as u64;
+            let freed_now = HEAP_FREED_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+            if freed_now > HEAP_ALLOCATED_BYTES.load(Ordering::Relaxed) {
+                // This free's bytes pushed cumulative-freed past
+                // cumulative-allocated for the current window: proof this
+                // dealloc (or an earlier one this window) freed bytes that
+                // predate the current enable. See `HEAP_UNDERCOUNT_DETECTED`.
+                HEAP_UNDERCOUNT_DETECTED.store(true, Ordering::Relaxed);
+            }
         }
     }
     // `GlobalAlloc::realloc`'s default body calls `self.alloc`/`self.dealloc`
@@ -85,14 +151,28 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 /// Enables or disables heap tracking. Wired to the `memory_heap_tracking_enabled`
 /// config field alongside every `PerformanceRecorder::configure` call site, so
 /// it shares the performance recorder's off-by-default, explicit-opt-in
-/// contract. Disabling clears both counters so a later re-enable starts from
-/// a known baseline instead of carrying over a stale peak from a previous
-/// enabled window.
+/// contract. `commands::save_config` calls this unconditionally on every
+/// settings save (not only when the toggle actually changed), so this must
+/// tell a real disabled -> enabled transition apart from a redundant
+/// enabled -> enabled call before deciding whether to reset.
+///
+/// Resets all heap state (both byte counters, the peak, and the undercount
+/// flag) on every disable, and on the disabled -> enabled rising edge — this
+/// is the "establish a baseline at enable time" half of the underflow fix:
+/// starting `HEAP_FREED_BYTES` at 0 on enable means the very next `dealloc`
+/// of a pre-existing (untracked) allocation is measured against a known-empty
+/// baseline rather than an accumulated one, so [`HEAP_UNDERCOUNT_DETECTED`]
+/// catches it immediately instead of it silently inflating an already-stale
+/// reading. An enabled -> enabled call (an unrelated settings save while
+/// tracking is already on) deliberately does NOT reset — it must not wipe an
+/// in-progress reading just because the user changed an unrelated field.
 pub fn configure_heap_tracking(enabled: bool) {
-    HEAP_TRACKING_ENABLED.store(enabled, Ordering::Relaxed);
-    if !enabled {
+    let was_enabled = HEAP_TRACKING_ENABLED.swap(enabled, Ordering::Relaxed);
+    if !enabled || (enabled && !was_enabled) {
         HEAP_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+        HEAP_FREED_BYTES.store(0, Ordering::Relaxed);
         HEAP_PEAK_BYTES.store(0, Ordering::Relaxed);
+        HEAP_UNDERCOUNT_DETECTED.store(false, Ordering::Relaxed);
     }
 }
 
@@ -104,8 +184,20 @@ pub fn heap_tracking_enabled() -> bool {
 /// (0 if it never was). `pub(crate)` for the probes that need an exact delta
 /// across a region of code rather than the enabled-or-unavailable shape
 /// [`heap_sample`] returns for recorded events.
+///
+/// Computed as `saturating_sub(HEAP_ALLOCATED_BYTES, HEAP_FREED_BYTES)` at
+/// read time rather than as a live-decremented single counter — the two
+/// monotonic accumulators can never wrap on their own, and `saturating_sub`
+/// floors the *derived* reading at 0 instead of letting it wrap past it. That
+/// floor can still be a low-biased undercount when a pre-enable allocation
+/// has been freed (see [`HEAP_FREED_BYTES`]'s doc comment); check
+/// [`HEAP_UNDERCOUNT_DETECTED`] (surfaced as
+/// [`HeapSample::possibly_undercounted`]) before treating this as a verified
+/// live total.
 pub(crate) fn heap_allocated_bytes_raw() -> u64 {
-    HEAP_ALLOCATED_BYTES.load(Ordering::Relaxed)
+    HEAP_ALLOCATED_BYTES
+        .load(Ordering::Relaxed)
+        .saturating_sub(HEAP_FREED_BYTES.load(Ordering::Relaxed))
 }
 
 /// Raw peak heap-byte reading since process start or the last
@@ -123,13 +215,23 @@ pub(crate) fn reset_heap_peak_to_current() {
     HEAP_PEAK_BYTES.store(heap_allocated_bytes_raw(), Ordering::Relaxed);
 }
 
-/// Heap reading shaped for a recorded event: `None` in both fields whenever
-/// tracking is disabled, so a JSONL consumer can tell "0 bytes tracked" apart
-/// from "not tracked" instead of a bare 0 meaning either.
+/// Heap reading shaped for a recorded event: `None` in both byte fields
+/// whenever tracking is disabled, so a JSONL consumer can tell "0 bytes
+/// tracked" apart from "not tracked" instead of a bare 0 meaning either.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct HeapSample {
     pub current_bytes: Option<u64>,
     pub peak_bytes: Option<u64>,
+    /// `true` once this enabled window has seen a `dealloc` free more bytes
+    /// than tracking has ever seen allocated — direct evidence that at least
+    /// one freed allocation predates the current enable (see
+    /// `HEAP_UNDERCOUNT_DETECTED`). When `true`, `current_bytes`/`peak_bytes`
+    /// are a lower bound on the delta since enable, not a verified live heap
+    /// total, and must be presented as such — never rendered as a plain
+    /// heap size. Always `false` while tracking is disabled, matching the
+    /// `None` byte fields: there is nothing to distrust when nothing is
+    /// tracked.
+    pub possibly_undercounted: bool,
 }
 
 pub fn heap_sample() -> HeapSample {
@@ -139,6 +241,7 @@ pub fn heap_sample() -> HeapSample {
     HeapSample {
         current_bytes: Some(heap_allocated_bytes_raw()),
         peak_bytes: Some(heap_peak_bytes_raw()),
+        possibly_undercounted: HEAP_UNDERCOUNT_DETECTED.load(Ordering::Relaxed),
     }
 }
 
@@ -547,6 +650,7 @@ pub fn record_phase_sample(performance: &PerformanceRecorder, phase: &str, bound
     );
     insert_optional_bytes(&mut metadata, "heap_bytes", heap.current_bytes);
     insert_optional_bytes(&mut metadata, "heap_peak_bytes", heap.peak_bytes);
+    insert_heap_undercounted(&mut metadata, &heap);
     performance.record_backend_duration_ms(format!("memory.{phase}"), 0.0, true, metadata);
 
     if boundary == "before" {
@@ -560,6 +664,23 @@ fn insert_optional_bytes(metadata: &mut BTreeMap<String, String>, key: &str, val
         value
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "unavailable".to_string()),
+    );
+}
+
+/// Records whether `heap.current_bytes`/`heap.peak_bytes` in this same event
+/// are trustworthy as a live total — see `HeapSample::possibly_undercounted`.
+/// `"unavailable"` while tracking is disabled (matching every other
+/// `insert_optional_bytes` field in this event: there is nothing to distrust
+/// when nothing is tracked), otherwise the literal `"true"`/`"false"`, never
+/// silently folded into the byte fields themselves.
+fn insert_heap_undercounted(metadata: &mut BTreeMap<String, String>, heap: &HeapSample) {
+    metadata.insert(
+        "heap_undercounted".to_string(),
+        if heap_tracking_enabled() {
+            heap.possibly_undercounted.to_string()
+        } else {
+            "unavailable".to_string()
+        },
     );
 }
 
@@ -886,6 +1007,7 @@ fn sampler_tick(
     );
     insert_optional_bytes(&mut metadata, "heap_bytes", heap.current_bytes);
     insert_optional_bytes(&mut metadata, "heap_peak_bytes", heap.peak_bytes);
+    insert_heap_undercounted(&mut metadata, &heap);
     if let Some(done) = progress_value.done {
         metadata.insert("progress_done".to_string(), done.to_string());
     }
@@ -1013,6 +1135,69 @@ mod tests {
         assert_eq!(disabled_sample.peak_bytes, None);
         assert_eq!(heap_allocated_bytes_raw(), 0);
         assert_eq!(heap_peak_bytes_raw(), 0);
+    }
+
+    /// Reproduces the underflow defect this module's `dealloc` used to have:
+    /// freeing an allocation made *before* tracking was enabled decremented
+    /// a counter that never counted it. On the original single-counter
+    /// design that `fetch_sub` wrapped a `u64` from 0 down to ~2^64
+    /// (18,446,744,073,709,551,616), and a subsequent allocation's
+    /// `fetch_max` then latched that wrapped magnitude into
+    /// `HEAP_PEAK_BYTES` permanently — this is exactly the path the
+    /// Settings toggle takes every time, since it enables tracking
+    /// mid-process against an already-live heap. Bounding the reading well
+    /// below the wrapped magnitude (rather than asserting an exact value,
+    /// which would be flaky under `cargo test`'s concurrent execution
+    /// sharing these process-wide statics — see this module's other heap
+    /// tests) is enough to tell "sound, possibly low" apart from "wrapped".
+    #[test]
+    fn dealloc_of_a_pre_enable_allocation_does_not_underflow_or_wrap() {
+        configure_heap_tracking(false);
+
+        // Allocate while tracking is off, so this allocation is genuinely
+        // untracked — `alloc` never added its bytes to any counter.
+        const PRE_ENABLE_SIZE: usize = 4 * 1024 * 1024;
+        let pre_existing = vec![0u8; PRE_ENABLE_SIZE];
+        std::hint::black_box(&pre_existing);
+
+        configure_heap_tracking(true);
+
+        // Free the untracked allocation while tracking is on: the exact
+        // `dealloc` call the defect describes.
+        drop(pre_existing);
+
+        // One more allocation after the free above: `HEAP_PEAK_BYTES` is
+        // only ever touched inside `alloc`, so on the buggy code the wrap
+        // above alone would leave `peak_bytes` looking fine by accident —
+        // this is what makes a subsequent `alloc`'s `fetch_max` latch the
+        // wrapped magnitude into the peak too.
+        let post_wrap = vec![0u8; 1024];
+        std::hint::black_box(&post_wrap);
+
+        let sample = heap_sample();
+        drop(post_wrap);
+
+        const SANE_UPPER_BOUND: u64 = 1024 * 1024 * 1024; // 1 GiB
+        let current = sample.current_bytes.expect("tracking is enabled");
+        let peak = sample.peak_bytes.expect("tracking is enabled");
+        assert!(
+            current < SANE_UPPER_BOUND,
+            "current_bytes ({current}) looks wrapped, not just low-biased"
+        );
+        assert!(
+            peak < SANE_UPPER_BOUND,
+            "peak_bytes ({peak}) looks wrapped, not just low-biased"
+        );
+
+        // The module must say so, not render a number that looks like a
+        // live heap size: freeing a pre-enable allocation is exactly the
+        // condition `possibly_undercounted` exists to catch.
+        assert!(
+            sample.possibly_undercounted,
+            "freeing a pre-enable allocation must be flagged as an undercount, not presented as trustworthy"
+        );
+
+        configure_heap_tracking(false);
     }
 
     #[test]
