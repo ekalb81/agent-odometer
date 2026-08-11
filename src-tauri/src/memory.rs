@@ -387,6 +387,18 @@ pub fn record_database_footprint(
     if !performance.is_enabled() {
         return;
     }
+    performance.record_backend_duration_ms(
+        "memory.database_footprint",
+        0.0,
+        true,
+        database_footprint_metadata(connection_label, footprint),
+    );
+}
+
+fn database_footprint_metadata(
+    connection_label: &str,
+    footprint: DatabaseFootprint,
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     metadata.insert("connection".to_string(), connection_label.to_string());
     insert_optional_bytes(&mut metadata, "db_bytes", footprint.db_bytes);
@@ -401,7 +413,7 @@ pub fn record_database_footprint(
         "volume_total_bytes",
         footprint.volume_total_bytes,
     );
-    performance.record_backend_duration_ms("memory.database_footprint", 0.0, true, metadata);
+    metadata
 }
 
 /// Records one memory sample as a `memory.<phase>` performance event —
@@ -553,6 +565,42 @@ mod tests {
             },
         );
         assert_eq!(recorder.status().recorded_this_run, 0);
+    }
+
+    #[test]
+    fn record_database_footprint_is_a_no_op_when_performance_tracking_is_disabled() {
+        let recorder = PerformanceRecorder::default();
+        record_database_footprint(&recorder, "history_store", DatabaseFootprint::default());
+        assert_eq!(recorder.status().recorded_this_run, 0);
+    }
+
+    #[test]
+    fn database_footprint_metadata_encodes_bytes_and_distinguishes_unavailable() {
+        // Exercised as a pure function rather than through an enabled
+        // `PerformanceRecorder`: enabling one writes to the user's real
+        // performance log directory, which no test in this crate does.
+        let metadata = database_footprint_metadata(
+            "history_store",
+            DatabaseFootprint {
+                db_bytes: Some(3_435_134_976),
+                wal_bytes: None,
+                volume_free_bytes: Some(73_859_072_000),
+                volume_total_bytes: Some(976_762_888_192),
+            },
+        );
+
+        assert_eq!(metadata["connection"], "history_store");
+        assert_eq!(metadata["db_bytes"], "3435134976");
+        // Absent, not zero — a `0` here would read as "empty database".
+        assert_eq!(metadata["wal_bytes"], "unavailable");
+        assert_eq!(metadata["volume_free_bytes"], "73859072000");
+        assert_eq!(metadata["volume_total_bytes"], "976762888192");
+        // `sanitize_metadata` keeps only the first 16 keys and drops any whose
+        // name is not a valid operation token, so both are worth pinning.
+        assert!(metadata.len() <= 16);
+        assert!(metadata.keys().all(|key| key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))));
     }
 
     /// Direct evidence for this PR's "what would the pragma values show"
