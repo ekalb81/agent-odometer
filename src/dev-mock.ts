@@ -7,6 +7,7 @@ import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } fr
 import type {
   DiagnosticsReport,
   Harness,
+  HistoryRebuildStatus,
   HistoryStatus,
   ProviderDiagnostic,
   QuotaAlert,
@@ -590,6 +591,30 @@ function historyStatus(): HistoryStatus {
   };
 }
 
+function historyRebuildStatus(): HistoryRebuildStatus {
+  // No visual scenario models an in-progress or completed rebuild — browser
+  // dev mode has no Rust backend to actually run one, and `rebuild_history`/
+  // `cancel_history_rebuild` are unhandled below (they fall through to
+  // mockIPC's default, an error), so a click in dev mode surfaces as an
+  // error rather than silently doing nothing.
+  return {
+    phase: 'idle',
+    done: 0,
+    total: 0,
+    elapsed_ms: null,
+    error: null,
+    sessions_reparsed: null,
+    sessions_missing_transcript: null,
+    sessions_failed: null,
+    rate_limit_points_before: null,
+    rate_limit_points_after: null,
+    session_json_bytes_before: null,
+    session_json_bytes_after: null,
+    file_size_before: null,
+    file_size_after: null,
+  };
+}
+
 function turnReceiptStatus(): TurnReceiptIntegrationStatus {
   return {
     enabled: false,
@@ -842,6 +867,8 @@ mockIPC((cmd, payload) => {
       return scanStatus();
     case 'get_history_status':
       return historyStatus();
+    case 'get_history_rebuild_status':
+      return historyRebuildStatus();
     case 'get_performance_status':
       return { enabled: false, max_log_mb: 64, stored_bytes: 0, recorded_this_run: 0, dropped_this_run: 0 };
     case 'get_turn_receipt_status':

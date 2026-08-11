@@ -30,14 +30,14 @@ pub mod turn_receipts;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, cancel_instruction_scan, check_quota_alerts,
+    add_defender_exclusions, cancel_history_rebuild, cancel_instruction_scan, check_quota_alerts,
     clear_session_project_override, compare_tool_impact, correlate_events, export_performance_data,
-    get_bundled_rates, get_config, get_history_status, get_performance_live_status,
-    get_performance_status, get_provider_diagnostics, get_quota_config, get_quota_snapshots,
-    get_rates, get_scan_status, get_session_details, get_subscription_usage,
-    get_turn_receipt_status, list_external_events, list_instruction_files, list_providers,
-    list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
-    open_task_in_chatgpt, read_instruction_file, reassign_session_project,
+    get_bundled_rates, get_config, get_history_rebuild_status, get_history_status,
+    get_performance_live_status, get_performance_status, get_provider_diagnostics,
+    get_quota_config, get_quota_snapshots, get_rates, get_scan_status, get_session_details,
+    get_subscription_usage, get_turn_receipt_status, list_external_events, list_instruction_files,
+    list_providers, list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
+    open_task_in_chatgpt, read_instruction_file, reassign_session_project, rebuild_history,
     record_frontend_performance, repair_turn_receipt_integrations, resolve_projects,
     resolve_working_directories, reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges,
     set_config, set_project_alias, set_quota_config, set_rates, set_tray_totals, unmerge_project,
@@ -127,6 +127,9 @@ pub fn run() {
             set_quota_config,
             check_quota_alerts,
             get_history_status,
+            rebuild_history,
+            cancel_history_rebuild,
+            get_history_rebuild_status,
         ])
         .setup(move |app| {
             let setup_started = Instant::now();

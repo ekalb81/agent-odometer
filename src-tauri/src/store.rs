@@ -69,6 +69,53 @@ pub struct HistoryStepSnapshot {
     pub elapsed_ms: Option<u64>,
 }
 
+/// Coarse phase of an issue #162 history rebuild. Serializes directly as
+/// this event/command payload's phase field — unlike `HistoryReadiness`,
+/// nothing here carries non-serializable content, so there is no need for a
+/// separate internal-vs-wire pair the way `HistoryReadiness`/
+/// `HistoryReadinessKind` split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRebuildPhase {
+    #[default]
+    Idle,
+    Running,
+    /// Re-parsing finished; `VACUUM` is in progress. SQLite reports no
+    /// per-page progress for `VACUUM`, so this phase has no `done`/`total`
+    /// of its own — it exists so a multi-minute silent tail on a
+    /// multi-gigabyte file still reads as "working", not "hung".
+    Vacuuming,
+    Complete,
+    Cancelled,
+    Failed,
+}
+
+/// Snapshot of issue #162's history-rebuild progress, retained so
+/// `commands::get_history_rebuild_status` can answer a listener that attaches
+/// after "history-rebuild-progress" events have already fired — mirrors
+/// [`HistoryStepSnapshot`]'s "call once on mount, then follow events"
+/// contract. Serializes directly as both that command's return value and the
+/// "history-rebuild-progress" event payload. The evidence fields (everything
+/// from `sessions_reparsed` down) are only ever `Some` once `phase` reaches
+/// `Complete`/`Cancelled`/`Failed`; see `commands::spawn_history_rebuild`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct HistoryRebuildSnapshot {
+    pub phase: HistoryRebuildPhase,
+    pub done: usize,
+    pub total: usize,
+    pub elapsed_ms: Option<u64>,
+    pub error: Option<String>,
+    pub sessions_reparsed: Option<usize>,
+    pub sessions_missing_transcript: Option<usize>,
+    pub sessions_failed: Option<usize>,
+    pub rate_limit_points_before: Option<usize>,
+    pub rate_limit_points_after: Option<usize>,
+    pub session_json_bytes_before: Option<u64>,
+    pub session_json_bytes_after: Option<u64>,
+    pub file_size_before: Option<u64>,
+    pub file_size_after: Option<u64>,
+}
+
 /// The most recently completed bulk/incremental scan's per-provider counters,
 /// retained for the provider diagnostics report (issue #39). This is a plain
 /// cache of the last `ScanReport`; it is never a source of truth and is
@@ -180,6 +227,19 @@ pub struct AppState {
     /// None for an ordinary warm scan. Set once the cache is opened, before
     /// the scan's progress events start firing.
     pub cold_reason: Mutex<Option<crate::scan_cache::ColdReason>>,
+    /// True while issue #162's history rebuild is running, guarding against
+    /// a second one starting concurrently. `commands::rebuild_history` sets
+    /// this before spawning the background thread and clears it when that
+    /// thread finishes (success, cancellation, or failure alike).
+    pub rebuild_running: AtomicBool,
+    /// Polled once per session by the rebuild's background thread; set by
+    /// `commands::cancel_history_rebuild`. Reset before each rebuild starts.
+    pub rebuild_cancel_requested: AtomicBool,
+    /// The rebuild's most recently reported status, for
+    /// `commands::get_history_rebuild_status` to answer a listener that
+    /// attaches after "history-rebuild-progress" events already fired —
+    /// mirrors `last_history_step`'s role for `get_history_status`.
+    rebuild_status: Mutex<HistoryRebuildSnapshot>,
     /// Identifies the configuration generation allowed to publish scan work.
     pub scan_generation: AtomicU64,
     /// Identifies the instruction-inventory scan allowed to publish results.
@@ -252,6 +312,9 @@ impl AppState {
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
             cold_reason: Mutex::new(None),
+            rebuild_running: AtomicBool::new(false),
+            rebuild_cancel_requested: AtomicBool::new(false),
+            rebuild_status: Mutex::new(HistoryRebuildSnapshot::default()),
             // Startup watcher events and the initial bulk scan share generation 1.
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
@@ -344,6 +407,16 @@ impl AppState {
 
     pub fn last_history_step(&self) -> Option<HistoryStepSnapshot> {
         self.last_history_step.lock().unwrap().clone()
+    }
+
+    /// Records issue #162's history rebuild's most recently reported status,
+    /// for `commands::get_history_rebuild_status`.
+    pub fn set_history_rebuild_status(&self, snapshot: HistoryRebuildSnapshot) {
+        *self.rebuild_status.lock().unwrap() = snapshot;
+    }
+
+    pub fn history_rebuild_status(&self) -> HistoryRebuildSnapshot {
+        self.rebuild_status.lock().unwrap().clone()
     }
 
     pub fn current_scan_generation(&self) -> u64 {
@@ -677,6 +750,42 @@ impl AppState {
             session: outcome.stored.session,
             displaced,
         }
+    }
+
+    /// Publishes one session's content after issue #162's history rebuild
+    /// durably rewrote it via `HistoryStore::observe_bulk`/
+    /// `observe_bulk_batch`. Applies the same in-memory bookkeeping
+    /// [`Self::apply_bulk_outcome`] and [`Self::publish_scanned_session`]
+    /// together perform for a normal bulk scan's write —
+    /// `ledger_stale`/`rollup_deferred_stale` cleared or set from
+    /// `outcome.rollups_deferred`, `quota_points_index` updated, the
+    /// resident summary replaced, `sessions_generation` bumped — but skips
+    /// `publish_scanned_session`'s `session_paths`/`current_scan_generation`
+    /// arbitration entirely: a rebuild only ever revisits a source path this
+    /// process's ledger already tracks (it never discovers a new one), so
+    /// there is no "did a scan or watcher already claim this path" race to
+    /// resolve the way fresh discovery has to.
+    pub fn publish_rebuilt_session(&self, outcome: crate::history_store::BulkObserveOutcome) {
+        self.ledger_stale.remove(&outcome.stored.key);
+        if outcome.rollups_deferred {
+            self.rollup_deferred_stale
+                .insert(outcome.stored.key.clone(), ());
+        } else {
+            self.rollup_deferred_stale.remove(&outcome.stored.key);
+        }
+        self.quota_points_index
+            .update_session(&outcome.stored.key, &outcome.stored.session);
+        self.sessions.insert(
+            outcome.stored.key.clone(),
+            self.resident_from_ledger(&outcome.stored.session),
+        );
+        if let Some(displaced) = outcome.displaced {
+            self.quota_points_index
+                .update_session(&displaced.key, &displaced.session);
+            self.sessions
+                .insert(displaced.key, self.resident_from_ledger(&displaced.session));
+        }
+        self.touch_sessions_generation();
     }
 
     /// Batched variant of [`Self::reconcile_scanned_session_if_current`]
@@ -1473,6 +1582,9 @@ mod tests {
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
             cold_reason: Mutex::new(None),
+            rebuild_running: AtomicBool::new(false),
+            rebuild_cancel_requested: AtomicBool::new(false),
+            rebuild_status: Mutex::new(HistoryRebuildSnapshot::default()),
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),

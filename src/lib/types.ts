@@ -357,6 +357,37 @@ export interface ScanStatus {
   cold_reason: ColdReason | null;
 }
 
+/** Issue #162: re-parse every archived session from its source transcript,
+ *  then VACUUM. `vacuuming` has no `done`/`total` of its own — SQLite
+ *  reports no per-page VACUUM progress. */
+export type HistoryRebuildPhase =
+  | 'idle'
+  | 'running'
+  | 'vacuuming'
+  | 'complete'
+  | 'cancelled'
+  | 'failed';
+
+/** History-rebuild progress, from get_history_rebuild_status and
+ *  "history-rebuild-progress" events. The evidence fields below `elapsed_ms`
+ *  are only non-null once `phase` is 'complete' | 'cancelled' | 'failed'. */
+export interface HistoryRebuildStatus {
+  phase: HistoryRebuildPhase;
+  done: number;
+  total: number;
+  elapsed_ms: number | null;
+  error: string | null;
+  sessions_reparsed: number | null;
+  sessions_missing_transcript: number | null;
+  sessions_failed: number | null;
+  rate_limit_points_before: number | null;
+  rate_limit_points_after: number | null;
+  session_json_bytes_before: number | null;
+  session_json_bytes_after: number | null;
+  file_size_before: number | null;
+  file_size_after: number | null;
+}
+
 /**
  * Durable-history archive lifecycle (#116): `pending` until the archive has
  * finished opening/migrating, `ready` once available, `unavailable` if it

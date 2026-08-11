@@ -12,7 +12,10 @@ use crate::model::{
     SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolDimensionMetrics, ToolKind,
     ToolMetrics, ToolObservation, ToolOrigin, ToolOutcome,
 };
-use crate::provider::{claude_code_provider_id, codex_provider_id};
+use crate::provider::{
+    claude_code_provider_id, codex_provider_id, ProviderRegistry, ProviderSourceKind,
+};
+use crate::scanner::SCAN_WRITE_BATCH_SIZE;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::TimeZone;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -62,6 +65,46 @@ pub struct BulkObserveOutcome {
 pub struct HydrationStats {
     pub sessions: usize,
     pub bytes: u64,
+}
+
+/// Corpus-wide evidence for issue #162's rebuild: v0.8.14 shipped #153's
+/// rate-limit point collapsing, but a field recording showed it landing on
+/// only 92 of 4,530 sessions in one run — the other 4,438 keep their
+/// pre-#153 uncollapsed `rate_limits_history`, forever, because nothing ever
+/// re-parses an already-archived session on its own. This is the "did it
+/// actually work" measurement a rebuild reports before and after itself,
+/// rather than trusting the parser's own claim.
+///
+/// `rate_limit_points` requires walking every session's parsed content once
+/// ([`HistoryStore::stream_sessions`]) since — unlike token/tool/finding
+/// events — `rate_limits_history` is not normalized into its own fact table,
+/// so there is no SQL aggregate that can answer it directly. `stream_sessions`
+/// keeps that walk at O(one-session) resident at a time, the same discipline
+/// [`crate::store::AppState::hydrate_history`] already relies on for a real
+/// corpus. `session_json_bytes` needs no deserialization at all: it is a
+/// single `SUM(LENGTH())` over the stored blob column.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RebuildEvidence {
+    pub sessions: usize,
+    pub rate_limit_points: usize,
+    pub session_json_bytes: u64,
+}
+
+/// Result of [`HistoryStore::rebuild_from_transcripts`]: how many of the
+/// sessions it considered were actually re-parsed versus skipped (missing
+/// transcript, unrecognized provider, or a parse failure — all three keep
+/// the session's existing stored snapshot rather than losing it), whether it
+/// was cancelled partway, and the before/after evidence a caller reports as
+/// proof the rebuild did what it claims.
+#[derive(Debug, Clone)]
+pub struct RebuildOutcome {
+    pub sessions_considered: usize,
+    pub sessions_reparsed: usize,
+    pub sessions_missing_transcript: usize,
+    pub sessions_failed: usize,
+    pub cancelled: bool,
+    pub before: RebuildEvidence,
+    pub after: RebuildEvidence,
 }
 
 /// A materialized durable session together with source availability metadata.
@@ -415,6 +458,227 @@ impl HistoryStore {
         } else {
             Ok(false)
         }
+    }
+
+    /// Total `session_json` bytes currently stored, across every session's
+    /// *current* snapshot version only (superseded versions are deleted by
+    /// [`store_snapshot`] the moment a new one is written, so this is never
+    /// inflated by history). A pure SQL aggregate over the stored blob
+    /// column — the content is measured, never deserialized, to compute it.
+    fn session_json_bytes(&self) -> Result<u64> {
+        let connection = self.connection()?;
+        let bytes: i64 = connection.query_row(
+            "SELECT COALESCE(SUM(LENGTH(s.session_json)), 0)
+             FROM durable_sessions d
+             JOIN session_snapshots s
+               ON s.session_key = d.session_key AND s.version = d.current_snapshot_version",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(bytes.max(0) as u64)
+    }
+
+    /// Snapshot of [`RebuildEvidence`] for the corpus right now. Exposed on
+    /// its own (not only folded into [`Self::rebuild_from_transcripts`]) so
+    /// a caller can report "before" evidence even when it chooses not to
+    /// proceed, and so a test can assert on it independently.
+    pub fn rebuild_evidence(&self) -> Result<RebuildEvidence> {
+        let mut sessions = 0usize;
+        let mut rate_limit_points = 0usize;
+        self.stream_sessions(|stored| {
+            sessions += 1;
+            rate_limit_points += stored.session.rate_limits_history.len();
+        })?;
+        let session_json_bytes = self.session_json_bytes()?;
+        Ok(RebuildEvidence {
+            sessions,
+            rate_limit_points,
+            session_json_bytes,
+        })
+    }
+
+    /// Re-parses every archived session from its source transcript and
+    /// durably rewrites it, so a stored snapshot picks up whatever the
+    /// current parser now does differently — issue #162's opt-in escape
+    /// hatch for #153's collapsing never reaching a session that is never
+    /// re-scanned once archived. The transcripts on disk stay the source of
+    /// truth throughout: nothing here invents or discards content that a
+    /// fresh parse of the same file would not itself produce.
+    ///
+    /// Three things deliberately never lose a session's existing stored
+    /// snapshot: a source path that no longer exists on disk (counted in
+    /// `sessions_missing_transcript` — the ledger is the only remaining
+    /// record for that session, so a maintenance rebuild must not be able to
+    /// erase it), a re-parse the adapter declines (`Ok(None)`), and a parse
+    /// error. All three fall through to `sessions_failed`/
+    /// `sessions_missing_transcript` and simply move on to the next session.
+    ///
+    /// Writes go through [`Self::observe_bulk_batch`]/[`Self::observe_bulk`]
+    /// — the same deferred-rollup path a bulk scan uses (issue #132) — in
+    /// batches of [`SCAN_WRITE_BATCH_SIZE`], for the same ~160x-vs-per-session-
+    /// commit reason `observe_bulk_batch`'s own doc comment measures. That
+    /// choice is also this method's crash-safety story, not just its
+    /// throughput one: every batch commits as one all-or-nothing transaction
+    /// that durably marks `rollups_stale` before returning, so a process
+    /// killed at any point — mid-batch, between batches, or before the
+    /// final [`Self::rebuild_rollups_if_stale`] call below ever runs — is
+    /// exactly the interrupted-bulk-scan scenario issue #132's crash-safety
+    /// net already exists for: every already-committed batch's sessions are
+    /// fully, correctly written; every not-yet-processed session is
+    /// untouched, still holding its previous (valid, complete) snapshot; and
+    /// the next [`Self::open`]/[`Self::open_with_progress`] rebuilds rollups
+    /// from scratch before this store is ever handed to a caller again. A
+    /// half-rebuilt ledger is never a half-*written* one.
+    ///
+    /// `should_cancel` is polled once per session; a `true` stops before
+    /// that session is parsed (nothing already committed is undone) and
+    /// `RebuildOutcome::cancelled` is set. `on_progress(done, total)` is
+    /// called once before the first session and once after every session
+    /// (`done` counting every outcome — reparsed, missing, or failed —
+    /// alike). `on_session_rewritten` fires once per durably-written
+    /// session, so a caller can publish the update to any in-memory
+    /// projection the way it already does for a normal scan's writes.
+    pub fn rebuild_from_transcripts(
+        &self,
+        mut on_progress: impl FnMut(usize, usize),
+        mut on_session_rewritten: impl FnMut(BulkObserveOutcome),
+        should_cancel: impl Fn() -> bool,
+    ) -> Result<RebuildOutcome> {
+        struct WorkItem {
+            path: PathBuf,
+            harness: crate::provider::ProviderId,
+            archived: bool,
+        }
+
+        // One streaming pass builds the worklist and measures "before" at
+        // once, rather than a separate full-corpus pass for each — the same
+        // O(one-session)-resident discipline `stream_sessions` documents on
+        // itself. `items` itself only holds a path/provider/bool triple per
+        // session (kilobytes for a real corpus), never session content.
+        let mut items: Vec<WorkItem> = Vec::new();
+        let mut before = RebuildEvidence::default();
+        self.stream_sessions(|stored| {
+            before.sessions += 1;
+            before.rate_limit_points += stored.session.rate_limits_history.len();
+            items.push(WorkItem {
+                path: PathBuf::from(&stored.session.file_path),
+                harness: stored.session.harness.clone(),
+                archived: stored.session.archived,
+            });
+        })?;
+        before.session_json_bytes = self.session_json_bytes()?;
+
+        let total = items.len();
+        let registry = ProviderRegistry::builtin();
+        // A fresh generation for this pass's `source_locations.seen_generation`
+        // bookkeeping only (see `observe_one_in_transaction`) — this never
+        // calls `finish_scan`, so nothing about source availability is ever
+        // touched or marked missing by a rebuild; only durable content is.
+        let generation = self.begin_scan()?;
+
+        let mut reparsed = 0usize;
+        let mut missing = 0usize;
+        let mut failed = 0usize;
+        let mut cancelled = false;
+        let mut batch: Vec<(PathBuf, Session)> = Vec::with_capacity(SCAN_WRITE_BATCH_SIZE);
+
+        on_progress(0, total);
+        for (index, item) in items.iter().enumerate() {
+            if should_cancel() {
+                cancelled = true;
+                break;
+            }
+
+            if !item.path.exists() {
+                missing += 1;
+            } else if let Some(adapter) = registry.adapter(&item.harness) {
+                let kind = if item.archived {
+                    ProviderSourceKind::Archived
+                } else {
+                    ProviderSourceKind::Live
+                };
+                match adapter.parse_file(&item.path, kind) {
+                    Ok(Some(session)) => {
+                        batch.push((item.path.clone(), session));
+                        if batch.len() >= SCAN_WRITE_BATCH_SIZE {
+                            flush_rebuild_batch(
+                                self,
+                                &mut batch,
+                                generation,
+                                &mut reparsed,
+                                &mut failed,
+                                &mut on_session_rewritten,
+                            )?;
+                        }
+                    }
+                    // The adapter no longer recognizes this file as a
+                    // session on re-parse, or parsing it failed outright.
+                    // Either way the transcript exists but this pass cannot
+                    // trust a replacement from it, so the existing stored
+                    // snapshot is left exactly as it was.
+                    Ok(None) => failed += 1,
+                    Err(error) => {
+                        tracing::warn!(
+                            "rebuild: could not parse {}: {}",
+                            item.path.display(),
+                            error
+                        );
+                        failed += 1;
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    "rebuild: no registered provider for {} ({})",
+                    item.harness,
+                    item.path.display()
+                );
+                failed += 1;
+            }
+            on_progress(index + 1, total);
+        }
+        flush_rebuild_batch(
+            self,
+            &mut batch,
+            generation,
+            &mut reparsed,
+            &mut failed,
+            &mut on_session_rewritten,
+        )?;
+
+        // Runs regardless of `cancelled`: every batch already committed its
+        // facts and durably marked `rollups_stale` (deferred rollups, same
+        // as a bulk scan), so resolving it now — rather than leaving it for
+        // the next app restart's crash-safety check — makes this process's
+        // own ledger reads consistent immediately.
+        self.rebuild_rollups_if_stale()?;
+        let after = self.rebuild_evidence()?;
+
+        Ok(RebuildOutcome {
+            sessions_considered: total,
+            sessions_reparsed: reparsed,
+            sessions_missing_transcript: missing,
+            sessions_failed: failed,
+            cancelled,
+            before,
+            after,
+        })
+    }
+
+    /// Reclaims freed pages after a rebuild (issue #162). Every write path
+    /// in this module already replaces rather than accumulates content —
+    /// [`store_snapshot`] deletes a session's superseded snapshot version in
+    /// the same transaction that writes its new one — so re-parsing a
+    /// duplicate-heavy corpus does shrink what is logically stored. SQLite
+    /// itself does not shrink the file for that alone: freed pages go on an
+    /// internal free list for reuse by future writes, not back to the
+    /// filesystem, so the file measured by [`Self::database_footprint`]
+    /// stays exactly as large until a `VACUUM` rewrites it. Must run outside
+    /// any transaction; briefly holds the writer connection exclusively,
+    /// like [`Self::stream_sessions`] or a bulk write.
+    pub fn vacuum(&self) -> Result<()> {
+        let connection = self.connection()?;
+        connection.execute_batch("VACUUM;")?;
+        Ok(())
     }
 
     /// Marks locations not seen in this completed, newest scan as missing.
@@ -2889,6 +3153,64 @@ enum SnapshotPolicy {
     /// Local overlays intentionally change display metadata without a source
     /// scan and must remain writable even when their token history is older.
     MetadataOverlay,
+}
+
+/// Durably writes one accumulated re-parse batch for
+/// [`HistoryStore::rebuild_from_transcripts`] and clears it, via
+/// [`HistoryStore::observe_bulk_batch`] — one shared transaction per batch,
+/// per [`SCAN_WRITE_BATCH_SIZE`]'s own rationale. On the batch transaction's
+/// own failure (as opposed to any individual session's content, already
+/// validated by a successful parse before it was queued here), falls back to
+/// [`HistoryStore::observe_bulk`] one session at a time, exactly the retry
+/// [`HistoryStore::observe_bulk_batch`]'s doc comment prescribes and
+/// `store::AppState::reconcile_scanned_batch_if_current` already performs
+/// for a normal scan's batches — so one session this pass cannot persist
+/// does not cost the whole batch.
+fn flush_rebuild_batch(
+    store: &HistoryStore,
+    batch: &mut Vec<(PathBuf, Session)>,
+    generation: i64,
+    reparsed: &mut usize,
+    failed: &mut usize,
+    on_session_rewritten: &mut dyn FnMut(BulkObserveOutcome),
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let refs: Vec<(&Path, &Session, i64)> = batch
+        .iter()
+        .map(|(path, session)| (path.as_path(), session, generation))
+        .collect();
+    match store.observe_bulk_batch(&refs) {
+        Ok(outcomes) => {
+            *reparsed += outcomes.len();
+            for outcome in outcomes {
+                on_session_rewritten(outcome);
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                "rebuild: could not persist a batch of {} session(s) as one transaction, \
+                 retrying one at a time: {}",
+                batch.len(),
+                error
+            );
+            for (path, session) in batch.iter() {
+                match store.observe_bulk(path, session, generation) {
+                    Ok(outcome) => {
+                        *reparsed += 1;
+                        on_session_rewritten(outcome);
+                    }
+                    Err(error) => {
+                        *failed += 1;
+                        tracing::warn!("rebuild: could not persist {}: {}", path.display(), error);
+                    }
+                }
+            }
+        }
+    }
+    batch.clear();
+    Ok(())
 }
 
 /// Core per-session write, extracted so both [`HistoryStore::observe_internal`]
@@ -8538,6 +8860,553 @@ mod tests {
                 .contains(" in ("),
             "the snapshot fetch must not batch multiple sessions' blobs into one query: {}",
             BACKFILL_PROJECT_IDENTITY_SNAPSHOT_SQL
+        );
+    }
+
+    // -- Issue #162: rebuild_from_transcripts ---------------------------------
+
+    /// A `session_meta`, one `token_count` event carrying real usage (so
+    /// `tokens_history` is non-empty and this session is never treated as
+    /// "provisional" by `observe_one_in_transaction`'s fingerprint logic),
+    /// then `duplicate_count` more `token_count` events in the same turn
+    /// reporting byte-identical `rate_limits` — issue #153's collapse
+    /// target. A fresh parse of this file collapses the whole run (the
+    /// initial event plus every duplicate) into exactly one
+    /// `RateLimitSnapshotPoint` with `observation_count == duplicate_count + 1`.
+    fn write_duplicate_heavy_codex_transcript(
+        path: &Path,
+        session_id: &str,
+        duplicate_count: usize,
+    ) {
+        assert!(duplicate_count < 55, "keeps every event inside one minute");
+        let mut contents = String::new();
+        contents.push_str(&format!(
+            r#"{{"timestamp":"2026-08-01T00:00:00Z","type":"session_meta","payload":{{"id":"{session_id}","timestamp":"2026-08-01T00:00:00Z"}}}}"#
+        ));
+        contents.push('\n');
+        contents.push_str(
+            r#"{"timestamp":"2026-08-01T00:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-5.5"}}"#,
+        );
+        contents.push('\n');
+        contents.push_str(
+            r#"{"timestamp":"2026-08-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":150},"last_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":150},"model_context_window":128000},"rate_limits":{"limit_id":"codex","primary":{"used_percent":10.0,"window_minutes":300,"resets_at":1784998800},"secondary":{"used_percent":5.0,"window_minutes":10080,"resets_at":1785603600}}}}"#,
+        );
+        contents.push('\n');
+        for i in 0..duplicate_count {
+            let second = 3 + i;
+            contents.push_str(&format!(
+                r#"{{"timestamp":"2026-08-01T00:00:{second:02}Z","type":"event_msg","payload":{{"type":"token_count","info":null,"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":10.0,"window_minutes":300,"resets_at":1784998800}},"secondary":{{"used_percent":5.0,"window_minutes":10080,"resets_at":1785603600}}}}}}}}"#
+            ));
+            contents.push('\n');
+        }
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// The inverse of collapsing: expands one (possibly-collapsed) point back
+    /// into `observation_count` individual, uncollapsed points — simulating
+    /// what a session's stored `rate_limits_history` looked like before
+    /// #153 shipped (every point a run of exactly one). Timestamps are not
+    /// reconstructed faithfully; only the point *count* matters to these
+    /// tests.
+    fn expand_uncollapsed(point: &RateLimitSnapshotPoint) -> Vec<RateLimitSnapshotPoint> {
+        (0..point.observation_count.max(1))
+            .map(|_| RateLimitSnapshotPoint {
+                timestamp: point.timestamp,
+                turn_id: point.turn_id.clone(),
+                limit_id: point.limit_id.clone(),
+                primary: point.primary.clone(),
+                secondary: point.secondary.clone(),
+                run_started_at: None,
+                observation_count: 1,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rebuild_reduces_stored_rate_limit_points_on_a_duplicate_heavy_fixture() {
+        // End-to-end evidence test (issue #162's own deliverable): seeds the
+        // ledger with a pre-#153-shaped (uncollapsed) snapshot, then asks
+        // rebuild_from_transcripts to re-parse the real transcript through
+        // the real (post-#153) parser and durably rewrite it. This is the
+        // "did it actually work" check the field recording exists for —
+        // asserting on the parser's own collapsing logic elsewhere is not
+        // enough; this proves the rebuild path reaches it.
+        let (_directory, store) = store();
+        let transcripts = tempdir().unwrap();
+        let path = transcripts.path().join("duplicate-heavy.jsonl");
+        write_duplicate_heavy_codex_transcript(&path, "dup-session", 40);
+
+        let parsed_fresh = crate::parser::parse_file(&path, false).unwrap().unwrap();
+        assert_eq!(
+            parsed_fresh.rate_limits_history.len(),
+            1,
+            "the whole duplicate run collapses into one point through the real parser"
+        );
+        assert_eq!(parsed_fresh.rate_limits_history[0].observation_count, 41);
+
+        let mut pre_rebuild = parsed_fresh.clone();
+        pre_rebuild.rate_limits_history = parsed_fresh
+            .rate_limits_history
+            .iter()
+            .flat_map(expand_uncollapsed)
+            .collect();
+        assert_eq!(pre_rebuild.rate_limits_history.len(), 41);
+
+        let generation = store.begin_scan().unwrap();
+        let seeded = store.observe(&path, &pre_rebuild, generation).unwrap();
+        assert_eq!(
+            store
+                .load_one(&seeded.key)
+                .unwrap()
+                .session
+                .rate_limits_history
+                .len(),
+            41,
+            "the seeded ledger row must start out uncollapsed"
+        );
+
+        let mut rewritten_keys = Vec::new();
+        let outcome = store
+            .rebuild_from_transcripts(
+                |_done, _total| {},
+                |outcome| rewritten_keys.push(outcome.stored.key.clone()),
+                || false,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.sessions_considered, 1);
+        assert_eq!(outcome.sessions_reparsed, 1);
+        assert_eq!(outcome.sessions_missing_transcript, 0);
+        assert_eq!(outcome.sessions_failed, 0);
+        assert!(!outcome.cancelled);
+        assert_eq!(rewritten_keys, vec![seeded.key.clone()]);
+
+        assert_eq!(outcome.before.rate_limit_points, 41);
+        assert_eq!(outcome.after.rate_limit_points, 1);
+        assert!(
+            outcome.after.rate_limit_points < outcome.before.rate_limit_points,
+            "rebuild must reduce the stored point count on this duplicate-heavy fixture"
+        );
+        assert!(
+            outcome.after.session_json_bytes < outcome.before.session_json_bytes,
+            "collapsing fewer, richer points must also shrink session_json bytes"
+        );
+
+        let reloaded = store.load_one(&seeded.key).unwrap();
+        assert_eq!(reloaded.session.rate_limits_history.len(), 1);
+        assert_eq!(
+            reloaded.session.rate_limits_history[0].observation_count,
+            41
+        );
+    }
+
+    #[test]
+    fn rebuild_keeps_the_stored_snapshot_when_the_source_transcript_is_gone() {
+        // Requirement: "sessions whose source transcript no longer exists
+        // must keep their current stored snapshot, not be dropped." The
+        // ledger is the only remaining record for such a session, so a
+        // maintenance rebuild must never be able to erase it.
+        let (_directory, store) = store();
+        let transcripts = tempdir().unwrap();
+        // Never written to disk: `rebuild_from_transcripts` must see this
+        // path does not exist and leave the session alone.
+        let path = transcripts.path().join("gone.jsonl");
+
+        let original = rich_session("still-here");
+        let generation = store.begin_scan().unwrap();
+        let seeded = store.observe(&path, &original, generation).unwrap();
+
+        let mut rewritten_keys = Vec::new();
+        let outcome = store
+            .rebuild_from_transcripts(
+                |_done, _total| {},
+                |outcome| rewritten_keys.push(outcome.stored.key.clone()),
+                || false,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.sessions_considered, 1);
+        assert_eq!(outcome.sessions_reparsed, 0);
+        assert_eq!(outcome.sessions_missing_transcript, 1);
+        assert_eq!(outcome.sessions_failed, 0);
+        assert!(
+            rewritten_keys.is_empty(),
+            "a missing transcript must never be rewritten"
+        );
+        // Evidence is unchanged too: nothing about this session's stored
+        // content moved.
+        assert_eq!(
+            outcome.before.rate_limit_points,
+            outcome.after.rate_limit_points
+        );
+        assert_eq!(
+            outcome.before.session_json_bytes,
+            outcome.after.session_json_bytes
+        );
+
+        let reloaded = store.load_one(&seeded.key).unwrap();
+        assert_eq!(reloaded.session.tokens_history, original.tokens_history);
+        assert_eq!(
+            reloaded.session.tool_observations,
+            original.tool_observations
+        );
+        assert_eq!(
+            reloaded.session.optimization_findings,
+            original.optimization_findings
+        );
+    }
+
+    #[test]
+    fn rebuild_cancellation_leaves_already_written_sessions_intact_and_unprocessed_ones_unchanged()
+    {
+        // Requirement: cancelling mid-rebuild must not lose or corrupt
+        // anything — everything already durably rewritten stays rewritten,
+        // and everything not yet reached is untouched.
+        let (_directory, store) = store();
+        let transcripts = tempdir().unwrap();
+
+        let first_path = transcripts.path().join("first.jsonl");
+        write_duplicate_heavy_codex_transcript(&first_path, "first-session", 20);
+        let first_parsed = crate::parser::parse_file(&first_path, false)
+            .unwrap()
+            .unwrap();
+        let mut first_uncollapsed = first_parsed.clone();
+        first_uncollapsed.rate_limits_history = first_parsed
+            .rate_limits_history
+            .iter()
+            .flat_map(expand_uncollapsed)
+            .collect();
+
+        let second_path = transcripts.path().join("second.jsonl");
+        write_duplicate_heavy_codex_transcript(&second_path, "second-session", 20);
+        let second_parsed = crate::parser::parse_file(&second_path, false)
+            .unwrap()
+            .unwrap();
+        let mut second_uncollapsed = second_parsed.clone();
+        second_uncollapsed.rate_limits_history = second_parsed
+            .rate_limits_history
+            .iter()
+            .flat_map(expand_uncollapsed)
+            .collect();
+
+        let generation = store.begin_scan().unwrap();
+        let first_seeded = store
+            .observe(&first_path, &first_uncollapsed, generation)
+            .unwrap();
+        let second_seeded = store
+            .observe(&second_path, &second_uncollapsed, generation)
+            .unwrap();
+
+        // Cancel after exactly one session is durably rewritten. Which of
+        // the two `stream_sessions` reaches first is not asserted on (it
+        // depends on wall-clock `last_seen_at_ms`, not test-controlled) —
+        // only that cancellation stops *after* one and *before* the other,
+        // regardless of which is which.
+        let cancel_after = std::sync::atomic::AtomicUsize::new(0);
+        let mut rewritten_keys = Vec::new();
+        let outcome = store
+            .rebuild_from_transcripts(
+                |_done, _total| {},
+                |outcome| rewritten_keys.push(outcome.stored.key.clone()),
+                || cancel_after.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1,
+            )
+            .unwrap();
+
+        assert!(outcome.cancelled);
+        assert_eq!(outcome.sessions_considered, 2);
+        assert_eq!(
+            outcome.sessions_reparsed
+                + outcome.sessions_missing_transcript
+                + outcome.sessions_failed,
+            1,
+            "cancellation must stop before the second session is touched at all"
+        );
+        assert_eq!(
+            rewritten_keys.len(),
+            1,
+            "cancellation must durably rewrite exactly one session before stopping"
+        );
+        let rewritten_key = rewritten_keys[0].clone();
+        assert!(rewritten_key == first_seeded.key || rewritten_key == second_seeded.key);
+
+        // The rewritten session picked up the real parser's collapse...
+        let rewritten_parsed = if rewritten_key == first_seeded.key {
+            &first_parsed
+        } else {
+            &second_parsed
+        };
+        let reloaded_rewritten = store.load_one(&rewritten_key).unwrap();
+        assert_eq!(
+            reloaded_rewritten.session.rate_limits_history.len(),
+            rewritten_parsed.rate_limits_history.len()
+        );
+
+        // ...while the session cancellation stopped before is byte-for-byte
+        // its pre-rebuild (uncollapsed) self.
+        let untouched_key = if rewritten_key == first_seeded.key {
+            second_seeded.key.clone()
+        } else {
+            first_seeded.key.clone()
+        };
+        let untouched_original = if untouched_key == first_seeded.key {
+            &first_uncollapsed
+        } else {
+            &second_uncollapsed
+        };
+        let reloaded_untouched = store.load_one(&untouched_key).unwrap();
+        assert_eq!(
+            reloaded_untouched.session.rate_limits_history,
+            untouched_original.rate_limits_history
+        );
+
+        // A cancelled rebuild must still leave *this* process's ledger
+        // reads consistent immediately — it does not defer that to the next
+        // restart's crash-safety check.
+        assert!(!store.rollups_are_stale().unwrap());
+    }
+
+    #[test]
+    fn rebuild_survives_a_hard_kill_before_any_cleanup_runs() {
+        // The crash-safety precedent this issue was told to follow (#132's
+        // `rollups_stale` marker) protects any caller of `observe_bulk`/
+        // `observe_bulk_batch`, not just a normal bulk scan. This test
+        // bypasses `rebuild_from_transcripts` entirely and calls
+        // `observe_bulk` directly — simulating a rebuild killed so abruptly
+        // (process kill, power loss) that not even its own graceful
+        // cancellation cleanup (which `rebuild_from_transcripts` always runs,
+        // see the cancellation test above) ever executes — to prove the
+        // store's own reopen-time check is what actually saves it, not
+        // anything rebuild-specific.
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let untouched_fixture = rich_session("untouched");
+        let rewritten_fixture = rich_session("rewritten");
+        let untouched_key;
+        let rewritten_key;
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            untouched_key = store
+                .observe(Path::new("untouched.jsonl"), &untouched_fixture, generation)
+                .unwrap()
+                .key;
+            // Only this one goes through the deferred-rollup bulk path, the
+            // same one `flush_rebuild_batch` uses, and only this one gets
+            // "rewritten" — mirroring a rebuild interrupted partway through
+            // its worklist.
+            let outcome = store
+                .observe_bulk(Path::new("rewritten.jsonl"), &rewritten_fixture, generation)
+                .unwrap();
+            rewritten_key = outcome.stored.key;
+            assert!(outcome.rollups_deferred);
+            assert!(store.rollups_are_stale().unwrap());
+            // Dropped here without ever calling rebuild_rollups_if_stale —
+            // the simulated hard kill. Nothing further is written to this
+            // database file.
+        }
+
+        let reopened = HistoryStore::open(&path).unwrap();
+        assert!(
+            !reopened.rollups_are_stale().unwrap(),
+            "reopening after a hard kill must rebuild stale rollups before returning"
+        );
+
+        // Nothing was lost: both sessions are still fully readable, one
+        // still its pre-rebuild self, the other holding what the
+        // interrupted rebuild managed to write.
+        let windows: Vec<RangeWindow> = vec![(None, None)];
+        for (key, fixture) in [
+            (&untouched_key, &untouched_fixture),
+            (&rewritten_key, &rewritten_fixture),
+        ] {
+            let from_ledger = reopened
+                .range_totals_multi(std::slice::from_ref(key), &windows)
+                .unwrap();
+            let expected = fixture.range_totals_multi(&windows);
+            let expected = &expected[0];
+            match from_ledger[0].get(key) {
+                Some(actual) => {
+                    assert_eq!(&actual.tokens, &expected.tokens, "tokens for {key}");
+                    assert_eq!(
+                        &actual.tool_metrics, &expected.tool_metrics,
+                        "tool_metrics for {key}"
+                    );
+                }
+                None => panic!("rebuilt rollups must still serve {key}'s data, not omit it"),
+            }
+        }
+    }
+
+    #[test]
+    fn vacuum_shrinks_the_file_after_a_rebuild_removes_content() {
+        // Requirement: "SQLite reuses freed pages rather than shrinking, so
+        // without [VACUUM] the file stays [large] even once its contents
+        // shrink." This is the file-size half of that claim, exercised
+        // end-to-end: write enough duplicate-heavy content that collapsing
+        // it materially shrinks `session_json`, rebuild, VACUUM, and assert
+        // the on-disk file actually got smaller — not just its logical
+        // content.
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let store = HistoryStore::open(&path).unwrap();
+        let transcripts = tempdir().unwrap();
+
+        let generation = store.begin_scan().unwrap();
+        const SESSION_COUNT: usize = 60;
+        for i in 0..SESSION_COUNT {
+            let session_id = format!("vacuum-session-{i}");
+            let file_path = transcripts.path().join(format!("{session_id}.jsonl"));
+            write_duplicate_heavy_codex_transcript(&file_path, &session_id, 50);
+            let parsed = crate::parser::parse_file(&file_path, false)
+                .unwrap()
+                .unwrap();
+            let mut uncollapsed = parsed.clone();
+            uncollapsed.rate_limits_history = parsed
+                .rate_limits_history
+                .iter()
+                .flat_map(expand_uncollapsed)
+                .collect();
+            store.observe(&file_path, &uncollapsed, generation).unwrap();
+        }
+
+        // Total on-disk footprint (main file + WAL sidecar), not just the
+        // main file. A raw `PRAGMA wal_checkpoint` from a second connection
+        // (WAL mode supports concurrent connections) folds everything
+        // committed so far into the main file before either measurement, so
+        // "before" and "after" are both fully-materialized snapshots rather
+        // than one comparing against content still sitting unflushed in the
+        // WAL — otherwise a rebuild's own additional writes (new snapshots,
+        // a full rollup-table rebuild) landing in a *freshly growing* WAL
+        // could make "after" look larger even though VACUUM shrank the main
+        // file exactly as claimed.
+        let checkpoint = |path: &Path| {
+            let connection = Connection::open(path).unwrap();
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+        };
+        checkpoint(&path);
+        let footprint_before = store.database_footprint();
+        let total_before =
+            footprint_before.db_bytes.unwrap_or(0) + footprint_before.wal_bytes.unwrap_or(0);
+        assert!(total_before > 0);
+
+        let outcome = store
+            .rebuild_from_transcripts(|_done, _total| {}, |_outcome| {}, || false)
+            .unwrap();
+        assert_eq!(outcome.sessions_reparsed, SESSION_COUNT);
+        assert!(outcome.after.session_json_bytes < outcome.before.session_json_bytes);
+
+        store.vacuum().unwrap();
+        checkpoint(&path);
+        let footprint_after = store.database_footprint();
+        let total_after =
+            footprint_after.db_bytes.unwrap_or(0) + footprint_after.wal_bytes.unwrap_or(0);
+        assert!(
+            total_after < total_before,
+            "VACUUM must shrink the on-disk footprint after a rebuild shrinks its content: \
+             before={total_before} after={total_after}"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with --release --ignored --nocapture"]
+    fn probe_rebuild_from_transcripts_cost() {
+        // Issue #162's own cost estimate ("~4.7 ms/file... ~21s of CPU for
+        // 4,530 files, plus reading roughly 15 GB of source transcripts
+        // against the cache's 2 GB") is explicitly flagged as something to
+        // measure, not trust. This probe cannot reproduce a real 15 GB /
+        // 4,530-file corpus locally — no such corpus exists in this
+        // environment, and running against a real ledger is disallowed —
+        // but it runs the same real parser and the same
+        // `rebuild_from_transcripts` write path this feature actually ships,
+        // at a per-file size representative of a real session, so the
+        // estimate above can be extrapolated from a measurement instead of
+        // trusted outright.
+        const FILE_COUNT: usize = 300;
+        const TURNS_PER_FILE: usize = 40;
+
+        let transcripts = tempdir().unwrap();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let store = HistoryStore::open(&path).unwrap();
+        let generation = store.begin_scan().unwrap();
+
+        let mut total_source_bytes: u64 = 0;
+        let build_started = Instant::now();
+        for i in 0..FILE_COUNT {
+            let session_id = format!("probe-session-{i}");
+            let file_path = transcripts.path().join(format!("{session_id}.jsonl"));
+            let mut contents = format!(
+                "{{\"timestamp\":\"2026-08-01T00:00:00Z\",\"type\":\"session_meta\",\
+                 \"payload\":{{\"id\":\"{session_id}\",\"timestamp\":\"2026-08-01T00:00:00Z\"}}}}\n"
+            );
+            for turn in 0..TURNS_PER_FILE {
+                let minute = turn % 60;
+                let input = 100 * (turn + 1);
+                let total = 150 * (turn + 1);
+                contents.push_str(&format!(
+                    "{{\"timestamp\":\"2026-08-01T00:{minute:02}:00Z\",\"type\":\"turn_context\",\
+                     \"payload\":{{\"turn_id\":\"turn-{turn}\",\"model\":\"gpt-5.5\"}}}}\n"
+                ));
+                contents.push_str(&format!(
+                    "{{\"timestamp\":\"2026-08-01T00:{minute:02}:01Z\",\"type\":\"event_msg\",\
+                     \"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":\
+                     {{\"input_tokens\":{input},\"cached_input_tokens\":0,\"output_tokens\":50,\
+                     \"reasoning_output_tokens\":0,\"total_tokens\":{total}}},\"last_token_usage\":\
+                     {{\"input_tokens\":100,\"cached_input_tokens\":0,\"output_tokens\":50,\
+                     \"reasoning_output_tokens\":0,\"total_tokens\":150}},\"model_context_window\":\
+                     128000}},\"rate_limits\":{{\"limit_id\":\"codex\",\"primary\":{{\"used_percent\":\
+                     10.0,\"window_minutes\":300,\"resets_at\":1784998800}},\"secondary\":\
+                     {{\"used_percent\":5.0,\"window_minutes\":10080,\"resets_at\":1785603600}}}}}}}}\n"
+                ));
+                contents.push_str(&format!(
+                    "{{\"timestamp\":\"2026-08-01T00:{minute:02}:02Z\",\"type\":\"response_item\",\
+                     \"payload\":{{\"type\":\"function_call\",\"name\":\"shell\",\"arguments\":\
+                     \"{{\\\"command\\\":[\\\"echo\\\",\\\"hello from turn {turn}\\\"]}}\",\
+                     \"call_id\":\"call-{turn}\"}}}}\n"
+                ));
+            }
+            total_source_bytes += contents.len() as u64;
+            std::fs::write(&file_path, &contents).unwrap();
+            let parsed = crate::parser::parse_file(&file_path, false)
+                .unwrap()
+                .unwrap();
+            store.observe(&file_path, &parsed, generation).unwrap();
+        }
+        let build_elapsed = build_started.elapsed();
+
+        let mut sessions_rewritten = 0usize;
+        let rebuild_started = Instant::now();
+        let outcome = store
+            .rebuild_from_transcripts(
+                |_done, _total| {},
+                |_outcome| sessions_rewritten += 1,
+                || false,
+            )
+            .unwrap();
+        let rebuild_elapsed = rebuild_started.elapsed();
+
+        let vacuum_started = Instant::now();
+        store.vacuum().unwrap();
+        let vacuum_elapsed = vacuum_started.elapsed();
+
+        assert_eq!(outcome.sessions_reparsed, FILE_COUNT);
+        assert_eq!(sessions_rewritten, FILE_COUNT);
+
+        let ms_per_file = rebuild_elapsed.as_secs_f64() * 1_000.0 / FILE_COUNT as f64;
+        let mb_total = total_source_bytes as f64 / (1024.0 * 1024.0);
+        let mb_per_sec = mb_total / rebuild_elapsed.as_secs_f64().max(0.000_001);
+
+        println!(
+            "probe_rebuild_from_transcripts_cost: {FILE_COUNT} files, {mb_total:.2} MB source, \
+             seed-build {build_elapsed:.2?}, rebuild {rebuild_elapsed:.2?} \
+             ({ms_per_file:.3} ms/file, {mb_per_sec:.1} MB/s), vacuum {vacuum_elapsed:.2?}"
+        );
+        println!(
+            "extrapolated to 4,530 files at this measured ms/file: {:.1}s CPU \
+             (issue #162's own estimate: ~21s)",
+            ms_per_file * 4_530.0 / 1_000.0
         );
     }
 }
