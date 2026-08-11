@@ -205,7 +205,12 @@
               <div>RSS: {fmtBytes(liveStatus.process?.rss_bytes)}</div>
               <div>Peak RSS: {fmtBytes(liveStatus.process?.peak_rss_bytes)}</div>
               <div>Private bytes: {fmtBytes(liveStatus.process?.private_bytes)}</div>
-              <div>Heap: {liveStatus.heap?.current_bytes != null ? fmtBytes(liveStatus.heap.current_bytes) : 'not tracked'}</div>
+              <div>
+                Heap: {liveStatus.heap?.current_bytes != null ? fmtBytes(liveStatus.heap.current_bytes) : 'not tracked'}
+                {#if liveStatus.heap?.possibly_undercounted}
+                  <span class="text-amber-500" title="Tracking was enabled after this process already had live heap. A later free of that pre-existing memory cannot be told apart from a tracked free, so this is a lower bound / delta since tracking was enabled — not a verified live heap total.">(delta since enabled, not a verified total)</span>
+                {/if}
+              </div>
             </div>
 
             {#if liveStatus.active_phase}

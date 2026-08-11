@@ -589,11 +589,18 @@ export interface ProcessMemorySample {
   private_bytes: number | null;
 }
 
-/** Allocator-tracked heap (see `memory.rs::HeapSample`). Both fields are
- *  `null` when heap tracking itself is off, distinct from "0 bytes tracked". */
+/** Allocator-tracked heap (see `memory.rs::HeapSample`). Both byte fields are
+ *  `null` when heap tracking itself is off, distinct from "0 bytes tracked".
+ *  `possibly_undercounted` is `true` once tracking has seen a free of an
+ *  allocation that predates the current enable — freeing memory `alloc`
+ *  never saw is indistinguishable, without per-allocation provenance, from
+ *  freeing tracked memory, so `current_bytes`/`peak_bytes` become a lower
+ *  bound / delta since enable rather than a verified live total. Render that
+ *  as a caveat, never silently as an ordinary heap size. */
 export interface HeapSample {
   current_bytes: number | null;
   peak_bytes: number | null;
+  possibly_undercounted: boolean;
 }
 
 /** One continuous-sampler tick during a long startup phase (issue #163). */

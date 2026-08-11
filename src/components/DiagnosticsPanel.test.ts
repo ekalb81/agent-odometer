@@ -46,7 +46,7 @@ function liveStatus(overrides: Partial<PerformanceLiveStatus> = {}): Performance
   return {
     enabled: true,
     process: { rss_bytes: 104_857_600, peak_rss_bytes: 209_715_200, private_bytes: 52_428_800 },
-    heap: { current_bytes: 10_485_760, peak_bytes: 20_971_520 },
+    heap: { current_bytes: 10_485_760, peak_bytes: 20_971_520, possibly_undercounted: false },
     active_phase: 'bulk_scan_parallel',
     active_phase_elapsed_ms: 4_200,
     progress_done: 40,
@@ -275,6 +275,20 @@ describe('DiagnosticsPanel', () => {
       expect(screen.getByText(/history_store: 3.2 GB/)).toBeInTheDocument();
       await user.click(screen.getByText('Recent phase timings'));
       expect(screen.getByText(/startup.bulk_scan: 118400ms/)).toBeInTheDocument();
+    });
+
+    it('flags a possibly-undercounted heap reading as a delta, not a verified total', async () => {
+      getConfig.mockResolvedValue(config({ performance_tracking_enabled: true }));
+      getPerformanceLiveStatus.mockResolvedValue(
+        liveStatus({ heap: { current_bytes: 8_500, peak_bytes: 8_500, possibly_undercounted: true } }),
+      );
+      const user = userEvent.setup();
+      render(DiagnosticsPanel);
+
+      await user.click(await screen.findByText('Show live view'));
+
+      expect(await screen.findByText(/Heap: 8\.3 KB/)).toBeInTheDocument();
+      expect(screen.getByText(/not a verified total/)).toBeInTheDocument();
     });
 
     it('surfaces a live-status fetch error', async () => {
