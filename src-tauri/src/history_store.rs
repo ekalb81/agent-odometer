@@ -15,6 +15,7 @@ use crate::model::{
 use crate::provider::{
     claude_code_provider_id, codex_provider_id, ProviderRegistry, ProviderSourceKind,
 };
+use crate::scan_cache::{self, ScanCache};
 use crate::scanner::SCAN_WRITE_BATCH_SIZE;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::TimeZone;
@@ -554,11 +555,30 @@ impl HistoryStore {
     /// alike). `on_session_rewritten` fires once per durably-written
     /// session, so a caller can publish the update to any in-memory
     /// projection the way it already does for a normal scan's writes.
+    ///
+    /// `scan_cache`, when given, closes the gap issue #174 reports: this
+    /// method rewrites the history store, but a populated scan cache still
+    /// holds whatever it cached before the rebuild ran, and the very next
+    /// scan trusts any row whose `(size, mtime_ms)` still matches the file
+    /// on disk without re-parsing it — replaying that stale content straight
+    /// back into the ledger and undoing the rebuild's entire benefit within
+    /// one scan. Every session already gets re-parsed here for the history
+    /// store's own sake, so folding the same freshly-collapsed `Session`
+    /// into the scan cache costs no extra parse, just one more keyed write
+    /// per session ([`refresh_scan_cache_entry`]). A row this pass cannot
+    /// safely refresh — the re-parse declined or failed, or the on-disk
+    /// key/stat a correct write needs could not be resolved — is deleted
+    /// rather than left holding pre-rebuild content ([`invalidate_scan_cache_entry`]);
+    /// see [`resolve_scan_cache_key_and_stamp`] for why a wrong key would be
+    /// worse than no write at all. `None` (scan cache unavailable, or the
+    /// caller chooses not to touch it) skips this entirely and reproduces
+    /// the pre-#174 behavior.
     pub fn rebuild_from_transcripts(
         &self,
         mut on_progress: impl FnMut(usize, usize),
         mut on_session_rewritten: impl FnMut(BulkObserveOutcome),
         should_cancel: impl Fn() -> bool,
+        scan_cache: Option<&ScanCache>,
     ) -> Result<RebuildOutcome> {
         struct WorkItem {
             path: PathBuf,
@@ -615,6 +635,14 @@ impl HistoryStore {
                 };
                 match adapter.parse_file(&item.path, kind) {
                     Ok(Some(session)) => {
+                        // Issue #174: fold this pass's own re-parse straight
+                        // into the scan cache so the very next scan hits the
+                        // freshly-collapsed session instead of whatever was
+                        // cached before the rebuild ran. Must happen before
+                        // `session` moves into `batch` below.
+                        if let Some(cache) = scan_cache {
+                            refresh_scan_cache_entry(cache, &item.path, &session);
+                        }
                         batch.push((item.path.clone(), session));
                         if batch.len() >= SCAN_WRITE_BATCH_SIZE {
                             flush_rebuild_batch(
@@ -631,14 +659,27 @@ impl HistoryStore {
                     // session on re-parse, or parsing it failed outright.
                     // Either way the transcript exists but this pass cannot
                     // trust a replacement from it, so the existing stored
-                    // snapshot is left exactly as it was.
-                    Ok(None) => failed += 1,
+                    // snapshot is left exactly as it was. Any scan-cache row
+                    // for it is a different story: it may still hold
+                    // pre-rebuild content a later scan would happily replay
+                    // (issue #174), so it is invalidated rather than left
+                    // stale even though the history store keeps its own
+                    // snapshot untouched.
+                    Ok(None) => {
+                        if let Some(cache) = scan_cache {
+                            invalidate_scan_cache_entry(cache, &item.path);
+                        }
+                        failed += 1;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             "rebuild: could not parse {}: {}",
                             item.path.display(),
                             error
                         );
+                        if let Some(cache) = scan_cache {
+                            invalidate_scan_cache_entry(cache, &item.path);
+                        }
                         failed += 1;
                     }
                 }
@@ -3178,6 +3219,65 @@ enum SnapshotPolicy {
     /// Local overlays intentionally change display metadata without a source
     /// scan and must remain writable even when their token history is older.
     MetadataOverlay,
+}
+
+/// Resolves the exact `(key, size, mtime_ms)` a fresh directory scan would
+/// compute for `path`, for [`refresh_scan_cache_entry`]/
+/// [`invalidate_scan_cache_entry`] to key a scan-cache write or delete with
+/// during [`HistoryStore::rebuild_from_transcripts`] (issue #174).
+///
+/// This canonicalizes rather than using `path` as given because every path
+/// a rebuild sees came back out of this store, where it was already folded
+/// through [`source_path_key`] — lowercased on Windows, `/`-separated —
+/// while `scanner::scan_all` keys the cache with the raw, case-preserved
+/// path `WalkDir` discovers. The cache's `sessions.path` column has no
+/// collation, so a folded key is not just untidy: on a case-sensitive
+/// filesystem it is merely a wasted write, but on Windows — where real
+/// config roots are essentially never already lowercase — it would write
+/// under a key a later scan never looks up, leaving the real stale row for
+/// that file completely untouched and defeating this fix for exactly the
+/// platform the field recording was measured on. `std::fs::canonicalize`
+/// resolves a path to its on-disk stored casing (confirmed empirically: a
+/// deliberately lowercased input round-trips to the real mixed-case name),
+/// so re-deriving the key this way recovers the same string
+/// `scanner::scan_all` would have used, without needing a fresh directory
+/// walk. Returns `None` when the path cannot be resolved on disk right now
+/// (a race with deletion) or its metadata cannot be read afterward — the
+/// caller falls back to invalidation rather than guessing at a key.
+fn resolve_scan_cache_key_and_stamp(path: &Path) -> Option<(String, u64, u64)> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let canonical = crate::paths::strip_verbatim_prefix(&canonical);
+    let (size, mtime_ms) = scan_cache::file_stamp(&canonical)?;
+    Some((canonical.to_string_lossy().into_owned(), size, mtime_ms))
+}
+
+/// Writes `session` — the collapsed snapshot this rebuild pass just
+/// produced from `path` — into the scan cache under the same key/stat a
+/// later scan will look it up with, so that scan's cache hit already
+/// reflects the rebuild instead of replaying whatever was cached before it
+/// (issue #174). Falls back to [`invalidate_scan_cache_entry`] when the key
+/// or stat cannot be resolved right now; see
+/// [`resolve_scan_cache_key_and_stamp`] for why a wrong key is worse than no
+/// write at all.
+fn refresh_scan_cache_entry(cache: &ScanCache, path: &Path, session: &Session) {
+    match resolve_scan_cache_key_and_stamp(path) {
+        Some((key, size, mtime_ms)) => cache.store(&key, size, mtime_ms, session),
+        None => invalidate_scan_cache_entry(cache, path),
+    }
+}
+
+/// Deletes any scan-cache row for `path` rather than leaving it to be
+/// replayed by a later scan holding content this rebuild pass could not
+/// refresh — a declined/failed re-parse, or a key/stat that could not be
+/// resolved (issue #174). A no-op when the key itself cannot be resolved
+/// either (the file vanished or became unreadable mid-rebuild): there is
+/// nothing this pass can target for deletion, the same narrow race
+/// [`HistoryStore::rebuild_from_transcripts`]'s own `item.path.exists()`
+/// check already tolerates.
+fn invalidate_scan_cache_entry(cache: &ScanCache, path: &Path) {
+    if let Some((key, _size, _mtime_ms)) = resolve_scan_cache_key_and_stamp(path) {
+        cache.invalidate(&key);
+    }
 }
 
 /// Durably writes one accumulated re-parse batch for
@@ -9063,6 +9163,7 @@ mod tests {
                 |_done, _total| {},
                 |outcome| rewritten_keys.push(outcome.stored.key.clone()),
                 || false,
+                None,
             )
             .unwrap();
 
@@ -9114,6 +9215,7 @@ mod tests {
                 |_done, _total| {},
                 |outcome| rewritten_keys.push(outcome.stored.key.clone()),
                 || false,
+                None,
             )
             .unwrap();
 
@@ -9201,6 +9303,7 @@ mod tests {
                 |_done, _total| {},
                 |outcome| rewritten_keys.push(outcome.stored.key.clone()),
                 || cancel_after.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1,
+                None,
             )
             .unwrap();
 
@@ -9395,7 +9498,7 @@ mod tests {
         assert!(total_before > 0);
 
         let outcome = store
-            .rebuild_from_transcripts(|_done, _total| {}, |_outcome| {}, || false)
+            .rebuild_from_transcripts(|_done, _total| {}, |_outcome| {}, || false, None)
             .unwrap();
         assert_eq!(outcome.sessions_reparsed, SESSION_COUNT);
         assert!(outcome.after.session_json_bytes < outcome.before.session_json_bytes);
@@ -9409,6 +9512,136 @@ mod tests {
             "VACUUM must shrink the on-disk footprint after a rebuild shrinks its content, \
              including checkpointing its own WAL growth back down — not just the main file: \
              before={total_before} after={total_after}"
+        );
+    }
+
+    #[test]
+    fn rebuild_benefit_survives_a_subsequent_scan_via_the_scan_cache() {
+        // Issue #174: `rebuild_from_transcripts` durably rewrites the
+        // history store, but before this fix it never touched the scan
+        // cache. A populated cache still held whatever it cached before the
+        // rebuild ran, and the very next scan trusts any row whose
+        // `(size, mtime_ms)` still matches the file on disk without
+        // re-parsing it — so it replayed that stale, uncollapsed content
+        // straight back into the ledger through `observe_bulk_batch`, the
+        // same write path `store::AppState::reconcile_scanned_batch_if_current`
+        // uses for a real bulk scan's batches, undoing the rebuild's entire
+        // measured benefit within one scan (2.46 -> 3.30 GB in the field
+        // recording). No existing test spanned rebuild-then-scan; this one
+        // does: it builds a store plus a populated scan cache from
+        // duplicate-heavy transcripts, rebuilds, then runs a scan the same
+        // way startup does (`scanner::scan_all` reconciled through
+        // `observe_bulk_batch`), and asserts the stored `session_json`
+        // bytes are still reduced afterward — not just at the moment the
+        // rebuild finished.
+        use crate::provider::{ProviderSource, ProviderSourceSet};
+
+        let (_directory, store) = store();
+        let transcripts = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let cache_path = cache_dir.path().join("scan-cache-v2.sqlite3");
+
+        const SESSION_COUNT: usize = 6;
+        let seed_generation = store.begin_scan().unwrap();
+        let cache = ScanCache::load(&cache_path);
+        for i in 0..SESSION_COUNT {
+            let session_id = format!("survive-scan-{i}");
+            let file_path = transcripts.path().join(format!("{session_id}.jsonl"));
+            write_duplicate_heavy_codex_transcript(&file_path, &session_id, 40);
+
+            let fresh = crate::parser::parse_file(&file_path, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fresh.rate_limits_history.len(),
+                1,
+                "fixture must collapse through the real (post-#153) parser"
+            );
+
+            let mut uncollapsed = fresh.clone();
+            uncollapsed.rate_limits_history = fresh
+                .rate_limits_history
+                .iter()
+                .flat_map(expand_uncollapsed)
+                .collect();
+
+            // Seed the ledger with the pre-#153 uncollapsed shape, as an
+            // earlier scan would have durably written it.
+            store
+                .observe(&file_path, &uncollapsed, seed_generation)
+                .unwrap();
+
+            // Seed the scan cache with the SAME uncollapsed shape, keyed by
+            // this file's real, current (size, mtime) — exactly what a
+            // pre-rebuild scan would have cached, and what the very next
+            // scan still finds unchanged on disk (the rebuild never writes
+            // to the transcript files themselves).
+            let (size, mtime_ms) = scan_cache::file_stamp(&file_path).unwrap();
+            cache.store(&file_path.to_string_lossy(), size, mtime_ms, &uncollapsed);
+        }
+        cache.finish_scan();
+
+        let before_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+
+        let rebuild_outcome = store
+            .rebuild_from_transcripts(|_, _| {}, |_| {}, || false, Some(&cache))
+            .unwrap();
+        assert_eq!(rebuild_outcome.sessions_reparsed, SESSION_COUNT);
+        assert_eq!(rebuild_outcome.sessions_failed, 0);
+        assert_eq!(rebuild_outcome.sessions_missing_transcript, 0);
+
+        let after_rebuild_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+        assert!(
+            after_rebuild_bytes < before_bytes,
+            "the rebuild alone must shrink stored bytes: before={before_bytes} \
+             after_rebuild={after_rebuild_bytes}"
+        );
+
+        // The scan that runs on the very next startup: same roots, same
+        // scan-cache file, no user action in between — exactly the field
+        // recording's "4 minutes later" run. Reconciled through
+        // `observe_bulk_batch` directly, the same durable-write call a real
+        // bulk scan's batches go through.
+        let sources = ProviderSourceSet::try_new([ProviderSource::new(
+            codex_provider_id(),
+            transcripts.path().to_path_buf(),
+            ProviderSourceKind::Live,
+        )])
+        .unwrap();
+        drop(cache);
+        let post_rebuild_cache = ScanCache::load(&cache_path);
+        let scan_generation = store.begin_scan().unwrap();
+        let report = crate::scanner::scan_all(
+            &sources,
+            Some(post_rebuild_cache),
+            |batch| {
+                let items: Vec<(&Path, &Session, i64)> = batch
+                    .iter()
+                    .map(|(path, session)| (path.as_path(), session, scan_generation))
+                    .collect();
+                store.observe_bulk_batch(&items).unwrap();
+            },
+            |_, _| {},
+        );
+        assert_eq!(report.files, SESSION_COUNT);
+        // Not just "bytes stayed low" — specifically because the scan hit
+        // the cache row this rebuild refreshed, not because a key mismatch
+        // silently forced every file through a cold re-parse instead (which
+        // would also happen to produce correct output through today's
+        // parser and could mask a broken cache key under this same
+        // assertion).
+        assert_eq!(
+            report.cache_hits, SESSION_COUNT as u64,
+            "the scan must hit the cache rows the rebuild refreshed, not cold-reparse around them"
+        );
+        assert_eq!(report.cache_misses, 0);
+
+        let after_scan_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+        assert!(
+            after_scan_bytes < before_bytes,
+            "the rebuild's reduced footprint must survive the very next scan, not just \
+             the moment the rebuild finished: pre_rebuild={before_bytes} \
+             post_rebuild={after_rebuild_bytes} post_scan={after_scan_bytes}"
         );
     }
 
@@ -9486,6 +9719,7 @@ mod tests {
                 |_done, _total| {},
                 |_outcome| sessions_rewritten += 1,
                 || false,
+                None,
             )
             .unwrap();
         let rebuild_elapsed = rebuild_started.elapsed();
