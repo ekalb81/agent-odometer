@@ -322,6 +322,32 @@ impl ScanCache {
         self.connection.is_some()
     }
 
+    /// Every currently-keyed path, for a caller that needs to reconcile the
+    /// cache under a normalization this table has no index for (issue #174:
+    /// [`crate::history_store::HistoryStore::rebuild_from_transcripts`]'s
+    /// end-of-pass sweep for stale rows a case-mismatched provider root
+    /// would otherwise leave behind). One `SELECT path FROM sessions`,
+    /// materializing every key at once — intended for a single batched pass
+    /// over the whole cache, not a hot-path or per-file lookup. Errors
+    /// degrade to an empty result, same as every other read here: the cache
+    /// is never a source of truth.
+    pub fn keys(&self) -> Vec<String> {
+        let Some(connection) = &self.connection else {
+            return Vec::new();
+        };
+        let Ok(connection) = connection.lock() else {
+            tracing::warn!("scan-cache lock poisoned while listing keys");
+            return Vec::new();
+        };
+        let Ok(mut statement) = connection.prepare("SELECT path FROM sessions") else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(std::result::Result::ok).collect()
+    }
+
     /// Returns an owned cached session when the stored stamp matches, and
     /// marks the row as seen in this scan generation.
     pub fn lookup(&self, key: &str, size: u64, mtime_ms: u64) -> Option<Session> {
