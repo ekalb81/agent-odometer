@@ -1153,6 +1153,59 @@ mod tests {
         assert!(!card.api_models.contains_key("gpt-5.3-codex-spark"));
     }
 
+    /// The Daybreak aliases are floating: OpenAI repoints them as new
+    /// frontier models ship, and pricing follows whatever they point at. That
+    /// makes the mapping correct only as of the card's `fetched_at`, so this
+    /// pins three things that must hold together — the alias resolves, it
+    /// resolves to a model the card actually prices, and resolving it is
+    /// `Aliased` rather than `Fallback`. The last one is the user-visible
+    /// part: `Fallback` is what raises "Fallback rate used for:" in the UI,
+    /// and a mapping that resolved to an unpriced id would silently keep
+    /// doing that while looking fixed here.
+    #[test]
+    fn daybreak_blue_alias_resolves_to_a_priced_model_without_falling_back() {
+        let card = RateCard::load_bundled().expect("bundled rate card should parse");
+
+        for raw in ["gpt-daybreak-blue-latest", "daybreak-blue-latest"] {
+            let canonical = card
+                .model_aliases
+                .get(raw)
+                .unwrap_or_else(|| panic!("{raw} should be aliased"));
+            assert_eq!(canonical, "gpt-5.6-sol");
+            assert!(
+                card.models.contains_key(canonical) && card.api_models.contains_key(canonical),
+                "{raw} aliases to {canonical}, which the card must price in both currencies"
+            );
+
+            for table in [&card.models, &card.api_models] {
+                let resolved = card.resolve_model_pricing(raw, "codex", table, chrono::Utc::now());
+                assert_eq!(
+                    resolved.resolved_model, *canonical,
+                    "{raw} must resolve to {canonical}"
+                );
+                assert_eq!(
+                    resolved.basis,
+                    PricingBasis::Aliased,
+                    "{raw} must resolve as Aliased; Fallback is what surfaces the UI warning"
+                );
+            }
+        }
+    }
+
+    /// The bundled card only reaches an install whose on-disk copy is older
+    /// (`merge_older_override` returns early otherwise), so shipping an alias
+    /// without bumping `version` would leave every existing user exactly as
+    /// broken as before while every test here passed.
+    #[test]
+    fn bundled_card_version_is_ahead_of_the_last_shipped_card() {
+        let card = RateCard::load_bundled().expect("bundled rate card should parse");
+        assert!(
+            card.version >= 9,
+            "adding models or aliases requires a version bump to propagate; got {}",
+            card.version
+        );
+    }
+
     #[test]
     fn catalog_uses_half_open_period_boundaries_for_sonnet_five() {
         let card = RateCard::load_bundled().expect("bundled rate card should parse");
