@@ -1281,10 +1281,9 @@ pub fn spawn_scan(
         let started = std::time::Instant::now();
         // An invalid legacy source configuration must not prune an otherwise
         // healthy cache merely because the fail-closed scan has no roots.
-        let cache_path = source_configuration_valid.then(|| {
-            dirs::cache_dir().map(|d| d.join("agent-odometer").join("scan-cache-v2.sqlite3"))
-        });
-        let cache_path = cache_path.flatten();
+        let cache_path = source_configuration_valid
+            .then(scan_cache::default_path)
+            .flatten();
 
         // Opened here, not inside scan_all: the caller needs cold_reason
         // before the scan's progress events start firing, and a cache must
@@ -1927,6 +1926,20 @@ pub fn spawn_history_rebuild(app: AppHandle, state: Arc<AppState>) {
         state.set_history_rebuild_status(running.clone());
         let _ = app.emit("history-rebuild-progress", &running);
 
+        // Issue #174: opened here, separately from any concurrent scan's own
+        // cache handle, so the rebuild can fold each session's freshly
+        // re-parsed content straight into the same cache file a later scan
+        // reads — otherwise a populated cache still holding pre-rebuild
+        // content would let that later scan replay it straight back into
+        // the ledger this rebuild just shrank. `ScanCache::load` tolerates
+        // concurrent opens from other processes/threads (see its own
+        // generation bookkeeping), so this needs no coordination with
+        // `spawn_scan`'s handle. `None` (no cache directory resolvable)
+        // degrades to the pre-#174 behavior: the history store still gets
+        // rebuilt, just without the scan-cache fix.
+        let scan_cache_for_rebuild =
+            scan_cache::default_path().map(|path| scan_cache::ScanCache::load(&path));
+
         let progress_state = state.clone();
         let progress_app = app.clone();
         let publish_state = state.clone();
@@ -1962,6 +1975,7 @@ pub fn spawn_history_rebuild(app: AppHandle, state: Arc<AppState>) {
                     .rebuild_cancel_requested
                     .load(Ordering::Acquire)
             },
+            scan_cache_for_rebuild.as_ref(),
         );
 
         let status = match outcome {

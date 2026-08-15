@@ -100,6 +100,16 @@ pub struct ScanCache {
     path: Option<PathBuf>,
 }
 
+/// Default location for the scan cache, shared by every caller that opens
+/// it: a normal scan (`commands::spawn_scan`) and, since issue #174, a
+/// history rebuild writing its freshly re-parsed sessions into the same
+/// cache a subsequent scan will read (`commands::spawn_history_rebuild`).
+/// Keeping the path literal in one place means the two can never drift
+/// apart and silently stop sharing a cache file.
+pub fn default_path() -> Option<PathBuf> {
+    dirs::cache_dir().map(|dir| dir.join("agent-odometer").join("scan-cache-v2.sqlite3"))
+}
+
 /// (size, mtime in ms since epoch) for a file; None when it can't be stat'ed.
 pub fn file_stamp(path: &Path) -> Option<(u64, u64)> {
     let meta = std::fs::metadata(path).ok()?;
@@ -312,6 +322,32 @@ impl ScanCache {
         self.connection.is_some()
     }
 
+    /// Every currently-keyed path, for a caller that needs to reconcile the
+    /// cache under a normalization this table has no index for (issue #174:
+    /// [`crate::history_store::HistoryStore::rebuild_from_transcripts`]'s
+    /// end-of-pass sweep for stale rows a case-mismatched provider root
+    /// would otherwise leave behind). One `SELECT path FROM sessions`,
+    /// materializing every key at once — intended for a single batched pass
+    /// over the whole cache, not a hot-path or per-file lookup. Errors
+    /// degrade to an empty result, same as every other read here: the cache
+    /// is never a source of truth.
+    pub fn keys(&self) -> Vec<String> {
+        let Some(connection) = &self.connection else {
+            return Vec::new();
+        };
+        let Ok(connection) = connection.lock() else {
+            tracing::warn!("scan-cache lock poisoned while listing keys");
+            return Vec::new();
+        };
+        let Ok(mut statement) = connection.prepare("SELECT path FROM sessions") else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map([], |row| row.get::<_, String>(0)) else {
+            return Vec::new();
+        };
+        rows.filter_map(std::result::Result::ok).collect()
+    }
+
     /// Returns an owned cached session when the stored stamp matches, and
     /// marks the row as seen in this scan generation.
     pub fn lookup(&self, key: &str, size: u64, mtime_ms: u64) -> Option<Session> {
@@ -358,11 +394,32 @@ impl ScanCache {
             }),
             Err(error) => {
                 tracing::warn!("corrupt scan-cache entry {:?}: {}; discarding", key, error);
-                if let Ok(connection) = connection.lock() {
-                    let _ = connection.execute("DELETE FROM sessions WHERE path = ?1", [key]);
-                }
+                self.invalidate(key);
                 None
             }
+        }
+    }
+
+    /// Removes one entry, if present. Used when a caller determined a row
+    /// cannot be safely refreshed with fresh content — a corrupt blob (above),
+    /// or, since issue #174,
+    /// [`crate::history_store::HistoryStore::rebuild_from_transcripts`]
+    /// re-parsing a transcript that declined or failed, or being unable to
+    /// resolve the on-disk key/stat a fresh write would need. Leaving the
+    /// previous row in place in any of those cases risks it being served as
+    /// a stale hit by a later scan — the exact mechanism issue #174 reports
+    /// — so it is deleted instead. A path with no existing row is a silent
+    /// no-op.
+    pub fn invalidate(&self, key: &str) {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        let Ok(connection) = connection.lock() else {
+            tracing::warn!("scan-cache lock poisoned while invalidating {:?}", key);
+            return;
+        };
+        if let Err(error) = connection.execute("DELETE FROM sessions WHERE path = ?1", [key]) {
+            tracing::warn!("could not invalidate scan-cache entry {:?}: {}", key, error);
         }
     }
 

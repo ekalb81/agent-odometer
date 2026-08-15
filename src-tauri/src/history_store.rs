@@ -15,6 +15,7 @@ use crate::model::{
 use crate::provider::{
     claude_code_provider_id, codex_provider_id, ProviderRegistry, ProviderSourceKind,
 };
+use crate::scan_cache::{self, ScanCache};
 use crate::scanner::SCAN_WRITE_BATCH_SIZE;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::TimeZone;
@@ -554,11 +555,33 @@ impl HistoryStore {
     /// alike). `on_session_rewritten` fires once per durably-written
     /// session, so a caller can publish the update to any in-memory
     /// projection the way it already does for a normal scan's writes.
+    ///
+    /// `scan_cache`, when given, closes the gap issue #174 reports: this
+    /// method rewrites the history store, but a populated scan cache still
+    /// holds whatever it cached before the rebuild ran, and the very next
+    /// scan trusts any row whose `(size, mtime_ms)` still matches the file
+    /// on disk without re-parsing it — replaying that stale content straight
+    /// back into the ledger and undoing the rebuild's entire benefit within
+    /// one scan. Every session already gets re-parsed here for the history
+    /// store's own sake, so folding the same freshly-collapsed `Session`
+    /// into the scan cache costs no extra parse, just one more keyed write
+    /// per session ([`record_scan_cache_refresh`]). A declined/failed
+    /// re-parse leaves nothing valid to write ([`record_scan_cache_invalidation`]).
+    /// Either way, nothing is deleted per session directly: a single
+    /// [`sweep_normalized_scan_cache_duplicates`] pass at the end reconciles
+    /// the whole cache against what this rebuild touched, because the exact
+    /// key [`resolve_scan_cache_key_and_stamp`] resolves (the file's
+    /// on-disk casing) is not always the key a real scan actually cached
+    /// the stale row under (the *configured provider root's* casing, for
+    /// the root portion of the path) — see that function's own doc comment.
+    /// `None` (scan cache unavailable, or the caller chooses not to touch
+    /// it) skips this entirely and reproduces the pre-#174 behavior.
     pub fn rebuild_from_transcripts(
         &self,
         mut on_progress: impl FnMut(usize, usize),
         mut on_session_rewritten: impl FnMut(BulkObserveOutcome),
         should_cancel: impl Fn() -> bool,
+        scan_cache: Option<&ScanCache>,
     ) -> Result<RebuildOutcome> {
         struct WorkItem {
             path: PathBuf,
@@ -597,6 +620,11 @@ impl HistoryStore {
         let mut failed = 0usize;
         let mut cancelled = false;
         let mut batch: Vec<(PathBuf, Session)> = Vec::with_capacity(SCAN_WRITE_BATCH_SIZE);
+        // Issue #174: which normalized paths this pass touched in the scan
+        // cache, and the one key that now correctly represents each —
+        // `sweep_normalized_scan_cache_duplicates` reconciles the whole
+        // cache against this once, after the loop, rather than per session.
+        let mut scan_cache_touched: HashMap<String, Option<String>> = HashMap::new();
 
         on_progress(0, total);
         for (index, item) in items.iter().enumerate() {
@@ -615,6 +643,19 @@ impl HistoryStore {
                 };
                 match adapter.parse_file(&item.path, kind) {
                     Ok(Some(session)) => {
+                        // Issue #174: fold this pass's own re-parse straight
+                        // into the scan cache so the very next scan hits the
+                        // freshly-collapsed session instead of whatever was
+                        // cached before the rebuild ran. Must happen before
+                        // `session` moves into `batch` below.
+                        if let Some(cache) = scan_cache {
+                            record_scan_cache_refresh(
+                                cache,
+                                &item.path,
+                                &session,
+                                &mut scan_cache_touched,
+                            );
+                        }
                         batch.push((item.path.clone(), session));
                         if batch.len() >= SCAN_WRITE_BATCH_SIZE {
                             flush_rebuild_batch(
@@ -631,14 +672,27 @@ impl HistoryStore {
                     // session on re-parse, or parsing it failed outright.
                     // Either way the transcript exists but this pass cannot
                     // trust a replacement from it, so the existing stored
-                    // snapshot is left exactly as it was.
-                    Ok(None) => failed += 1,
+                    // snapshot is left exactly as it was. Any scan-cache row
+                    // for it is a different story: it may still hold
+                    // pre-rebuild content a later scan would happily replay
+                    // (issue #174), so it is marked for removal by the
+                    // sweep below rather than left stale even though the
+                    // history store keeps its own snapshot untouched.
+                    Ok(None) => {
+                        if scan_cache.is_some() {
+                            record_scan_cache_invalidation(&item.path, &mut scan_cache_touched);
+                        }
+                        failed += 1;
+                    }
                     Err(error) => {
                         tracing::warn!(
                             "rebuild: could not parse {}: {}",
                             item.path.display(),
                             error
                         );
+                        if scan_cache.is_some() {
+                            record_scan_cache_invalidation(&item.path, &mut scan_cache_touched);
+                        }
                         failed += 1;
                     }
                 }
@@ -660,6 +714,14 @@ impl HistoryStore {
             &mut failed,
             &mut on_session_rewritten,
         )?;
+
+        // Runs regardless of `cancelled`, for the same reason as the rollup
+        // rebuild below: `scan_cache_touched` only reflects sessions this
+        // pass actually reached, so reconciling it now is safe and leaves
+        // nothing for an interrupted run to half-finish later.
+        if let Some(cache) = scan_cache {
+            sweep_normalized_scan_cache_duplicates(cache, &scan_cache_touched);
+        }
 
         // Runs regardless of `cancelled`: every batch already committed its
         // facts and durably marked `rollups_stale` (deferred rollups, same
@@ -3178,6 +3240,127 @@ enum SnapshotPolicy {
     /// Local overlays intentionally change display metadata without a source
     /// scan and must remain writable even when their token history is older.
     MetadataOverlay,
+}
+
+/// Resolves the exact `(key, size, mtime_ms)` a fresh directory scan would
+/// compute for `path` *if the configured root's own casing matches the
+/// disk's* — the common case — for [`record_scan_cache_refresh`] to key a
+/// scan-cache write with during [`HistoryStore::rebuild_from_transcripts`]
+/// (issue #174).
+///
+/// This canonicalizes rather than using `path` as given because every path
+/// a rebuild sees came back out of this store, where it was already folded
+/// through [`source_path_key`] — lowercased on Windows, `/`-separated —
+/// while `scanner::scan_all` keys the cache with the raw, case-preserved
+/// path `WalkDir` discovers. `std::fs::canonicalize` resolves a path to its
+/// on-disk stored casing (confirmed empirically: a deliberately lowercased
+/// input round-trips to the real mixed-case name), so re-deriving the key
+/// this way recovers the same string `scanner::scan_all` would have used —
+/// *provided* the configured provider root itself is already spelled the
+/// way the disk spells it. When it is not (a root typed as `C:\users\...`
+/// over a disk that reports `C:\Users\...`), `WalkDir` still keys its cache
+/// rows with the root's own casing, not the disk's, so this function's
+/// canonical answer and the *actual* stale row's key can differ in that
+/// root segment specifically — see [`sweep_normalized_scan_cache_duplicates`],
+/// which exists to catch exactly that gap; this function alone is not
+/// sufficient to guarantee the stale row is reached. Returns `None` when
+/// the path cannot be resolved on disk right now (a race with deletion) or
+/// its metadata cannot be read afterward.
+fn resolve_scan_cache_key_and_stamp(path: &Path) -> Option<(String, u64, u64)> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let canonical = crate::paths::strip_verbatim_prefix(&canonical);
+    let (size, mtime_ms) = scan_cache::file_stamp(&canonical)?;
+    Some((canonical.to_string_lossy().into_owned(), size, mtime_ms))
+}
+
+/// Writes `session` — the collapsed snapshot this rebuild pass just
+/// produced from `path` — into the scan cache under the best key this pass
+/// can resolve for it (issue #174), and records the outcome in `touched`
+/// for [`sweep_normalized_scan_cache_duplicates`] to reconcile afterward.
+///
+/// `touched` maps `path`'s [`source_path_key`]-normalized form (case-folded
+/// on Windows, `/`-separated — the same normalization every path already
+/// went through once on its way out of this store) to `Some(key)` when a
+/// fresh write actually landed under `key`, or `None` when it could not
+/// (the key/stat could not be resolved right now). Nothing is deleted here
+/// directly: the sweep is what removes whatever this write did not reach.
+fn record_scan_cache_refresh(
+    cache: &ScanCache,
+    path: &Path,
+    session: &Session,
+    touched: &mut HashMap<String, Option<String>>,
+) {
+    let normalized = source_path_key(path);
+    match resolve_scan_cache_key_and_stamp(path) {
+        Some((key, size, mtime_ms)) => {
+            cache.store(&key, size, mtime_ms, session);
+            touched.insert(normalized, Some(key));
+        }
+        None => {
+            touched.insert(normalized, None);
+        }
+    }
+}
+
+/// Records that `path`'s re-parse was declined or failed this rebuild pass
+/// (issue #174): nothing here is valid to write, so [`touched`] gets `None`
+/// for its normalized form, meaning [`sweep_normalized_scan_cache_duplicates`]
+/// will delete every scan-cache row for this logical path regardless of
+/// casing — there is nothing this pass produced that a later scan could
+/// safely reuse. The history store's own stored snapshot is untouched by
+/// this, exactly as documented on [`HistoryStore::rebuild_from_transcripts`]
+/// itself; this only concerns the scan cache.
+fn record_scan_cache_invalidation(path: &Path, touched: &mut HashMap<String, Option<String>>) {
+    touched.insert(source_path_key(path), None);
+}
+
+/// After a rebuild pass writes or declines to write each session's
+/// scan-cache entry under its own best-resolved key, sweeps the *entire*
+/// cache once for any row naming the same logical path under different
+/// casing — the gap [`resolve_scan_cache_key_and_stamp`]'s own doc comment
+/// flags: `scanner::scan_all` keys new writes off `WalkDir`'s raw path,
+/// which carries the *configured provider root's* casing for the root
+/// portion, not necessarily the disk's, so a root typed differently than
+/// the disk stores it produces a stale row this pass's own canonical-keyed
+/// write never touches. Left alone, that row is exactly the staleness this
+/// rebuild exists to remove: untouched, it sits ready to be served as a
+/// stale hit by the next scan and issue #174 reproduces in full — with this
+/// fix present and its own test green, and nothing to show it.
+///
+/// `touched` (built by [`record_scan_cache_refresh`]/
+/// [`record_scan_cache_invalidation`]) maps each rebuilt session's
+/// normalized path to the one key that now correctly represents it —
+/// `Some(key)` when this pass wrote fresh content there, `None` when it
+/// could not (declined/failed re-parse, or an unresolvable key/stat). A
+/// cache row survives this sweep only when its own literal key equals that
+/// `Some` value; every other row sharing the normalized path is deleted —
+/// including, for a `None` entry, one that happens to already carry
+/// "correct" casing, since this pass produced nothing valid to keep for
+/// that session. A deleted row costs its one session a cold re-parse on the
+/// next scan, not the silent, full-corpus staleness a surviving duplicate
+/// would.
+///
+/// One `SELECT path FROM sessions` plus an in-memory pass — not a query per
+/// session: `scan_cache.rs`'s `sessions.path` has no expression index a
+/// normalized lookup could use, and probing it per session would make this
+/// pass cost O(cache size × sessions rebuilt) instead of the O(cache size)
+/// this pays once, at the end of the whole rebuild.
+fn sweep_normalized_scan_cache_duplicates(
+    cache: &ScanCache,
+    touched: &HashMap<String, Option<String>>,
+) {
+    if touched.is_empty() {
+        return;
+    }
+    for key in cache.keys() {
+        let normalized = source_path_key(Path::new(&key));
+        let Some(expected) = touched.get(&normalized) else {
+            continue;
+        };
+        if expected.as_deref() != Some(key.as_str()) {
+            cache.invalidate(&key);
+        }
+    }
 }
 
 /// Durably writes one accumulated re-parse batch for
@@ -9063,6 +9246,7 @@ mod tests {
                 |_done, _total| {},
                 |outcome| rewritten_keys.push(outcome.stored.key.clone()),
                 || false,
+                None,
             )
             .unwrap();
 
@@ -9114,6 +9298,7 @@ mod tests {
                 |_done, _total| {},
                 |outcome| rewritten_keys.push(outcome.stored.key.clone()),
                 || false,
+                None,
             )
             .unwrap();
 
@@ -9201,6 +9386,7 @@ mod tests {
                 |_done, _total| {},
                 |outcome| rewritten_keys.push(outcome.stored.key.clone()),
                 || cancel_after.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1,
+                None,
             )
             .unwrap();
 
@@ -9395,7 +9581,7 @@ mod tests {
         assert!(total_before > 0);
 
         let outcome = store
-            .rebuild_from_transcripts(|_done, _total| {}, |_outcome| {}, || false)
+            .rebuild_from_transcripts(|_done, _total| {}, |_outcome| {}, || false, None)
             .unwrap();
         assert_eq!(outcome.sessions_reparsed, SESSION_COUNT);
         assert!(outcome.after.session_json_bytes < outcome.before.session_json_bytes);
@@ -9409,6 +9595,300 @@ mod tests {
             "VACUUM must shrink the on-disk footprint after a rebuild shrinks its content, \
              including checkpointing its own WAL growth back down — not just the main file: \
              before={total_before} after={total_after}"
+        );
+    }
+
+    #[test]
+    fn rebuild_benefit_survives_a_subsequent_scan_via_the_scan_cache() {
+        // Issue #174: `rebuild_from_transcripts` durably rewrites the
+        // history store, but before this fix it never touched the scan
+        // cache. A populated cache still held whatever it cached before the
+        // rebuild ran, and the very next scan trusts any row whose
+        // `(size, mtime_ms)` still matches the file on disk without
+        // re-parsing it — so it replayed that stale, uncollapsed content
+        // straight back into the ledger through `observe_bulk_batch`, the
+        // same write path `store::AppState::reconcile_scanned_batch_if_current`
+        // uses for a real bulk scan's batches, undoing the rebuild's entire
+        // measured benefit within one scan (2.46 -> 3.30 GB in the field
+        // recording). No existing test spanned rebuild-then-scan; this one
+        // does: it builds a store plus a populated scan cache from
+        // duplicate-heavy transcripts, rebuilds, then runs a scan the same
+        // way startup does (`scanner::scan_all` reconciled through
+        // `observe_bulk_batch`), and asserts the stored `session_json`
+        // bytes are still reduced afterward — not just at the moment the
+        // rebuild finished.
+        use crate::provider::{ProviderSource, ProviderSourceSet};
+
+        let (_directory, store) = store();
+        let transcripts = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let cache_path = cache_dir.path().join("scan-cache-v2.sqlite3");
+
+        const SESSION_COUNT: usize = 6;
+        let seed_generation = store.begin_scan().unwrap();
+        let cache = ScanCache::load(&cache_path);
+        for i in 0..SESSION_COUNT {
+            let session_id = format!("survive-scan-{i}");
+            let file_path = transcripts.path().join(format!("{session_id}.jsonl"));
+            write_duplicate_heavy_codex_transcript(&file_path, &session_id, 40);
+
+            let fresh = crate::parser::parse_file(&file_path, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fresh.rate_limits_history.len(),
+                1,
+                "fixture must collapse through the real (post-#153) parser"
+            );
+
+            let mut uncollapsed = fresh.clone();
+            uncollapsed.rate_limits_history = fresh
+                .rate_limits_history
+                .iter()
+                .flat_map(expand_uncollapsed)
+                .collect();
+
+            // Seed the ledger with the pre-#153 uncollapsed shape, as an
+            // earlier scan would have durably written it.
+            store
+                .observe(&file_path, &uncollapsed, seed_generation)
+                .unwrap();
+
+            // Seed the scan cache with the SAME uncollapsed shape, keyed by
+            // this file's real, current (size, mtime) — exactly what a
+            // pre-rebuild scan would have cached, and what the very next
+            // scan still finds unchanged on disk (the rebuild never writes
+            // to the transcript files themselves).
+            let (size, mtime_ms) = scan_cache::file_stamp(&file_path).unwrap();
+            cache.store(&file_path.to_string_lossy(), size, mtime_ms, &uncollapsed);
+        }
+        cache.finish_scan();
+
+        let before_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+
+        let rebuild_outcome = store
+            .rebuild_from_transcripts(|_, _| {}, |_| {}, || false, Some(&cache))
+            .unwrap();
+        assert_eq!(rebuild_outcome.sessions_reparsed, SESSION_COUNT);
+        assert_eq!(rebuild_outcome.sessions_failed, 0);
+        assert_eq!(rebuild_outcome.sessions_missing_transcript, 0);
+
+        let after_rebuild_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+        assert!(
+            after_rebuild_bytes < before_bytes,
+            "the rebuild alone must shrink stored bytes: before={before_bytes} \
+             after_rebuild={after_rebuild_bytes}"
+        );
+
+        // The scan that runs on the very next startup: same roots, same
+        // scan-cache file, no user action in between — exactly the field
+        // recording's "4 minutes later" run. Reconciled through
+        // `observe_bulk_batch` directly, the same durable-write call a real
+        // bulk scan's batches go through.
+        let sources = ProviderSourceSet::try_new([ProviderSource::new(
+            codex_provider_id(),
+            transcripts.path().to_path_buf(),
+            ProviderSourceKind::Live,
+        )])
+        .unwrap();
+        drop(cache);
+        let post_rebuild_cache = ScanCache::load(&cache_path);
+        let scan_generation = store.begin_scan().unwrap();
+        let report = crate::scanner::scan_all(
+            &sources,
+            Some(post_rebuild_cache),
+            |batch| {
+                let items: Vec<(&Path, &Session, i64)> = batch
+                    .iter()
+                    .map(|(path, session)| (path.as_path(), session, scan_generation))
+                    .collect();
+                store.observe_bulk_batch(&items).unwrap();
+            },
+            |_, _| {},
+        );
+        assert_eq!(report.files, SESSION_COUNT);
+        // Not just "bytes stayed low" — specifically because the scan hit
+        // the cache row this rebuild refreshed, not because a key mismatch
+        // silently forced every file through a cold re-parse instead (which
+        // would also happen to produce correct output through today's
+        // parser and could mask a broken cache key under this same
+        // assertion).
+        assert_eq!(
+            report.cache_hits, SESSION_COUNT as u64,
+            "the scan must hit the cache rows the rebuild refreshed, not cold-reparse around them"
+        );
+        assert_eq!(report.cache_misses, 0);
+
+        let after_scan_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+        assert!(
+            after_scan_bytes < before_bytes,
+            "the rebuild's reduced footprint must survive the very next scan, not just \
+             the moment the rebuild finished: pre_rebuild={before_bytes} \
+             post_rebuild={after_rebuild_bytes} post_scan={after_scan_bytes}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn rebuild_deletes_a_differently_cased_stale_scan_cache_row_instead_of_leaving_it() {
+        // Issue #174 follow-up: a configured provider root can be spelled
+        // differently than the disk actually stores it (e.g. a root typed
+        // as `C:\users\...` over a disk that reports `C:\Users\...`).
+        // `scanner::scan_all` always keys a cache row off `WalkDir`'s raw
+        // path, which carries the *root's own* casing for the root
+        // portion — not necessarily the disk's — so a stale row cached
+        // under a misconfigured root can differ, in exactly that segment,
+        // from the canonical (disk-accurate) key
+        // `resolve_scan_cache_key_and_stamp` resolves for the very same
+        // session. Writing only under the canonical key would insert a
+        // second row and leave the real stale row completely untouched:
+        // the next scan (against the same still-misconfigured root) would
+        // hit it and replay pre-rebuild content straight back into the
+        // ledger — issue #174 reproducing in full, with this fix's own
+        // `cache_hits` assertion above still green, because that test's
+        // `tempdir()`-sourced root trivially already matches disk casing
+        // and is blind to this.
+        //
+        // This constructs the mismatch directly rather than depending on
+        // the OS to hand back a differently-cased root: Windows' filesystem
+        // is case-insensitive, so an uppercased root string still resolves
+        // every file underneath it, letting the cache be seeded with a
+        // stale row under a key no real disk casing would ever produce.
+        //
+        // `#[cfg(windows)]` is load-bearing, not incidental: on a
+        // case-sensitive filesystem (CI's `ubuntu-22.04` runner included —
+        // see `.github/workflows/ci.yml`), `misconfigured_root` would name
+        // a directory that genuinely does not exist, and — independent of
+        // that — `source_path_key`/`normalized_path_key` only fold case
+        // `cfg!(windows)`-conditionally, so two differently-cased strings
+        // are not "the same normalized path" anywhere else. The bug this
+        // pins is Windows-only by construction; there is no cross-platform
+        // way to exercise it, and gating rather than forcing it to "pass"
+        // elsewhere is the accurate reflection of that, not a workaround.
+        use crate::provider::{ProviderSource, ProviderSourceSet};
+
+        let (_directory, store) = store();
+        let transcripts = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let cache_path = cache_dir.path().join("scan-cache-v2.sqlite3");
+
+        let misconfigured_root = PathBuf::from(transcripts.path().to_string_lossy().to_uppercase());
+        assert_ne!(
+            misconfigured_root.as_os_str(),
+            transcripts.path().as_os_str(),
+            "the fixture must actually construct a casing mismatch to be meaningful"
+        );
+
+        const SESSION_COUNT: usize = 3;
+        let seed_generation = store.begin_scan().unwrap();
+        let cache = ScanCache::load(&cache_path);
+        let mut misconfigured_paths = Vec::new();
+        for i in 0..SESSION_COUNT {
+            let session_id = format!("case-mismatch-{i}");
+            let file_path = transcripts.path().join(format!("{session_id}.jsonl"));
+            write_duplicate_heavy_codex_transcript(&file_path, &session_id, 40);
+
+            let fresh = crate::parser::parse_file(&file_path, false)
+                .unwrap()
+                .unwrap();
+            let mut uncollapsed = fresh.clone();
+            uncollapsed.rate_limits_history = fresh
+                .rate_limits_history
+                .iter()
+                .flat_map(expand_uncollapsed)
+                .collect();
+
+            store
+                .observe(&file_path, &uncollapsed, seed_generation)
+                .unwrap();
+
+            // Seed the scan cache exactly as a scan against the
+            // misconfigured root would have: the real file's (size,
+            // mtime), but a path string carrying the root's wrong casing.
+            let misconfigured_path = misconfigured_root.join(format!("{session_id}.jsonl"));
+            let (size, mtime_ms) = scan_cache::file_stamp(&file_path).unwrap();
+            cache.store(
+                &misconfigured_path.to_string_lossy(),
+                size,
+                mtime_ms,
+                &uncollapsed,
+            );
+            misconfigured_paths.push(misconfigured_path);
+        }
+        cache.finish_scan();
+
+        // Sanity: the seeded rows are really keyed under the wrong casing,
+        // not the one `resolve_scan_cache_key_and_stamp` will resolve.
+        let seeded_keys = cache.keys();
+        for path in &misconfigured_paths {
+            assert!(seeded_keys.contains(&path.to_string_lossy().into_owned()));
+        }
+
+        let before_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+
+        store
+            .rebuild_from_transcripts(|_, _| {}, |_| {}, || false, Some(&cache))
+            .unwrap();
+
+        let after_rebuild_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+        assert!(
+            after_rebuild_bytes < before_bytes,
+            "the rebuild alone must shrink stored bytes: before={before_bytes} \
+             after_rebuild={after_rebuild_bytes}"
+        );
+
+        // The stale, wrongly-cased rows must be gone — not left beside a
+        // second, correctly-cased row the sweep wrote instead.
+        let remaining_keys = cache.keys();
+        for path in &misconfigured_paths {
+            assert!(
+                !remaining_keys.contains(&path.to_string_lossy().into_owned()),
+                "the differently-cased stale row for {path:?} must be deleted by the \
+                 sweep, not left beside a second, correctly-cased entry: {remaining_keys:?}"
+            );
+        }
+
+        // The scan that runs on the very next startup — crucially, against
+        // the SAME misconfigured root: nothing about the user's config
+        // changed just because a rebuild ran.
+        let sources = ProviderSourceSet::try_new([ProviderSource::new(
+            codex_provider_id(),
+            misconfigured_root.clone(),
+            ProviderSourceKind::Live,
+        )])
+        .unwrap();
+        drop(cache);
+        let post_rebuild_cache = ScanCache::load(&cache_path);
+        let scan_generation = store.begin_scan().unwrap();
+        let report = crate::scanner::scan_all(
+            &sources,
+            Some(post_rebuild_cache),
+            |batch| {
+                let items: Vec<(&Path, &Session, i64)> = batch
+                    .iter()
+                    .map(|(path, session)| (path.as_path(), session, scan_generation))
+                    .collect();
+                store.observe_bulk_batch(&items).unwrap();
+            },
+            |_, _| {},
+        );
+        assert_eq!(report.files, SESSION_COUNT);
+        // The deleted stale row can no longer be hit under the
+        // misconfigured root's own key: every file must cold-reparse
+        // exactly once — the cost the sweep spends in exchange for never
+        // leaving a stale row that would silently re-inflate the ledger.
+        assert_eq!(
+            report.cache_hits, 0,
+            "the misconfigured root's key was deleted; nothing should be left to hit"
+        );
+        assert_eq!(report.cache_misses, SESSION_COUNT as u64);
+
+        let after_scan_bytes = store.rebuild_evidence().unwrap().session_json_bytes;
+        assert!(
+            after_scan_bytes < before_bytes,
+            "a scan against the SAME misconfigured root must not resurrect pre-rebuild \
+             uncollapsed content via the stale row: pre_rebuild={before_bytes} \
+             post_rebuild={after_rebuild_bytes} post_scan={after_scan_bytes}"
         );
     }
 
@@ -9486,6 +9966,7 @@ mod tests {
                 |_done, _total| {},
                 |_outcome| sessions_rewritten += 1,
                 || false,
+                None,
             )
             .unwrap();
         let rebuild_elapsed = rebuild_started.elapsed();
