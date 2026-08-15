@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -2100,6 +2100,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 7 {
         steps += 1;
+        version = 8;
+    }
+    if version == 8 {
+        steps += 1;
     }
     steps
 }
@@ -2145,6 +2149,7 @@ fn migrate(
              );
              CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key);
              CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key);
+             CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key);
              CREATE TABLE project_overrides (
                project_key TEXT PRIMARY KEY,
                display_label TEXT,
@@ -2791,6 +2796,66 @@ fn migrate(
             step_total,
             7,
             8,
+            started.elapsed(),
+        ));
+    }
+    let version_before_last_seen_index: i64 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version_before_last_seen_index == 8 {
+        // Issue #168: `stream_sessions`'s snapshot walk orders by
+        // `d.last_seen_at_ms DESC, d.session_key` with no supporting index,
+        // so SQLite builds a temporary B-tree to satisfy the ORDER BY. This
+        // connection never sets `PRAGMA temp_store` (unlike scan_cache.rs's
+        // connection, which does), so the sorter spills to disk-backed temp
+        // pages, and — confirmed by varying `cache_size` alone, holding
+        // payload constant — peak private memory scales with spilled PMA
+        // count, not with `session_json` bytes: 2,952 MB measured against
+        // the real 3.5 GB / 4,826-session corpus this issue measured
+        // against, versus 36 MB with the ORDER BY removed entirely. This
+        // index lets the query planner serve the ORDER BY directly from the
+        // index instead of a temp B-tree. Verified by
+        // `stream_sessions_query_plan_has_no_temp_btree_for_order_by`, which
+        // asserts this from `EXPLAIN QUERY PLAN`'s actual output rather than
+        // trusting the index's mere existence — an index that exists but is
+        // not chosen by the planner is the real failure mode here, and it
+        // looks identical to success from the outside. Row order is
+        // unaffected: `stream_sessions_row_order_is_unchanged_by_the_index`
+        // proves the exact same `StoredSession` sequence comes back with the
+        // index present or absent, including under `last_seen_at_ms` ties.
+        //
+        // `CREATE INDEX IF NOT EXISTS` on an existing multi-GB
+        // `durable_sessions` table is not instantaneous — see this PR's
+        // description for the measured one-time cost against a
+        // realistically-sized corpus — but it runs exactly once, on the
+        // startup path, the same as every other migration step in this
+        // function.
+        //
+        // No backfill: unlike every other step above, an index has no
+        // historical data to reconcile.
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v8_to_v9_last_seen_index",
+            step_index,
+            step_total,
+            8,
+            9,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS durable_sessions_last_seen_idx
+               ON durable_sessions(last_seen_at_ms DESC, session_key);
+             INSERT INTO history_meta(key, value) VALUES('schema_version', '9')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 9;",
+        )?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v8_to_v9_last_seen_index",
+            step_index,
+            step_total,
+            8,
+            9,
             started.elapsed(),
         ));
     }
@@ -5894,6 +5959,157 @@ mod tests {
         assert_eq!(seen.len(), 25);
     }
 
+    /// The exact SQL `stream_sessions`'s snapshot walk runs, kept as its own
+    /// constant so the query-plan and row-order tests below exercise the
+    /// real statement rather than a hand-copied approximation of it that
+    /// could silently drift from the production query.
+    const STREAM_SESSIONS_SNAPSHOT_SQL: &str =
+        "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json
+             FROM durable_sessions d
+             LEFT JOIN session_snapshots s
+               ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+             ORDER BY d.last_seen_at_ms DESC, d.session_key";
+
+    /// Joins every `detail` column `EXPLAIN QUERY PLAN` reports for `sql`,
+    /// one per line, so a test can assert on the planner's actual chosen
+    /// plan instead of trusting that an index which merely exists in the
+    /// schema is the one SQLite picked.
+    fn explain_query_plan(connection: &Connection, sql: &str) -> String {
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        let details: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        details.join("\n")
+    }
+
+    #[test]
+    fn stream_sessions_query_plan_has_no_temp_btree_for_order_by() {
+        // Issue #168: `stream_sessions`'s snapshot walk used to force SQLite
+        // to build a temporary B-tree to satisfy `ORDER BY
+        // d.last_seen_at_ms DESC, d.session_key` because no index supported
+        // it — that temp B-tree's spilling PMAs are what held ~2.9 GB of
+        // private memory against the real corpus the issue measured
+        // against. Asserting the index merely *exists* would not catch the
+        // actual failure mode: the planner declining to use it looks
+        // identical to success from the outside. This asserts on `EXPLAIN
+        // QUERY PLAN`'s real output instead.
+        let (_directory, store) = store();
+        let plan = explain_query_plan(&store.connection().unwrap(), STREAM_SESSIONS_SNAPSHOT_SQL);
+        assert!(
+            !plan.to_uppercase().contains("TEMP B-TREE"),
+            "expected no temp B-tree for the ORDER BY now that durable_sessions_last_seen_idx \
+             exists; got plan:\n{plan}"
+        );
+        assert!(
+            plan.contains("durable_sessions_last_seen_idx"),
+            "expected the planner to name the new index in its plan; got plan:\n{plan}"
+        );
+
+        // Self-check: with the index physically removed, the identical query
+        // must regress to a temp B-tree. This proves the assertions above
+        // would actually catch the "index exists but isn't chosen" failure
+        // mode, rather than passing vacuously (e.g. because the table is
+        // empty in this test).
+        store
+            .connection()
+            .unwrap()
+            .execute_batch("DROP INDEX durable_sessions_last_seen_idx;")
+            .unwrap();
+        let plan_without_index =
+            explain_query_plan(&store.connection().unwrap(), STREAM_SESSIONS_SNAPSHOT_SQL);
+        assert!(
+            plan_without_index.to_uppercase().contains("TEMP B-TREE"),
+            "sanity check failed: expected a temp B-tree once the index is removed -- this \
+             test cannot be trusted to detect the regression it exists to catch; got plan:\n\
+             {plan_without_index}"
+        );
+    }
+
+    #[test]
+    fn stream_sessions_row_order_is_unchanged_by_the_last_seen_index() {
+        // Issue #168's index must serve the existing `ORDER BY
+        // d.last_seen_at_ms DESC, d.session_key` without changing what it
+        // returns. `stream_sessions`'s own doc comment calls this ordering
+        // load-bearing: a `durable_sessions` row with no matching current
+        // snapshot is an invariant violation that must surface as a loud
+        // per-key error in this exact walk order, not be silently reordered
+        // away. This proves the real `StoredSession` key sequence
+        // `stream_sessions` returns is identical whether
+        // `durable_sessions_last_seen_idx` physically exists or not,
+        // including under `last_seen_at_ms` ties where only `session_key`
+        // breaks the tie.
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+
+        // Four groups of three sessions sharing one `last_seen_at_ms` each,
+        // so most of the expected order is decided by the `session_key`
+        // tie-break rather than by insertion or wall-clock order.
+        let mut forced: Vec<(String, i64)> = Vec::new();
+        for group in 0..4i64 {
+            let shared_ms = 1_700_000_000_000 + group * 1_000_000;
+            for member in 0..3 {
+                let id = format!("order-{group}-{member}");
+                let fixture = rich_session(&id);
+                let path = Path::new(&id).with_extension("jsonl");
+                let stored = store.observe(&path, &fixture, generation).unwrap();
+                forced.push((stored.key, shared_ms));
+            }
+        }
+        {
+            let connection = store.connection().unwrap();
+            for (key, ms) in &forced {
+                connection
+                    .execute(
+                        "UPDATE durable_sessions SET last_seen_at_ms = ?2 WHERE session_key = ?1",
+                        params![key, ms],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let mut expected = forced.clone();
+        expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let expected_keys: Vec<String> = expected.into_iter().map(|(key, _)| key).collect();
+        assert_eq!(
+            expected_keys.len(),
+            12,
+            "twelve sessions across four tied groups"
+        );
+
+        let mut with_index = Vec::new();
+        store
+            .stream_sessions(|session| with_index.push(session.key.clone()))
+            .unwrap();
+        assert_eq!(
+            with_index, expected_keys,
+            "order with the index present must match last_seen_at_ms DESC, session_key"
+        );
+
+        store
+            .connection()
+            .unwrap()
+            .execute_batch("DROP INDEX durable_sessions_last_seen_idx;")
+            .unwrap();
+
+        let mut without_index = Vec::new();
+        store
+            .stream_sessions(|session| without_index.push(session.key.clone()))
+            .unwrap();
+        assert_eq!(
+            without_index, expected_keys,
+            "order without the index must be unchanged -- same ORDER BY, just served by a temp \
+             B-tree instead of the index"
+        );
+        assert_eq!(
+            with_index, without_index,
+            "the index must not change stream_sessions's row order"
+        );
+    }
+
     #[test]
     fn v3_migration_backfills_facts_from_snapshots() {
         let directory = tempdir().unwrap();
@@ -7289,7 +7505,7 @@ mod tests {
     /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
     /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
     /// `HistoryStore::open` and pasting the result below.
-    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
 
     #[test]
     fn schema_fingerprint_matches_committed_expected_value() {
@@ -7524,6 +7740,7 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                9 => "DROP INDEX IF EXISTS durable_sessions_last_seen_idx;",
                 8 => {
                     "DROP TABLE durable_tool_dimension_events;
                      DROP TABLE rollup_tool_dimensions;"
@@ -7746,6 +7963,7 @@ mod tests {
                 "v5_to_v6_project_identity_backfill",
                 "v6_to_v7_tool_origin_backfill",
                 "v7_to_v8_tool_dimensions_backfill",
+                "v8_to_v9_last_seen_index",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );
@@ -8513,6 +8731,74 @@ mod tests {
             new_peak < old_peak / 4,
             "expected streaming to peak at well under a quarter of the whole-corpus-at-once \
              shape's peak; got {new_peak} vs {old_peak} bytes"
+        );
+    }
+
+    #[test]
+    #[ignore = "performance probe; run with `cargo test --release --lib \
+                probe_index_migration_one_time_cost_on_realistic_corpus -- --ignored \
+                --nocapture`"]
+    fn probe_index_migration_one_time_cost_on_realistic_corpus() {
+        // Issue #168's index migration (v8->v9 in `migrate()`) runs `CREATE
+        // INDEX IF NOT EXISTS` on `durable_sessions` exactly once, on the
+        // startup path, for every existing install. This times that exact
+        // statement against a corpus shaped like the real one the issue
+        // measured against (4,826 sessions from a 3.5 GB database), reusing
+        // `field_scale_session` so the per-session size matches the other
+        // realistic-scale probes in this file rather than the ~31 KB
+        // synthetic fixtures used elsewhere.
+        const SESSIONS: usize = 4_826;
+        const HOT_SESSIONS: usize = SESSIONS / 10;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        {
+            let store = HistoryStore::open(&path).unwrap();
+            let generation = store.begin_scan().unwrap().max(1);
+            for chunk_start in (0..SESSIONS).step_by(crate::scanner::SCAN_WRITE_BATCH_SIZE) {
+                let chunk_end = (chunk_start + crate::scanner::SCAN_WRITE_BATCH_SIZE).min(SESSIONS);
+                let sessions: Vec<Session> = (chunk_start..chunk_end)
+                    .map(|index| field_scale_session(index, HOT_SESSIONS))
+                    .collect();
+                let paths: Vec<PathBuf> = sessions
+                    .iter()
+                    .map(|fixture| Path::new(&fixture.id).with_extension("jsonl"))
+                    .collect();
+                let items: Vec<(&Path, &Session, i64)> = paths
+                    .iter()
+                    .zip(&sessions)
+                    .map(|(path, fixture)| (path.as_path(), fixture, generation))
+                    .collect();
+                store.observe_bulk_batch(&items).unwrap();
+            }
+            store.rebuild_rollups_if_stale().unwrap();
+            assert_eq!(store.stats().unwrap().sessions, SESSIONS);
+        }
+
+        // Physically remove the v8->v9 index to reproduce exactly what an
+        // existing pre-#168 install looks like the moment before its next
+        // launch runs this migration — everything else about the schema and
+        // every row of data stays untouched.
+        rewind_database_to_version(&path, 8);
+
+        let file_bytes = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        let connection = Connection::open(&path).unwrap();
+        let started = Instant::now();
+        connection
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS durable_sessions_last_seen_idx
+                   ON durable_sessions(last_seen_at_ms DESC, session_key);",
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "index migration cost: {SESSIONS} durable_sessions rows, {:.1} MB database file, \
+             CREATE INDEX IF NOT EXISTS durable_sessions_last_seen_idx took {elapsed:?}",
+            file_bytes as f64 / 1_048_576.0,
         );
     }
 
