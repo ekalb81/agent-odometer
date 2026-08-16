@@ -417,11 +417,39 @@ impl HistoryStore {
         }
         transaction.commit()?;
         drop(connection);
+        self.load_batch_outcomes(written)
+    }
+
+    /// Read-back half of [`Self::observe_bulk_batch`], split out so it can
+    /// be exercised directly by a test with a synthetic `written` list
+    /// (including a deliberately missing key) without needing to race the
+    /// write half. Opens **one** reader connection and reuses it across
+    /// every key, instead of a fresh `Connection` per `load_one` call
+    /// (issue #182) — up to 2x `written.len()` connection opens per batch
+    /// (main key plus an optional displaced key each), each also
+    /// materializing another full `Session` copy, all while this runs right
+    /// after the write transaction above.
+    ///
+    /// This deliberately does NOT reuse [`Self::load_many`] (issue #139):
+    /// that helper is best-effort per key (a missing row is skipped with a
+    /// warning, so its output can be shorter than its input), whereas every
+    /// caller of this method zips its result 1:1 against
+    /// `items`/`written` by position — a silently-shortened output would
+    /// misalign every outcome after the missing key, not just drop the
+    /// missing one. Preserving `load_one`'s "any missing/errored key fails
+    /// the whole call" semantics keeps that alignment and keeps the
+    /// caller's existing per-batch retry fallback (`observe_bulk`, one
+    /// session at a time) triggering exactly when it did before.
+    fn load_batch_outcomes(
+        &self,
+        written: Vec<(String, Option<String>, bool)>,
+    ) -> Result<Vec<BulkObserveOutcome>> {
+        let reader = self.open_reader()?;
         let mut outcomes = Vec::with_capacity(written.len());
         for (key, displaced_key, rollups_deferred) in written {
-            let stored = self.load_one(&key)?;
+            let stored = load_one(&reader, &key)?;
             let displaced = displaced_key
-                .map(|previous| self.load_one(&previous))
+                .map(|previous| load_one(&reader, &previous))
                 .transpose()?;
             outcomes.push(BulkObserveOutcome {
                 stored,
@@ -5173,6 +5201,117 @@ mod tests {
         assert_eq!(
             sessions, 0,
             "a failed batch must roll back every item, including ones that individually succeeded"
+        );
+    }
+
+    #[test]
+    fn observe_bulk_batch_read_back_matches_per_key_load_one_including_a_missing_key() {
+        // Issue #182 fix 2: `observe_bulk_batch`'s read-back
+        // (`HistoryStore::load_batch_outcomes`) now reuses one
+        // `open_reader()` connection across every key instead of opening a
+        // fresh `Connection` per `load_one` call. This calls the actual
+        // extracted read-back helper (not a hand-written stand-in) with a
+        // synthetic `written` list, and proves it is behaviorally
+        // identical to a loop of the original per-key-fresh-connection
+        // `load_one` calls — for both the ordinary case and, crucially, the
+        // missing-key case — and that it did NOT quietly adopt
+        // `load_many`'s best-effort skip-and-warn semantics (issue #139),
+        // which would silently misalign every outcome after a missing key
+        // rather than failing the call the way `observe_bulk_batch`'s
+        // documented contract requires.
+        let (_directory, store) = store();
+        let sessions = [
+            rich_session("mk-a"),
+            rich_session("mk-b"),
+            rich_session("mk-c"),
+        ];
+        let generation = store.begin_scan().unwrap().max(1);
+        let paths: Vec<PathBuf> = (0..sessions.len())
+            .map(|index| PathBuf::from(format!("mk-{index}.jsonl")))
+            .collect();
+        let items: Vec<(&Path, &Session, i64)> = paths
+            .iter()
+            .zip(&sessions)
+            .map(|(path, session)| (path.as_path(), session, generation))
+            .collect();
+        let outcomes = store.observe_bulk_batch(&items).unwrap();
+        let keys: Vec<String> = outcomes.iter().map(|o| o.stored.key.clone()).collect();
+        // `written` in the shape `load_batch_outcomes` expects: (key,
+        // displaced_key, rollups_deferred). None of these sessions collide
+        // with an existing storage id, so nothing was displaced.
+        let written: Vec<(String, Option<String>, bool)> =
+            keys.iter().map(|key| (key.clone(), None, true)).collect();
+
+        // Old path: one fresh reader connection per key, via the
+        // public(crate) `load_one` method — exactly what
+        // `observe_bulk_batch` did before this fix.
+        let old_path: Vec<StoredSession> = keys
+            .iter()
+            .map(|key| store.load_one(key).unwrap())
+            .collect();
+
+        // New path: the actual production read-back helper, which reuses
+        // one shared reader connection across every key.
+        let new_outcomes = store.load_batch_outcomes(written.clone()).unwrap();
+        let new_path: Vec<StoredSession> = new_outcomes
+            .into_iter()
+            .map(|outcome| outcome.stored)
+            .collect();
+
+        assert_eq!(old_path.len(), new_path.len());
+        for (old, new) in old_path.iter().zip(&new_path) {
+            assert_eq!(old.key, new.key);
+            assert_eq!(old.session.storage_id, new.session.storage_id);
+            assert_eq!(
+                old.session.source_availability,
+                new.session.source_availability
+            );
+            assert_eq!(
+                &old.session.tokens_total, &new.session.tokens_total,
+                "shared-connection read-back must materialize the same session content"
+            );
+        }
+
+        // Missing-key case: a key that was never written, spliced in the
+        // middle so a length mismatch (rather than a total failure) would
+        // still be visible as misalignment.
+        let mut keys_with_missing = keys.clone();
+        keys_with_missing.insert(1, "does-not-exist".to_string());
+        let mut written_with_missing = written.clone();
+        written_with_missing.insert(1, ("does-not-exist".to_string(), None, true));
+
+        let old_path_result: Result<Vec<StoredSession>> = keys_with_missing
+            .iter()
+            .map(|key| store.load_one(key))
+            .collect();
+        assert!(
+            old_path_result.is_err(),
+            "old per-key path must fail on a missing key, not silently omit it"
+        );
+
+        let new_path_result = store.load_batch_outcomes(written_with_missing);
+        assert!(
+            new_path_result.is_err(),
+            "the production read-back helper must fail on a missing key exactly like the old \
+             per-key path, preserving observe_bulk_batch's documented all-or-nothing read-back \
+             contract"
+        );
+
+        // Contrast: `load_many` — the helper issue #182 initially suggested
+        // reusing outright — has different semantics on purpose (issue
+        // #139): it skips a missing key with a warning instead of failing,
+        // so its output is shorter than its input. That is exactly the
+        // divergence `observe_bulk_batch`'s read-back must not inherit,
+        // because its caller (`reconcile_scanned_batch_if_current`) zips
+        // this function's result 1:1 against `items`/`written` by position
+        // — a silently shortened output would misalign every outcome after
+        // the missing key, not just drop the missing one.
+        let load_many_result = store.load_many(&keys_with_missing).unwrap();
+        assert_eq!(
+            load_many_result.len(),
+            keys_with_missing.len() - 1,
+            "load_many is expected to silently skip the missing key -- this is exactly why \
+             observe_bulk_batch's read-back does not call it directly"
         );
     }
 

@@ -102,14 +102,18 @@ struct ProviderAtomics {
     cache_misses: AtomicU64,
 }
 
-/// Scans all roots in parallel, invoking `on_session_batch(&[(path,
+/// Scans all roots in parallel, invoking `on_session_batch(vec![(path,
 /// session), ..])` from worker threads once per completed batch of up to
 /// [`SCAN_WRITE_BATCH_SIZE`] files (issue #132; before that change this
-/// called back once per file). Reading and parsing stay per-file and fully
-/// parallel — this only changes how many sessions accumulate before the
-/// durable-write callback fires, so a bulk scan's writer can batch them into
-/// one transaction instead of one per session. Progress callbacks still fire
-/// once per file, serialized and monotonic, independent of batch boundaries.
+/// called back once per file). The batch is handed over by value — it is a
+/// freshly built, worker-local `Vec` that nothing else references, so the
+/// callback taking ownership (rather than a borrowed slice) avoids a full
+/// deep clone at every call site that needs to hold onto it (issue #182).
+/// Reading and parsing stay per-file and fully parallel — this only changes
+/// how many sessions accumulate before the durable-write callback fires, so
+/// a bulk scan's writer can batch them into one transaction instead of one
+/// per session. Progress callbacks still fire once per file, serialized and
+/// monotonic, independent of batch boundaries.
 /// When `cache` is `Some`, files whose (size, mtime) match the cache are
 /// served from it without being read or parsed, and cache rows are updated
 /// individually. The cache must already be open: opening it is the caller's
@@ -127,7 +131,7 @@ pub fn scan_all<F, P>(
     on_progress: P,
 ) -> ScanReport
 where
-    F: Fn(&[(PathBuf, crate::model::Session)]) + Send + Sync,
+    F: Fn(Vec<(PathBuf, crate::model::Session)>) + Send + Sync,
     P: Fn(usize, usize) + Send + Sync,
 {
     let discovery_started = Instant::now();
@@ -273,7 +277,7 @@ where
             on_progress(*done, total);
         }
         if !batch.is_empty() {
-            on_session_batch(&batch);
+            on_session_batch(batch);
         }
     });
 
