@@ -1338,11 +1338,14 @@ pub fn spawn_scan(
                 // (issue #132), instead of one per session; everything
                 // downstream — in-memory publication, event emission — stays
                 // per-session, unchanged from before batching.
-                let reconciled = state.reconcile_scanned_batch_if_current(
-                    generation,
-                    history_generation,
-                    batch.to_vec(),
-                );
+                //
+                // `scan_all` hands `batch` over by value and drops its own
+                // reference immediately after this call (issue #182), so
+                // taking ownership here avoids a full deep clone of up to
+                // `SCAN_WRITE_BATCH_SIZE` owned `Session`s before the write
+                // lock is even taken.
+                let reconciled =
+                    state.reconcile_scanned_batch_if_current(generation, history_generation, batch);
                 for (path, reconciled) in reconciled {
                     let summary = SessionSummary::of(&reconciled.session);
                     if state.publish_scanned_session(generation, &path, reconciled.session) {
