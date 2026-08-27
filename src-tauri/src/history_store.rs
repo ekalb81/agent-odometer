@@ -243,7 +243,11 @@ impl HistoryStore {
             );
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            rebuild_rollups_in_transaction(&transaction)?;
+            // Deliberately the whole ledger, not the recorded deferred set
+            // (issue #154): this is the crash-recovery path, reached when a
+            // previous run died mid-scan, and the one case where what was
+            // deferred cannot be trusted to be fully recorded.
+            rebuild_rollups_in_transaction(&transaction, RollupScope::EntireLedger)?;
             clear_rollups_stale(&transaction)?;
             transaction.commit()?;
         }
@@ -482,9 +486,13 @@ impl HistoryStore {
     /// transaction as the rebuild, so a crash between the two can never leave
     /// the marker cleared while rollups are still wrong.
     pub fn rebuild_rollups(&self) -> Result<()> {
+        self.rebuild_rollups_scoped(RollupScope::EntireLedger)
+    }
+
+    fn rebuild_rollups_scoped(&self, scope: RollupScope) -> Result<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        rebuild_rollups_in_transaction(&transaction)?;
+        rebuild_rollups_in_transaction(&transaction, scope)?;
         clear_rollups_stale(&transaction)?;
         transaction.commit()?;
         Ok(())
@@ -497,12 +505,44 @@ impl HistoryStore {
     /// crash-safety check; both treat "nothing was ever deferred" as a cheap
     /// no-op rather than an unconditional full-table rebuild every time.
     pub fn rebuild_rollups_if_stale(&self) -> Result<bool> {
-        if self.rollups_are_stale()? {
-            self.rebuild_rollups()?;
-            Ok(true)
-        } else {
-            Ok(false)
+        self.rebuild_rollups_if_stale_reporting_scope()
+            .map(|outcome| !matches!(outcome, RollupRebuildOutcome::NothingDeferred))
+    }
+
+    /// [`Self::rebuild_rollups_if_stale`], additionally reporting how much
+    /// was rebuilt: `None` when nothing was deferred, otherwise the number of
+    /// sessions covered (`None` inside, for the whole ledger).
+    ///
+    /// The scan-completion path rebuilds only the sessions recorded as having
+    /// deferred (issue #154). Before this, `observe_bulk` deferred and set a
+    /// single whole-store marker, and since a bulk scan runs on every
+    /// startup, the marker was always set — so ~100 changed files out of
+    /// ~4,500 triggered a full O(entire ledger) recompute, 22.5 s in the
+    /// worst recorded field run.
+    ///
+    /// Falls back to the whole ledger when the marker is set but no
+    /// per-session rows are recorded. That is exactly a database left by an
+    /// older build, which recorded only the boolean — rebuilding nothing for
+    /// it would silently leave stale rollups serving queries.
+    ///
+    /// The crash-safety invariant is unchanged: the marker is cleared in the
+    /// same transaction as the rebuild, and the per-session rows are deleted
+    /// there too, so a crash between them cannot leave the marker cleared
+    /// with rollups still stale.
+    pub fn rebuild_rollups_if_stale_reporting_scope(&self) -> Result<RollupRebuildOutcome> {
+        if !self.rollups_are_stale()? {
+            return Ok(RollupRebuildOutcome::NothingDeferred);
         }
+        let pending = {
+            let connection = self.connection()?;
+            pending_rollup_session_count(&connection)?
+        };
+        if pending == 0 {
+            self.rebuild_rollups_scoped(RollupScope::EntireLedger)?;
+            return Ok(RollupRebuildOutcome::EntireLedger);
+        }
+        self.rebuild_rollups_scoped(RollupScope::DeferredSessions)?;
+        Ok(RollupRebuildOutcome::Scoped { sessions: pending })
     }
 
     /// Total `session_json` bytes currently stored, across every session's
@@ -3683,7 +3723,7 @@ fn observe_one_in_transaction(
     }
     let rollups_deferred = !maintain_rollups && facts_changed;
     if rollups_deferred {
-        mark_rollups_stale(transaction)?;
+        mark_rollups_stale(transaction, &key)?;
     }
     // A successful observe realigns snapshot and facts; any overlay-set
     // dirty marking is resolved.
@@ -3852,11 +3892,39 @@ fn overlay_thread_name_in_transaction(
     Ok(())
 }
 
-fn mark_rollups_stale(transaction: &Transaction<'_>) -> Result<()> {
+/// Prefix under which one `history_meta` row per session records that this
+/// session's rollup maintenance was deferred and not yet made good (issue
+/// #154). `history_meta` is the pre-existing generic key/value table, so
+/// this needs no schema change, exactly as `ROLLUPS_STALE_META_KEY` itself
+/// does not.
+const ROLLUPS_PENDING_PREFIX: &str = "rollups_pending:";
+
+/// The deferred session keys, as a subquery rather than a Rust-side list.
+///
+/// Keeping the set in SQL is what makes the scoped rebuild below a handful
+/// of plain statements: no key list crosses into Rust, so there is no
+/// chunking around SQLite's bound-variable limit and no second source of
+/// truth that could disagree with what is actually recorded. `17` is one
+/// past `ROLLUPS_PENDING_PREFIX`'s 16 characters.
+const PENDING_ROLLUP_SESSIONS_SQL: &str =
+    "SELECT substr(key, 17) FROM history_meta WHERE key LIKE 'rollups_pending:%'";
+
+fn mark_rollups_stale(transaction: &Transaction<'_>, session_key: &str) -> Result<()> {
     transaction.execute(
         "INSERT INTO history_meta(key, value) VALUES(?1, '1')
          ON CONFLICT(key) DO UPDATE SET value = '1'",
         [ROLLUPS_STALE_META_KEY],
+    )?;
+    // Also record *which* session deferred, so the rebuild can be
+    // proportional to what actually changed instead of recomputing the whole
+    // ledger. The boolean above is kept alongside it, unchanged, so a
+    // database written by an older build — which set the boolean and nothing
+    // else — is still recognised as needing a rebuild (see
+    // `rebuild_rollups_if_stale`).
+    transaction.execute(
+        "INSERT INTO history_meta(key, value) VALUES(?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = '1'",
+        [format!("{ROLLUPS_PENDING_PREFIX}{session_key}")],
     )?;
     Ok(())
 }
@@ -3867,7 +3935,20 @@ fn clear_rollups_stale(transaction: &Transaction<'_>) -> Result<()> {
          ON CONFLICT(key) DO UPDATE SET value = '0'",
         [ROLLUPS_STALE_META_KEY],
     )?;
+    transaction.execute(
+        "DELETE FROM history_meta WHERE key LIKE 'rollups_pending:%'",
+        [],
+    )?;
     Ok(())
+}
+
+/// How many sessions are recorded as having deferred rollup maintenance.
+fn pending_rollup_session_count(connection: &Connection) -> Result<i64> {
+    Ok(connection.query_row(
+        "SELECT COUNT(*) FROM history_meta WHERE key LIKE 'rollups_pending:%'",
+        [],
+        |row| row.get(0),
+    )?)
 }
 
 fn rollups_are_stale(connection: &Connection) -> Result<bool> {
@@ -3893,14 +3974,59 @@ fn rollups_are_stale(connection: &Connection) -> Result<bool> {
 /// incrementally — so this reproduces bit-identical rollup rows regardless
 /// of how many `observe_bulk` calls deferred rollup maintenance since the
 /// last rebuild. Never touches a session snapshot or re-parses a transcript.
-fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>) -> Result<()> {
-    transaction.execute_batch(
-        "DELETE FROM rollup_token_totals;
-         DELETE FROM rollup_tool_metrics;
-         DELETE FROM rollup_mutation_chains;
-         DELETE FROM rollup_tool_dimensions;",
-    )?;
-    transaction.execute_batch(
+/// What a scan-completion rollup rebuild actually did, so the caller's
+/// metric can say which rather than only whether (issue #154). Before this,
+/// `rebuilt: true` was recorded on every launch and could not distinguish a
+/// proportional rebuild from a full-ledger one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupRebuildOutcome {
+    /// Nothing had deferred; no rebuild ran.
+    NothingDeferred,
+    /// Rebuilt exactly the sessions recorded as having deferred.
+    Scoped { sessions: i64 },
+    /// Rebuilt everything, because the deferred set was not recorded — a
+    /// database written by a build older than this change.
+    EntireLedger,
+}
+
+/// Which sessions a rollup rebuild covers (issue #154).
+///
+/// `observe_bulk` defers rollup maintenance and a bulk scan runs on every
+/// startup, so the "did anything defer?" question was always answered yes at
+/// whole-store granularity — turning a scan of ~100 changed files into a
+/// full O(entire ledger) recompute, 22.5 s at the worst recorded field
+/// measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollupScope {
+    /// Every session. The crash-recovery path this rebuild was designed as,
+    /// and the fallback whenever the deferred set is not known precisely —
+    /// notably a database written by a build that recorded only the boolean
+    /// marker.
+    EntireLedger,
+    /// Only the sessions recorded as having deferred, via
+    /// `PENDING_ROLLUP_SESSIONS_SQL`.
+    DeferredSessions,
+}
+
+fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>, scope: RollupScope) -> Result<()> {
+    // The scope is spliced in as SQL text, not bound as parameters: it is one
+    // of two compile-time constants, and expressing the deferred set as a
+    // subquery is what keeps this a handful of plain statements. No caller
+    // value reaches this string.
+    let (filter, mutation_filter) = match scope {
+        RollupScope::EntireLedger => (String::new(), String::new()),
+        RollupScope::DeferredSessions => (
+            format!("WHERE session_key IN ({PENDING_ROLLUP_SESSIONS_SQL})"),
+            format!("AND session_key IN ({PENDING_ROLLUP_SESSIONS_SQL})"),
+        ),
+    };
+    transaction.execute_batch(&format!(
+        "DELETE FROM rollup_token_totals {filter};
+             DELETE FROM rollup_tool_metrics {filter};
+             DELETE FROM rollup_mutation_chains {filter};
+             DELETE FROM rollup_tool_dimensions {filter};"
+    ))?;
+    transaction.execute_batch(&format!(
         "INSERT INTO rollup_token_totals(
            session_key, hour_bucket, model, service_tier,
            input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
@@ -3908,7 +4034,7 @@ fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>) -> Result<()> {
          SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, ''),
            SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
            SUM(reasoning_output_tokens), SUM(total_tokens), SUM(cache_creation_input_tokens)
-         FROM durable_token_events
+         FROM durable_token_events {filter}
          GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, '');
 
          INSERT INTO rollup_tool_metrics(
@@ -3931,13 +4057,13 @@ fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>) -> Result<()> {
            SUM(CASE WHEN origin = 'mcp' THEN 1 ELSE 0 END),
            SUM(CASE WHEN origin = 'provider' THEN 1 ELSE 0 END),
            SUM(CASE WHEN origin NOT IN ('core', 'mcp', 'provider') THEN 1 ELSE 0 END)
-         FROM durable_tool_events
+         FROM durable_tool_events {filter}
          GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, '');
 
          INSERT INTO rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target, mutation_count)
          SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(turn_id, ''), COALESCE(target, ''), COUNT(*)
          FROM durable_tool_events
-         WHERE kind = 'mutation'
+         WHERE kind = 'mutation' {mutation_filter}
          GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(turn_id, ''), COALESCE(target, '');
 
          INSERT INTO rollup_tool_dimensions(
@@ -3947,9 +4073,9 @@ fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>) -> Result<()> {
            SUM(CASE WHEN outcome = 'failure' THEN 1 ELSE 0 END),
            SUM(output_bytes),
            SUM(COALESCE(duration_ms, 0))
-         FROM durable_tool_dimension_events
-         GROUP BY session_key, timestamp_ms / 3600000, dimension_kind, dimension_value;",
-    )?;
+         FROM durable_tool_dimension_events {filter}
+         GROUP BY session_key, timestamp_ms / 3600000, dimension_kind, dimension_value;"
+    ))?;
     Ok(())
 }
 
@@ -5438,6 +5564,161 @@ mod tests {
             "load_many is expected to silently skip the missing key -- this is exactly why \
              observe_bulk_batch's read-back does not call it directly"
         );
+    }
+
+    /// Issue #154's core equality: a rebuild scoped to the sessions that
+    /// actually deferred must produce exactly what a full-ledger rebuild
+    /// would, including leaving untouched sessions' rollups alone.
+    ///
+    /// The failure this guards against is subtle — a scoped rebuild that
+    /// deletes globally but re-inserts only for the scoped set would wipe
+    /// every other session's rollups, and every "did the changed session
+    /// come out right?" assertion would still pass.
+    #[test]
+    fn a_scoped_rollup_rebuild_matches_a_full_one_and_leaves_other_sessions_intact() {
+        let (_directory, store) = store();
+
+        // Two sessions observed and fully rolled up.
+        let settled = rich_session("settled");
+        let generation = store.begin_scan().unwrap().max(1);
+        let settled_key = store
+            .observe_bulk(Path::new("settled.jsonl"), &settled, generation)
+            .unwrap()
+            .stored
+            .key;
+        store.rebuild_rollups().unwrap();
+        let settled_rollups = rollup_rows(&store, &settled_key);
+        assert!(
+            !settled_rollups.is_empty(),
+            "fixture must produce rollup rows to be worth anything"
+        );
+
+        // A third session now defers, so only it is pending.
+        let changed = rich_session("changed");
+        let generation = store.begin_scan().unwrap().max(1);
+        let changed_key = store
+            .observe_bulk(Path::new("changed.jsonl"), &changed, generation)
+            .unwrap()
+            .stored
+            .key;
+
+        let outcome = store.rebuild_rollups_if_stale_reporting_scope().unwrap();
+        assert_eq!(
+            outcome,
+            RollupRebuildOutcome::Scoped { sessions: 1 },
+            "only the session that deferred should have been rebuilt"
+        );
+
+        // The untouched session's rollups survive byte-for-byte...
+        assert_eq!(
+            rollup_rows(&store, &settled_key),
+            settled_rollups,
+            "a scoped rebuild must not disturb sessions that did not defer"
+        );
+
+        // ...and the changed one matches what a full rebuild produces.
+        let scoped = rollup_rows(&store, &changed_key);
+        store.rebuild_rollups().unwrap();
+        assert_eq!(
+            rollup_rows(&store, &changed_key),
+            scoped,
+            "a scoped rebuild must produce exactly what a full rebuild would"
+        );
+        assert_eq!(rollup_rows(&store, &settled_key), settled_rollups);
+    }
+
+    /// A database left by a build that recorded only the boolean marker has
+    /// no per-session rows to scope by. Rebuilding nothing for it would
+    /// silently leave stale rollups serving queries, so it must fall back to
+    /// the whole ledger.
+    #[test]
+    fn a_stale_marker_with_no_recorded_sessions_still_rebuilds_everything() {
+        let (_directory, store) = store();
+        let fixture = rich_session("legacy-marker");
+        let generation = store.begin_scan().unwrap().max(1);
+        let key = store
+            .observe_bulk(Path::new("legacy-marker.jsonl"), &fixture, generation)
+            .unwrap()
+            .stored
+            .key;
+
+        // Exactly what an older build left behind: the marker set, and no
+        // record of which sessions it covers.
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "DELETE FROM history_meta WHERE key LIKE 'rollups_pending:%'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let outcome = store.rebuild_rollups_if_stale_reporting_scope().unwrap();
+        assert_eq!(
+            outcome,
+            RollupRebuildOutcome::EntireLedger,
+            "an unscoped marker must not be treated as nothing to do"
+        );
+        assert!(
+            !rollup_rows(&store, &key).is_empty(),
+            "the fallback must actually rebuild the rollups the marker covered"
+        );
+    }
+
+    /// The invariant the original code was careful about, preserved: the
+    /// marker and the per-session rows are cleared in the same transaction
+    /// as the rebuild, so nothing can observe a cleared marker alongside
+    /// rollups that are still stale.
+    #[test]
+    fn a_completed_rebuild_leaves_no_marker_and_no_pending_rows() {
+        let (_directory, store) = store();
+        let fixture = rich_session("cleared");
+        let generation = store.begin_scan().unwrap().max(1);
+        store
+            .observe_bulk(Path::new("cleared.jsonl"), &fixture, generation)
+            .unwrap();
+        assert!(store.rollups_are_stale().unwrap());
+
+        store.rebuild_rollups_if_stale().unwrap();
+
+        assert!(!store.rollups_are_stale().unwrap());
+        let connection = store.connection().unwrap();
+        assert_eq!(
+            pending_rollup_session_count(&connection).unwrap(),
+            0,
+            "pending rows must not outlive the rebuild that covered them"
+        );
+    }
+
+    /// Every `rollup_*` row for one session, ordered, for equality checks.
+    fn rollup_rows(store: &HistoryStore, key: &str) -> Vec<String> {
+        let connection = store.connection().unwrap();
+        let mut rows = Vec::new();
+        for table in [
+            "rollup_token_totals",
+            "rollup_tool_metrics",
+            "rollup_mutation_chains",
+            "rollup_tool_dimensions",
+        ] {
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT * FROM {table} WHERE session_key = ?1 ORDER BY hour_bucket"
+                ))
+                .unwrap();
+            let columns = statement.column_count();
+            let mut query = statement.query([key]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                let mut rendered = String::from(table);
+                for index in 0..columns {
+                    let value: rusqlite::types::Value = row.get(index).unwrap();
+                    rendered.push_str(&format!("|{value:?}"));
+                }
+                rows.push(rendered);
+            }
+        }
+        rows.sort();
+        rows
     }
 
     #[test]
