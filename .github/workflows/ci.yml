@@ -34,6 +34,11 @@ on:
         required: false
         default: false
         type: boolean
+      run_ci_image_probe:
+        description: 'Build the pinned Linux CI image and time it against the apt baseline (issue #78).'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -358,4 +363,86 @@ jobs:
             echo
             echo "- Target directory cached: \`${{ matrix.cache_targets }}\`"
             echo "- \`cargo test --locked\`: ${elapsed_seconds}s"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ci-image-probe:
+    name: CI image probe (issue #78)
+    # Opt-in, and adopts nothing: #78 requires the comparison before the
+    # image may replace the apt lanes, and pull time is the whole question —
+    # an image large enough to hold WebKit's dev headers may cost more to
+    # fetch than the apt install it replaces.
+    #
+    # Runs here rather than on a developer machine because the measurement
+    # needs disk and a cold cache, not a particular workstation.
+    if: github.event_name == 'workflow_dispatch' && inputs.run_ci_image_probe
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The baseline, measured the same way and in the same run as the
+      # image — comparing against numbers taken on another day and another
+      # runner is how a cache-warm result gets read as an improvement.
+      - name: Baseline — apt install (cold)
+        id: apt
+        shell: bash
+        run: |
+          start=$(date +%s%3N)
+          sudo apt-get update >/dev/null
+          sudo apt-get install -y --no-install-recommends             libwebkit2gtk-4.1-dev libsoup-3.0-dev librsvg2-dev             libayatana-appindicator3-dev libgtk-3-dev libssl-dev             build-essential pkg-config >/dev/null
+          echo "ms=$(( $(date +%s%3N) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Build the pinned image
+        id: build
+        shell: bash
+        run: |
+          start=$(date +%s%3N)
+          docker build -f .github/docker/ci-linux.Dockerfile -t odometer-ci-linux:probe . >/dev/null
+          echo "ms=$(( $(date +%s%3N) - start ))" >> "$GITHUB_OUTPUT"
+          echo "bytes=$(docker image inspect odometer-ci-linux:probe --format '{{.Size}}')" >> "$GITHUB_OUTPUT"
+
+      # What a consuming job actually pays once the image exists: load it
+      # from a tarball, which stands in for a registry pull without needing
+      # somewhere to publish it. Reported as a lower bound on pull cost,
+      # since a real pull adds network transfer.
+      - name: Measure image load (stand-in for pull)
+        id: load
+        shell: bash
+        run: |
+          docker save odometer-ci-linux:probe -o /tmp/ci-image.tar
+          echo "tar_bytes=$(stat -c%s /tmp/ci-image.tar)" >> "$GITHUB_OUTPUT"
+          docker image rm odometer-ci-linux:probe >/dev/null
+          start=$(date +%s%3N)
+          docker load -i /tmp/ci-image.tar >/dev/null
+          echo "ms=$(( $(date +%s%3N) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm the container really is the built image
+        shell: bash
+        run: |
+          # Without this a fallback to plain Ubuntu would report as a
+          # "warmed image" result, which is worse than no measurement.
+          marker=$(docker run --rm odometer-ci-linux:probe cat /etc/agent-odometer-ci-image)
+          test "$marker" = "agent-odometer-ci-linux"
+          docker run --rm odometer-ci-linux:probe pkg-config --exists webkit2gtk-4.1
+          echo "image provides the Tauri dependency set"
+
+      - name: Report
+        shell: bash
+        run: |
+          {
+            echo "## CI image probe (issue #78)"
+            echo
+            echo "| measurement | value |"
+            echo "| --- | ---: |"
+            echo "| apt install, cold | ${{ steps.apt.outputs.ms }} ms |"
+            echo "| image build (uncached) | ${{ steps.build.outputs.ms }} ms |"
+            echo "| image size (on disk) | $(( ${{ steps.build.outputs.bytes }} / 1048576 )) MB |"
+            echo "| image tarball | $(( ${{ steps.load.outputs.tar_bytes }} / 1048576 )) MB |"
+            echo "| image load (pull lower bound) | ${{ steps.load.outputs.ms }} ms |"
+            echo
+            echo "Adoption is worthwhile only if load time is comfortably below the apt"
+            echo "install it replaces, across all three Linux lanes. A real registry pull"
+            echo "costs more than this load, so treat the load figure as a floor."
           } >> "$GITHUB_STEP_SUMMARY"
