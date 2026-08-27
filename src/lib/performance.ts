@@ -58,10 +58,21 @@ export function measureSync<T>(
   }
 }
 
+/**
+ * Measures the time from `started` until the browser has painted.
+ *
+ * `metadata` may be a thunk, which is evaluated after the paint rather than
+ * at call time. That matters for anything describing what was actually
+ * rendered (issue #184): the caller runs before the paint it is measuring,
+ * so reading rows-rendered eagerly would capture the state the paint started
+ * from, not the state it produced.
+ */
 export function measureNextPaint(
   operation: string,
   started: number,
-  metadata: Record<string, string | number | boolean> = {},
+  metadata:
+    | Record<string, string | number | boolean>
+    | (() => Record<string, string | number | boolean>) = {},
 ): void {
   if (!enabled) return;
   const measurementGeneration = generation;
@@ -70,7 +81,7 @@ export function measureNextPaint(
       operation,
       performance.now() - started,
       true,
-      metadata,
+      typeof metadata === 'function' ? metadata() : metadata,
       measurementGeneration,
     ));
   });
