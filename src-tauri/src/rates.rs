@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -320,6 +320,17 @@ pub enum PricingBasis {
     /// The requested model id resolved to a different key via `model_aliases`
     /// before a rate was found.
     Aliased,
+    /// The requested model id resolved via `floating_model_aliases` — a
+    /// mapping the provider itself documents as temporary and repoints as
+    /// new models ship (issue #177).
+    ///
+    /// Correct as of the card's fetch, and priced from a real published rate
+    /// for the model the alias pointed at *then*. Distinct from `Aliased`
+    /// because it carries a known expiry: past `FloatingAlias::expires_at`
+    /// the mapping is not trusted and resolution falls through to
+    /// `Fallback`, which is what raises the UI's warning. Surface it as a
+    /// soft note, not a warning — the price is right today.
+    FloatingAlias,
     /// Neither the model nor an alias resolved; the harness's (or card's)
     /// configured fallback model rate was used instead.
     Fallback,
@@ -541,6 +552,34 @@ pub fn apply_refresh_candidate(
     }
 }
 
+/// A provider-declared *floating* model alias: a name that resolves to
+/// whichever model the provider currently considers current, and which the
+/// provider repoints without renaming (issue #177).
+///
+/// OpenAI's `daybreak-blue-latest` / `daybreak-red-latest` are the motivating
+/// case — documented as pointing at a specific model "currently", repointed
+/// as new frontier models ship, with pricing following the underlying model.
+///
+/// A static entry in `model_aliases` would be right on the day it is written
+/// and then silently wrong in the worst direction: `Aliased` provenance
+/// raises no warning, so the app would price a newer model at an older
+/// model's rate while presenting it as an exact match. Recording the expiry
+/// makes that failure loud instead of silent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloatingAlias {
+    /// Rate-table key this alias pointed at when the card was fetched.
+    pub target: String,
+    /// Last date (inclusive, UTC) on which `target` is trusted. After this,
+    /// resolution ignores the mapping entirely and falls through to the
+    /// harness fallback, so the UI's existing warning fires rather than the
+    /// app quietly pricing against a stale target.
+    pub expires_at: NaiveDate,
+    /// Where the mapping was read from, so a human re-checking it does not
+    /// have to guess. Same role as `PricingProvenance::source_url`.
+    #[serde(default)]
+    pub source_url: String,
+}
+
 /// Rate card shipped with the binary or customized by the user.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RateCard {
@@ -581,6 +620,11 @@ pub struct RateCard {
     /// `resolve_alias`) instead of resolving or hanging.
     #[serde(default)]
     pub model_aliases: HashMap<String, String>,
+    /// Raw provider model id -> a mapping the provider documents as
+    /// temporary, with the date it stops being trusted (issue #177). Checked
+    /// before `model_aliases`; see [`FloatingAlias`].
+    #[serde(default)]
+    pub floating_model_aliases: HashMap<String, FloatingAlias>,
     /// Models that are explicitly zero-cost (free tier, local/self-hosted),
     /// as distinct from `unpriced_models` (known models with no published
     /// price) and from an ordinary missing-rate `Unavailable` resolution.
@@ -722,6 +766,21 @@ impl RateCard {
                 basis: basis(PricingBasis::Direct),
             };
         }
+        // Checked before `model_aliases`, and only while unexpired: past its
+        // date the mapping is deliberately ignored so resolution reaches the
+        // fallback below and the UI's warning fires. Silently pricing a
+        // repointed alias against its old target is the failure this exists
+        // to prevent (issue #177).
+        if let Some(floating) = self.floating_model_aliases.get(model) {
+            if now.date_naive() <= floating.expires_at
+                && table.contains_key(floating.target.as_str())
+            {
+                return PricedModelResolution {
+                    resolved_model: floating.target.clone(),
+                    basis: basis(PricingBasis::FloatingAlias),
+                };
+            }
+        }
         let (resolved, hopped) = resolve_alias(model, &self.model_aliases);
         if hopped && table.contains_key(resolved) {
             return PricedModelResolution {
@@ -760,8 +819,10 @@ pub fn downgrade_for_cache_creation_fallback(
     rate: &ModelRate,
     cache_creation_tokens: u64,
 ) -> PricingBasis {
-    if matches!(basis, PricingBasis::Direct | PricingBasis::Aliased)
-        && cache_creation_tokens > 0
+    if matches!(
+        basis,
+        PricingBasis::Direct | PricingBasis::Aliased | PricingBasis::FloatingAlias
+    ) && cache_creation_tokens > 0
         && rate.cache_creation_rate_is_fallback()
     {
         PricingBasis::Estimated
@@ -828,6 +889,31 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     // exactly as they do for `models`/`api_models`/`unpriced_models` above:
     // a bundled alias, free/local declaration, or plan is added only when
     // the user hasn't already recorded their own entry for that key.
+    // A key the bundled card now treats as *floating* must stop being a
+    // static alias on disk, even though every other merge here is
+    // additive-only (issue #177).
+    //
+    // The daybreak names shipped as plain `model_aliases` entries in v9, so
+    // an upgrading install carries both. Static aliases are checked after
+    // floating ones, so the pair behaves correctly right up until the expiry
+    // — and then quietly resolves `Aliased` off the stale static entry,
+    // which is exactly the silent mispricing the expiry exists to prevent.
+    //
+    // Only a static entry pointing at the same target the bundled card
+    // declares is removed, so this discards the copy an earlier bundled card
+    // put there and never a mapping the user chose for themselves.
+    for (raw_id, floating) in bundled.floating_model_aliases {
+        let superseded_bundled_entry = disk
+            .model_aliases
+            .get(&raw_id)
+            .is_some_and(|existing| *existing == floating.target);
+        if superseded_bundled_entry {
+            disk.model_aliases.remove(&raw_id);
+        }
+        disk.floating_model_aliases
+            .entry(raw_id)
+            .or_insert(floating);
+    }
     for (raw_id, canonical) in bundled.model_aliases {
         disk.model_aliases.entry(raw_id).or_insert(canonical);
     }
@@ -1154,42 +1240,180 @@ mod tests {
     }
 
     /// The Daybreak aliases are floating: OpenAI repoints them as new
+    /// The daybreak names are *floating* aliases: OpenAI repoints them as new
     /// frontier models ship, and pricing follows whatever they point at. That
     /// makes the mapping correct only as of the card's `fetched_at`, so this
-    /// pins three things that must hold together — the alias resolves, it
-    /// resolves to a model the card actually prices, and resolving it is
-    /// `Aliased` rather than `Fallback`. The last one is the user-visible
-    /// part: `Fallback` is what raises "Fallback rate used for:" in the UI,
-    /// and a mapping that resolved to an unpriced id would silently keep
-    /// doing that while looking fixed here.
+    /// pins four things that must hold together — the alias resolves, it
+    /// resolves to a model the card actually prices, resolving it is
+    /// `FloatingAlias` rather than `Fallback`, and it is dated.
+    ///
+    /// `Fallback` is what raises "Fallback rate used for:" in the UI, so a
+    /// mapping that resolved to an unpriced id would silently keep doing
+    /// that while looking fixed here. `FloatingAlias` rather than `Aliased`
+    /// is the other half (issue #177): `Aliased` claims an exact match and
+    /// raises nothing, which is precisely the wrong thing to say about a
+    /// mapping the provider will repoint without notice.
     #[test]
     fn daybreak_blue_alias_resolves_to_a_priced_model_without_falling_back() {
         let card = RateCard::load_bundled().expect("bundled rate card should parse");
 
         for raw in ["gpt-daybreak-blue-latest", "daybreak-blue-latest"] {
-            let canonical = card
-                .model_aliases
+            let floating = card
+                .floating_model_aliases
                 .get(raw)
-                .unwrap_or_else(|| panic!("{raw} should be aliased"));
-            assert_eq!(canonical, "gpt-5.6-sol");
+                .unwrap_or_else(|| panic!("{raw} should be a floating alias"));
+            assert_eq!(floating.target, "gpt-5.6-sol");
             assert!(
-                card.models.contains_key(canonical) && card.api_models.contains_key(canonical),
-                "{raw} aliases to {canonical}, which the card must price in both currencies"
+                !card.model_aliases.contains_key(raw),
+                "{raw} must not also be a static alias, which would outlive its expiry"
+            );
+            assert!(
+                card.models.contains_key(&floating.target)
+                    && card.api_models.contains_key(&floating.target),
+                "{raw} points at {}, which the card must price in both currencies",
+                floating.target
             );
 
+            let before_expiry = floating
+                .expires_at
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight")
+                .and_utc();
             for table in [&card.models, &card.api_models] {
-                let resolved = card.resolve_model_pricing(raw, "codex", table, chrono::Utc::now());
+                let resolved = card.resolve_model_pricing(raw, "codex", table, before_expiry);
                 assert_eq!(
-                    resolved.resolved_model, *canonical,
-                    "{raw} must resolve to {canonical}"
+                    resolved.resolved_model, floating.target,
+                    "{raw} must resolve to {}",
+                    floating.target
                 );
                 assert_eq!(
                     resolved.basis,
-                    PricingBasis::Aliased,
-                    "{raw} must resolve as Aliased; Fallback is what surfaces the UI warning"
+                    PricingBasis::FloatingAlias,
+                    "{raw} must resolve as FloatingAlias; Fallback surfaces the UI warning,                      and Aliased would claim an exact match that expires without saying so"
                 );
             }
         }
+    }
+
+    /// The defect this issue is about: once the provider repoints the alias,
+    /// continuing to price against the old target is wrong *and* silent,
+    /// because alias provenance raises no warning. Past its date the mapping
+    /// must be ignored entirely, so resolution reaches the fallback and the
+    /// UI's existing warning fires.
+    #[test]
+    fn an_expired_floating_alias_falls_back_loudly_instead_of_pricing_silently() {
+        let card = RateCard::load_bundled().expect("bundled rate card should parse");
+        let floating = &card.floating_model_aliases["daybreak-blue-latest"];
+
+        let day_after = floating
+            .expires_at
+            .succ_opt()
+            .expect("a day after the expiry")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
+        let resolved =
+            card.resolve_model_pricing("daybreak-blue-latest", "codex", &card.models, day_after);
+
+        assert_eq!(
+            resolved.basis,
+            PricingBasis::Fallback,
+            "expiry must reach the fallback path, which is what warns the user"
+        );
+        // The resolved *model* is deliberately not asserted to change: the
+        // codex fallback happens to be `gpt-5.6-sol` today, the same id this
+        // alias targets. So expiry changes the provenance, not the number —
+        // which is the whole point. The app keeps charging the same rate and
+        // starts saying it is no longer sure, instead of silently claiming an
+        // exact match for a mapping that may have been repointed.
+        assert_eq!(
+            resolved.resolved_model,
+            *card
+                .fallback_models
+                .get("codex")
+                .unwrap_or(&card.fallback_model),
+            "an expired alias must be priced from the configured fallback, not from its own target"
+        );
+    }
+
+    /// The expiry is only meaningful if it is actually in the future when the
+    /// card ships. A card whose alias expired before release would raise the
+    /// fallback warning on day one — the noisy failure #178 removed.
+    #[test]
+    fn bundled_floating_aliases_expire_after_the_card_was_fetched() {
+        let card = RateCard::load_bundled().expect("bundled rate card should parse");
+        let fetched_at = card
+            .fetched_at
+            .as_deref()
+            .and_then(|raw| NaiveDate::parse_from_str(raw, "%Y-%m-%d").ok())
+            .expect("bundled card records the date it was fetched");
+
+        assert!(
+            !card.floating_model_aliases.is_empty(),
+            "this test is vacuous if the card declares no floating aliases"
+        );
+        for (raw, floating) in &card.floating_model_aliases {
+            assert!(
+                floating.expires_at > fetched_at,
+                "{raw} expires {} which is not after the card's fetch ({fetched_at})",
+                floating.expires_at
+            );
+            assert!(
+                !floating.source_url.trim().is_empty(),
+                "{raw} must record where its mapping was read from"
+            );
+        }
+    }
+
+    /// The v9 -> v10 upgrade path for #177. v9 shipped the daybreak names as
+    /// plain `model_aliases` entries, so an upgrading install has them on
+    /// disk. Floating aliases are checked first, so a stale static duplicate
+    /// looks harmless — right up until the expiry, when resolution would fall
+    /// through to it and report `Aliased`, silently reinstating exactly the
+    /// mispricing the expiry exists to prevent.
+    #[test]
+    fn upgrading_replaces_a_superseded_static_alias_with_its_floating_form() {
+        let bundled = RateCard::load_bundled().expect("bundled rate card should parse");
+        let mut disk = bundled.clone();
+        disk.version = bundled.version - 1;
+        disk.floating_model_aliases.clear();
+        // What v9 actually wrote to disk.
+        disk.model_aliases
+            .insert("daybreak-blue-latest".into(), "gpt-5.6-sol".into());
+        // A mapping the *user* chose, which must survive untouched.
+        disk.model_aliases
+            .insert("my-own-alias".into(), "gpt-5.6-sol".into());
+
+        let merged = merge_older_override(disk, bundled);
+
+        assert!(
+            !merged.model_aliases.contains_key("daybreak-blue-latest"),
+            "the superseded static alias must not outlive its floating replacement's expiry"
+        );
+        assert_eq!(
+            merged.floating_model_aliases["daybreak-blue-latest"].target,
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            merged.model_aliases.get("my-own-alias").map(String::as_str),
+            Some("gpt-5.6-sol"),
+            "a user's own alias must survive, even pointing at the same target"
+        );
+
+        let expired = merged.floating_model_aliases["daybreak-blue-latest"]
+            .expires_at
+            .succ_opt()
+            .expect("a day after the expiry")
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight")
+            .and_utc();
+        assert_eq!(
+            merged
+                .resolve_model_pricing("daybreak-blue-latest", "codex", &merged.models, expired)
+                .basis,
+            PricingBasis::Fallback,
+            "after upgrading, an expired floating alias must still fail loudly"
+        );
     }
 
     /// The bundled card only reaches an install whose on-disk copy is older
@@ -1200,7 +1424,7 @@ mod tests {
     fn bundled_card_version_is_ahead_of_the_last_shipped_card() {
         let card = RateCard::load_bundled().expect("bundled rate card should parse");
         assert!(
-            card.version >= 9,
+            card.version >= 10,
             "adding models or aliases requires a version bump to propagate; got {}",
             card.version
         );

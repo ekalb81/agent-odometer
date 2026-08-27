@@ -738,12 +738,28 @@ export interface PricingCatalog {
 export type PricingBasis =
   | 'direct'
   | 'aliased'
+  /** Resolved via a provider-declared *floating* alias — a mapping the
+   * provider repoints as new models ship. Correct as of the card's fetch and
+   * priced from a real published rate, but carrying a known expiry, past
+   * which resolution falls through to `fallback`. Render as a soft note, not
+   * a warning: the price is right today (issue #177). */
+  | 'floating_alias'
   | 'fallback'
   | 'estimated'
   | 'free_local'
   | 'subscription'
   | 'stale'
   | 'unavailable';
+
+/** A provider-declared floating model alias: a name the provider repoints
+ * without renaming, so a static mapping is right today and silently wrong
+ * later. Mirrors `FloatingAlias` in rates.rs — keep both in sync. */
+export interface FloatingAlias {
+  target: string;
+  /** Last date (inclusive, `YYYY-MM-DD`, UTC) on which `target` is trusted. */
+  expires_at: string;
+  source_url?: string;
+}
 
 /** The resolved pricing-table key and provenance for one raw model id. */
 export interface PricedModelResolution {
@@ -808,6 +824,10 @@ export interface RateCard {
   /** Raw provider model id -> canonical rate-table key, resolved before any
    * fallback lookup. */
   model_aliases: Record<string, string>;
+  /** Raw provider model id -> a mapping the provider documents as temporary,
+   * with the date it stops being trusted. Checked before `model_aliases`;
+   * mirrors `RateCard::floating_model_aliases` in rates.rs (issue #177). */
+  floating_model_aliases?: Record<string, FloatingAlias>;
   /** Models explicitly zero-cost (free tier, local/self-hosted) — distinct
    * from unpriced_models and from an ordinary unresolved rate. */
   free_local_models: string[];

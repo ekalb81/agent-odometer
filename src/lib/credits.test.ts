@@ -3,6 +3,7 @@ import {
   computeSessionApiCostScenarios,
   computeSessionCredits,
   creditsFromBuckets,
+  floatingAliasExpired,
   resolveModelPricing,
   tokensCost,
 } from './credits';
@@ -374,6 +375,68 @@ describe('aliases and alias cycles', () => {
 
     const direct = resolveModelPricing(card, 'claude-sonnet-5', 'claude_code', card.models);
     expect(direct.basis).toBe('direct');
+  });
+
+  it('resolves a floating alias with its own provenance, not as an exact match', () => {
+    // Issue #177: a provider-declared floating alias is priced from a real
+    // published rate, but the provider repoints it without renaming. Calling
+    // that `aliased` would claim an exact match and raise nothing in the UI.
+    const card: RateCard = {
+      ...rateCard,
+      model_aliases: {},
+      floating_model_aliases: {
+        'daybreak-blue-latest': { target: 'gpt-5.6-sol', expires_at: '2026-11-13' },
+      },
+      models: { 'gpt-5.6-sol': rate(5, 0.5, 30, 30), 'fallback-model': rate(9, 0.9, 9, 9) },
+      // Cleared so the per-harness codex fallback from the bundled card
+      // (which is `gpt-5.6-sol`, the alias target itself) cannot mask
+      // whether resolution actually took the fallback path.
+      fallback_models: {},
+      fallback_model: 'fallback-model',
+    };
+
+    const resolution = resolveModelPricing(
+      card, 'daybreak-blue-latest', 'codex', card.models, Date.parse('2026-09-01T00:00:00Z'),
+    );
+    expect(resolution.basis).toBe('floating_alias');
+    expect(resolution.resolvedModel).toBe('gpt-5.6-sol');
+  });
+
+  it('ignores an expired floating alias so the fallback warning fires', () => {
+    const card: RateCard = {
+      ...rateCard,
+      model_aliases: {},
+      floating_model_aliases: {
+        'daybreak-blue-latest': { target: 'gpt-5.6-sol', expires_at: '2026-11-13' },
+      },
+      models: { 'gpt-5.6-sol': rate(5, 0.5, 30, 30), 'fallback-model': rate(9, 0.9, 9, 9) },
+      // Cleared so the per-harness codex fallback from the bundled card
+      // (which is `gpt-5.6-sol`, the alias target itself) cannot mask
+      // whether resolution actually took the fallback path.
+      fallback_models: {},
+      fallback_model: 'fallback-model',
+    };
+
+    const resolution = resolveModelPricing(
+      card, 'daybreak-blue-latest', 'codex', card.models, Date.parse('2026-11-14T00:00:00Z'),
+    );
+    expect(resolution.basis).toBe('fallback');
+    expect(resolution.resolvedModel).toBe('fallback-model');
+  });
+
+  it('trusts a floating alias through the last moment of its expiry date', () => {
+    // `expires_at` is inclusive and compared in UTC, so the same card must
+    // not expire on different days either side of the date line.
+    const alias = { target: 'gpt-5.6-sol', expires_at: '2026-11-13' };
+    expect(floatingAliasExpired(alias, Date.parse('2026-11-13T23:59:59Z'))).toBe(false);
+    expect(floatingAliasExpired(alias, Date.parse('2026-11-14T00:00:00Z'))).toBe(true);
+  });
+
+  it('treats an undatable floating alias as expired rather than trusting it', () => {
+    // Refusing to trust a mapping we cannot date is the safe direction: the
+    // failure being guarded against is pricing silently against a stale
+    // target.
+    expect(floatingAliasExpired({ target: 'x', expires_at: 'not-a-date' }, Date.now())).toBe(true);
   });
 
   it('follows a multi-hop alias chain to its canonical target', () => {

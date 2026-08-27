@@ -719,6 +719,7 @@ mod tests {
             unpriced_models: unpriced.iter().map(|m| m.to_string()).collect(),
             pricing_catalog: Default::default(),
             model_aliases: Default::default(),
+            floating_model_aliases: Default::default(),
             free_local_models: Default::default(),
             subscription_plans: Default::default(),
             display_currency: None,
