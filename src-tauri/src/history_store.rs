@@ -881,10 +881,27 @@ impl HistoryStore {
         Ok(Some(load_one(&connection, &session_key)?))
     }
 
-    /// Stores a metadata-only revision of a materialized session. This is
-    /// used for local overlays such as `session_index` thread names after the
-    /// transcript has already been observed; it deliberately does not create
-    /// or alter source locations.
+    /// Stores a revision of a materialized session driven by a
+    /// metadata-level change — a local overlay such as a `session_index`
+    /// thread name, applied after the transcript has already been observed.
+    /// It deliberately does not create or alter source locations.
+    ///
+    /// **What is written is the whole `Session`, not only metadata.** The
+    /// snapshot is `serde_json`-serialized in full into `session_snapshots`,
+    /// which includes `first_user_message` and every turn's `user_message`
+    /// and `last_agent_message`. That is deliberate — the text backs
+    /// session-name fallback and search — but the older "metadata-only
+    /// snapshot" wording described the *trigger* and read as a claim about
+    /// the *contents* (issue #38, where the maintainer amended the storage
+    /// criterion rather than the behaviour, and flagged this comment as
+    /// inaccurate).
+    ///
+    /// The distinction is load-bearing, not pedantic. Local snapshots may
+    /// retain message text and inherit the same no-upload handling as the
+    /// transcripts they were parsed from. Derived aggregates, exports,
+    /// diagnostics, and anything leaving the device still exclude it. Any
+    /// future sync must project a filtered view rather than read these
+    /// snapshots directly — see `docs/adr/0003` and #49.
     pub fn update_snapshot(&self, session: &Session) -> Result<StoredSession> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -927,7 +944,9 @@ impl HistoryStore {
         Ok(out)
     }
 
-    /// Targeted metadata-only write for the session-index overlay (issue
+    /// Targeted write for the session-index overlay — genuinely metadata
+    /// only, unlike [`Self::update_snapshot`], since it touches two columns
+    /// and never serializes session content at all (issue
     /// #141 field regression): `updates` is `(durable key, new thread_name)`
     /// pairs, sourced directly from the just-patched `ResidentSession`
     /// summaries.
@@ -3763,7 +3782,7 @@ fn update_snapshot_in_transaction(
     }
     apply_project_identity(transaction, &key, &mut archived)?;
     let raw_snapshot =
-        serde_json::to_vec(&archived).context("could not encode metadata-only session snapshot")?;
+        serde_json::to_vec(&archived).context("could not encode session snapshot")?;
     let snapshot_hash = stable_hash_bytes(&raw_snapshot);
     // A metadata overlay may legitimately carry history that differs from
     // the durable snapshot (its caller's in-memory copy can be ahead when
@@ -6516,6 +6535,46 @@ mod tests {
             store.load_one(&key).unwrap().session.thread_name.as_deref(),
             Some("From the transcript"),
             "a stale overlay must not shadow a freshly written snapshot's own name"
+        );
+    }
+
+    /// Pins what `update_snapshot` actually stores, so the doc comment above
+    /// it cannot drift back into claiming "metadata-only" contents.
+    ///
+    /// Issue #38's amended criterion is explicit that local session
+    /// snapshots *may* retain message text, and that this is deliberate —
+    /// the text backs session-name fallback and search. It is also a hard
+    /// blocker for #49's ledger-derived sync, which must project a filtered
+    /// view rather than read these rows. Both halves depend on the actual
+    /// behaviour being known rather than assumed from a comment, so this
+    /// asserts the bytes.
+    #[test]
+    fn a_stored_snapshot_retains_message_text_as_issue_38_documents() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut fixture = rich_session("snapshot-contents");
+        fixture.first_user_message = Some("a distinctive first prompt".into());
+        let key = store
+            .observe(Path::new("snapshot-contents.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        let connection = store.connection().unwrap();
+        let raw: Vec<u8> = connection
+            .query_row(
+                "SELECT s.session_json FROM durable_sessions d
+                 JOIN session_snapshots s
+                   ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+                 WHERE d.session_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored = String::from_utf8(raw).expect("snapshots are UTF-8 JSON");
+
+        assert!(
+            stored.contains("a distinctive first prompt"),
+            "session snapshots retain message text by design (#38); if this changed              deliberately, update `update_snapshot`'s doc comment and #49's assumptions              along with it"
         );
     }
 

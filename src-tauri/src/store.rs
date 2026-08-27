@@ -1470,8 +1470,14 @@ impl AppState {
         }
     }
 
-    /// Persists a metadata-only in-memory overlay (a caller-supplied full
-    /// `Session`) without changing source ownership. General-purpose: unlike
+    /// Persists an in-memory overlay driven by a metadata-level change (a
+    /// caller-supplied full `Session`) without changing source ownership.
+    ///
+    /// The write itself is not metadata-only: [`HistoryStore::update_snapshot`]
+    /// serializes the whole session, message text included. See its doc
+    /// comment for why that distinction is worth stating (issue #38).
+    ///
+    /// General-purpose: unlike
     /// [`Self::persist_thread_name_overlay_batch`], this accepts arbitrary
     /// caller-side content and so still needs [`HistoryStore::update_snapshot`]'s
     /// divergence detection against the ledger's own facts. The session-index
@@ -1487,7 +1493,7 @@ impl AppState {
         };
         if let Err(error) = history.update_snapshot(session) {
             tracing::warn!(
-                "could not persist metadata-only session snapshot for {}: {}",
+                "could not persist session snapshot for {}: {}",
                 session.effective_storage_id(),
                 error
             );
@@ -1514,7 +1520,7 @@ impl AppState {
         };
         if let Err(error) = history.update_snapshot_batch(sessions) {
             tracing::warn!(
-                "could not persist metadata-only session snapshot batch of {} session(s) as \
+                "could not persist session snapshot batch of {} session(s) as \
                  one transaction, retrying one at a time: {}",
                 sessions.len(),
                 error
