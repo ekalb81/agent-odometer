@@ -1217,8 +1217,32 @@ mod tests {
         let disabled_sample = heap_sample();
         assert_eq!(disabled_sample.current_bytes, None);
         assert_eq!(disabled_sample.peak_bytes, None);
-        assert_eq!(heap_allocated_bytes_raw(), 0);
-        assert_eq!(heap_peak_bytes_raw(), 0);
+
+        // Bounded, not exact. `configure_heap_tracking(false)` does reset
+        // both counters to 0, but a thread already inside `alloc` — past its
+        // `HEAP_TRACKING_ENABLED` check and not yet at its `fetch_add` —
+        // lands its bytes *after* the reset. The heap lock cannot prevent
+        // that: it serializes tests, not the global allocator, which every
+        // thread in the process shares.
+        //
+        // This is the residual of #180 that the lock alone did not fix, and
+        // it failed in CI as `left: 7, right: 0`. Closing the window
+        // properly would mean re-checking the toggle after the counter
+        // update, on the allocator's hot path, to make a diagnostic
+        // assertion exact — the wrong trade. So this asserts what the reset
+        // is actually for: the counters are cleared, not merely paused at
+        // whatever they had reached.
+        const RESIDUE_BOUND: u64 = 64 * 1024;
+        let residual = heap_allocated_bytes_raw();
+        let residual_peak = heap_peak_bytes_raw();
+        assert!(
+            residual < RESIDUE_BOUND,
+            "disabling must clear the counters; {residual} bytes looks like they kept accumulating"
+        );
+        assert!(
+            residual_peak < RESIDUE_BOUND,
+            "disabling must clear the peak; {residual_peak} bytes looks like it was retained"
+        );
     }
 
     /// Reproduces the underflow defect this module's `dealloc` used to have:
