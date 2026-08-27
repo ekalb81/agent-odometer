@@ -2698,3 +2698,140 @@ fn report_json_carries_the_conversion_with_its_provenance() {
     // The original total is untouched.
     assert_eq!(parsed["cost_by_currency"]["USD"], 1.0);
 }
+
+// ---------------------------------------------------------------------------
+// Bulk-scan write batch-size sweep (issue #182)
+// ---------------------------------------------------------------------------
+
+/// #182's discriminating experiment: does the bulk-scan memory peak scale
+/// with `SCAN_WRITE_BATCH_SIZE`?
+///
+/// The issue names two candidate explanations for a ~1,491 MB peak that
+/// imply opposite fixes:
+///
+/// - **Queue model** — workers stalled on the durable-write mutex hold their
+///   batches alive, so the peak tracks batch size times waiters.
+/// - **In-flight-window model** — the peak is simply bytes being processed
+///   concurrently, so it flattens once the window saturates.
+///
+/// Sweeps 16 / 64 / 256 with concurrent writers, mirroring `scan_all`'s
+/// `par_chunks`, and reports peak heap.
+///
+/// Fidelity limit, stated because it bounds the conclusion: a synthetic
+/// corpus exercising only the write path is not the field's 4,687-file scan,
+/// and it does not measure `max_waiters`, which lives on `AppState`. It can
+/// show whether *this* path's peak responds to batch size; it cannot
+/// reproduce the field's absolute numbers.
+///
+/// Lives here rather than in `history_store.rs`'s test module so it is not
+/// counted as uncovered product code — an `#[ignore]`d probe can never be
+/// executed during a coverage run, so it would fail a patch-coverage gate by
+/// construction.
+/// A session at field scale rather than fixture scale.
+///
+/// #146's probe measured a real 4.2x improvement in something that was not
+/// the bottleneck, because its synthetic sessions were ~31 KB against a real
+/// corpus averaging closer to 400 KB. A batch-size sweep has the same
+/// exposure: peak memory is dominated by session bytes, so measuring at the
+/// wrong size measures the wrong thing.
+fn field_scale_session(id: &str, when_ms: i64) -> Session {
+    let mut session = session_at(id, "real-model", when_ms, 100_000, 10_000);
+    let timestamp = Utc.timestamp_millis_opt(when_ms).single().expect("instant");
+    // Turns carrying near-truncation-limit message text, which is what
+    // actually makes a real session large.
+    let user_message = "u".repeat(1_200);
+    let agent_message = "a".repeat(1_200);
+    // `session_at` clears turns, so the shape template comes from a fresh
+    // parse of the fixture rather than from the session being built.
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-session.jsonl");
+    let template = parser::parse_file(&fixture, false)
+        .expect("fixture parses")
+        .expect("fixture yields a session")
+        .turns
+        .into_iter()
+        .next()
+        .expect("the fixture session has at least one turn");
+    session.turns = (0..180)
+        .map(|index| {
+            let mut turn = odometer_lib::model::TurnInfo {
+                turn_id: format!("{id}-turn-{index}"),
+                model: Some("real-model".to_string()),
+                ..template.clone()
+            };
+            turn.user_message = Some(user_message.clone());
+            turn.last_agent_message = Some(agent_message.clone());
+            turn.started_at = Some(timestamp);
+            turn
+        })
+        .collect();
+    session
+}
+
+#[test]
+#[ignore = "issue #182 batch-size sweep; run with `cargo test --release --test             query_service_tests probe_scan_write_batch_size_sweep -- --ignored --nocapture`             (filtering to this exact test name keeps the process-wide counting allocator             from also seeing another concurrently-running test's allocations)"]
+fn probe_scan_write_batch_size_sweep() {
+    use rayon::prelude::*;
+
+    const SESSIONS: usize = 256;
+
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let sessions: Vec<Session> = (0..SESSIONS)
+        .map(|index| {
+            field_scale_session(
+                &format!("sweep-{index}"),
+                when.timestamp_millis() + index as i64 * 60_000,
+            )
+        })
+        .collect();
+    let bytes: usize = sessions
+        .iter()
+        .map(|session| {
+            serde_json::to_vec(session)
+                .map(|raw| raw.len())
+                .unwrap_or(0)
+        })
+        .sum();
+    eprintln!(
+        "corpus: {SESSIONS} sessions, {:.1} MB of session_json, {:.0} KB mean",
+        bytes as f64 / (1024.0 * 1024.0),
+        bytes as f64 / SESSIONS as f64 / 1024.0
+    );
+
+    for batch_size in [16usize, 64, 256] {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            HistoryStore::open(&directory.path().join("history.sqlite3")).expect("open ledger");
+        let generation = store.begin_scan().expect("scan").max(1);
+
+        let paths: Vec<std::path::PathBuf> = (0..SESSIONS)
+            .map(|index| std::path::PathBuf::from(format!("sweep-{index}.jsonl")))
+            .collect();
+        let items: Vec<(&Path, &Session, i64)> = paths
+            .iter()
+            .zip(sessions.iter())
+            .map(|(path, session)| (path.as_path(), session, generation))
+            .collect();
+
+        // Enabling resets the counters, so each batch size is measured from
+        // a clean baseline rather than inheriting the previous round's peak.
+        odometer_lib::memory::configure_heap_tracking(true);
+        let started = std::time::Instant::now();
+        items.par_chunks(batch_size).for_each(|chunk| {
+            let _ = store.observe_bulk_batch(chunk);
+        });
+        let elapsed = started.elapsed();
+        let peak = odometer_lib::memory::heap_sample()
+            .peak_bytes
+            .unwrap_or_default();
+        odometer_lib::memory::configure_heap_tracking(false);
+
+        let batch_bytes = bytes as f64 / SESSIONS as f64 * batch_size as f64;
+        eprintln!(
+            "batch={batch_size:>3}  peak_heap={:>8.1} MB  wall={:>7.0} ms  peak/batch_bytes={:>5.2}x",
+            peak as f64 / (1024.0 * 1024.0),
+            elapsed.as_secs_f64() * 1_000.0,
+            peak as f64 / batch_bytes,
+        );
+    }
+}
