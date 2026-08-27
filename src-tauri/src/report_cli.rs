@@ -54,7 +54,10 @@ pub fn try_run_cli() -> bool {
     let Some(command) = args.first().map(String::as_str) else {
         return false;
     };
-    if !matches!(command, "status" | "report" | "quota" | "projects") {
+    if !matches!(
+        command,
+        "status" | "report" | "quota" | "projects" | "metrics"
+    ) {
         return false;
     }
 
@@ -80,6 +83,7 @@ fn run(command: &str, args: &[String]) -> Result<String> {
         "report" => run_report(args, format),
         "quota" => run_quota(format),
         "projects" => run_projects(args, format),
+        "metrics" => run_metrics(args, format),
         other => bail!("unknown command '{other}'"),
     }
 }
@@ -333,6 +337,83 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
 ",
                     report.unpriced_models.join(", ")
                 ));
+            }
+            out
+        }
+    })
+}
+
+fn run_metrics(args: &[String], format: Format) -> Result<String> {
+    let store = open_ledger()?;
+    let rates = load_rates();
+    let config = Config::load().unwrap_or_default();
+    metrics_from(&store, &rates, &config, args, format)
+}
+
+/// The testable half of `metrics`.
+pub fn metrics_from(
+    store: &HistoryStore,
+    rates: &RateCard,
+    config: &Config,
+    args: &[String],
+    format: Format,
+) -> Result<String> {
+    let (from, to) = parse_window(args)?;
+    let report = crate::query::workflow_metrics(
+        store,
+        rates,
+        harness_resolver(config),
+        from,
+        to,
+        Utc::now(),
+    )?;
+
+    Ok(match format {
+        Format::Json => serde_json::to_string_pretty(&report)?,
+        Format::Csv => {
+            let mut out = String::from(
+                "metric,value,numerator,denominator,denominator_is
+",
+            );
+            for metric in &report.metrics {
+                out.push_str(&format!(
+                    "{},{},{},{},{}
+",
+                    metric.id,
+                    metric
+                        .value
+                        .map(|value| format!("{value:.6}"))
+                        .unwrap_or_default(),
+                    metric.numerator,
+                    metric.denominator,
+                    csv_field(metric.denominator_is),
+                ));
+            }
+            out
+        }
+        Format::Text => {
+            let mut out = format!(
+                "metrics v{} over {} session(s)
+",
+                report.schema_version, report.sessions
+            );
+            for metric in &report.metrics {
+                match metric.value {
+                    // The denominator travels with the value: a ratio
+                    // without its sample size is not interpretable, and 1.0
+                    // from one observation reads identically to 1.0 from ten
+                    // thousand.
+                    Some(value) => out.push_str(&format!(
+                        "  {:<24} {:>8.4}   (of {} {})
+",
+                        metric.id, value, metric.denominator, metric.denominator_is
+                    )),
+                    None => out.push_str(&format!(
+                        "  {:<24} {:>8}   (no {})
+",
+                        metric.id, "n/a", metric.denominator_is
+                    )),
+                }
             }
             out
         }

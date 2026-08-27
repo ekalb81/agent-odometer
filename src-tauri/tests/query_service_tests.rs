@@ -1322,3 +1322,204 @@ fn project_text_output_reports_orphan_sessions() {
         "orphans must be visible so totals reconcile: {rendered}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Workflow metrics (issue #45)
+// ---------------------------------------------------------------------------
+
+fn metric<'a>(
+    report: &'a odometer_lib::query::WorkflowMetrics,
+    id: &str,
+) -> &'a odometer_lib::query::WorkflowMetric {
+    report
+        .metrics
+        .iter()
+        .find(|metric| metric.id == id)
+        .unwrap_or_else(|| panic!("no metric {id}"))
+}
+
+fn metrics_for(store: &HistoryStore, rates: &RateCard) -> odometer_lib::query::WorkflowMetrics {
+    odometer_lib::query::workflow_metrics(
+        store,
+        rates,
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Utc::now(),
+    )
+    .expect("metrics")
+}
+
+/// #45: "Every metric has a documented denominator, coverage rule,
+/// missing-data state."
+///
+/// An empty corpus gives every metric a zero denominator, and the value must
+/// then be absent rather than 0.0 — "no tool calls happened" and "no tool
+/// call failed" are opposite facts that a bare 0.0 collapses into one. A
+/// float division would also produce NaN here and poison anything that
+/// aggregated it.
+#[test]
+fn a_metric_with_no_denominator_reports_no_value_rather_than_zero() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let report = metrics_for(&store, &card());
+
+    assert_eq!(report.sessions, 0);
+    for metric in &report.metrics {
+        assert_eq!(
+            metric.value, None,
+            "{} must have no value on an empty corpus",
+            metric.id
+        );
+        assert_eq!(metric.denominator, 0.0);
+        assert!(
+            !metric.denominator_is.is_empty(),
+            "{} must document what its denominator counts",
+            metric.id
+        );
+    }
+}
+
+#[test]
+fn metrics_carry_their_definition_version() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    // A changed denominator silently changes the meaning of a series, so a
+    // stored comparison needs to be able to refuse to compare across
+    // versions rather than plot a discontinuity as a trend.
+    assert_eq!(
+        metrics_for(&store, &card()).schema_version,
+        odometer_lib::query::WORKFLOW_METRICS_VERSION
+    );
+}
+
+#[test]
+fn context_to_output_ratio_divides_input_by_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "r",
+            "real-model",
+            when.timestamp_millis(),
+            1_000,
+            250,
+        )],
+    );
+
+    let report = metrics_for(&store, &card());
+    let ratio = metric(&report, "context_to_output_ratio");
+
+    assert_eq!(ratio.numerator, 1_000.0);
+    assert_eq!(ratio.denominator, 250.0);
+    assert_eq!(ratio.value, Some(4.0));
+}
+
+/// A fallback rate produces a number, but it is a stand-in. Counting it as
+/// covered is exactly how a pricing gap hides — the metric would read 100%
+/// while every model was being priced at someone else's rate.
+#[test]
+fn pricing_coverage_excludes_fallback_priced_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut rates = card();
+    rates.fallback_models.clear();
+    let store = ledger(
+        directory.path(),
+        &[
+            session_at("known", "real-model", when.timestamp_millis(), 1_000, 0),
+            session_at(
+                "unknown",
+                "model-not-in-the-card",
+                when.timestamp_millis(),
+                1_000,
+                0,
+            ),
+        ],
+    );
+
+    let report = metrics_for(&store, &rates);
+    let coverage = metric(&report, "pricing_coverage");
+
+    assert_eq!(
+        coverage.denominator, 2_000.0,
+        "both models are priceable usage"
+    );
+    assert_eq!(
+        coverage.numerator, 1_000.0,
+        "only the directly-priced model counts as covered"
+    );
+    assert_eq!(coverage.value, Some(0.5));
+}
+
+/// An aliased model *is* covered: it resolves to a real published rate for
+/// the model it points at, unlike a fallback.
+#[test]
+fn pricing_coverage_counts_an_aliased_model_as_covered() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut rates = card();
+    rates
+        .model_aliases
+        .insert("aliased-model".into(), "real-model".into());
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "aliased",
+            "aliased-model",
+            when.timestamp_millis(),
+            1_000,
+            0,
+        )],
+    );
+
+    let report = metrics_for(&store, &rates);
+
+    assert_eq!(metric(&report, "pricing_coverage").value, Some(1.0));
+}
+
+#[test]
+fn metrics_text_output_shows_the_denominator_beside_the_value() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{metrics_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "t",
+            "real-model",
+            when.timestamp_millis(),
+            1_000,
+            250,
+        )],
+    );
+
+    let rendered = metrics_from(&store, &card(), &Config::default(), &[], Format::Text).unwrap();
+
+    // A ratio without its sample size is not interpretable, so the rendering
+    // must not print one alone.
+    assert!(rendered.contains("context_to_output_ratio"), "{rendered}");
+    assert!(rendered.contains("output tokens produced"), "{rendered}");
+    assert!(rendered.contains("metrics v"), "{rendered}");
+}
+
+#[test]
+fn metrics_text_output_marks_a_metric_with_no_evidence() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{metrics_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = metrics_from(&store, &card(), &Config::default(), &[], Format::Text).unwrap();
+
+    assert!(
+        rendered.contains("n/a"),
+        "a metric with no denominator must read as unavailable, not 0: {rendered}"
+    );
+}
