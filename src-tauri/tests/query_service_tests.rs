@@ -1241,3 +1241,84 @@ fn sessions_without_a_project_are_reported_rather_than_dropped() {
     assert!(report.projects.is_empty());
     assert_eq!(report.sessions_without_project, 1);
 }
+
+#[test]
+fn project_csv_output_quotes_labels_and_names_the_currency() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{projects_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    // A label with a comma in it: aliases are user-supplied, so an
+    // unquoted field would shift every later column in a spreadsheet.
+    let work = directory.path().join("comma, project");
+    std::fs::create_dir_all(&work).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_in_project(
+            "c",
+            when.timestamp_millis(),
+            "repo:comma",
+            &work.to_string_lossy(),
+            "repository_root",
+        )],
+    );
+
+    let rendered = projects_from(
+        &store,
+        &card(),
+        &Config::default(),
+        &["--include-paths".to_string()],
+        Format::Csv,
+    )
+    .unwrap();
+    let mut lines = rendered.lines();
+
+    assert_eq!(
+        lines.next().unwrap(),
+        "project_key,label,sessions,total_tokens,cost,currency"
+    );
+    let row = lines.next().expect("one project row");
+    assert!(
+        row.contains('"'),
+        "a label containing a comma must be quoted: {row}"
+    );
+}
+
+#[test]
+fn project_text_output_says_so_when_the_window_is_empty() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{projects_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = projects_from(&store, &card(), &Config::default(), &[], Format::Text).unwrap();
+
+    assert!(
+        rendered.contains("no project activity"),
+        "an empty window is an answer, not blank output: {rendered}"
+    );
+}
+
+#[test]
+fn project_text_output_reports_orphan_sessions() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{projects_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut orphan = session_at("orphan", "real-model", when.timestamp_millis(), 1_000, 0);
+    orphan.working_directory = None;
+    orphan.project_key = None;
+    orphan.project_label = None;
+    orphan.project_provenance = None;
+    let store = ledger(directory.path(), &[orphan]);
+
+    let rendered = projects_from(&store, &card(), &Config::default(), &[], Format::Text).unwrap();
+
+    assert!(
+        rendered.contains("belong to no project"),
+        "orphans must be visible so totals reconcile: {rendered}"
+    );
+}
