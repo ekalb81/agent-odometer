@@ -34,6 +34,7 @@
   import GitOutcomes from './GitOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
+  import { clearRenderedSessionRows, publishRenderedSessionRows } from '../lib/paintContext';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
   import { formatStartedLocal, formatTokenCategory, formatTokenTotal, modelProviderVisual } from '../lib/sessionGrid';
   import {
@@ -754,6 +755,26 @@
     const started = performance.now();
     const rows = listRows.length;
     measureNextPaint('frontend.session_list_paint', started, { rows });
+  });
+
+  // Publishes what this list actually has in the DOM, so `App.svelte`'s
+  // `session_batch_paint` can record it (issue #184). The virtualized slice
+  // rather than `listRows.length`: the slice is the row work a paint does,
+  // while `listRows` is how many rows the model holds — a 4,000-session
+  // corpus renders a few dozen of them.
+  //
+  // Several `SessionsView`s stay mounted at once (one per provider tab) and
+  // only the active one paints, so only the active one publishes. On
+  // deactivation it withdraws its count, and the withdrawal is a no-op if
+  // another instance has already published: effect order across components
+  // is not guaranteed during a tab switch.
+  $effect(() => {
+    if (!active) {
+      clearRenderedSessionRows(harness);
+      return;
+    }
+    publishRenderedSessionRows(harness, virtualList.rows.length);
+    return () => clearRenderedSessionRows(harness);
   });
 
   onMount(() => {

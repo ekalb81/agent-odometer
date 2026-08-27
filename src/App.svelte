@@ -25,6 +25,7 @@
   import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
   import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
+  import { renderedSessionRows } from './lib/paintContext';
   import { appViews, providerIdForTab, type AppView } from './lib/appViews';
   import { providersStore } from './lib/stores/providers.svelte';
   import { providerAccent } from './lib/providerAccents';
@@ -230,7 +231,20 @@
       () => sessionsStore.applyMutations(upserts, removals),
       { sessions: batch.size },
     );
-    measureNextPaint('frontend.session_batch_paint', started, { sessions: batch.size });
+    // Metadata as a thunk, evaluated after the paint rather than now:
+    // `rows_rendered` has to describe the paint this measures, and the
+    // sessions list re-renders between here and then.
+    //
+    // Without these two fields, a `session_batch_paint` number is not
+    // comparable across runs — it splits into a ~110-140 ms regime with a
+    // sessions list on screen and a ~5-6 ms one without, and which regime a
+    // recording lands in depends only on which tab the user happened to
+    // leave open (issue #184).
+    measureNextPaint('frontend.session_batch_paint', started, () => ({
+      sessions: batch.size,
+      rows_rendered: renderedSessionRows(),
+      view: activeView,
+    }));
   }
 
   function scheduleMutationFlush() {
