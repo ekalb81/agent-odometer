@@ -1952,3 +1952,160 @@ fn session_csv_and_json_carry_the_same_rows() {
         odometer_lib::query::SESSION_REPORT_SCHEMA_VERSION
     );
 }
+
+// ---------------------------------------------------------------------------
+// MCP tools (issue #47)
+// ---------------------------------------------------------------------------
+
+fn call_mcp(store: &HistoryStore, rates: &RateCard, params: serde_json::Value) -> String {
+    odometer_lib::mcp_server::call_tool_with(store, rates, &params, Utc::now()).expect("tool call")
+}
+
+#[test]
+fn the_usage_report_tool_answers_from_the_ledger() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "mcp",
+            "real-model",
+            when.timestamp_millis(),
+            1_000,
+            100,
+        )],
+    );
+
+    let text = call_mcp(
+        &store,
+        &card(),
+        serde_json::json!({ "name": "usage_report", "arguments": {} }),
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("tool returns JSON");
+
+    assert_eq!(parsed["sessions"], 1);
+    assert_eq!(parsed["tokens"]["input_tokens"], 1_000);
+}
+
+/// The CLI has `--include-paths` because a person can consent to seeing
+/// their own paths. An agent over MCP is a different audience with nobody
+/// present to make that call, so redaction is unconditional here.
+#[test]
+fn the_project_tool_never_returns_a_local_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let work = directory.path().join("secret-project");
+    std::fs::create_dir_all(&work).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_in_project(
+            "p",
+            when.timestamp_millis(),
+            "path:abc",
+            &work.to_string_lossy(),
+            "fallback_path_identity",
+        )],
+    );
+
+    let text = call_mcp(
+        &store,
+        &card(),
+        serde_json::json!({ "name": "project_report", "arguments": {} }),
+    );
+
+    assert!(
+        !text.contains("secret-project"),
+        "MCP must never hand an agent a local path: {text}"
+    );
+    assert!(
+        text.contains("path:"),
+        "the hashed key still identifies it: {text}"
+    );
+}
+
+#[test]
+fn the_metrics_tool_returns_versioned_metrics() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "m",
+            "real-model",
+            when.timestamp_millis(),
+            1_000,
+            250,
+        )],
+    );
+
+    let text = call_mcp(
+        &store,
+        &card(),
+        serde_json::json!({ "name": "workflow_metrics", "arguments": {} }),
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+
+    assert_eq!(
+        parsed["schema_version"],
+        odometer_lib::query::WORKFLOW_METRICS_VERSION
+    );
+}
+
+#[test]
+fn the_quota_tool_answers_without_a_window_argument() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let text = call_mcp(
+        &store,
+        &card(),
+        serde_json::json!({ "name": "quota_status", "arguments": {} }),
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+
+    assert!(parsed.is_array(), "quota returns one entry per provider");
+}
+
+#[test]
+fn a_tool_window_argument_filters_the_result() {
+    let directory = tempfile::tempdir().unwrap();
+    let august = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "aug",
+            "real-model",
+            august.timestamp_millis(),
+            1_000,
+            0,
+        )],
+    );
+
+    let text = call_mcp(
+        &store,
+        &card(),
+        serde_json::json!({
+            "name": "usage_report",
+            "arguments": { "from": "2026-07-01", "to": "2026-07-31" }
+        }),
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+
+    assert_eq!(parsed["sessions"], 0, "the August session is outside July");
+}
+
+#[test]
+fn a_tool_call_without_a_name_is_rejected() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let error = odometer_lib::mcp_server::call_tool_with(
+        &store,
+        &card(),
+        &serde_json::json!({ "arguments": {} }),
+        Utc::now(),
+    )
+    .expect_err("a call with no tool name is malformed");
+
+    assert!(format!("{error:?}").contains("name"), "{error:?}");
+}
