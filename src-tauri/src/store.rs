@@ -13,6 +13,58 @@ use std::sync::{Arc, Condvar, Mutex};
 
 const MAX_EXTERNAL_EVENTS: usize = 10_000;
 
+/// The two writers that rewrite durable session snapshots, and so must not
+/// run at the same time (issue #176). Both are tracked in one lock so a
+/// check-then-set is a single atomic step.
+#[derive(Debug, Default, Clone, Copy)]
+struct DurableWriters {
+    /// A bulk scan (`commands::spawn_scan`) is writing session snapshots.
+    scan: bool,
+    /// Issue #162's history rebuild is re-parsing and rewriting the archive.
+    rebuild: bool,
+}
+
+/// Which writer a [`DurableWriteGuard`] holds the durable-write path for.
+#[derive(Debug, Clone, Copy)]
+enum DurableWriter {
+    Scan,
+    Rebuild,
+}
+
+/// RAII reservation of the durable-write path, from
+/// [`AppState::try_begin_rebuild`] or
+/// [`AppState::begin_scan_after_any_rebuild`].
+///
+/// Holding the `Arc` rather than borrowing keeps this usable from the
+/// background threads both writers run on, and makes release automatic on
+/// every exit path they have: the scan thread returns early whenever its
+/// generation is superseded, the rebuild thread returns early when the
+/// archive is unavailable, and either could panic. A flag cleared only on
+/// the success path would leave the app refusing every later rebuild until
+/// restart.
+pub struct DurableWriteGuard {
+    state: Arc<AppState>,
+    writer: DurableWriter,
+}
+
+/// Hand-written rather than derived: the guard holds an `Arc<AppState>`,
+/// which is not `Debug`. Naming the writer is all a failing assertion on a
+/// `Result<DurableWriteGuard, String>` needs.
+impl std::fmt::Debug for DurableWriteGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurableWriteGuard")
+            .field("writer", &self.writer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for DurableWriteGuard {
+    fn drop(&mut self) {
+        self.state.release_durable_writer(self.writer);
+    }
+}
+
 /// Durable-history archive lifecycle (#116). `AppState::new()` used to open
 /// and migrate the archive synchronously before Tauri's `.setup()` ran,
 /// which meant a chained schema migration on an existing install completed
@@ -233,11 +285,24 @@ pub struct AppState {
     /// None for an ordinary warm scan. Set once the cache is opened, before
     /// the scan's progress events start firing.
     pub cold_reason: Mutex<Option<crate::scan_cache::ColdReason>>,
-    /// True while issue #162's history rebuild is running, guarding against
-    /// a second one starting concurrently. `commands::rebuild_history` sets
-    /// this before spawning the background thread and clears it when that
-    /// thread finishes (success, cancellation, or failure alike).
-    pub rebuild_running: AtomicBool,
+    /// Which of the two writers that rewrite durable session snapshots — the
+    /// bulk scan and issue #162's history rebuild — is currently running.
+    ///
+    /// Both write to `durable_sessions`, so letting them overlap makes the
+    /// final state depend on interleaving: a scan replaying a cached
+    /// pre-#153 session can land after a rebuild has written the collapsed
+    /// one for the same key (issue #176 — the concurrent counterpart of
+    /// #174, which was the same defect across sequential launches). It also
+    /// invalidates the rebuild's own before/after byte evidence, since a
+    /// concurrent scan is mutating the thing being measured.
+    ///
+    /// Guarded by a mutex plus [`AppState::durable_writers_cv`] rather than
+    /// two atomics: "is a scan running, and if not mark a rebuild as
+    /// running" has to be one atomic step, or both writers can pass their
+    /// own check before either sets its flag.
+    durable_writers: Mutex<DurableWriters>,
+    /// Wakes [`AppState::begin_scan_after_any_rebuild`] when a rebuild ends.
+    durable_writers_cv: Condvar,
     /// Polled once per session by the rebuild's background thread; set by
     /// `commands::cancel_history_rebuild`. Reset before each rebuild starts.
     pub rebuild_cancel_requested: AtomicBool,
@@ -318,7 +383,8 @@ impl AppState {
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
             cold_reason: Mutex::new(None),
-            rebuild_running: AtomicBool::new(false),
+            durable_writers: Mutex::new(DurableWriters::default()),
+            durable_writers_cv: Condvar::new(),
             rebuild_cancel_requested: AtomicBool::new(false),
             rebuild_status: Mutex::new(HistoryRebuildSnapshot::default()),
             // Startup watcher events and the initial bulk scan share generation 1.
@@ -380,6 +446,74 @@ impl AppState {
             .wait_while(guard, |state| matches!(state, HistoryReadiness::Pending))
             .unwrap();
         HistoryReadinessKind::from(&*guard)
+    }
+
+    /// Reserves the durable-write path for issue #162's history rebuild,
+    /// refusing rather than waiting.
+    ///
+    /// Refuses when a bulk scan is running (issue #176): the two would
+    /// interleave writes to the same `durable_sessions` rows, and the
+    /// rebuild's before/after byte evidence would be measuring a ledger
+    /// another writer is concurrently changing. Refuses a second rebuild for
+    /// the reason it always did — two rebuilds against one connection.
+    ///
+    /// The returned guard releases the reservation when dropped, so a
+    /// rebuild thread that returns early, is cancelled, or panics cannot
+    /// leave the app permanently unable to start another one. The `Err` is
+    /// surfaced verbatim by `SettingsView`, so it is written for a user.
+    pub fn try_begin_rebuild(self: &Arc<Self>) -> Result<DurableWriteGuard, String> {
+        let mut writers = self.durable_writers.lock().unwrap();
+        if writers.rebuild {
+            return Err("a history rebuild is already running".into());
+        }
+        if writers.scan {
+            return Err(
+                "a session scan is running; wait for it to finish, then start the rebuild".into(),
+            );
+        }
+        writers.rebuild = true;
+        Ok(DurableWriteGuard {
+            state: Arc::clone(self),
+            writer: DurableWriter::Rebuild,
+        })
+    }
+
+    /// Reserves the durable-write path for a bulk scan, waiting out any
+    /// in-flight rebuild rather than refusing.
+    ///
+    /// The asymmetry with [`Self::try_begin_rebuild`] is deliberate. A
+    /// rebuild is user-triggered from Settings, so refusing it gives a
+    /// person an immediate, honest answer they can act on. A scan is
+    /// automatic — startup, and every settings change that alters the
+    /// source roots — so refusing one would silently drop the work that
+    /// makes a configuration change take effect. Waiting defers it instead,
+    /// mirroring how the same thread already waits out
+    /// [`Self::wait_for_history_ready`].
+    ///
+    /// Only a rebuild is waited for; two scans never overlap by
+    /// construction, since `scan_generation` already supersedes the older
+    /// one. There is no deadlock: a rebuild never waits for a scan.
+    pub fn begin_scan_after_any_rebuild(self: &Arc<Self>) -> DurableWriteGuard {
+        let writers = self.durable_writers.lock().unwrap();
+        let mut writers = self
+            .durable_writers_cv
+            .wait_while(writers, |writers| writers.rebuild)
+            .unwrap();
+        writers.scan = true;
+        DurableWriteGuard {
+            state: Arc::clone(self),
+            writer: DurableWriter::Scan,
+        }
+    }
+
+    fn release_durable_writer(&self, writer: DurableWriter) {
+        let mut writers = self.durable_writers.lock().unwrap();
+        match writer {
+            DurableWriter::Scan => writers.scan = false,
+            DurableWriter::Rebuild => writers.rebuild = false,
+        }
+        drop(writers);
+        self.durable_writers_cv.notify_all();
     }
 
     /// Resolves `Pending` to `Ready`/`Unavailable`. The only caller is
@@ -1588,7 +1722,8 @@ mod tests {
             scan_total: AtomicUsize::new(0),
             scan_elapsed_ms: AtomicU64::new(0),
             cold_reason: Mutex::new(None),
-            rebuild_running: AtomicBool::new(false),
+            durable_writers: Mutex::new(DurableWriters::default()),
+            durable_writers_cv: Condvar::new(),
             rebuild_cancel_requested: AtomicBool::new(false),
             rebuild_status: Mutex::new(HistoryRebuildSnapshot::default()),
             scan_generation: AtomicU64::new(1),
@@ -1923,6 +2058,109 @@ mod tests {
         let items = vec![(path, session("a", 1))];
         let results = state.reconcile_scanned_batch_if_current(generation, None, items);
         assert!(results.is_empty());
+    }
+
+    /// Issue #176: the two writers that rewrite `durable_sessions` must not
+    /// overlap. A scan replaying a cached pre-#153 session can otherwise
+    /// land after a rebuild has written the collapsed one for the same key,
+    /// making the final state depend on interleaving — and the rebuild's
+    /// before/after byte evidence would be measuring a ledger another
+    /// writer is changing underneath it.
+    #[test]
+    fn a_rebuild_is_refused_while_a_bulk_scan_holds_the_write_path() {
+        let state = Arc::new(AppState::new());
+        let scan = state.begin_scan_after_any_rebuild();
+
+        let refusal = state
+            .try_begin_rebuild()
+            .expect_err("a rebuild must not start while a scan is writing");
+        // Surfaced verbatim in Settings, so it has to tell a user what to
+        // do rather than name an internal flag.
+        assert!(
+            refusal.contains("scan is running"),
+            "unhelpful refusal text: {refusal}"
+        );
+
+        drop(scan);
+        assert!(
+            state.try_begin_rebuild().is_ok(),
+            "the scan's guard must release the write path when dropped"
+        );
+    }
+
+    #[test]
+    fn a_second_rebuild_is_still_refused_while_one_is_running() {
+        let state = Arc::new(AppState::new());
+        let first = state.try_begin_rebuild().expect("first rebuild");
+
+        let refusal = state.try_begin_rebuild().expect_err("second rebuild");
+        assert!(refusal.contains("already running"), "{refusal}");
+
+        drop(first);
+        assert!(state.try_begin_rebuild().is_ok());
+    }
+
+    /// The reason the reservation is an RAII guard rather than a flag
+    /// cleared on the success path: the rebuild thread returns early when
+    /// the archive is unavailable, can be cancelled, and can panic. Any of
+    /// those leaking the reservation would leave the app refusing every
+    /// later rebuild until restart.
+    #[test]
+    fn a_panicking_writer_still_releases_the_write_path() {
+        let state = Arc::new(AppState::new());
+
+        let panicking_state = Arc::clone(&state);
+        let panicked = std::thread::spawn(move || {
+            let _rebuild = panicking_state.try_begin_rebuild().expect("rebuild");
+            panic!("rebuild thread died");
+        })
+        .join();
+        assert!(panicked.is_err(), "the test thread was supposed to panic");
+
+        assert!(
+            state.try_begin_rebuild().is_ok(),
+            "a panicked rebuild must not wedge the write path shut"
+        );
+    }
+
+    /// The deliberate asymmetry with a rebuild's refusal: a scan is
+    /// automatic (startup, and every settings change that alters the source
+    /// roots), so refusing it would silently drop the work that makes a
+    /// configuration change take effect. It waits instead.
+    #[test]
+    fn a_scan_waits_for_an_in_flight_rebuild_rather_than_being_refused() {
+        let state = Arc::new(AppState::new());
+        let rebuild = state.try_begin_rebuild().expect("rebuild");
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let scan_state = Arc::clone(&state);
+        let scan = std::thread::spawn(move || {
+            let guard = scan_state.begin_scan_after_any_rebuild();
+            started_tx.send(()).expect("report scan start");
+            guard
+        });
+
+        // Still blocked while the rebuild holds the path. A timeout rather
+        // than an instantaneous check: the scan thread needs a moment to
+        // reach the wait at all, and this must fail if it sails past it.
+        assert!(
+            started_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the scan started writing while a rebuild was still running"
+        );
+
+        drop(rebuild);
+
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the scan must proceed once the rebuild releases the path");
+        let scan_guard = scan.join().expect("scan thread");
+
+        // And the scan now holds it, so the next rebuild is refused.
+        assert!(state.try_begin_rebuild().is_err());
+        drop(scan_guard);
+        assert!(state.try_begin_rebuild().is_ok());
     }
 
     #[test]

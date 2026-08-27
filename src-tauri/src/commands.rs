@@ -1270,6 +1270,18 @@ pub fn spawn_scan(
         // wholesale overwrite of the in-memory map.
         state.wait_for_history_ready();
 
+        // Reserve the durable-write path, waiting out an in-flight rebuild
+        // (issue #176) — the two would otherwise interleave writes to the
+        // same `durable_sessions` rows, and a scan replaying a cached
+        // pre-#153 session could land after the rebuild wrote the collapsed
+        // one for that key. Held for the rest of this thread, so every
+        // superseded-generation early return below releases it.
+        //
+        // Ordered after `wait_for_history_ready` deliberately: a rebuild
+        // cannot start until the archive is `Ready` anyway, so waiting here
+        // never holds the reservation across the archive's own opening.
+        let _durable_write = state.begin_scan_after_any_rebuild();
+
         // Allocate the archive generation before workers start. Live
         // watcher writes during discovery use the same generation,
         // preventing a newly created file from being falsely marked missing
@@ -1854,16 +1866,17 @@ pub fn get_history_status(state: State<'_, Arc<AppState>>) -> HistoryStatus {
 /// so the cost stays opt-in and schedulable — and confirmed by the frontend
 /// before this is ever called; this command does not confirm again.
 /// Rejects a concurrent second call while one is already running rather than
-/// running two at once against the same connection.
+/// running two at once against the same connection, and equally rejects one
+/// started while a bulk scan is running (issue #176) — both write durable
+/// session snapshots, so overlapping them makes the result depend on
+/// interleaving and invalidates the rebuild's own before/after evidence.
 #[tauri::command]
 pub fn rebuild_history(app: AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    if state.rebuild_running.swap(true, Ordering::AcqRel) {
-        return Err("a history rebuild is already running".into());
-    }
+    let reservation = state.try_begin_rebuild()?;
     state
         .rebuild_cancel_requested
         .store(false, Ordering::Release);
-    spawn_history_rebuild(app, state.inner().clone());
+    spawn_history_rebuild(app, state.inner().clone(), reservation);
     Ok(())
 }
 
@@ -1902,13 +1915,21 @@ pub fn get_history_rebuild_status(state: State<'_, Arc<AppState>>) -> HistoryReb
 /// This mirrors "history-progress"'s existing precedent instead — a second
 /// event/status pair built on the *same* done/total/complete shape and
 /// throttling rule, for a concern `scan-progress` does not own.
-pub fn spawn_history_rebuild(app: AppHandle, state: Arc<AppState>) {
+pub fn spawn_history_rebuild(
+    app: AppHandle,
+    state: Arc<AppState>,
+    reservation: crate::store::DurableWriteGuard,
+) {
     std::thread::spawn(move || {
+        // Moved onto this thread and dropped when it ends, however it ends:
+        // the early return below, a cancellation, a failure, or a panic all
+        // release the durable-write path (issue #176). Previously an atomic
+        // cleared only on the paths that reached `finish`.
+        let _reservation = reservation;
         let started = Instant::now();
         let finish = |status: HistoryRebuildSnapshot| {
             state.set_history_rebuild_status(status.clone());
             let _ = app.emit("history-rebuild-progress", &status);
-            state.rebuild_running.store(false, Ordering::Release);
         };
 
         let Some(history) = state.history_ready() else {
