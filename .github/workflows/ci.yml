@@ -238,8 +238,39 @@ jobs:
     # merge rather than only after. The Codecov *upload* stays informational
     # (continue-on-error, fail_ci_if_error: false below) since it depends on
     # GitHub OIDC and only authenticates while the repo is public — a PR
-    # context where that fails must not fail this job. Measured at ~2m16s-2m22s
-    # on recent pushes, under the "Check + test" job it runs alongside.
+    # context where that fails must not fail this job.
+    #
+    # Cadence reassessed against measured pipeline cost (issue #79), over a
+    # 50-run window (2026-08; 15 push runs, 37 PR runs):
+    #
+    #   job                     n   p50    p95   total runner-min
+    #   Check + test           44   166s   381s   145.4
+    #   Coverage               52   110s   250s   113.5   (31.5% of all CI minutes)
+    #   Minimum supported Rust 52    65s   148s    62.6
+    #   Visual regression      56    18s    85s    38.6
+    #
+    # Of Coverage's 113.5 min, the post-merge half is 28.9 min across 15
+    # pushes — 1.9 min per merge, 8.0% of total pipeline minutes. Moving it
+    # to a schedule or release candidates would recover roughly that, and no
+    # more.
+    #
+    # Kept per-merge anyway, because the push run is what makes the *PR* run
+    # mean anything: Codecov compares a PR's report against the base commit
+    # on main, and with no report uploaded for main's commits it falls back
+    # to the nearest ancestor that has one. On a schedule, the base would be
+    # up to a week stale, so `codecov/patch` on a PR would silently start
+    # measuring a delta against the wrong tree. That is a worse failure than
+    # the one it saves 1.9 min/merge to avoid — it is wrong rather than
+    # merely late, and it looks identical to being right.
+    #
+    # Failure ownership: this job is informational and never blocks a merge.
+    # The merge-blocking frontend coverage gate lives in "Check + test"
+    # ("Frontend tests and coverage gate") and is unaffected. If a Codecov
+    # upload fails, the run still passes; re-trigger with
+    # `gh run rerun <run-id> --job Coverage`, or push an empty commit.
+    #
+    # Revisit if Coverage's share of pipeline minutes materially exceeds the
+    # ~30% measured here, or if per-merge feedback stops being wanted.
     runs-on: ubuntu-22.04
     timeout-minutes: 15
 
