@@ -9,6 +9,7 @@ pub mod git_outcomes;
 pub mod harness_integration;
 pub mod history_store;
 pub mod instructions;
+pub mod mcp_server;
 pub mod memory;
 pub mod model;
 pub mod parser;

@@ -11,5 +11,9 @@ fn main() {
     if odometer_lib::report_cli::try_run_cli() {
         return;
     }
+    // Read-only stdio MCP server (issue #47), for local agents.
+    if odometer_lib::mcp_server::try_run_cli() {
+        return;
+    }
     odometer_lib::run();
 }
