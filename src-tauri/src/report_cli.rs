@@ -56,7 +56,7 @@ pub fn try_run_cli() -> bool {
     };
     if !matches!(
         command,
-        "status" | "report" | "quota" | "projects" | "metrics" | "mirrors"
+        "status" | "report" | "quota" | "projects" | "metrics" | "mirrors" | "sessions"
     ) {
         return false;
     }
@@ -85,6 +85,7 @@ fn run(command: &str, args: &[String]) -> Result<String> {
         "projects" => run_projects(args, format),
         "metrics" => run_metrics(args, format),
         "mirrors" => run_mirrors(format),
+        "sessions" => run_sessions(args, format),
         other => bail!("unknown command '{other}'"),
     }
 }
@@ -337,6 +338,111 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
                     "  (floor; unpriced: {})
 ",
                     report.unpriced_models.join(", ")
+                ));
+            }
+            out
+        }
+    })
+}
+
+/// Default listing length. Bounded because an unbounded list over a
+/// thousands-session corpus is unusable in a terminal; `--limit 0` shows
+/// everything for a script that wants it.
+const DEFAULT_SESSION_LIMIT: usize = 20;
+
+fn run_sessions(args: &[String], format: Format) -> Result<String> {
+    let store = open_ledger()?;
+    let rates = load_rates();
+    let config = Config::load().unwrap_or_default();
+    sessions_from(&store, &rates, &config, args, format)
+}
+
+/// The testable half of `sessions`.
+pub fn sessions_from(
+    store: &HistoryStore,
+    rates: &RateCard,
+    config: &Config,
+    args: &[String],
+    format: Format,
+) -> Result<String> {
+    let (from, to) = parse_window(args)?;
+    let limit = match flag_value(args, "--limit")? {
+        None => Some(DEFAULT_SESSION_LIMIT),
+        Some(raw) => {
+            let parsed: usize = raw
+                .parse()
+                .with_context(|| format!("--limit needs a whole number, got '{raw}'"))?;
+            // 0 means "no limit" rather than "show nothing", which is the
+            // only reading that is ever useful.
+            (parsed > 0).then_some(parsed)
+        }
+    };
+    let report = crate::query::session_report(
+        store,
+        rates,
+        harness_resolver(config),
+        from,
+        to,
+        limit,
+        Utc::now(),
+    )?;
+
+    Ok(match format {
+        Format::Json => serde_json::to_string_pretty(&report)?,
+        Format::Csv => {
+            let mut out = String::from(
+                "session_key,harness,total_tokens,input,output,cost,currency
+",
+            );
+            for session in &report.sessions {
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{}
+",
+                    session.session_key,
+                    session.harness,
+                    session.tokens.total_tokens,
+                    session.tokens.input_tokens,
+                    session.tokens.output_tokens,
+                    session
+                        .cost
+                        .map(|cost| format!("{cost:.6}"))
+                        .unwrap_or_default(),
+                    session.currency
+                ));
+            }
+            out
+        }
+        Format::Text => {
+            let mut out = String::new();
+            for session in &report.sessions {
+                out.push_str(&format!(
+                    "{:<44} {:>14} tokens",
+                    session.session_key, session.tokens.total_tokens
+                ));
+                match session.cost {
+                    Some(cost) => out.push_str(&format!("  {cost:.4} {}", session.currency)),
+                    None => out.push_str("  (unpriced)"),
+                }
+                if !session.unpriced_models.is_empty() {
+                    out.push_str(&format!(
+                        "  [floor; unpriced: {}]",
+                        session.unpriced_models.join(", ")
+                    ));
+                }
+                out.push('\n');
+            }
+            if out.is_empty() {
+                out.push_str(
+                    "no session activity in this window
+",
+                );
+            }
+            if let Some(limit) = report.truncated_to {
+                // Never silent: a truncated list that looks complete is how
+                // a total gets read as the whole picture.
+                out.push_str(&format!(
+                    "(showing the {limit} heaviest; pass --limit 0 for all)
+"
                 ));
             }
             out
