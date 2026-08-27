@@ -513,3 +513,121 @@ fn costs_are_reported_per_currency_and_never_summed_across_them() {
     assert_eq!(report.cost_by_currency.get("credits"), Some(&1.0));
     assert_eq!(report.cost_by_currency.get("USD"), Some(&1.0));
 }
+
+/// End-to-end through the CLI's own report path, against a real ledger.
+///
+/// The parsing and rendering halves are unit-tested; this covers the seam
+/// between them — flags in, ledger queried, output out — which is where a
+/// wiring mistake would live and where neither half's tests would look.
+#[test]
+fn the_report_command_renders_a_real_ledger_end_to_end() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{report_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "cli",
+            "real-model",
+            when.timestamp_millis(),
+            1_000_000,
+            0,
+        )],
+    );
+    let args: Vec<String> = ["--from", "2026-08-01", "--to", "2026-08-31"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+
+    let json = report_from(&store, &card(), &Config::default(), &args, Format::Json)
+        .expect("report renders");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+    assert_eq!(parsed["sessions"], 1);
+    assert_eq!(parsed["tokens"]["input_tokens"], 1_000_000);
+    assert_eq!(parsed["by_model"][0]["model"], "real-model");
+}
+
+/// A window that excludes every session must render an empty report rather
+/// than fail — "nothing happened in July" is an answer.
+#[test]
+fn the_report_command_renders_an_empty_window() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{report_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "cli",
+            "real-model",
+            when.timestamp_millis(),
+            1_000,
+            0,
+        )],
+    );
+    let args: Vec<String> = ["--from", "2026-07-01", "--to", "2026-07-31"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+
+    let text = report_from(&store, &card(), &Config::default(), &args, Format::Text)
+        .expect("an empty window is an answer, not an error");
+
+    assert!(text.contains("sessions with usage: 0"), "{text}");
+    assert!(text.contains("total cost: unavailable"), "{text}");
+}
+
+/// A reversed range is rejected rather than silently returning nothing,
+/// which would look identical to a quiet month.
+#[test]
+fn the_report_command_rejects_a_reversed_range() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{report_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+    let args: Vec<String> = ["--from", "2026-08-31", "--to", "2026-08-01"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+
+    assert!(report_from(&store, &card(), &Config::default(), &args, Format::Text).is_err());
+}
+
+/// `status` reports the ledger it was given, and says "unavailable" rather
+/// than 0 when there is none — a zero session count would read as an empty
+/// install rather than an unreadable one.
+#[test]
+fn status_distinguishes_an_unavailable_ledger_from_an_empty_one() {
+    use odometer_lib::report_cli::{render_status, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "one",
+            "real-model",
+            when.timestamp_millis(),
+            10,
+            10,
+        )],
+    );
+
+    let present = render_status(Some(&store), &card(), Format::Json).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&present).unwrap();
+    assert_eq!(parsed["ledger_available"], true);
+    assert_eq!(parsed["sessions"], 1);
+
+    let absent = render_status(None, &card(), Format::Json).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&absent).unwrap();
+    assert_eq!(parsed["ledger_available"], false);
+    assert!(
+        parsed["sessions"].is_null(),
+        "an unreadable ledger must not report 0 sessions"
+    );
+}

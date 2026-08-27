@@ -24,7 +24,7 @@ use crate::rates::RateCard;
 
 /// Output shape a subcommand renders in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Format {
+pub enum Format {
     Json,
     Csv,
     Text,
@@ -143,15 +143,21 @@ fn open_ledger() -> Result<HistoryStore> {
 }
 
 fn run_status(format: Format) -> Result<String> {
-    let rates = load_rates();
-    let store = open_ledger().ok();
+    render_status(open_ledger().ok().as_ref(), &load_rates(), format)
+}
+
+/// The testable half of `status`: everything except resolving the ledger
+/// path and rate card from the user's real directories, which a test cannot
+/// supply without writing to them.
+pub fn render_status(
+    store: Option<&HistoryStore>,
+    rates: &RateCard,
+    format: Format,
+) -> Result<String> {
     let sessions = store
-        .as_ref()
         .and_then(|store| store.session_keys().ok())
         .map(|keys| keys.len());
-    let ledger_bytes = store
-        .as_ref()
-        .and_then(|store| store.database_footprint().total_bytes());
+    let ledger_bytes = store.and_then(|store| store.database_footprint().total_bytes());
 
     let status = StatusReport {
         schema_version: STATUS_SCHEMA_VERSION,
@@ -198,6 +204,21 @@ fn run_status(format: Format) -> Result<String> {
 }
 
 fn run_report(args: &[String], format: Format) -> Result<String> {
+    let store = open_ledger()?;
+    let rates = load_rates();
+    let config = Config::load().unwrap_or_default();
+    report_from(&store, &rates, &config, args, format)
+}
+
+/// The testable half of `report`, taking its inputs rather than resolving
+/// them from the user's real ledger and configuration.
+pub fn report_from(
+    store: &HistoryStore,
+    rates: &RateCard,
+    config: &Config,
+    args: &[String],
+    format: Format,
+) -> Result<String> {
     let from = flag_value(args, "--from")?
         .map(|value| parse_date(&value, false))
         .transpose()?;
@@ -210,12 +231,8 @@ fn run_report(args: &[String], format: Format) -> Result<String> {
         }
     }
 
-    let store = open_ledger()?;
-    let rates = load_rates();
-    let config = Config::load().unwrap_or_default();
-    let harness_for = harness_resolver(&config);
-
-    let report = range_report(&store, &rates, harness_for, from, to, Utc::now())?;
+    let harness_for = harness_resolver(config);
+    let report = range_report(store, rates, harness_for, from, to, Utc::now())?;
     render_report(&report, format)
 }
 
