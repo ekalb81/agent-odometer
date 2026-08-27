@@ -1425,12 +1425,32 @@ pub fn spawn_scan(
         // evidence of its cost.
         crate::memory::record_phase_sample(&state.performance, "rollup_rebuild", "before");
         let rollup_rebuild_started = Instant::now();
-        let rollups_rebuilt = state.finalize_bulk_scan_rollups();
+        let rollup_outcome = state.finalize_bulk_scan_rollups();
+        // `scope` and `sessions` alongside `rebuilt` (issue #154): every
+        // recording from v0.8.9 on reported `rebuilt: true` on every launch,
+        // which could not distinguish a rebuild proportional to what the scan
+        // changed from a full O(entire ledger) recompute. Those are now the
+        // two cases this phase can take, and the metric has to say which.
+        let (rebuilt, scope, sessions) = match rollup_outcome {
+            crate::history_store::RollupRebuildOutcome::NothingDeferred => {
+                (false, "none", String::from("0"))
+            }
+            crate::history_store::RollupRebuildOutcome::Scoped { sessions } => {
+                (true, "deferred_sessions", sessions.to_string())
+            }
+            crate::history_store::RollupRebuildOutcome::EntireLedger => {
+                (true, "entire_ledger", String::from("all"))
+            }
+        };
         state.performance.record_backend(
             "startup.bulk_scan.rollup_rebuild",
             rollup_rebuild_started,
             true,
-            BTreeMap::from([("rebuilt".into(), rollups_rebuilt.to_string())]),
+            BTreeMap::from([
+                ("rebuilt".into(), rebuilt.to_string()),
+                ("scope".into(), scope.into()),
+                ("sessions".into(), sessions),
+            ]),
         );
         crate::memory::record_phase_sample(&state.performance, "rollup_rebuild", "after");
 

@@ -1,6 +1,7 @@
 use crate::config_events::ConfigWatcherHandle;
 use crate::correlation::ExternalEvent;
 use crate::history_store::HistoryStore;
+use crate::history_store::RollupRebuildOutcome;
 use crate::model::{ResidentSession, Session, SessionSummary, SourceAvailability};
 use crate::scanner::ScanReport;
 use crate::watcher::WatcherHandle;
@@ -1148,25 +1149,33 @@ impl AppState {
     /// once per completed (non-superseded) scan, unconditionally — whether
     /// or not the scan reported parse failures, since a deferred rollup is
     /// orthogonal to whether source availability could be finalized.
-    /// Returns whether a rebuild actually ran, for the caller's metric
-    /// (issue #140): "nothing was deferred" and "rebuilt" both take this
-    /// path, and only a recording can otherwise tell them apart.
-    pub fn finalize_bulk_scan_rollups(&self) -> bool {
+    /// Returns what the rebuild actually did, for the caller's metric (issue
+    /// #140/#154): "nothing was deferred", "rebuilt the deferred sessions",
+    /// and "rebuilt everything" all take this path, and only a recording can
+    /// otherwise tell them apart.
+    ///
+    /// Clearing every in-memory `rollup_deferred_stale` marker stays correct
+    /// now that the rebuild is scoped (issue #154). Every session this
+    /// process deferred recorded a durable pending row at the same time, and
+    /// those rows are only ever deleted by a rebuild — so the scoped rebuild
+    /// covers at least this process's deferred set, and possibly more (rows
+    /// left by a previous run that died mid-scan).
+    pub fn finalize_bulk_scan_rollups(&self) -> RollupRebuildOutcome {
         let Some(history) = self.history_ready() else {
-            return false;
+            return RollupRebuildOutcome::NothingDeferred;
         };
-        match history.rebuild_rollups_if_stale() {
-            Ok(true) => {
+        match history.rebuild_rollups_if_stale_reporting_scope() {
+            Ok(RollupRebuildOutcome::NothingDeferred) => RollupRebuildOutcome::NothingDeferred,
+            Ok(outcome) => {
                 self.rollup_deferred_stale.clear();
-                true
+                outcome
             }
-            Ok(false) => false,
             Err(error) => {
                 tracing::warn!(
                     "could not rebuild durable history rollups after scan: {}",
                     error
                 );
-                false
+                RollupRebuildOutcome::NothingDeferred
             }
         }
     }
