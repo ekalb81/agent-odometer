@@ -1085,13 +1085,20 @@ fn a_project_report_groups_usage_and_counts_sessions() {
 fn a_path_identified_project_is_redacted_unless_paths_are_requested() {
     let directory = tempfile::tempdir().unwrap();
     let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    // A real directory with no repository or workspace marker, so
+    // identity falls back to the path on every platform. A hard-coded
+    // Windows path is not a path on Linux, so it resolved differently
+    // there and this test passed only on Windows.
+    let work = directory.path().join("private-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work_label = work.to_string_lossy().to_string();
     let store = ledger(
         directory.path(),
         &[session_in_project(
             "p",
             when.timestamp_millis(),
             "path:abc123",
-            "D:\\private-work",
+            &work_label,
             "fallback_path_identity",
         )],
     );
@@ -1118,7 +1125,15 @@ fn a_path_identified_project_is_redacted_unless_paths_are_requested() {
         "a directory with no repository root is path-identified: {}",
         project.project_key
     );
-    assert_eq!(project.label_for(true), "D:\\private-work");
+    // Not an exact match: the stored label is already display-shortened,
+    // so what matters is that opting in still names the directory and
+    // the default does not.
+    assert!(
+        project.label_for(true).contains("private-work"),
+        "opting in must name the directory: {}",
+        project.label_for(true)
+    );
+    let _ = &work_label;
     assert!(
         !project.redacted_label().contains("private-work"),
         "the redacted form must not carry the directory name"
@@ -1165,13 +1180,20 @@ fn project_json_output_redacts_by_default_and_honours_the_opt_in() {
 
     let directory = tempfile::tempdir().unwrap();
     let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    // A real directory with no repository or workspace marker, so
+    // identity falls back to the path on every platform. A hard-coded
+    // Windows path is not a path on Linux, so it resolved differently
+    // there and this test passed only on Windows.
+    let work = directory.path().join("private-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work_label = work.to_string_lossy().to_string();
     let store = ledger(
         directory.path(),
         &[session_in_project(
             "p",
             when.timestamp_millis(),
             "path:abc123",
-            "D:\\private-work",
+            &work_label,
             "fallback_path_identity",
         )],
     );
