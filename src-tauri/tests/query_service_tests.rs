@@ -1523,3 +1523,67 @@ fn metrics_text_output_marks_a_metric_with_no_evidence() {
         "a metric with no denominator must read as unavailable, not 0: {rendered}"
     );
 }
+
+#[test]
+fn metrics_csv_output_carries_the_denominator_and_its_description() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{metrics_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "csv",
+            "real-model",
+            when.timestamp_millis(),
+            1_000,
+            250,
+        )],
+    );
+
+    let rendered = metrics_from(&store, &card(), &Config::default(), &[], Format::Csv).unwrap();
+    let mut lines = rendered.lines();
+
+    assert_eq!(
+        lines.next().unwrap(),
+        "metric,value,numerator,denominator,denominator_is"
+    );
+    let rows: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    assert_eq!(rows.len(), 5, "one row per metric");
+    let ratio = rows
+        .iter()
+        .find(|row| row.starts_with("context_to_output_ratio,"))
+        .expect("the ratio row");
+    // The description contains a comma-free phrase today, but the field is
+    // quoted through the same helper the projects report uses, so a future
+    // wording change cannot shift the columns.
+    assert!(ratio.contains("1000"), "{ratio}");
+    assert!(ratio.contains("250"), "{ratio}");
+}
+
+#[test]
+fn metrics_json_output_parses_and_keeps_absent_values_null() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{metrics_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = metrics_from(&store, &card(), &Config::default(), &[], Format::Json).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    assert_eq!(
+        parsed["schema_version"],
+        odometer_lib::query::WORKFLOW_METRICS_VERSION
+    );
+    for metric in parsed["metrics"].as_array().expect("metrics array") {
+        assert!(
+            metric["value"].is_null(),
+            "an absent value must be null, not 0: {metric}"
+        );
+        assert!(metric["denominator_is"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()));
+    }
+}
