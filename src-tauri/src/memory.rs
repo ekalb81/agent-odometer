@@ -215,6 +215,64 @@ pub(crate) fn reset_heap_peak_to_current() {
     HEAP_PEAK_BYTES.store(heap_allocated_bytes_raw(), Ordering::Relaxed);
 }
 
+/// Serializes every test that touches the process-wide heap-tracking
+/// statics, and restores the disabled default when each one finishes.
+///
+/// `cargo test` runs a crate's unit tests as many threads inside a single
+/// process, so `HEAP_TRACKING_ENABLED` and the three byte counters are
+/// shared by every test at once. Two tests that both call
+/// [`configure_heap_tracking`] therefore interleave: one enabling tracking
+/// while another asserts it is disabled makes the second fail, on code that
+/// is correct. That is issue #180 — a flake around the one counter whose
+/// job is to be trusted when a number looks wrong, which trains people to
+/// re-run rather than read.
+///
+/// Taking this guard is what makes a heap test's assertions meaningful. It
+/// is deliberately not a `configure_heap_tracking` implementation detail:
+/// production code sets the toggle from a settings save on the main thread
+/// and must not pay for a mutex, and the allocator hot path must stay one
+/// relaxed load when disabled.
+///
+/// The lock is intentionally recovered from poisoning. A panicking heap test
+/// leaves the statics in whatever state it reached, which the `Drop` below
+/// then resets — so a single failing test reports its own failure rather
+/// than cascading into every other heap test as a poison error.
+#[cfg(test)]
+static HEAP_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII handle returned by [`lock_heap_for_test`]. Disables heap tracking on
+/// drop, before releasing the lock, so the next test to take it starts from
+/// the documented process default rather than from whatever the previous
+/// test left behind.
+#[cfg(test)]
+pub(crate) struct HeapTestGuard(
+    // Never read: held solely so the lock is released when this guard drops,
+    // which must happen *after* `Drop::drop` below has reset the statics.
+    #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+);
+
+#[cfg(test)]
+impl Drop for HeapTestGuard {
+    fn drop(&mut self) {
+        configure_heap_tracking(false);
+    }
+}
+
+/// Acquires exclusive access to the heap-tracking statics for the duration
+/// of one test, and leaves tracking disabled when the returned guard drops.
+///
+/// Hold it for the whole test — including the allocations being measured,
+/// not just the [`configure_heap_tracking`] calls — since the counting
+/// allocator attributes *every* thread's allocations to the same counters.
+#[cfg(test)]
+pub(crate) fn lock_heap_for_test() -> HeapTestGuard {
+    let guard = HEAP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    configure_heap_tracking(false);
+    HeapTestGuard(guard)
+}
+
 /// Heap reading shaped for a recorded event: `None` in both byte fields
 /// whenever tracking is disabled, so a JSONL consumer can tell "0 bytes
 /// tracked" apart from "not tracked" instead of a bare 0 meaning either.
@@ -1079,14 +1137,21 @@ pub fn live_status(performance: &PerformanceRecorder) -> MemoryLiveStatus {
 mod tests {
     use super::*;
 
-    // Heap-tracking assertions in this module check the enabled/disabled
-    // *shape* (Some vs None, toggle state) rather than exact byte deltas:
-    // `HEAP_ALLOCATED_BYTES`/`HEAP_PEAK_BYTES` are process-wide statics, and
-    // `cargo test` runs many tests concurrently on threads that all share
-    // them, so an exact-delta assertion here would be flaky by construction
-    // (see the `#[ignore]`d probes in `model.rs`/`history_store.rs`, which
-    // accept that trade-off deliberately and instead document running them
-    // filtered to a single test name).
+    // Every test below that touches heap tracking takes
+    // `lock_heap_for_test()` first: `HEAP_TRACKING_ENABLED` and the byte
+    // counters are process-wide statics shared by all of `cargo test`'s
+    // concurrent test threads, so without it one test enabling tracking
+    // races another asserting it is disabled (issue #180).
+    //
+    // The lock makes the *toggle* reliable. It does not make exact byte
+    // deltas reliable: the counting allocator still attributes allocations
+    // from non-test threads (and from any test not holding the lock) to the
+    // same counters, so assertions here check the enabled/disabled shape
+    // (Some vs None, toggle state) or a generous bound, never an exact
+    // delta. The `#[ignore]`d probes in `model.rs`/`history_store.rs` want
+    // exact deltas and take the same lock, which is necessary but not
+    // sufficient — they are additionally documented to run filtered to a
+    // single test name.
 
     #[test]
     fn database_footprint_reports_sizes_and_volume_headroom() {
@@ -1129,6 +1194,8 @@ mod tests {
 
     #[test]
     fn heap_tracking_is_disabled_by_default() {
+        let _heap = lock_heap_for_test();
+
         assert!(!heap_tracking_enabled());
         let sample = heap_sample();
         assert_eq!(sample.current_bytes, None);
@@ -1137,6 +1204,8 @@ mod tests {
 
     #[test]
     fn disabling_heap_tracking_clears_and_reports_unavailable() {
+        let _heap = lock_heap_for_test();
+
         configure_heap_tracking(true);
         assert!(heap_tracking_enabled());
         let enabled_sample = heap_sample();
@@ -1162,12 +1231,15 @@ mod tests {
     /// Settings toggle takes every time, since it enables tracking
     /// mid-process against an already-live heap. Bounding the reading well
     /// below the wrapped magnitude (rather than asserting an exact value,
-    /// which would be flaky under `cargo test`'s concurrent execution
-    /// sharing these process-wide statics — see this module's other heap
-    /// tests) is enough to tell "sound, possibly low" apart from "wrapped".
+    /// which stays unreliable even under this module's heap lock, since the
+    /// counting allocator also sees allocations from threads that never take
+    /// it — see the note at the top of this module) is enough to tell
+    /// "sound, possibly low" apart from "wrapped".
     #[test]
     fn dealloc_of_a_pre_enable_allocation_does_not_underflow_or_wrap() {
-        configure_heap_tracking(false);
+        // Also leaves tracking disabled on the way in, which this test
+        // depends on: the allocation below must be genuinely untracked.
+        let _heap = lock_heap_for_test();
 
         // Allocate while tracking is off, so this allocation is genuinely
         // untracked — `alloc` never added its bytes to any counter.
@@ -1211,8 +1283,56 @@ mod tests {
             sample.possibly_undercounted,
             "freeing a pre-enable allocation must be flagged as an undercount, not presented as trustworthy"
         );
+    }
 
-        configure_heap_tracking(false);
+    /// The regression test for #180 itself: two threads doing exactly what
+    /// two concurrent heap tests do — take the lock, find tracking disabled,
+    /// enable it, drop — must never observe each other's enabled window.
+    ///
+    /// Each thread asserts the invariant [`lock_heap_for_test`] promises
+    /// (tracking is disabled on entry) *while holding the lock*, which is
+    /// the assertion that failed intermittently before this guard existed.
+    /// Without serialization one thread's `configure_heap_tracking(true)`
+    /// lands inside the other's window and the entry assertion fails.
+    #[test]
+    fn heap_test_lock_serializes_toggling_and_restores_the_disabled_default() {
+        const THREADS: usize = 4;
+        const ROUNDS: usize = 50;
+
+        let observed_enabled_on_entry = Arc::new(AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let observed = Arc::clone(&observed_enabled_on_entry);
+                std::thread::spawn(move || {
+                    for _ in 0..ROUNDS {
+                        let _heap = lock_heap_for_test();
+
+                        // The guard's contract: whatever the previous holder
+                        // did, this one starts from the process default.
+                        if heap_tracking_enabled() {
+                            observed.fetch_add(1, Ordering::Relaxed);
+                        }
+
+                        configure_heap_tracking(true);
+                        assert!(heap_tracking_enabled());
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("heap lock thread panicked");
+        }
+
+        assert_eq!(
+            observed_enabled_on_entry.load(Ordering::Relaxed),
+            0,
+            "a thread saw tracking already enabled on entry, so the heap statics are not serialized"
+        );
+        // And the last guard to drop left the process back at its default,
+        // rather than leaking an enabled window into unrelated tests.
+        assert!(!heap_tracking_enabled());
     }
 
     #[test]
