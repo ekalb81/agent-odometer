@@ -985,3 +985,340 @@ fn quota_point(
         observation_count: 1,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Per-project reporting (issue #47's `projects`, over #41's dimension).
+// ---------------------------------------------------------------------------
+
+/// A session whose stored project identity is set directly, so a test can
+/// choose the provenance without needing a real repository on disk.
+fn session_in_project(
+    id: &str,
+    when_ms: i64,
+    project_key: &str,
+    label: &str,
+    provenance: &str,
+) -> Session {
+    let mut session = session_at(id, "real-model", when_ms, 1_000, 100);
+    session.working_directory = Some(label.to_string());
+    session.project_key = Some(project_key.to_string());
+    session.project_label = Some(label.to_string());
+    session.project_provenance = Some(match provenance {
+        "fallback_path_identity" => {
+            odometer_lib::project_identity::ProjectProvenance::FallbackPathIdentity
+        }
+        _ => odometer_lib::project_identity::ProjectProvenance::RepositoryRoot,
+    });
+    session
+}
+
+#[test]
+fn a_project_report_groups_usage_and_counts_sessions() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    // Real, distinct directories: project identity is computed from the
+    // working directory, so two sessions only share a project when they
+    // genuinely share a directory.
+    let shared = directory.path().join("shared-project");
+    let other = directory.path().join("other-project");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[
+            session_in_project(
+                "a",
+                when.timestamp_millis(),
+                "repo:one",
+                &shared.to_string_lossy(),
+                "repository_root",
+            ),
+            session_in_project(
+                "b",
+                when.timestamp_millis() + 3_600_000,
+                "repo:one",
+                &shared.to_string_lossy(),
+                "repository_root",
+            ),
+            session_in_project(
+                "c",
+                when.timestamp_millis(),
+                "repo:two",
+                &other.to_string_lossy(),
+                "repository_root",
+            ),
+        ],
+    );
+
+    let report = odometer_lib::query::project_report(
+        &store,
+        &card(),
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Utc::now(),
+    )
+    .expect("report");
+
+    // The store recomputes `project_key` from the working directory, so the
+    // assertion is on the grouping, not on a synthetic key.
+    assert_eq!(report.projects.len(), 2);
+    let mut counts: Vec<usize> = report
+        .projects
+        .iter()
+        .map(|project| project.sessions)
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(counts, vec![1, 2]);
+    let two_session = report
+        .projects
+        .iter()
+        .find(|project| project.sessions == 2)
+        .expect("the shared-directory project");
+    assert_eq!(two_session.tokens.input_tokens, 2_000);
+}
+
+/// #41's redaction contract, applied where data leaves the desktop. A
+/// `fallback_path_identity` label *is* an absolute local path, and CLI
+/// output gets piped into files and pasted into issues.
+#[test]
+fn a_path_identified_project_is_redacted_unless_paths_are_requested() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    // A real directory with no repository or workspace marker, so
+    // identity falls back to the path on every platform. A hard-coded
+    // Windows path is not a path on Linux, so it resolved differently
+    // there and this test passed only on Windows.
+    let work = directory.path().join("private-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work_label = work.to_string_lossy().to_string();
+    let store = ledger(
+        directory.path(),
+        &[session_in_project(
+            "p",
+            when.timestamp_millis(),
+            "path:abc123",
+            &work_label,
+            "fallback_path_identity",
+        )],
+    );
+
+    let report = odometer_lib::query::project_report(
+        &store,
+        &card(),
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Utc::now(),
+    )
+    .expect("report");
+
+    let project = &report.projects[0];
+    assert!(project.label_is_path);
+    assert_eq!(
+        project.redacted_label(),
+        project.project_key,
+        "a path label must fall back to the already-hashed key"
+    );
+    assert!(
+        project.project_key.starts_with("path:"),
+        "a directory with no repository root is path-identified: {}",
+        project.project_key
+    );
+    // Not an exact match: the stored label is already display-shortened,
+    // so what matters is that opting in still names the directory and
+    // the default does not.
+    assert!(
+        project.label_for(true).contains("private-work"),
+        "opting in must name the directory: {}",
+        project.label_for(true)
+    );
+    let _ = &work_label;
+    assert!(
+        !project.redacted_label().contains("private-work"),
+        "the redacted form must not carry the directory name"
+    );
+}
+
+/// A repository-root label is a project name, not a path, so it is not
+/// redacted — over-redacting would make the report useless.
+#[test]
+fn a_repository_project_label_is_not_redacted() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_in_project(
+            "r",
+            when.timestamp_millis(),
+            "repo:abc",
+            "my-project",
+            "repository_root",
+        )],
+    );
+
+    let report = odometer_lib::query::project_report(
+        &store,
+        &card(),
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Utc::now(),
+    )
+    .expect("report");
+
+    assert!(!report.projects[0].label_is_path);
+    assert_eq!(report.projects[0].redacted_label(), "my-project");
+}
+
+/// JSON is the format most likely to be stored or piped, so its labels must
+/// be redacted too — not just the human-readable text output.
+#[test]
+fn project_json_output_redacts_by_default_and_honours_the_opt_in() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{projects_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    // A real directory with no repository or workspace marker, so
+    // identity falls back to the path on every platform. A hard-coded
+    // Windows path is not a path on Linux, so it resolved differently
+    // there and this test passed only on Windows.
+    let work = directory.path().join("private-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work_label = work.to_string_lossy().to_string();
+    let store = ledger(
+        directory.path(),
+        &[session_in_project(
+            "p",
+            when.timestamp_millis(),
+            "path:abc123",
+            &work_label,
+            "fallback_path_identity",
+        )],
+    );
+
+    let default = projects_from(&store, &card(), &Config::default(), &[], Format::Json).unwrap();
+    assert!(
+        !default.contains("private-work"),
+        "default JSON must not carry a local path: {default}"
+    );
+
+    let opted_in = projects_from(
+        &store,
+        &card(),
+        &Config::default(),
+        &["--include-paths".to_string()],
+        Format::Json,
+    )
+    .unwrap();
+    assert!(opted_in.contains("private-work"));
+}
+
+/// Sessions with usage but no project are counted, not dropped — otherwise
+/// per-project totals silently fail to reconcile with the overall report.
+#[test]
+fn sessions_without_a_project_are_reported_rather_than_dropped() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut orphan = session_at("orphan", "real-model", when.timestamp_millis(), 1_000, 0);
+    orphan.working_directory = None;
+    orphan.project_key = None;
+    orphan.project_label = None;
+    orphan.project_provenance = None;
+    let store = ledger(directory.path(), &[orphan]);
+
+    let report = odometer_lib::query::project_report(
+        &store,
+        &card(),
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Utc::now(),
+    )
+    .expect("report");
+
+    assert!(report.projects.is_empty());
+    assert_eq!(report.sessions_without_project, 1);
+}
+
+#[test]
+fn project_csv_output_quotes_labels_and_names_the_currency() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{projects_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    // A label with a comma in it: aliases are user-supplied, so an
+    // unquoted field would shift every later column in a spreadsheet.
+    let work = directory.path().join("comma, project");
+    std::fs::create_dir_all(&work).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_in_project(
+            "c",
+            when.timestamp_millis(),
+            "repo:comma",
+            &work.to_string_lossy(),
+            "repository_root",
+        )],
+    );
+
+    let rendered = projects_from(
+        &store,
+        &card(),
+        &Config::default(),
+        &["--include-paths".to_string()],
+        Format::Csv,
+    )
+    .unwrap();
+    let mut lines = rendered.lines();
+
+    assert_eq!(
+        lines.next().unwrap(),
+        "project_key,label,sessions,total_tokens,cost,currency"
+    );
+    let row = lines.next().expect("one project row");
+    assert!(
+        row.contains('"'),
+        "a label containing a comma must be quoted: {row}"
+    );
+}
+
+#[test]
+fn project_text_output_says_so_when_the_window_is_empty() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{projects_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = projects_from(&store, &card(), &Config::default(), &[], Format::Text).unwrap();
+
+    assert!(
+        rendered.contains("no project activity"),
+        "an empty window is an answer, not blank output: {rendered}"
+    );
+}
+
+#[test]
+fn project_text_output_reports_orphan_sessions() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{projects_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut orphan = session_at("orphan", "real-model", when.timestamp_millis(), 1_000, 0);
+    orphan.working_directory = None;
+    orphan.project_key = None;
+    orphan.project_label = None;
+    orphan.project_provenance = None;
+    let store = ledger(directory.path(), &[orphan]);
+
+    let rendered = projects_from(&store, &card(), &Config::default(), &[], Format::Text).unwrap();
+
+    assert!(
+        rendered.contains("belong to no project"),
+        "orphans must be visible so totals reconcile: {rendered}"
+    );
+}

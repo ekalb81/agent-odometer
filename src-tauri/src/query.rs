@@ -393,3 +393,191 @@ pub fn quota_snapshots(
     }
     Ok(index.snapshots(now, max_cache_age))
 }
+
+/// Usage for one project in a reported window.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectUsage {
+    /// Effective (post-merge) project key. Always safe to emit: it is a
+    /// hash (`repo:…` / `path:…`), never a path.
+    pub project_key: String,
+    /// Local alias when set, else the auto-computed label. For a
+    /// `fallback_path_identity` project the auto label *is* an absolute
+    /// local path, so a caller that emits this off-device must redact —
+    /// see [`ProjectUsage::redacted_label`].
+    pub label: String,
+    /// True when `label` is an absolute local path rather than a project
+    /// name, because no repository or workspace root was found.
+    pub label_is_path: bool,
+    pub sessions: usize,
+    pub tokens: TokenTotals,
+    /// Totals keyed by currency, never summed across them — the same rule
+    /// [`RangeReport`] follows and for the same reason.
+    pub cost_by_currency: BTreeMap<String, f64>,
+}
+
+/// A per-project usage report (issue #47's `projects` command, over #41's
+/// project dimension).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectReport {
+    pub schema_version: u32,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub projects: Vec<ProjectUsage>,
+    /// Sessions with usage in the window that belong to no project — a real
+    /// state (no working directory), reported rather than dropped so the
+    /// per-project totals can be reconciled against the overall one.
+    pub sessions_without_project: usize,
+}
+
+pub const PROJECT_REPORT_SCHEMA_VERSION: u32 = 1;
+
+impl ProjectUsage {
+    /// The label as it should appear in anything that can leave the device.
+    ///
+    /// `project_identity`'s contract puts redaction at "the presentation
+    /// layer, applied where data leaves the desktop". A CLI is such a layer:
+    /// its output gets piped into files, pasted into issues, and read by
+    /// agents. So a path-derived label falls back to the already-hashed
+    /// project key, which stays stable and correlatable across runs without
+    /// naming a directory on this machine.
+    pub fn redacted_label(&self) -> &str {
+        if self.label_is_path {
+            &self.project_key
+        } else {
+            &self.label
+        }
+    }
+
+    /// [`Self::redacted_label`], or the exact label when the caller has
+    /// explicitly opted in to local paths.
+    pub fn label_for(&self, include_paths: bool) -> &str {
+        if include_paths {
+            &self.label
+        } else {
+            self.redacted_label()
+        }
+    }
+}
+
+/// Groups windowed usage by project, applying the local alias and merge
+/// overrides (#41) exactly as the desktop does.
+///
+/// Reads project identity from `durable_sessions`' own columns rather than
+/// from session content, so this costs a column scan plus the rollup reads
+/// `range_report` already makes — not a walk of the corpus.
+pub fn project_report(
+    store: &HistoryStore,
+    rates: &RateCard,
+    harness_for: impl Fn(&str) -> String,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<ProjectReport> {
+    let overrides: std::collections::HashMap<String, crate::history_store::ProjectOverrideRow> =
+        store
+            .list_project_overrides()?
+            .into_iter()
+            .map(|row| (row.project_key.clone(), row))
+            .collect();
+    let session_overrides = store.list_session_project_overrides()?;
+    let rows = store.session_project_rows()?;
+    let keys: Vec<String> = rows.iter().map(|row| row.session_key.clone()).collect();
+    let totals = store
+        .range_totals_multi(&keys, &[(from, to)])?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+
+    struct Accumulated {
+        label: String,
+        label_is_path: bool,
+        sessions: usize,
+        tokens: TokenTotals,
+        buckets: Vec<TierBucket>,
+        harness: String,
+    }
+    let mut by_project: BTreeMap<String, Accumulated> = BTreeMap::new();
+    let mut without_project = 0usize;
+
+    for row in &rows {
+        let Some(range) = totals.get(&row.session_key) else {
+            continue;
+        };
+        if range.tokens.total_tokens == 0 && range.buckets.is_empty() {
+            continue;
+        }
+        // A per-session reassignment (#41) wins over the auto-computed key,
+        // then merges fold that into its canonical project.
+        let raw = session_overrides
+            .get(&row.session_key)
+            .cloned()
+            .or_else(|| row.project_key.clone());
+        let Some(raw) = raw else {
+            without_project += 1;
+            continue;
+        };
+        let canonical = crate::history_store::resolve_canonical_project_key(&overrides, &raw);
+        let alias = overrides
+            .get(&canonical)
+            .and_then(|row| row.display_label.clone());
+        let aliased = alias.is_some();
+        let label = alias
+            .or_else(|| row.label.clone())
+            .unwrap_or_else(|| canonical.clone());
+
+        let entry = by_project.entry(canonical).or_insert_with(|| Accumulated {
+            label,
+            // An explicit local alias replaces the path entirely, so a
+            // renamed project is no longer path-identified.
+            label_is_path: !aliased && row.provenance.as_deref() == Some("fallback_path_identity"),
+            sessions: 0,
+            tokens: TokenTotals::default(),
+            buckets: Vec::new(),
+            harness: harness_for(&row.session_key),
+        });
+        entry.sessions += 1;
+        accumulate(&mut entry.tokens, &range.tokens);
+        entry.buckets.extend(range.buckets.iter().cloned());
+    }
+
+    let projects = by_project
+        .into_iter()
+        .map(|(project_key, accumulated)| {
+            // Only the path-identity case carries a path: a repository or
+            // workspace root yields a name.
+            let label_is_path = accumulated.label_is_path;
+            let mut cost_by_currency: BTreeMap<String, f64> = BTreeMap::new();
+            let currency = rates
+                .currencies
+                .get(&accumulated.harness)
+                .cloned()
+                .unwrap_or_else(|| rates.currency.clone());
+            let (cost, _unpriced) = price_buckets(
+                rates,
+                &accumulated.harness,
+                &accumulated.buckets,
+                RateTable::Plan,
+                now,
+            );
+            if let Some(cost) = cost {
+                cost_by_currency.insert(currency, cost);
+            }
+            ProjectUsage {
+                project_key,
+                label: accumulated.label,
+                label_is_path,
+                sessions: accumulated.sessions,
+                tokens: accumulated.tokens,
+                cost_by_currency,
+            }
+        })
+        .collect();
+
+    Ok(ProjectReport {
+        schema_version: PROJECT_REPORT_SCHEMA_VERSION,
+        from,
+        to,
+        projects,
+        sessions_without_project: without_project,
+    })
+}

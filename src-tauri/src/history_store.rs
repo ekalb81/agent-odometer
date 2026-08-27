@@ -141,6 +141,17 @@ pub struct StoredSession {
 /// sessions under another project. Both are reversible by deleting or
 /// clearing this row; neither ever touches the auto-computed
 /// `durable_sessions.project_*` columns or a source transcript.
+/// One session's auto-computed project identity, as stored (issue #47).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionProjectRow {
+    pub session_key: String,
+    /// `None` for a session with no working directory, which is a real
+    /// state — not every session belongs to a project.
+    pub project_key: Option<String>,
+    pub label: Option<String>,
+    pub provenance: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectOverrideRow {
     pub project_key: String,
@@ -1208,6 +1219,35 @@ impl HistoryStore {
             .query_map([cutoff_ms], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(keys)
+    }
+
+    /// Each session's auto-computed project identity, straight from
+    /// `durable_sessions`.
+    ///
+    /// Columns only, never a snapshot blob (issue #47's `projects` report):
+    /// project identity is already denormalized onto the row by
+    /// `apply_project_identity`, so grouping by project needs no session
+    /// content at all. `resolve_projects` on the desktop walks
+    /// `SessionSummary`s because it already holds them in memory; a
+    /// UI-independent caller has no such luxury and must not materialize the
+    /// corpus to answer a grouping question.
+    pub fn session_project_rows(&self) -> Result<Vec<SessionProjectRow>> {
+        let connection = self.open_reader()?;
+        let mut statement = connection.prepare(
+            "SELECT session_key, project_key, project_label, project_provenance
+             FROM durable_sessions",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SessionProjectRow {
+                    session_key: row.get(0)?,
+                    project_key: row.get(1)?,
+                    label: row.get(2)?,
+                    provenance: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn range_totals_multi(
