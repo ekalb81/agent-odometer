@@ -1739,3 +1739,216 @@ fn mirrors_csv_is_empty_apart_from_its_header_when_none_are_found() {
     // A header with no rows is a valid, parseable "none" for a script.
     assert_eq!(csv.trim(), "fingerprint,providers,session_key");
 }
+
+// ---------------------------------------------------------------------------
+// Per-session listing (issue #47's `sessions`)
+// ---------------------------------------------------------------------------
+
+fn sessions_ledger(directory: &Path) -> HistoryStore {
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let sessions: Vec<Session> = (0..5)
+        .map(|index| {
+            session_at(
+                &format!("s{index}"),
+                "real-model",
+                when.timestamp_millis() + index as i64 * 3_600_000,
+                1_000 * (index as u64 + 1),
+                0,
+            )
+        })
+        .collect();
+    ledger(directory, &sessions)
+}
+
+#[test]
+fn a_session_listing_is_ordered_heaviest_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = sessions_ledger(directory.path());
+
+    let report = odometer_lib::query::session_report(
+        &store,
+        &card(),
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        None,
+        Utc::now(),
+    )
+    .expect("report");
+
+    let totals: Vec<u64> = report
+        .sessions
+        .iter()
+        .map(|session| session.tokens.total_tokens)
+        .collect();
+    let mut sorted = totals.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(totals, sorted, "heaviest first is the order a reader wants");
+    assert_eq!(report.truncated_to, None, "nothing was cut");
+}
+
+/// A truncated list that looks complete is how a partial total gets read as
+/// the whole picture, so the truncation is recorded in the payload and
+/// stated in the rendering.
+#[test]
+fn a_truncated_listing_says_it_was_truncated() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = sessions_ledger(directory.path());
+
+    let report = odometer_lib::query::session_report(
+        &store,
+        &card(),
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Some(2),
+        Utc::now(),
+    )
+    .expect("report");
+
+    assert_eq!(report.sessions.len(), 2);
+    assert_eq!(report.truncated_to, Some(2));
+}
+
+#[test]
+fn a_limit_larger_than_the_corpus_is_not_reported_as_truncation() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = sessions_ledger(directory.path());
+
+    let report = odometer_lib::query::session_report(
+        &store,
+        &card(),
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Some(500),
+        Utc::now(),
+    )
+    .expect("report");
+
+    assert_eq!(report.sessions.len(), 5);
+    assert_eq!(
+        report.truncated_to, None,
+        "a limit that cut nothing must not claim it did"
+    );
+}
+
+#[test]
+fn a_zero_limit_lists_every_session() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{sessions_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = sessions_ledger(directory.path());
+
+    // `--limit 0` means "no limit", the only useful reading — "show
+    // nothing" would be a command nobody runs.
+    let rendered = sessions_from(
+        &store,
+        &card(),
+        &Config::default(),
+        &["--limit".to_string(), "0".to_string()],
+        Format::Csv,
+    )
+    .unwrap();
+
+    let rows = rendered
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .count();
+    assert_eq!(rows, 5);
+}
+
+#[test]
+fn a_malformed_limit_is_rejected_rather_than_ignored() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{sessions_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = sessions_ledger(directory.path());
+
+    let error = sessions_from(
+        &store,
+        &card(),
+        &Config::default(),
+        &["--limit".to_string(), "twenty".to_string()],
+        Format::Text,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(
+        error.contains("twenty"),
+        "the error must name the value: {error}"
+    );
+}
+
+#[test]
+fn a_session_listing_names_models_it_could_not_price() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{sessions_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut rates = card();
+    rates.unpriced_models.push("mystery-model".into());
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "unpriced",
+            "mystery-model",
+            when.timestamp_millis(),
+            1_000,
+            0,
+        )],
+    );
+
+    let rendered = sessions_from(&store, &rates, &Config::default(), &[], Format::Text).unwrap();
+
+    assert!(
+        rendered.contains("unpriced"),
+        "a per-session cost must never be a silent floor: {rendered}"
+    );
+}
+
+#[test]
+fn an_empty_window_says_so_rather_than_printing_nothing() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{sessions_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = sessions_from(&store, &card(), &Config::default(), &[], Format::Text).unwrap();
+
+    assert!(rendered.contains("no session activity"), "{rendered}");
+}
+
+#[test]
+fn session_csv_and_json_carry_the_same_rows() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{sessions_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = sessions_ledger(directory.path());
+    let args = vec!["--limit".to_string(), "0".to_string()];
+
+    let csv = sessions_from(&store, &card(), &Config::default(), &args, Format::Csv).unwrap();
+    assert_eq!(
+        csv.lines().next().unwrap(),
+        "session_key,harness,total_tokens,input,output,cost,currency"
+    );
+
+    let json = sessions_from(&store, &card(), &Config::default(), &args, Format::Json).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(
+        parsed["sessions"].as_array().map(Vec::len),
+        Some(5),
+        "both formats list the same sessions"
+    );
+    assert_eq!(
+        parsed["schema_version"],
+        odometer_lib::query::SESSION_REPORT_SCHEMA_VERSION
+    );
+}
