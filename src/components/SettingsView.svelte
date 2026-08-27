@@ -5,6 +5,13 @@
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations, rebuildHistory, cancelHistoryRebuild, getHistoryRebuildStatus, onHistoryRebuildProgress } from '../lib/ipc';
+
+  /**
+   * Matches `provider::gemini_cli_provider_id()`. Gemini CLI's roots live in
+   * the authoritative `providers` map with no flat mirror on `Config`, so
+   * this is the only key that reaches them (issue #40).
+   */
+  const GEMINI_CLI_PROVIDER_ID = 'gemini_cli';
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
@@ -53,10 +60,16 @@
   let editedSessionRoots = $state<string[]>([]);
   let editedArchiveRoots = $state<string[]>([]);
   let editedClaudeRoots = $state<string[]>([]);
+  // Gemini CLI has no legacy flat mirror on `Config` — the `providers` map
+  // has been authoritative for it from the start (config_version 1), so
+  // this reads and writes that map directly rather than a top-level field
+  // (issue #40).
+  let editedGeminiRoots = $state<string[]>([]);
   let editedIndexPath = $state('');
   let newSessionRoot = $state('');
   let newArchiveRoot = $state('');
   let newClaudeRoot = $state('');
+  let newGeminiRoot = $state('');
 
   let rootsDirty = $state(false);
   let rootsSaving = $state(false);
@@ -71,6 +84,7 @@
       editedSessionRoots = [...c.session_roots];
       editedArchiveRoots = [...c.archive_roots];
       editedClaudeRoots = [...(c.claude_session_roots ?? [])];
+      editedGeminiRoots = [...(c.providers?.[GEMINI_CLI_PROVIDER_ID]?.live_roots ?? [])];
       editedIndexPath = c.session_index_path ?? '';
     }
   });
@@ -78,7 +92,8 @@
   const hasDuplicateRoots = $derived(
     new Set(editedSessionRoots).size !== editedSessionRoots.length ||
     new Set(editedArchiveRoots).size !== editedArchiveRoots.length ||
-    new Set(editedClaudeRoots).size !== editedClaudeRoots.length,
+    new Set(editedClaudeRoots).size !== editedClaudeRoots.length ||
+    new Set(editedGeminiRoots).size !== editedGeminiRoots.length,
   );
 
   function markRootsDirty() {
@@ -126,6 +141,19 @@
     markRootsDirty();
   }
 
+  function addGeminiRoot() {
+    const v = newGeminiRoot.trim();
+    if (!v) return;
+    editedGeminiRoots = [...editedGeminiRoots, v];
+    newGeminiRoot = '';
+    markRootsDirty();
+  }
+
+  function removeGeminiRoot(i: number) {
+    editedGeminiRoots = editedGeminiRoots.filter((_, idx) => idx !== i);
+    markRootsDirty();
+  }
+
   function resetRoots() {
     rootsDirty = false;
     rootsSavedAt = null;
@@ -164,6 +192,16 @@
         archive_roots: editedArchiveRoots,
         session_index_path: editedIndexPath.trim(),
         claude_session_roots: editedClaudeRoots,
+        // Merged into the existing entry rather than replacing it, so a
+        // Gemini `archive_roots` (or any field a later build adds) is not
+        // dropped by an edit that only touched live roots.
+        providers: {
+          ...$config.providers,
+          [GEMINI_CLI_PROVIDER_ID]: {
+            ...($config.providers?.[GEMINI_CLI_PROVIDER_ID] ?? { live_roots: [], archive_roots: [] }),
+            live_roots: editedGeminiRoots,
+          },
+        },
       });
       rootsDirty = false;
       rootsSavedAt = new Date().toLocaleTimeString();
@@ -1049,6 +1087,44 @@
         />
         <button
           onclick={addClaudeRoot}
+          class="shrink-0 text-xs px-2 py-0.5 rounded-sm bg-accent-tab hover:opacity-90 text-white transition-colors"
+        >Add</button>
+      </li>
+    </ul>
+
+    <!-- Gemini CLI session roots (issue #40) -->
+    <h3 class="text-xs text-ink-faint uppercase tracking-wider mb-1">Gemini CLI session roots</h3>
+    <p class="text-xs text-ink-faint mb-1">
+      Directories containing Gemini CLI session logs. Gemini CLI writes one directory per project
+      under <span class="font-mono">~/.gemini/tmp</span> by default. Removing every root here stops
+      Odometer reading Gemini CLI sessions without affecting the files themselves.
+    </p>
+    <ul class="bg-card border border-edge rounded-lg divide-y divide-edge overflow-hidden mb-2">
+      {#if editedGeminiRoots.length === 0}
+        <li class="px-4 py-2 text-xs text-ink-faint italic">None configured</li>
+      {:else}
+        {#each editedGeminiRoots as root, i}
+          <li class="flex items-center justify-between gap-2 px-4 py-2">
+            <span class="font-mono text-xs text-ink-2 break-all">{root}</span>
+            <button
+              onclick={() => removeGeminiRoot(i)}
+              class="shrink-0 text-ink-faint hover:text-red-500 transition-colors text-xs px-1.5 py-0.5 rounded-sm hover:bg-(--row-hover)"
+              aria-label="Remove {root}"
+              title="Remove"
+            >Remove</button>
+          </li>
+        {/each}
+      {/if}
+      <li class="flex items-center gap-2 px-4 py-2">
+        <input
+          type="text"
+          placeholder="/absolute/path/to/.gemini/tmp"
+          bind:value={newGeminiRoot}
+          onkeydown={(e) => { if (e.key === 'Enter') addGeminiRoot(); }}
+          class="flex-1 bg-app border border-edge rounded-sm px-2 py-0.5 text-xs text-ink placeholder-ink-faint focus:outline-hidden focus:ring-1 focus:ring-(--accent) font-mono"
+        />
+        <button
+          onclick={addGeminiRoot}
           class="shrink-0 text-xs px-2 py-0.5 rounded-sm bg-accent-tab hover:opacity-90 text-white transition-colors"
         >Add</button>
       </li>
