@@ -859,3 +859,129 @@ fn quota_json_output_is_parseable_and_names_every_provider() {
         "every provider gets a row: {providers:?}"
     );
 }
+
+/// #43: "Forecast math is deterministic and suppresses projections when
+/// evidence is insufficient." Two observations is below
+/// `MIN_EVIDENCE_POINTS`, so no pace line may appear — extrapolating a
+/// burn rate from two readings is the kind of confident guess this
+/// criterion exists to prevent.
+#[test]
+fn quota_suppresses_a_forecast_when_the_evidence_is_thin() {
+    use odometer_lib::report_cli::{render_quota, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let started = now - chrono::Duration::hours(2);
+    let resets_at = now + chrono::Duration::hours(3);
+    let mut session = session_at("thin", "real-model", started.timestamp_millis(), 1_000, 100);
+    session.rate_limits_history = vec![
+        quota_point(started, "turn-1", 10.0, resets_at),
+        quota_point(
+            now - chrono::Duration::minutes(5),
+            "turn-2",
+            40.0,
+            resets_at,
+        ),
+    ];
+    let store = ledger(directory.path(), &[session]);
+
+    let rendered =
+        render_quota(&store, chrono::Duration::hours(6), now, Format::Text).expect("renders");
+
+    assert!(
+        rendered.contains("40 used"),
+        "the reading is still shown: {rendered}"
+    );
+    assert!(
+        !rendered.contains("pace "),
+        "two observations must not produce a projection: {rendered}"
+    );
+}
+
+/// The other side of that gate: with enough in-window observations spanning
+/// enough of the window, the pace and reserve/deficit line is rendered.
+#[test]
+fn quota_renders_a_forecast_once_there_is_enough_evidence() {
+    use odometer_lib::report_cli::{render_quota, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let resets_at = now + chrono::Duration::hours(3);
+    let started = now - chrono::Duration::hours(2);
+    let mut session = session_at(
+        "thick",
+        "real-model",
+        started.timestamp_millis(),
+        1_000,
+        100,
+    );
+    // Six readings across two hours of a five-hour window: over
+    // MIN_EVIDENCE_POINTS, and well over MIN_EVIDENCE_SPAN_FRACTION.
+    session.rate_limits_history = (0..6)
+        .map(|index| {
+            quota_point(
+                started + chrono::Duration::minutes(index * 24),
+                &format!("turn-{index}"),
+                10.0 + index as f64 * 5.0,
+                resets_at,
+            )
+        })
+        .collect();
+    let store = ledger(directory.path(), &[session]);
+
+    let rendered =
+        render_quota(&store, chrono::Duration::hours(6), now, Format::Text).expect("renders");
+
+    assert!(
+        rendered.contains("pace "),
+        "expected a pace line: {rendered}"
+    );
+    assert!(
+        rendered.contains("deficit") || rendered.contains("reserve"),
+        "a forecast must say which side of an even pace it is on: {rendered}"
+    );
+}
+
+/// An unlimited credit balance renders the word, never a number — "0 used"
+/// would be wrong in both directions.
+#[test]
+fn quota_renders_an_unlimited_window_as_a_state_not_a_number() {
+    use odometer_lib::report_cli::{render_quota, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let store = ledger(
+        directory.path(),
+        &[session_with_quota(
+            "unlimited",
+            (now - chrono::Duration::minutes(10)).timestamp_millis(),
+            20.0,
+        )],
+    );
+
+    let rendered =
+        render_quota(&store, chrono::Duration::hours(6), now, Format::Text).expect("renders");
+
+    assert!(rendered.contains("unlimited"), "{rendered}");
+}
+
+fn quota_point(
+    at: chrono::DateTime<Utc>,
+    turn: &str,
+    used_percent: f64,
+    resets_at: chrono::DateTime<Utc>,
+) -> RateLimitSnapshotPoint {
+    RateLimitSnapshotPoint {
+        timestamp: at,
+        turn_id: Some(turn.to_string()),
+        limit_id: None,
+        primary: Some(RateLimitWindow {
+            used_percent,
+            window_minutes: Some(300),
+            resets_at: Some(resets_at),
+        }),
+        secondary: None,
+        run_started_at: None,
+        observation_count: 1,
+    }
+}
