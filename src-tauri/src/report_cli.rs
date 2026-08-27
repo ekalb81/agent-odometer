@@ -54,7 +54,7 @@ pub fn try_run_cli() -> bool {
     let Some(command) = args.first().map(String::as_str) else {
         return false;
     };
-    if !matches!(command, "status" | "report") {
+    if !matches!(command, "status" | "report" | "quota") {
         return false;
     }
 
@@ -78,6 +78,7 @@ fn run(command: &str, args: &[String]) -> Result<String> {
     match command {
         "status" => run_status(format),
         "report" => run_report(args, format),
+        "quota" => run_quota(format),
         other => bail!("unknown command '{other}'"),
     }
 }
@@ -321,6 +322,118 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
 ",
                     report.unpriced_models.join(", ")
                 ));
+            }
+            out
+        }
+    })
+}
+
+fn run_quota(format: Format) -> Result<String> {
+    let store = open_ledger()?;
+    let quota_store = crate::quota_store::QuotaStoreFile::load();
+    let max_cache_age = chrono::Duration::seconds(quota_store.max_cache_age_secs);
+    render_quota(&store, max_cache_age, Utc::now(), format)
+}
+
+/// The testable half of `quota`, taking the ledger and clock rather than
+/// resolving them from the user's directories.
+pub fn render_quota(
+    store: &HistoryStore,
+    max_cache_age: chrono::Duration,
+    now: DateTime<Utc>,
+    format: Format,
+) -> Result<String> {
+    let snapshots = crate::query::quota_snapshots(store, now, max_cache_age)?;
+    Ok(match format {
+        Format::Json => serde_json::to_string_pretty(&snapshots)?,
+        Format::Csv => {
+            let mut out = String::from(
+                "provider,window,unit,used,remaining,limit,unlimited,resets_at,stale,unavailable
+",
+            );
+            for snapshot in &snapshots {
+                for window in &snapshot.windows {
+                    out.push_str(&format!(
+                        "{},{:?},{:?},{},{},{},{},{},{},{}
+",
+                        snapshot.provider,
+                        window.kind,
+                        window.unit,
+                        render_opt(window.used),
+                        render_opt(window.remaining),
+                        render_opt(window.limit),
+                        window.unlimited,
+                        window
+                            .resets_at
+                            .map(|at| at.to_rfc3339())
+                            .unwrap_or_default(),
+                        window.stale,
+                        window
+                            .unavailable
+                            .map(|reason| format!("{reason:?}"))
+                            .unwrap_or_default(),
+                    ));
+                }
+            }
+            out
+        }
+        Format::Text => {
+            let mut out = String::new();
+            for snapshot in &snapshots {
+                out.push_str(&format!(
+                    "{}
+",
+                    snapshot.provider
+                ));
+                if snapshot.windows.is_empty() {
+                    // An explicit line, not an omitted provider: "no
+                    // observations" is a state, and a silently missing row
+                    // reads as "this provider does not exist".
+                    out.push_str(
+                        "  no quota observations
+",
+                    );
+                }
+                for window in &snapshot.windows {
+                    out.push_str(&format!("  {:?}: ", window.kind));
+                    if window.unlimited {
+                        // Never rendered as a number: unlimited is a known
+                        // state, and "0 used" would be a lie in both
+                        // directions.
+                        out.push_str("unlimited");
+                    } else if let Some(reason) = window.unavailable {
+                        out.push_str(&format!("unavailable ({reason:?})"));
+                    } else {
+                        out.push_str(&format!(
+                            "{} used, {} remaining",
+                            render_opt(window.used),
+                            render_opt(window.remaining)
+                        ));
+                    }
+                    if window.stale {
+                        out.push_str(" [stale]");
+                    }
+                    if let Some(resets_at) = window.resets_at {
+                        out.push_str(&format!(" · resets {}", resets_at.to_rfc3339()));
+                    }
+                    if let Some(forecast) = &window.forecast {
+                        out.push_str(&format!(
+                            "
+    pace {:.2}/h, {} {:.1}",
+                            forecast.pace_per_hour,
+                            if forecast.reserve_deficit_percent >= 0.0 {
+                                "deficit"
+                            } else {
+                                "reserve"
+                            },
+                            forecast.reserve_deficit_percent.abs()
+                        ));
+                        if let Some(at) = forecast.projected_exhaustion_at {
+                            out.push_str(&format!(", exhausted {}", at.to_rfc3339()));
+                        }
+                    }
+                    out.push('\n');
+                }
             }
             out
         }

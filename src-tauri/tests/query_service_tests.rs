@@ -631,3 +631,152 @@ fn status_distinguishes_an_unavailable_ledger_from_an_empty_one() {
         "an unreadable ledger must not report 0 sessions"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Quota (issue #43): one service, fed from recently-active sessions only.
+// ---------------------------------------------------------------------------
+
+use odometer_lib::model::{RateLimitSnapshotPoint, RateLimitWindow};
+use odometer_lib::query::QUOTA_LOOKBACK_DAYS;
+
+/// A session carrying one provider rate-limit observation.
+fn session_with_quota(id: &str, when_ms: i64, used_percent: f64) -> Session {
+    let mut session = session_at(id, "real-model", when_ms, 1_000, 100);
+    let timestamp = Utc.timestamp_millis_opt(when_ms).single().expect("instant");
+    session.rate_limits_history = vec![RateLimitSnapshotPoint {
+        timestamp,
+        turn_id: Some(format!("{id}-turn")),
+        limit_id: None,
+        primary: Some(RateLimitWindow {
+            used_percent,
+            window_minutes: Some(300),
+            resets_at: Some(timestamp + chrono::Duration::hours(5)),
+        }),
+        secondary: None,
+        run_started_at: None,
+        observation_count: 1,
+    }];
+    session
+}
+
+#[test]
+fn quota_reports_every_provider_even_with_no_observations() {
+    // #43: "no data" must be an explicit, honest state rather than an
+    // absent row — an omitted provider reads as one that does not exist.
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let snapshots =
+        odometer_lib::query::quota_snapshots(&store, Utc::now(), chrono::Duration::hours(1))
+            .expect("snapshots");
+
+    assert!(
+        snapshots.len() >= 2,
+        "every registered provider gets a row: {snapshots:?}"
+    );
+    assert!(snapshots.iter().all(|snapshot| snapshot.windows.is_empty()
+        || snapshot.windows.iter().all(|window| window.used.is_none())));
+}
+
+#[test]
+fn quota_reads_a_recent_observation() {
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let store = ledger(
+        directory.path(),
+        &[session_with_quota(
+            "recent",
+            (now - chrono::Duration::minutes(30)).timestamp_millis(),
+            42.0,
+        )],
+    );
+
+    let snapshots = odometer_lib::query::quota_snapshots(&store, now, chrono::Duration::hours(6))
+        .expect("snapshots");
+
+    let codex = snapshots
+        .iter()
+        .find(|snapshot| snapshot.provider == codex_provider_id())
+        .expect("codex row");
+    let window = codex
+        .windows
+        .iter()
+        .find(|window| window.used.is_some())
+        .expect("a window with a reading");
+    assert_eq!(window.used, Some(42.0));
+    assert!(!window.stale, "a 30-minute-old reading is not stale here");
+}
+
+#[test]
+fn an_old_observation_is_marked_stale_rather_than_hidden() {
+    // A stale number is a different and more honest fact than no number,
+    // and both differ from zero usage.
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let store = ledger(
+        directory.path(),
+        &[session_with_quota(
+            "old",
+            (now - chrono::Duration::hours(20)).timestamp_millis(),
+            80.0,
+        )],
+    );
+
+    let snapshots = odometer_lib::query::quota_snapshots(&store, now, chrono::Duration::hours(1))
+        .expect("snapshots");
+
+    let window = snapshots
+        .iter()
+        .find(|snapshot| snapshot.provider == codex_provider_id())
+        .expect("codex row")
+        .windows
+        .iter()
+        .find(|window| window.used.is_some())
+        .expect("the reading is still reported");
+    assert_eq!(window.used, Some(80.0));
+    assert!(window.stale, "an out-of-date reading must say so");
+}
+
+#[test]
+fn the_lookback_filters_on_when_a_session_was_last_observed() {
+    // What keeps a quota answer cheap enough for a shell prompt. Note the
+    // filter is `last_seen_at_ms` — when Odometer last *observed* the file,
+    // not when the work happened. That is the correct axis here: a session
+    // Odometer has not seen in a fortnight cannot hold an observation
+    // relevant to a window measured in hours or days.
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let store = ledger(
+        directory.path(),
+        &[session_with_quota("seen-now", now.timestamp_millis(), 50.0)],
+    );
+
+    // Observed just now, so a fortnight-old cutoff includes it...
+    let included = store
+        .session_keys_since((now - chrono::Duration::days(QUOTA_LOOKBACK_DAYS)).timestamp_millis())
+        .expect("keys");
+    assert_eq!(included.len(), 1);
+
+    // ...and a cutoff after the observation excludes it, which is the
+    // bound that stops a quota query walking the whole corpus.
+    let excluded = store
+        .session_keys_since((now + chrono::Duration::hours(1)).timestamp_millis())
+        .expect("keys");
+    assert!(excluded.is_empty(), "the cutoff must actually exclude");
+}
+
+#[test]
+fn quota_text_output_never_renders_unlimited_as_a_number() {
+    use odometer_lib::report_cli::{render_quota, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = render_quota(&store, chrono::Duration::hours(1), Utc::now(), Format::Text)
+        .expect("renders");
+
+    // With no observations at all, the output must say so per provider
+    // rather than print zeros that read as "you have used nothing".
+    assert!(rendered.contains("no quota observations"), "{rendered}");
+    assert!(!rendered.contains("0 used"), "{rendered}");
+}
