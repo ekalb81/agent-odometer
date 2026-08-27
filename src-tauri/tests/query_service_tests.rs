@@ -2109,3 +2109,187 @@ fn a_tool_call_without_a_name_is_rejected() {
 
     assert!(format!("{error:?}").contains("name"), "{error:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Activity heatmap (issue #48)
+// ---------------------------------------------------------------------------
+
+fn utc_offset(hours: i32) -> chrono::FixedOffset {
+    chrono::FixedOffset::east_opt(hours * 3_600).expect("valid offset")
+}
+
+/// A heatmap exists to answer "when do I work", so the hour must be the
+/// caller's local hour. Bucketing in UTC answers a question nobody asked —
+/// and the error is not subtle: the same data reads as "late nights" or
+/// "early mornings" depending on the zone.
+#[test]
+fn heatmap_hours_are_local_not_utc() {
+    let directory = tempfile::tempdir().unwrap();
+    // 02:00 UTC.
+    let at = Utc.with_ymd_and_hms(2026, 8, 10, 2, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "h",
+            "real-model",
+            at.timestamp_millis(),
+            1_000,
+            0,
+        )],
+    );
+
+    let utc =
+        odometer_lib::query::activity_heatmap(&store, utc_offset(0), None, None).expect("heatmap");
+    assert_eq!(utc.cells.len(), 1);
+    assert_eq!(utc.cells[0].hour, 2);
+    assert_eq!(utc.cells[0].date, "2026-08-10");
+
+    // UTC+9: the same instant is 11:00 the same day.
+    let tokyo =
+        odometer_lib::query::activity_heatmap(&store, utc_offset(9), None, None).expect("heatmap");
+    assert_eq!(tokyo.cells[0].hour, 11);
+    assert_eq!(tokyo.cells[0].date, "2026-08-10");
+
+    // UTC-5: the same instant is 21:00 the *previous* day, which is the
+    // case a naive UTC bucketing gets wrong in both hour and date.
+    let east =
+        odometer_lib::query::activity_heatmap(&store, utc_offset(-5), None, None).expect("heatmap");
+    assert_eq!(east.cells[0].hour, 21);
+    assert_eq!(east.cells[0].date, "2026-08-09");
+}
+
+#[test]
+fn the_heatmap_records_the_offset_it_used() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    // Without this a consumer cannot tell which zone it is looking at, and a
+    // heatmap read in the wrong zone is shifted rather than slightly wrong.
+    let heatmap =
+        odometer_lib::query::activity_heatmap(&store, utc_offset(9), None, None).expect("heatmap");
+
+    assert_eq!(heatmap.utc_offset_seconds, 9 * 3_600);
+}
+
+#[test]
+fn an_empty_window_has_no_peak_rather_than_a_zero_peak() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let heatmap =
+        odometer_lib::query::activity_heatmap(&store, utc_offset(0), None, None).expect("heatmap");
+
+    // Callers scale a colour ramp by the peak. A fabricated 0 would make
+    // every empty cell render as maximal.
+    assert_eq!(heatmap.peak_total_tokens, None);
+    assert!(heatmap.cells.is_empty());
+}
+
+#[test]
+fn the_heatmap_window_excludes_activity_outside_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let august = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let july = Utc.with_ymd_and_hms(2026, 7, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[
+            session_at("aug", "real-model", august.timestamp_millis(), 1_000, 0),
+            session_at("jul", "real-model", july.timestamp_millis(), 9_000, 0),
+        ],
+    );
+
+    let heatmap = odometer_lib::query::activity_heatmap(
+        &store,
+        utc_offset(0),
+        Some(Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap()),
+        Some(Utc.with_ymd_and_hms(2026, 8, 31, 23, 0, 0).unwrap()),
+    )
+    .expect("heatmap");
+
+    assert_eq!(heatmap.cells.len(), 1);
+    assert_eq!(heatmap.cells[0].date, "2026-08-10");
+}
+
+#[test]
+fn heatmap_cells_count_distinct_sessions_active_in_the_hour() {
+    let directory = tempfile::tempdir().unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[
+            session_at("a", "real-model", at.timestamp_millis(), 1_000, 0),
+            session_at("b", "real-model", at.timestamp_millis() + 60_000, 500, 0),
+        ],
+    );
+
+    let heatmap =
+        odometer_lib::query::activity_heatmap(&store, utc_offset(0), None, None).expect("heatmap");
+
+    assert_eq!(heatmap.cells.len(), 1, "both fall in one hour");
+    assert_eq!(heatmap.cells[0].sessions, 2);
+    assert_eq!(heatmap.cells[0].total_tokens, 1_500);
+}
+
+/// An hour with real work must never render as blank, however small it is
+/// relative to the peak — a heatmap that hides activity is worse than none.
+#[test]
+fn a_quiet_hour_still_renders_as_activity() {
+    use odometer_lib::report_cli::{activity_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let busy = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let quiet = Utc.with_ymd_and_hms(2026, 8, 10, 3, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[
+            session_at("busy", "real-model", busy.timestamp_millis(), 10_000_000, 0),
+            session_at("quiet", "real-model", quiet.timestamp_millis(), 1, 0),
+        ],
+    );
+
+    let rendered = activity_from(&store, utc_offset(0), &[], Format::Text).expect("renders");
+    let row = rendered
+        .lines()
+        .find(|line| line.starts_with("2026-08-10"))
+        .expect("the day row");
+    let cells: Vec<char> = row.chars().skip("2026-08-10  ".len()).collect();
+
+    assert_ne!(cells[3], ' ', "the 03:00 hour had work and must be shaded");
+    assert_ne!(cells[12], ' ', "the busy hour must be shaded");
+}
+
+#[test]
+fn activity_says_so_when_there_is_none() {
+    use odometer_lib::report_cli::{activity_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = activity_from(&store, utc_offset(0), &[], Format::Text).expect("renders");
+
+    assert!(rendered.contains("no activity"), "{rendered}");
+}
+
+#[test]
+fn activity_csv_has_a_stable_header() {
+    use odometer_lib::report_cli::{activity_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "c",
+            "real-model",
+            at.timestamp_millis(),
+            1_000,
+            0,
+        )],
+    );
+
+    let rendered = activity_from(&store, utc_offset(0), &[], Format::Csv).expect("renders");
+    let mut lines = rendered.lines();
+
+    assert_eq!(lines.next().unwrap(), "date,hour,total_tokens,sessions");
+    assert_eq!(lines.filter(|line| !line.is_empty()).count(), 1);
+}

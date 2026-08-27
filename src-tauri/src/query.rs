@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Timelike, Utc};
 use serde::Serialize;
 
 use crate::history_store::HistoryStore;
@@ -875,5 +875,82 @@ pub fn session_report(
         to,
         sessions,
         truncated_to,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Activity heatmap (issue #48)
+// ---------------------------------------------------------------------------
+
+/// Usage in one hour of one local day, for a heatmap grid.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityCell {
+    /// Local date, `YYYY-MM-DD`.
+    pub date: String,
+    /// Local hour, 0-23.
+    pub hour: u32,
+    pub total_tokens: u64,
+    pub sessions: u64,
+}
+
+/// A heatmap of when work happened (issue #48).
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityHeatmap {
+    pub schema_version: u32,
+    /// Fixed offset from UTC in seconds that the cells are expressed in.
+    /// Recorded because a heatmap read in the wrong zone is not slightly
+    /// wrong, it is shifted — "I work late" and "I work early" are the same
+    /// data eight hours apart.
+    pub utc_offset_seconds: i32,
+    pub cells: Vec<ActivityCell>,
+    /// Busiest cell, or `None` when there is no activity at all. Callers
+    /// scale a colour ramp by this; scaling by a fabricated 0 would paint an
+    /// empty grid as uniformly maximal.
+    pub peak_total_tokens: Option<u64>,
+}
+
+pub const ACTIVITY_HEATMAP_SCHEMA_VERSION: u32 = 1;
+
+/// Builds an hour-of-day heatmap over a window.
+///
+/// Bucketing happens in the caller's local zone, not UTC: a heatmap exists
+/// to answer "when do I work", and hour-of-day in UTC answers a question
+/// nobody asked. The offset used is recorded on the result so a consumer can
+/// tell which zone it is looking at.
+pub fn activity_heatmap(
+    store: &HistoryStore,
+    offset: chrono::FixedOffset,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+) -> Result<ActivityHeatmap> {
+    const HOUR_MS: i64 = 3_600_000;
+    let from_bucket = from.map(|at| at.timestamp_millis().div_euclid(HOUR_MS));
+    let to_bucket = to.map(|at| at.timestamp_millis().div_euclid(HOUR_MS));
+
+    let rows = store.activity_by_hour(from_bucket, to_bucket)?;
+    let mut cells = Vec::with_capacity(rows.len());
+    let mut peak = 0u64;
+    for row in rows {
+        let Some(at) = Utc.timestamp_millis_opt(row.hour_bucket * HOUR_MS).single() else {
+            // A bucket that is not a representable instant is corrupt rather
+            // than merely odd; skipping it beats rendering a cell at an
+            // invented time.
+            continue;
+        };
+        let local = at.with_timezone(&offset);
+        peak = peak.max(row.total_tokens);
+        cells.push(ActivityCell {
+            date: local.format("%Y-%m-%d").to_string(),
+            hour: local.hour(),
+            total_tokens: row.total_tokens,
+            sessions: row.sessions,
+        });
+    }
+
+    Ok(ActivityHeatmap {
+        schema_version: ACTIVITY_HEATMAP_SCHEMA_VERSION,
+        utc_offset_seconds: offset.local_minus_utc(),
+        peak_total_tokens: (peak > 0).then_some(peak),
+        cells,
     })
 }
