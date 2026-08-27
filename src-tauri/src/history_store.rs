@@ -141,6 +141,19 @@ pub struct StoredSession {
 /// sessions under another project. Both are reversible by deleting or
 /// clearing this row; neither ever touches the auto-computed
 /// `durable_sessions.project_*` columns or a source transcript.
+/// Sessions that appear to be the same underlying run recorded by more than
+/// one tool (issue #40).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MirroredSessionGroup {
+    /// The shared first-event fingerprint that matched them.
+    pub fingerprint: String,
+    /// The distinct providers involved, sorted. Always two or more — a
+    /// single-provider group is the collision case, not a mirror.
+    pub providers: Vec<String>,
+    /// Every session key in the group.
+    pub session_keys: Vec<String>,
+}
+
 /// One session's auto-computed project identity, as stored (issue #47).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionProjectRow {
@@ -1208,6 +1221,63 @@ impl HistoryStore {
     /// Odometer has not seen in a fortnight cannot hold an observation
     /// relevant to a window measured in hours or days, and the quota code
     /// filters the points themselves by age regardless.
+    /// Groups of sessions that look like the same underlying run recorded by
+    /// more than one tool (issue #40).
+    ///
+    /// Two sessions match when they share a `first_event_fingerprint` — a
+    /// content hash over the start time, first turn id, and the first usage
+    /// event's model and token counts — but were stored under *different*
+    /// providers. Within one provider a shared fingerprint is the existing
+    /// collision case, already flagged by `collision` and handled by
+    /// `refresh_collision_flags`; across providers it is the mirroring case,
+    /// where the same work would otherwise be counted twice.
+    ///
+    /// Reports only. Deciding which copy is authoritative changes totals and
+    /// is a separate decision from noticing the duplication — and a wrong
+    /// automatic choice silently deletes usage from the accounting, which is
+    /// worse than the double count it set out to fix.
+    ///
+    /// Costs one indexed group-by over `durable_sessions`; no session
+    /// content is read.
+    pub fn mirrored_session_groups(&self) -> Result<Vec<MirroredSessionGroup>> {
+        let connection = self.open_reader()?;
+        let mut statement = connection.prepare(
+            "SELECT first_event_fingerprint, session_key
+             FROM durable_sessions
+             WHERE first_event_fingerprint IN (
+               SELECT first_event_fingerprint
+               FROM durable_sessions
+               GROUP BY first_event_fingerprint
+               HAVING COUNT(DISTINCT substr(session_key, 1, instr(session_key, ':') - 1)) > 1
+             )
+             ORDER BY first_event_fingerprint, session_key",
+        )?;
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let fingerprint: String = row.get(0)?;
+            let key: String = row.get(1)?;
+            grouped.entry(fingerprint).or_default().push(key);
+        }
+        Ok(grouped
+            .into_iter()
+            .map(|(fingerprint, session_keys)| {
+                let mut providers: Vec<String> = session_keys
+                    .iter()
+                    .filter_map(|key| key.split_once(':').map(|(provider, _)| provider.to_owned()))
+                    .collect();
+                providers.sort();
+                providers.dedup();
+                MirroredSessionGroup {
+                    fingerprint,
+                    providers,
+                    session_keys,
+                }
+            })
+            .collect())
+    }
+
     pub fn session_keys_since(&self, cutoff_ms: i64) -> Result<Vec<String>> {
         let connection = self.open_reader()?;
         let mut statement = connection.prepare(

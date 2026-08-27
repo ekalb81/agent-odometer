@@ -56,7 +56,7 @@ pub fn try_run_cli() -> bool {
     };
     if !matches!(
         command,
-        "status" | "report" | "quota" | "projects" | "metrics"
+        "status" | "report" | "quota" | "projects" | "metrics" | "mirrors"
     ) {
         return false;
     }
@@ -84,6 +84,7 @@ fn run(command: &str, args: &[String]) -> Result<String> {
         "quota" => run_quota(format),
         "projects" => run_projects(args, format),
         "metrics" => run_metrics(args, format),
+        "mirrors" => run_mirrors(format),
         other => bail!("unknown command '{other}'"),
     }
 }
@@ -337,6 +338,66 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
 ",
                     report.unpriced_models.join(", ")
                 ));
+            }
+            out
+        }
+    })
+}
+
+fn run_mirrors(format: Format) -> Result<String> {
+    render_mirrors(&open_ledger()?, format)
+}
+
+/// The testable half of `mirrors`.
+pub fn render_mirrors(store: &HistoryStore, format: Format) -> Result<String> {
+    let groups = store.mirrored_session_groups()?;
+    Ok(match format {
+        Format::Json => serde_json::to_string_pretty(&groups)?,
+        Format::Csv => {
+            let mut out = String::from(
+                "fingerprint,providers,session_key
+",
+            );
+            for group in &groups {
+                for key in &group.session_keys {
+                    out.push_str(&format!(
+                        "{},{},{}
+",
+                        group.fingerprint,
+                        csv_field(&group.providers.join(" ")),
+                        key
+                    ));
+                }
+            }
+            out
+        }
+        Format::Text => {
+            if groups.is_empty() {
+                // An explicit answer: "none found" is a result, and a blank
+                // response reads as a broken command.
+                return Ok("no mirrored sessions detected
+"
+                .to_string());
+            }
+            let mut out = format!(
+                "{} group(s) of sessions look like the same run recorded by more than one tool.
+                 Totals count each copy, so usage in these groups is double counted.
+",
+                groups.len()
+            );
+            for group in &groups {
+                out.push_str(&format!(
+                    "  {} ({})
+",
+                    group.fingerprint,
+                    group.providers.join(", ")
+                ));
+                for key in &group.session_keys {
+                    out.push_str(&format!(
+                        "    {key}
+"
+                    ));
+                }
             }
             out
         }
