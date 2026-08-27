@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -1480,7 +1480,8 @@ impl HistoryStore {
         drop(location_statement);
 
         let mut snapshot_statement = connection.prepare(
-            "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json
+            "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json,
+                    d.thread_name_overlay_set, d.thread_name_overlay
              FROM durable_sessions d
              LEFT JOIN session_snapshots s
                ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
@@ -1494,11 +1495,14 @@ impl HistoryStore {
             let first_event_fingerprint: String = row.get(2)?;
             let collision: bool = row.get(3)?;
             let raw: Option<Vec<u8>> = row.get(4)?;
+            let thread_name_overlay_set: bool = row.get(5)?;
+            let thread_name_overlay: Option<String> = row.get(6)?;
             let raw = raw.ok_or_else(|| anyhow!("missing durable session snapshot for {key}"))?;
             stats.bytes += raw.len() as u64;
             let mut session: Session = serde_json::from_slice(&raw)
                 .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
             drop(raw);
+            apply_thread_name_overlay(&mut session, thread_name_overlay_set, thread_name_overlay);
             let locations = locations_by_key.remove(&key).unwrap_or_default();
             let available = locations.iter().any(|location| location.present);
             session.storage_id = key.clone();
@@ -2132,6 +2136,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 8 {
         steps += 1;
+        version = 9;
+    }
+    if version == 9 {
+        steps += 1;
     }
     steps
 }
@@ -2173,7 +2181,9 @@ fn migrate(
                project_key TEXT,
                project_label TEXT,
                project_provenance TEXT,
-               project_source_directory TEXT
+               project_source_directory TEXT,
+               thread_name_overlay TEXT,
+               thread_name_overlay_set INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key);
              CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key);
@@ -2884,6 +2894,74 @@ fn migrate(
             step_total,
             8,
             9,
+            started.elapsed(),
+        ));
+    }
+    let version_before_thread_name_overlay: i64 =
+        connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version_before_thread_name_overlay == 9 {
+        // Issue #141: give `thread_name` a home outside `session_json`.
+        //
+        // The session-index overlay changes one short string per session,
+        // but `thread_name` was durably stored *only* inside the snapshot
+        // blob — so applying it meant reading a whole session out of the
+        // ledger, deserializing it, patching one field, re-serializing, and
+        // writing a fresh snapshot row. At field scale that is roughly 400
+        // sessions x ~300 KB read plus the same again written, to change 400
+        // short strings, and it showed up as the second-largest named
+        // post-scan cost.
+        //
+        // Two columns rather than one, because a nullable column alone
+        // cannot distinguish "no overlay recorded" from "the overlay says
+        // this session has no name" — the session index legitimately
+        // produces both, and collapsing them would silently resurrect a
+        // deleted name.
+        //
+        // No backfill, deliberately. `thread_name_overlay_set = 0` means
+        // "the snapshot's own value stands", which is exactly true for every
+        // pre-existing row, so the migration is two O(1) `ALTER TABLE`
+        // statements rather than a pass over a multi-GB table. The overlay
+        // pass populates rows as it touches them.
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v9_to_v10_thread_name_overlay",
+            step_index,
+            step_total,
+            9,
+            10,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`, and adding a column that
+        // is already there is a hard error rather than a no-op. Checking
+        // first makes this step resumable: `PRAGMA user_version` and the
+        // columns are committed together below, but a database that reached
+        // one without the other (an interrupted or hand-repaired install)
+        // must still migrate rather than fail every startup from then on.
+        let already_added: bool = transaction.query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('durable_sessions')
+              WHERE name = 'thread_name_overlay'",
+            [],
+            |row| row.get(0),
+        )?;
+        if !already_added {
+            transaction.execute_batch(
+                "ALTER TABLE durable_sessions ADD COLUMN thread_name_overlay TEXT;
+                 ALTER TABLE durable_sessions ADD COLUMN thread_name_overlay_set INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        transaction.execute_batch(
+            "INSERT INTO history_meta(key, value) VALUES('schema_version', '10')
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+             PRAGMA user_version = 10;",
+        )?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v9_to_v10_thread_name_overlay",
+            step_index,
+            step_total,
+            9,
+            10,
             started.elapsed(),
         ));
     }
@@ -3702,68 +3780,77 @@ fn update_snapshot_in_transaction(
 /// this writes back came from the ledger itself, moments earlier, in the
 /// same transaction, so it cannot have diverged from the ledger's own fact
 /// tables.
-fn overlay_thread_name_in_transaction(
-    transaction: &Transaction<'_>,
-    key: &str,
-    thread_name: Option<&str>,
-) -> Result<()> {
-    let now = now_ms();
-    let current: Option<(i64, Vec<u8>)> = transaction
-        .query_row(
-            "SELECT d.current_snapshot_version, s.session_json
-             FROM durable_sessions d
-             JOIN session_snapshots s
-               ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
-             WHERE d.session_key = ?1",
-            [key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
-    let Some((version, raw)) = current else {
-        bail!("cannot update snapshot for unknown durable session {key}");
-    };
-    let mut session: Session = serde_json::from_slice(&raw)
-        .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
-    drop(raw);
-    if session.thread_name.as_deref() == thread_name {
-        // Already current: nothing to write. Avoids a no-op snapshot
-        // version and its accompanying `last_seen_at_ms` bump for a session
-        // the caller merely re-confirmed rather than actually changed.
-        return Ok(());
-    }
-    session.thread_name = thread_name.map(str::to_owned);
-    session.storage_id = key.to_owned();
-    // Reused for parity with `update_snapshot_in_transaction`: the fast path
-    // (unchanged `working_directory`) is one cheap `SELECT` against
-    // `durable_sessions`, not a filesystem/git probe, so this does not
-    // reintroduce the cost this function exists to avoid.
-    apply_project_identity(transaction, key, &mut session)?;
-    let raw_snapshot =
-        serde_json::to_vec(&session).context("could not encode metadata-only session snapshot")?;
-    let snapshot_hash = stable_hash_bytes(&raw_snapshot);
-    let next_version = version + 1;
-    transaction.execute(
-        "INSERT INTO session_snapshots(session_key, version, format_version, snapshot_hash, captured_at_ms, session_json)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        params![key, next_version, SNAPSHOT_FORMAT_VERSION, snapshot_hash, now, raw_snapshot],
-    )?;
-    transaction.execute(
-        "UPDATE durable_sessions SET current_snapshot_version = ?2, current_snapshot_hash = ?3, last_seen_at_ms = ?4
-         WHERE session_key = ?1",
-        params![key, next_version, snapshot_hash, now],
-    )?;
-    transaction.execute(
-        "DELETE FROM session_snapshots WHERE session_key = ?1 AND version <> ?2",
-        params![key, next_version],
-    )?;
-    Ok(())
-}
-
 /// `history_meta` key marking whether `rollup_*` is behind the fact tables
 /// (issue #132). `history_meta` is a pre-existing generic key/value table —
 /// adding this key is not a schema change, so it does not move
 /// `SCHEMA_VERSION` or the committed schema fingerprint.
 const ROLLUPS_STALE_META_KEY: &str = "rollups_stale";
+
+/// Applies a durable thread-name overlay to a session decoded from its
+/// snapshot blob (issue #141).
+///
+/// `thread_name` is the one field that can live in two places: inside
+/// `session_json`, where the parser puts it, and in
+/// `durable_sessions.thread_name_overlay`, where the session-index overlay
+/// pass writes it without rewriting a whole snapshot. When the overlay is
+/// set it wins, including when it is set to `None` — the session index can
+/// legitimately remove a name, and honouring only non-null overlays would
+/// silently resurrect a deleted one.
+///
+/// Every path that decodes a `Session` for the application to see must call
+/// this, or an overlaid name silently reverts to whatever the snapshot last
+/// happened to contain.
+fn apply_thread_name_overlay(session: &mut Session, overlay_set: bool, overlay: Option<String>) {
+    if overlay_set {
+        session.thread_name = overlay;
+    }
+}
+
+fn overlay_thread_name_in_transaction(
+    transaction: &Transaction<'_>,
+    key: &str,
+    thread_name: Option<&str>,
+) -> Result<()> {
+    // Issue #141: a targeted two-column update, not a read-modify-write of
+    // the snapshot blob.
+    //
+    // This used to `SELECT` the full `session_json`, deserialize it into a
+    // `Session`, patch one field, re-serialize, and `INSERT` an entirely new
+    // snapshot row. For an overlay pass over ~400 changed sessions at field
+    // scale that is ~120 MB read and ~120 MB written to change 400 short
+    // strings — plus the transient deserialization churn, which showed up as
+    // ~100 MB of permanent RSS the app then held for hours (#182).
+    //
+    // Now `thread_name` has somewhere to live outside the blob, so this is
+    // one small `UPDATE` per changed session and no session content is read
+    // or written at all.
+    let updated = transaction.execute(
+        "UPDATE durable_sessions
+            SET thread_name_overlay = ?2, thread_name_overlay_set = 1
+          WHERE session_key = ?1
+            AND (thread_name_overlay_set = 0 OR thread_name_overlay IS NOT ?2)",
+        params![key, thread_name],
+    )?;
+    if updated == 0 {
+        // Either the session does not exist, or the overlay already says
+        // exactly this. Only the first is an error, and the two are told
+        // apart cheaply — no snapshot blob is touched either way. The
+        // already-current case is a genuine no-op, as before: it must not
+        // bump anything for a session the caller merely re-confirmed.
+        let exists: bool = transaction
+            .query_row(
+                "SELECT 1 FROM durable_sessions WHERE session_key = ?1",
+                [key],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            bail!("cannot update snapshot for unknown durable session {key}");
+        }
+    }
+    Ok(())
+}
 
 fn mark_rollups_stale(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute(
@@ -3906,8 +3993,28 @@ fn store_snapshot(
          VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         params![key, next_version, SNAPSHOT_FORMAT_VERSION, snapshot_hash, now, raw],
     )?;
+    // Clearing the thread-name overlay is part of storing a snapshot (issue
+    // #141). The overlay exists so the session-index pass can change one
+    // short string without rewriting session content; once a full snapshot
+    // *is* written, its own `thread_name` is current and authoritative
+    // again, and leaving a stale overlay set would shadow it.
+    //
+    // This deliberately keeps the observable behaviour identical to before
+    // the overlay column existed. In particular a rebuild, which re-parses
+    // from the source transcript, drops an overlaid name exactly as it
+    // always did — the overlay is a storage optimization here, not a change
+    // to which value wins.
+    //
+    // Only reached when a snapshot is actually written: the unchanged-hash
+    // and non-monotonic early returns above leave the overlay alone, since
+    // they leave `session_json` alone too.
     transaction.execute(
-        "UPDATE durable_sessions SET current_snapshot_version = ?2, current_snapshot_hash = ?3 WHERE session_key = ?1",
+        "UPDATE durable_sessions
+            SET current_snapshot_version = ?2,
+                current_snapshot_hash = ?3,
+                thread_name_overlay = NULL,
+                thread_name_overlay_set = 0
+          WHERE session_key = ?1",
         params![key, next_version, snapshot_hash],
     )?;
     transaction.execute(
@@ -4344,17 +4451,35 @@ fn refresh_collision_flags(transaction: &Transaction<'_>, identity: &str) -> Res
 }
 
 fn load_one(connection: &Connection, key: &str) -> Result<StoredSession> {
-    let (identity_key, fingerprint, collision, raw): (String, String, bool, Vec<u8>) = connection
+    let (identity_key, fingerprint, collision, raw, thread_name_overlay_set, thread_name_overlay): (
+        String,
+        String,
+        bool,
+        Vec<u8>,
+        bool,
+        Option<String>,
+    ) = connection
         .query_row(
-        "SELECT d.identity_key, d.first_event_fingerprint, d.collision, s.session_json
+        "SELECT d.identity_key, d.first_event_fingerprint, d.collision, s.session_json,
+                d.thread_name_overlay_set, d.thread_name_overlay
          FROM durable_sessions d JOIN session_snapshots s
            ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
          WHERE d.session_key = ?1",
         [key],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
     )?;
     let mut session: Session = serde_json::from_slice(&raw)
         .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
+    apply_thread_name_overlay(&mut session, thread_name_overlay_set, thread_name_overlay);
     let mut statement = connection.prepare(
         "SELECT path, present, first_seen_at_ms, last_seen_at_ms FROM source_locations
          WHERE session_key = ?1 ORDER BY path",
@@ -5947,6 +6072,170 @@ mod tests {
             expected.optimization_findings
         );
         assert_eq!(reloaded.session.tokens_total, expected.tokens_total);
+    }
+
+    /// The read path that actually matters. `load_one` serves one session on
+    /// demand; `stream_sessions` is what hydration walks at startup, and an
+    /// overlay that only survived the former would look correct in a unit
+    /// test and silently revert for every session in the app.
+    #[test]
+    fn overlay_thread_name_survives_hydration_not_just_a_single_load() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let fixture = rich_session("overlay-hydration");
+        let key = store
+            .observe(Path::new("overlay-hydration.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        store
+            .overlay_thread_names(&[(key.clone(), Some("Renamed via overlay".into()))])
+            .unwrap();
+
+        let mut hydrated = Vec::new();
+        store
+            .stream_sessions(|stored| hydrated.push(stored))
+            .unwrap();
+
+        let session = hydrated
+            .iter()
+            .find(|stored| stored.key == key)
+            .expect("hydration must return the overlaid session");
+        assert_eq!(
+            session.session.thread_name.as_deref(),
+            Some("Renamed via overlay"),
+            "hydration must honour the durable overlay, not the snapshot's stale name"
+        );
+    }
+
+    /// Why the overlay needs two columns rather than one nullable column.
+    ///
+    /// The session index legitimately produces "this session has no name" —
+    /// a name the user removed. With a single nullable column, that is
+    /// indistinguishable from "no overlay recorded", and the read path would
+    /// fall back to the snapshot and resurrect the deleted name.
+    #[test]
+    fn overlay_can_clear_a_thread_name_without_resurrecting_the_snapshot_value() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let mut fixture = rich_session("overlay-clear");
+        fixture.thread_name = Some("Name from the transcript".into());
+        let key = store
+            .observe(Path::new("overlay-clear.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+        assert_eq!(
+            store.load_one(&key).unwrap().session.thread_name.as_deref(),
+            Some("Name from the transcript")
+        );
+
+        store.overlay_thread_names(&[(key.clone(), None)]).unwrap();
+
+        assert_eq!(
+            store.load_one(&key).unwrap().session.thread_name,
+            None,
+            "clearing a name must stick, not fall back to the snapshot's copy"
+        );
+    }
+
+    /// The mechanism of the #141 fix, asserted directly rather than inferred
+    /// from a timing.
+    ///
+    /// The old overlay read the whole snapshot blob, deserialized it,
+    /// patched one field, re-serialized, and wrote an entirely new snapshot
+    /// row — roughly 300 KB read and 300 KB written per changed session at
+    /// field scale, to change one short string, ~400 times per pass. If a
+    /// future change reintroduces a snapshot rewrite here, this fails even
+    /// though every behavioural test above would still pass.
+    #[test]
+    fn overlay_thread_names_does_not_rewrite_the_session_snapshot() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let fixture = rich_session("overlay-no-rewrite");
+        let key = store
+            .observe(Path::new("overlay-no-rewrite.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+
+        let snapshot_state = |store: &HistoryStore| -> (i64, i64, Vec<u8>) {
+            let connection = store.connection().unwrap();
+            connection
+                .query_row(
+                    "SELECT d.current_snapshot_version, COUNT(s2.version), s.session_json
+                     FROM durable_sessions d
+                     JOIN session_snapshots s
+                       ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+                     JOIN session_snapshots s2 ON s2.session_key = d.session_key
+                     WHERE d.session_key = ?1",
+                    [&key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap()
+        };
+
+        let (version_before, rows_before, json_before) = snapshot_state(&store);
+
+        store
+            .overlay_thread_names(&[(key.clone(), Some("Renamed via overlay".into()))])
+            .unwrap();
+
+        let (version_after, rows_after, json_after) = snapshot_state(&store);
+        assert_eq!(
+            version_after, version_before,
+            "an overlay must not bump the snapshot version"
+        );
+        assert_eq!(
+            rows_after, rows_before,
+            "an overlay must not add a snapshot row"
+        );
+        assert_eq!(
+            json_after, json_before,
+            "an overlay must not rewrite a single byte of session content"
+        );
+        // And the name still reads back, so this is not passing by doing
+        // nothing at all.
+        assert_eq!(
+            store.load_one(&key).unwrap().session.thread_name.as_deref(),
+            Some("Renamed via overlay")
+        );
+    }
+
+    /// The overlay is a storage optimization, not a change to which value
+    /// wins. A full snapshot write makes `session_json`'s own `thread_name`
+    /// authoritative again and clears the overlay — so behaviour after a
+    /// re-observe or a rebuild is identical to before the column existed,
+    /// rather than a stale overlay shadowing freshly written content.
+    #[test]
+    fn a_full_snapshot_write_clears_the_overlay_so_it_cannot_shadow_new_content() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap().max(1);
+        let fixture = rich_session("overlay-superseded");
+        let key = store
+            .observe(Path::new("overlay-superseded.jsonl"), &fixture, generation)
+            .unwrap()
+            .key;
+        store
+            .overlay_thread_names(&[(key.clone(), Some("Overlaid".into()))])
+            .unwrap();
+        assert_eq!(
+            store.load_one(&key).unwrap().session.thread_name.as_deref(),
+            Some("Overlaid")
+        );
+
+        // A later observation carrying different content and its own name.
+        let mut updated = rich_session("overlay-superseded");
+        updated.thread_name = Some("From the transcript".into());
+        updated.working_directory = Some("C:/somewhere/else".into());
+        let generation = store.begin_scan().unwrap().max(1);
+        store
+            .observe(Path::new("overlay-superseded.jsonl"), &updated, generation)
+            .unwrap();
+
+        assert_eq!(
+            store.load_one(&key).unwrap().session.thread_name.as_deref(),
+            Some("From the transcript"),
+            "a stale overlay must not shadow a freshly written snapshot's own name"
+        );
     }
 
     #[test]
@@ -7644,7 +7933,7 @@ mod tests {
     /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
     /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
     /// `HistoryStore::open` and pasting the result below.
-    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT, thread_name_overlay TEXT, thread_name_overlay_set INTEGER NOT NULL DEFAULT 0 )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
 
     #[test]
     fn schema_fingerprint_matches_committed_expected_value() {
@@ -7879,6 +8168,10 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                10 => {
+                    "ALTER TABLE durable_sessions DROP COLUMN thread_name_overlay;
+                     ALTER TABLE durable_sessions DROP COLUMN thread_name_overlay_set;"
+                }
                 9 => "DROP INDEX IF EXISTS durable_sessions_last_seen_idx;",
                 8 => {
                     "DROP TABLE durable_tool_dimension_events;
@@ -8103,6 +8396,7 @@ mod tests {
                 "v6_to_v7_tool_origin_backfill",
                 "v7_to_v8_tool_dimensions_backfill",
                 "v8_to_v9_last_seen_index",
+                "v9_to_v10_thread_name_overlay",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );
@@ -9036,7 +9330,7 @@ mod tests {
              ({HOT_SESSIONS} hot / {} cold):\n\
              \x20 before (full_sessions-equivalent load_many + update_snapshot_batch): \
              peak={old_peak} bytes, {old_elapsed:?}\n\
-             \x20 after  (overlay_thread_names, one read + one write per session):     \
+             \x20 after  (overlay_thread_names, targeted two-column UPDATE):  \
              peak={new_peak} bytes, {new_elapsed:?}\n\
              \x20 speedup(before/after)={:.2}x, peak reduction={:.1}x",
             SESSIONS - HOT_SESSIONS,
