@@ -541,6 +541,111 @@ mod tests {
         assert_eq!(rewritten["config_version"], serde_json::json!(2));
     }
 
+    /// Issue #40: Settings can now edit Gemini CLI's roots, and it does so
+    /// through the `providers` map because Gemini has no legacy flat mirror.
+    ///
+    /// `preserve_backend_owned_config` forces `config_version = 0` on every
+    /// incoming settings payload, so that edit arrives on the *legacy*
+    /// normalization path — the one that rebuilds builtin entries from flat
+    /// fields. This pins that the path rebuilds only Codex and Claude, and
+    /// carries a Gemini edit through untouched. Without it, the UI would
+    /// silently save nothing.
+    #[test]
+    fn a_gemini_root_edit_survives_the_legacy_normalization_a_settings_save_uses() {
+        let chosen = PathBuf::from("/somewhere/custom/gemini");
+        let mut config = Config {
+            session_roots: vec![PathBuf::from("/codex")],
+            claude_session_roots: vec![PathBuf::from("/claude")],
+            // What `preserve_backend_owned_config` guarantees.
+            config_version: 0,
+            ..Config::default()
+        };
+        config.providers.insert(
+            gemini_cli_provider_id(),
+            ProviderSourceConfig {
+                live_roots: vec![chosen.clone()],
+                ..Default::default()
+            },
+        );
+
+        let normalized = config.normalized();
+
+        assert_eq!(
+            normalized.providers[&gemini_cli_provider_id()].live_roots,
+            vec![chosen],
+            "legacy normalization must not rebuild or reseed a Gemini entry the payload carried"
+        );
+        // And the flat-field providers still take their values from the flat
+        // fields, which is what makes this path legacy-authoritative.
+        assert_eq!(
+            normalized.providers[&codex_provider_id()].live_roots,
+            vec![PathBuf::from("/codex")]
+        );
+    }
+
+    /// Removing every Gemini root must stick. The default is seeded by
+    /// `.entry().or_insert_with()`, which fires only when the key is
+    /// *entirely absent* — so an explicitly empty entry has to survive, or
+    /// the UI could never turn Gemini CLI off.
+    #[test]
+    fn clearing_every_gemini_root_is_not_reseeded_with_the_default() {
+        let mut config = Config {
+            config_version: 0,
+            ..Config::default()
+        };
+        config.providers.insert(
+            gemini_cli_provider_id(),
+            ProviderSourceConfig {
+                live_roots: Vec::new(),
+                ..Default::default()
+            },
+        );
+
+        let normalized = config.normalized();
+
+        assert!(
+            normalized.providers[&gemini_cli_provider_id()]
+                .live_roots
+                .is_empty(),
+            "an explicitly emptied Gemini entry must not be refilled with the default root"
+        );
+        // It also produces no Gemini source, so nothing is scanned for it.
+        let sources = normalized.provider_sources().unwrap();
+        assert!(
+            !sources
+                .iter()
+                .any(|source| *source.provider_id() == gemini_cli_provider_id()),
+            "an emptied Gemini entry must not still be scanned"
+        );
+    }
+
+    /// A payload with no Gemini entry at all — an older frontend, or a
+    /// first run — still gets the default, which is what makes Gemini work
+    /// out of the box.
+    #[test]
+    fn an_absent_gemini_entry_is_still_seeded_with_the_default_root() {
+        let config = Config {
+            config_version: 0,
+            ..Config::default()
+        };
+        let without_gemini = Config {
+            providers: config
+                .providers
+                .iter()
+                .filter(|(id, _)| **id != gemini_cli_provider_id())
+                .map(|(id, entry)| (id.clone(), entry.clone()))
+                .collect(),
+            ..config
+        };
+
+        let normalized = without_gemini.normalized();
+
+        assert_eq!(
+            normalized.providers[&gemini_cli_provider_id()].live_roots,
+            vec![gemini_cli_tmp_dir()]
+        );
+    }
+
     #[test]
     fn session_sources_equal_compares_the_authoritative_map() {
         let base = Config {
