@@ -2293,3 +2293,61 @@ fn activity_csv_has_a_stable_header() {
     assert_eq!(lines.next().unwrap(), "date,hour,total_tokens,sessions");
     assert_eq!(lines.filter(|line| !line.is_empty()).count(), 1);
 }
+
+#[test]
+fn activity_json_carries_its_schema_version_and_offset() {
+    use odometer_lib::report_cli::{activity_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "j",
+            "real-model",
+            at.timestamp_millis(),
+            1_000,
+            0,
+        )],
+    );
+
+    let rendered = activity_from(&store, utc_offset(-5), &[], Format::Json).expect("renders");
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    assert_eq!(
+        parsed["schema_version"],
+        odometer_lib::query::ACTIVITY_HEATMAP_SCHEMA_VERSION
+    );
+    assert_eq!(parsed["utc_offset_seconds"], -5 * 3_600);
+    assert_eq!(parsed["cells"].as_array().map(Vec::len), Some(1));
+    assert_eq!(parsed["peak_total_tokens"], 1_000);
+}
+
+#[test]
+fn activity_json_reports_an_empty_window_with_a_null_peak() {
+    use odometer_lib::report_cli::{activity_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = activity_from(&store, utc_offset(0), &[], Format::Json).expect("renders");
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    // null, not 0: a consumer scaling a ramp by this must be able to tell
+    // "nothing happened" from "the busiest hour was nothing".
+    assert!(parsed["peak_total_tokens"].is_null(), "{rendered}");
+}
+
+#[test]
+fn activity_rejects_a_reversed_window() {
+    use odometer_lib::report_cli::{activity_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+    let args: Vec<String> = ["--from", "2026-08-31", "--to", "2026-08-01"]
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+
+    assert!(activity_from(&store, utc_offset(0), &args, Format::Text).is_err());
+}
