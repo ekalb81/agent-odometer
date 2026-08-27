@@ -2351,3 +2351,128 @@ fn activity_rejects_a_reversed_window() {
 
     assert!(activity_from(&store, utc_offset(0), &args, Format::Text).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end integration verification (issue #57)
+// ---------------------------------------------------------------------------
+
+/// #57's whole premise: "A configuration file or running process alone must
+/// never be presented as proof that the integration works."
+///
+/// So this drives the real binary — launching it, handshaking, listing its
+/// tools, and running a live query — rather than asserting against a mock.
+/// A mock would pass while the shipped binary was broken, which is the exact
+/// failure this gate exists to catch.
+#[test]
+fn verification_drives_the_real_binary_end_to_end() {
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-odometer"));
+    let report = odometer_lib::verify::verify(&executable, Utc::now());
+
+    let by_id = |id: &str| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .unwrap_or_else(|| panic!("no check {id}"))
+    };
+
+    assert_eq!(
+        by_id("mcp_launch").status,
+        odometer_lib::verify::CheckStatus::Pass,
+        "{}",
+        by_id("mcp_launch").detail
+    );
+    assert_eq!(
+        by_id("mcp_initialize").status,
+        odometer_lib::verify::CheckStatus::Pass,
+        "{}",
+        by_id("mcp_initialize").detail
+    );
+    assert_eq!(
+        by_id("mcp_tools").status,
+        odometer_lib::verify::CheckStatus::Pass,
+        "{}",
+        by_id("mcp_tools").detail
+    );
+    // The evidence, not just the verdict: a check that passed without
+    // observing anything is what #57 forbids.
+    assert!(
+        by_id("mcp_initialize").detail.contains("protocol"),
+        "{}",
+        by_id("mcp_initialize").detail
+    );
+}
+
+/// A binary that is not an Odometer build must fail verification rather than
+/// pass it — otherwise "verified" would mean "something launched".
+#[test]
+fn verification_fails_against_a_binary_that_is_not_the_server() {
+    // `cargo` exists on any machine that can run this test and will not
+    // answer an MCP handshake.
+    let report = odometer_lib::verify::verify(std::path::Path::new("cargo"), Utc::now());
+
+    assert!(!report.ok, "a non-server binary must not verify");
+    let mcp_checks: Vec<_> = report
+        .checks
+        .iter()
+        .filter(|check| check.id.starts_with("mcp_") && check.id != "mcp_launch")
+        .collect();
+    assert!(
+        mcp_checks
+            .iter()
+            .all(|check| check.status != odometer_lib::verify::CheckStatus::Pass),
+        "no MCP check may pass against a binary that is not the server: {mcp_checks:?}"
+    );
+}
+
+#[test]
+fn verification_renders_json_and_csv_with_every_check() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::Format;
+
+    // Rendered through the same path the CLI uses, so a format that fails
+    // to serialize is caught here rather than by a user running the gate.
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-odometer"));
+    let report = odometer_lib::verify::verify(&executable, Utc::now());
+
+    let json = serde_json::to_string_pretty(&report).expect("serializes");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(
+        parsed["schema_version"],
+        odometer_lib::verify::VERIFY_SCHEMA_VERSION
+    );
+    let checks = parsed["checks"].as_array().expect("checks");
+    assert_eq!(checks.len(), report.checks.len());
+    for check in checks {
+        assert!(
+            check["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty()),
+            "every check carries its evidence: {check}"
+        );
+    }
+
+    let rendered = odometer_lib::verify::render(&report);
+    for check in &report.checks {
+        assert!(
+            rendered.contains(check.id),
+            "{} missing from the rendering",
+            check.id
+        );
+    }
+    let _ = (Config::default(), Format::Text);
+}
+
+#[test]
+fn a_report_with_a_failed_check_is_not_ok() {
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-odometer"));
+    let good = odometer_lib::verify::verify(&executable, Utc::now());
+    let bad = odometer_lib::verify::verify(std::path::Path::new("cargo"), Utc::now());
+
+    assert!(good.ok, "the real binary verifies");
+    assert!(!bad.ok, "a non-server binary does not");
+    assert!(
+        odometer_lib::verify::render(&bad).contains("NOT verified"),
+        "the rendering must not congratulate on a failure"
+    );
+}

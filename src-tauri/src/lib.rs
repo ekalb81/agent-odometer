@@ -30,6 +30,7 @@ pub mod telemetry;
 pub mod tool_impact;
 pub mod tray;
 pub mod turn_receipts;
+pub mod verify;
 pub mod watcher;
 
 use commands::{
