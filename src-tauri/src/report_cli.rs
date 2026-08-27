@@ -317,6 +317,8 @@ fn render_opt<T: std::fmt::Display>(value: Option<T>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::TokenTotals;
+    use std::collections::BTreeMap;
 
     #[test]
     fn a_flag_without_a_value_is_an_error_not_a_silent_default() {
@@ -373,6 +375,126 @@ mod tests {
                 "{command} must not be claimed by the report CLI"
             );
         }
+    }
+
+    fn sample_report() -> RangeReport {
+        RangeReport {
+            schema_version: crate::query::RANGE_REPORT_SCHEMA_VERSION,
+            from: None,
+            to: None,
+            sessions: 2,
+            sessions_without_usage: 1,
+            tokens: TokenTotals {
+                input_tokens: 1_000,
+                output_tokens: 200,
+                total_tokens: 1_200,
+                ..Default::default()
+            },
+            by_model: vec![
+                crate::query::ModelUsage {
+                    model: "gpt-5.6-sol".into(),
+                    harness: "codex".into(),
+                    tokens: TokenTotals {
+                        input_tokens: 1_000,
+                        total_tokens: 1_000,
+                        ..Default::default()
+                    },
+                    cost: Some(12.5),
+                    currency: "credits".into(),
+                    basis: crate::rates::PricingBasis::Direct,
+                },
+                crate::query::ModelUsage {
+                    model: "mystery".into(),
+                    harness: "codex".into(),
+                    tokens: TokenTotals {
+                        output_tokens: 200,
+                        total_tokens: 200,
+                        ..Default::default()
+                    },
+                    cost: None,
+                    currency: "credits".into(),
+                    basis: crate::rates::PricingBasis::Unavailable,
+                },
+            ],
+            cost_by_currency: BTreeMap::from([
+                ("credits".to_string(), 12.5),
+                ("USD".to_string(), 3.25),
+            ]),
+            unpriced_models: vec!["mystery".into()],
+        }
+    }
+
+    /// The JSON output is a published schema (issue #47), so the version has
+    /// to travel inside the payload — a consumer that stores or pipes it
+    /// keeps the version with the data rather than losing it to a header.
+    #[test]
+    fn json_output_carries_its_schema_version_and_parses() {
+        let rendered = render_report(&sample_report(), Format::Json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+        assert_eq!(
+            parsed["schema_version"],
+            crate::query::RANGE_REPORT_SCHEMA_VERSION
+        );
+        assert_eq!(parsed["cost_by_currency"]["credits"], 12.5);
+        assert_eq!(parsed["cost_by_currency"]["USD"], 3.25);
+        // Absent, not zero: an unpriced model must not read as free.
+        assert!(parsed["by_model"][1]["cost"].is_null());
+    }
+
+    /// Currencies get one line each and are never added together — 12.5
+    /// credits plus 3.25 dollars is not 15.75 of anything.
+    #[test]
+    fn text_output_reports_each_currency_separately() {
+        let rendered = render_report(&sample_report(), Format::Text).unwrap();
+
+        assert!(rendered.contains("total credits: 12.5000"), "{rendered}");
+        assert!(rendered.contains("total USD: 3.2500"), "{rendered}");
+        assert!(
+            !rendered.contains("15.75"),
+            "currencies must never be summed: {rendered}"
+        );
+    }
+
+    /// A total that silently omits a model reads as complete. It must say
+    /// which models are missing from it.
+    #[test]
+    fn text_output_marks_a_total_that_excludes_unpriced_models() {
+        let rendered = render_report(&sample_report(), Format::Text).unwrap();
+
+        assert!(rendered.contains("floor"), "{rendered}");
+        assert!(rendered.contains("mystery"), "{rendered}");
+        assert!(rendered.contains("(unpriced)"), "{rendered}");
+    }
+
+    #[test]
+    fn text_output_says_so_when_nothing_could_be_priced() {
+        let mut report = sample_report();
+        report.cost_by_currency.clear();
+        report.by_model.clear();
+        report.unpriced_models.clear();
+
+        let rendered = render_report(&report, Format::Text).unwrap();
+
+        assert!(rendered.contains("total cost: unavailable"), "{rendered}");
+    }
+
+    /// CSV is consumed by scripts, so the header and column count are part
+    /// of the contract, not incidental formatting.
+    #[test]
+    fn csv_output_has_a_stable_header_and_one_row_per_model() {
+        let rendered = render_report(&sample_report(), Format::Csv).unwrap();
+        let mut lines = rendered.lines();
+
+        assert_eq!(
+            lines.next().unwrap(),
+            "model,harness,total_tokens,input,cached_input,output,reasoning,cost,currency"
+        );
+        let rows: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].starts_with("gpt-5.6-sol,codex,1000,"));
+        // An unpriceable cost is an empty cell, never a zero.
+        assert!(rows[1].ends_with(",,credits"), "{}", rows[1]);
     }
 
     #[test]
