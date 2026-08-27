@@ -14,7 +14,7 @@
 //! pricing, per #47's DRY boundary.
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::config::Config;
@@ -56,7 +56,14 @@ pub fn try_run_cli() -> bool {
     };
     if !matches!(
         command,
-        "status" | "report" | "quota" | "projects" | "metrics" | "mirrors" | "sessions"
+        "status"
+            | "report"
+            | "quota"
+            | "projects"
+            | "metrics"
+            | "mirrors"
+            | "sessions"
+            | "activity"
     ) {
         return false;
     }
@@ -86,6 +93,7 @@ fn run(command: &str, args: &[String]) -> Result<String> {
         "metrics" => run_metrics(args, format),
         "mirrors" => run_mirrors(format),
         "sessions" => run_sessions(args, format),
+        "activity" => run_activity(args, format),
         other => bail!("unknown command '{other}'"),
     }
 }
@@ -349,6 +357,83 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
 /// thousands-session corpus is unusable in a terminal; `--limit 0` shows
 /// everything for a script that wants it.
 const DEFAULT_SESSION_LIMIT: usize = 20;
+
+fn run_activity(args: &[String], format: Format) -> Result<String> {
+    let store = open_ledger()?;
+    // The machine's own zone: a heatmap answers "when do I work", and
+    // hour-of-day in UTC answers a question nobody asked.
+    let offset = *Local::now().offset();
+    activity_from(&store, offset, args, format)
+}
+
+/// The testable half of `activity`, taking the ledger and zone.
+pub fn activity_from(
+    store: &HistoryStore,
+    offset: chrono::FixedOffset,
+    args: &[String],
+    format: Format,
+) -> Result<String> {
+    let (from, to) = parse_window(args)?;
+    let heatmap = crate::query::activity_heatmap(store, offset, from, to)?;
+
+    Ok(match format {
+        Format::Json => serde_json::to_string_pretty(&heatmap)?,
+        Format::Csv => {
+            let mut out = String::from(
+                "date,hour,total_tokens,sessions
+",
+            );
+            for cell in &heatmap.cells {
+                out.push_str(&format!(
+                    "{},{},{},{}
+",
+                    cell.date, cell.hour, cell.total_tokens, cell.sessions
+                ));
+            }
+            out
+        }
+        Format::Text => {
+            let Some(peak) = heatmap.peak_total_tokens else {
+                return Ok("no activity in this window
+"
+                .to_string());
+            };
+            // One row per day, 24 cells, shaded by share of the busiest
+            // hour. Scaling by the peak rather than an absolute threshold is
+            // what makes a quiet week readable instead of uniformly blank.
+            let mut by_day: std::collections::BTreeMap<&str, [u64; 24]> =
+                std::collections::BTreeMap::new();
+            for cell in &heatmap.cells {
+                let row = by_day.entry(cell.date.as_str()).or_insert([0; 24]);
+                row[cell.hour.min(23) as usize] += cell.total_tokens;
+            }
+            const SHADES: [char; 5] = [' ', '.', ':', '*', '#'];
+            let mut out = String::from(
+                "       0h                      12h                     23h
+",
+            );
+            for (date, hours) in by_day {
+                out.push_str(&format!("{date}  "));
+                for tokens in hours {
+                    let shade = if tokens == 0 {
+                        0
+                    } else {
+                        // At least one step for any activity: an hour with
+                        // real work must never render as empty.
+                        1 + ((tokens as f64 / peak as f64) * 3.0).round() as usize
+                    };
+                    out.push(SHADES[shade.min(SHADES.len() - 1)]);
+                }
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "busiest hour: {peak} tokens
+"
+            ));
+            out
+        }
+    })
+}
 
 fn run_sessions(args: &[String], format: Format) -> Result<String> {
     let store = open_ledger()?;

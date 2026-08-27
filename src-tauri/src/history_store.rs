@@ -141,6 +141,20 @@ pub struct StoredSession {
 /// sessions under another project. Both are reversible by deleting or
 /// clearing this row; neither ever touches the auto-computed
 /// `durable_sessions.project_*` columns or a source transcript.
+/// Usage in one hour bucket (issue #48).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct HourlyActivity {
+    /// Milliseconds-since-epoch divided by 3,600,000 — the same bucketing
+    /// the `rollup_*` tables already use.
+    pub hour_bucket: i64,
+    pub total_tokens: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Distinct sessions active in this hour. A session spanning three
+    /// hours counts once in each, which is what "active then" means.
+    pub sessions: u64,
+}
+
 /// Sessions that appear to be the same underlying run recorded by more than
 /// one tool (issue #40).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1276,6 +1290,48 @@ impl HistoryStore {
                 }
             })
             .collect())
+    }
+
+    /// Token usage per hour bucket over a window (issue #48's activity
+    /// heatmap).
+    ///
+    /// A pure SQL aggregate over `rollup_token_totals`, whose `hour_bucket`
+    /// column is exactly this grouping — the rollups were already keyed by
+    /// hour, so a heatmap needs no new storage and no session content. One
+    /// scan of a rollup table, not of the corpus.
+    ///
+    /// Bounds are in hour buckets (`timestamp_ms / 3_600_000`) and are
+    /// inclusive, matching how `range_totals_multi` reads the same column.
+    pub fn activity_by_hour(
+        &self,
+        from_bucket: Option<i64>,
+        to_bucket: Option<i64>,
+    ) -> Result<Vec<HourlyActivity>> {
+        let connection = self.open_reader()?;
+        let mut statement = connection.prepare(
+            "SELECT hour_bucket,
+                    SUM(total_tokens),
+                    SUM(input_tokens),
+                    SUM(output_tokens),
+                    COUNT(DISTINCT session_key)
+             FROM rollup_token_totals
+             WHERE (?1 IS NULL OR hour_bucket >= ?1)
+               AND (?2 IS NULL OR hour_bucket <= ?2)
+             GROUP BY hour_bucket
+             ORDER BY hour_bucket",
+        )?;
+        let rows = statement
+            .query_map(params![from_bucket, to_bucket], |row| {
+                Ok(HourlyActivity {
+                    hour_bucket: row.get(0)?,
+                    total_tokens: row.get::<_, i64>(1)?.max(0) as u64,
+                    input_tokens: row.get::<_, i64>(2)?.max(0) as u64,
+                    output_tokens: row.get::<_, i64>(3)?.max(0) as u64,
+                    sessions: row.get::<_, i64>(4)?.max(0) as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn session_keys_since(&self, cutoff_ms: i64) -> Result<Vec<String>> {
