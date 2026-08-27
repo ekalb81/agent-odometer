@@ -9499,17 +9499,6 @@ mod tests {
         );
     }
 
-    /// Builds a corpus whose average serialized session size lands near the
-    /// v0.8.10 field recording's own ratio (2,151,487,813 bytes / 4,463
-    /// sessions ≈ 482 KB/session), unlike `rich_session`/`synthetic_session`
-    /// (~31 KB, no `turns` populated at all — both shipped fixes measured
-    /// well against sessions that size and did essentially nothing in the
-    /// field). Reuses `model.rs`'s `realistic_session_with_shape` so every
-    /// probe measures the same session shape. A 10%-hot / 90%-cold split at
-    /// 180/5/6 (~1.0 MB) and 90/3/3 (~349 KB) turns/tokens-per-turn/tools-
-    /// per-turn averages ~415 KB/session — the right order of magnitude,
-    /// without the >4 GB a session-for-session field-scale corpus would put
-    /// on disk for a probe that only needs to be run locally.
     fn field_scale_session(index: usize, hot_count: usize) -> Session {
         if index < hot_count {
             crate::model::tests::realistic_session_with_shape(
