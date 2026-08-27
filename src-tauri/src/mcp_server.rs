@@ -200,23 +200,32 @@ fn tool_descriptors() -> Vec<Value> {
 }
 
 #[derive(Debug)]
-enum ToolError {
+pub enum ToolError {
     UnknownTool(String),
     BadArguments(String),
     Failed(String),
 }
 
 fn call_tool(params: &Value) -> std::result::Result<String, ToolError> {
+    let store = open_ledger().map_err(|error| ToolError::Failed(error.to_string()))?;
+    call_tool_with(&store, &load_rates(), params, Utc::now())
+}
+
+/// The testable half of `tools/call`, taking the ledger and clock rather
+/// than resolving them from the user's directories.
+pub fn call_tool_with(
+    store: &HistoryStore,
+    rates: &RateCard,
+    params: &Value,
+    now: DateTime<Utc>,
+) -> std::result::Result<String, ToolError> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::BadArguments("tools/call needs a 'name'".into()))?;
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-    let store = open_ledger().map_err(|error| ToolError::Failed(error.to_string()))?;
-    let rates = load_rates();
     let config = Config::load().unwrap_or_default();
-    let now = Utc::now();
 
     let (from, to) = window_from(&arguments)?;
     let harness_for = |key: &str| {
@@ -228,13 +237,12 @@ fn call_tool(params: &Value) -> std::result::Result<String, ToolError> {
 
     let value = match name {
         "usage_report" => serialize(
-            crate::query::range_report(&store, &rates, harness_for, from, to, now)
+            crate::query::range_report(store, rates, harness_for, from, to, now)
                 .map_err(|error| ToolError::Failed(error.to_string()))?,
         ),
         "project_report" => {
-            let mut report =
-                crate::query::project_report(&store, &rates, harness_for, from, to, now)
-                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+            let mut report = crate::query::project_report(store, rates, harness_for, from, to, now)
+                .map_err(|error| ToolError::Failed(error.to_string()))?;
             // Redaction is not optional here. The CLI has `--include-paths`
             // because a person can consent to seeing their own paths; an
             // agent asking over MCP is a different audience, and there is no
@@ -245,14 +253,14 @@ fn call_tool(params: &Value) -> std::result::Result<String, ToolError> {
             serialize(report)
         }
         "workflow_metrics" => serialize(
-            crate::query::workflow_metrics(&store, &rates, harness_for, from, to, now)
+            crate::query::workflow_metrics(store, rates, harness_for, from, to, now)
                 .map_err(|error| ToolError::Failed(error.to_string()))?,
         ),
         "quota_status" => {
             let quota_store = crate::quota_store::QuotaStoreFile::load();
             let max_cache_age = chrono::Duration::seconds(quota_store.max_cache_age_secs);
             serialize(
-                crate::query::quota_snapshots(&store, now, max_cache_age)
+                crate::query::quota_snapshots(store, now, max_cache_age)
                     .map_err(|error| ToolError::Failed(error.to_string()))?,
             )
         }
