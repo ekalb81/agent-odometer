@@ -1702,3 +1702,40 @@ fn the_mirrors_command_explains_why_a_group_matters() {
     assert!(rendered.contains("codex"), "{rendered}");
     assert!(rendered.contains("claude_code"), "{rendered}");
 }
+
+#[test]
+fn mirrors_csv_and_json_carry_one_entry_per_copy() {
+    use odometer_lib::report_cli::{render_mirrors, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let codex = session_at("shared", "real-model", when.timestamp_millis(), 1_000, 100);
+    let mut claude = codex.clone();
+    claude.harness = odometer_lib::provider::claude_code_provider_id();
+    let store = ledger(directory.path(), &[codex, claude]);
+
+    let csv = render_mirrors(&store, Format::Csv).expect("csv");
+    let mut lines = csv.lines();
+    assert_eq!(lines.next().unwrap(), "fingerprint,providers,session_key");
+    let rows: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    assert_eq!(rows.len(), 2, "one row per copy, not per group: {rows:?}");
+
+    let json = render_mirrors(&store, Format::Json).expect("json");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let groups = parsed.as_array().expect("array of groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["session_keys"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn mirrors_csv_is_empty_apart_from_its_header_when_none_are_found() {
+    use odometer_lib::report_cli::{render_mirrors, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let csv = render_mirrors(&store, Format::Csv).expect("csv");
+
+    // A header with no rows is a valid, parseable "none" for a script.
+    assert_eq!(csv.trim(), "fingerprint,providers,session_key");
+}
