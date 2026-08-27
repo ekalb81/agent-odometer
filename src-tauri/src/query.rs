@@ -581,3 +581,198 @@ pub fn project_report(
         sessions_without_project: without_project,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Workflow metrics (issue #45)
+// ---------------------------------------------------------------------------
+
+/// One workflow metric, with the evidence behind it (issue #45).
+///
+/// #45 requires that "every metric has a documented denominator, coverage
+/// rule, missing-data state". All three are carried in the value rather than
+/// only in prose, because a ratio without its sample size is not
+/// interpretable: 1.0 from one observation and 1.0 from ten thousand are the
+/// same number and completely different facts.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowMetric {
+    /// Stable identity, safe to key on across versions.
+    pub id: &'static str,
+    /// What the denominator counts, in one line, so a reader never has to
+    /// guess what the ratio is *of*.
+    pub denominator_is: &'static str,
+    /// `None` when the denominator is zero — the missing-data state. This is
+    /// deliberately not 0.0: "no tool calls happened" and "no tool call
+    /// failed" are opposite facts about the same number.
+    pub value: Option<f64>,
+    pub numerator: f64,
+    pub denominator: f64,
+}
+
+impl WorkflowMetric {
+    fn new(
+        id: &'static str,
+        denominator_is: &'static str,
+        numerator: f64,
+        denominator: f64,
+    ) -> Self {
+        Self {
+            id,
+            denominator_is,
+            // A zero denominator yields no value rather than a fabricated
+            // one; `f64` division would produce NaN or infinity here and
+            // poison anything that aggregated it.
+            value: (denominator > 0.0).then(|| numerator / denominator),
+            numerator,
+            denominator,
+        }
+    }
+}
+
+/// A versioned set of workflow metrics over a window (issue #45).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowMetrics {
+    pub schema_version: u32,
+    pub from: Option<DateTime<Utc>>,
+    pub to: Option<DateTime<Utc>>,
+    pub sessions: usize,
+    pub metrics: Vec<WorkflowMetric>,
+}
+
+/// Version of the metric *definitions*, not the payload shape.
+///
+/// #45 asks for versioned metrics because a changed denominator silently
+/// changes the meaning of a series. Bump this when any metric's definition
+/// changes, so a stored comparison can refuse to compare across versions
+/// rather than plot a discontinuity as a trend.
+pub const WORKFLOW_METRICS_VERSION: u32 = 1;
+
+/// Computes workflow metrics from ledger rollups over a window.
+///
+/// Deterministic and provider-agnostic: every input is a durable fact
+/// already aggregated by the ledger, so two runs over the same window give
+/// the same answer, and nothing here re-parses a transcript.
+///
+/// Deliberately a subset of #45's list. These five are the ones the existing
+/// rollups can answer honestly; the rest (median time to first edit,
+/// planning/delegation rate, tools per turn) need per-turn timing the
+/// rollups do not retain, and inventing them from what is stored would
+/// produce a confident number with no evidence behind it.
+pub fn workflow_metrics(
+    store: &HistoryStore,
+    rates: &RateCard,
+    harness_for: impl Fn(&str) -> String,
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<WorkflowMetrics> {
+    let keys = store.session_keys()?;
+    let totals = store
+        .range_totals_multi(&keys, &[(from, to)])?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+
+    let mut tokens = TokenTotals::default();
+    let mut tools = crate::model::ToolMetrics::default();
+    let mut sessions = 0usize;
+    let mut priced_tokens = 0f64;
+    let mut total_priceable_tokens = 0f64;
+
+    for key in &keys {
+        let Some(range) = totals.get(key) else {
+            continue;
+        };
+        if range.tokens.total_tokens == 0 && range.buckets.is_empty() {
+            continue;
+        }
+        sessions += 1;
+        accumulate(&mut tokens, &range.tokens);
+        accumulate_tools(&mut tools, &range.tool_metrics);
+
+        let harness = harness_for(key);
+        for bucket in &range.buckets {
+            let priced = price_tokens(
+                rates,
+                &harness,
+                &bucket.model,
+                bucket.service_tier.as_deref(),
+                &bucket.tokens,
+                RateTable::Plan,
+                now,
+            );
+            let bucket_tokens = bucket.tokens.total_tokens as f64;
+            total_priceable_tokens += bucket_tokens;
+            // Only a direct or aliased resolution is real coverage. A
+            // fallback rate produces a number, but it is a stand-in — and
+            // counting it as covered is how a pricing gap hides.
+            if matches!(
+                priced.basis,
+                PricingBasis::Direct | PricingBasis::Aliased | PricingBasis::FloatingAlias
+            ) {
+                priced_tokens += bucket_tokens;
+            }
+        }
+    }
+
+    let attempted_tools = (tools.successes + tools.failures) as f64;
+    let reworked = tools
+        .mutation_targets
+        .saturating_sub(tools.one_shot_mutations) as f64;
+
+    let metrics = vec![
+        WorkflowMetric::new(
+            "tool_failure_rate",
+            "tool calls whose outcome was recorded as success or failure",
+            tools.failures as f64,
+            attempted_tools,
+        ),
+        WorkflowMetric::new(
+            "mutation_rework_rate",
+            "distinct targets mutated at least once",
+            reworked,
+            tools.mutation_targets as f64,
+        ),
+        WorkflowMetric::new(
+            "context_to_output_ratio",
+            "output tokens produced",
+            tokens.input_tokens as f64,
+            tokens.output_tokens as f64,
+        ),
+        WorkflowMetric::new(
+            "cached_input_share",
+            "input tokens",
+            tokens.cached_input_tokens as f64,
+            tokens.input_tokens as f64,
+        ),
+        WorkflowMetric::new(
+            "pricing_coverage",
+            "tokens in priceable (model-attributed) buckets",
+            priced_tokens,
+            total_priceable_tokens,
+        ),
+    ];
+
+    Ok(WorkflowMetrics {
+        schema_version: WORKFLOW_METRICS_VERSION,
+        from,
+        to,
+        sessions,
+        metrics,
+    })
+}
+
+fn accumulate_tools(into: &mut crate::model::ToolMetrics, from: &crate::model::ToolMetrics) {
+    into.calls += from.calls;
+    into.reads += from.reads;
+    into.searches += from.searches;
+    into.mutations += from.mutations;
+    into.commands += from.commands;
+    into.other += from.other;
+    into.successes += from.successes;
+    into.failures += from.failures;
+    into.unknown += from.unknown;
+    into.mutation_targets += from.mutation_targets;
+    into.one_shot_mutations += from.one_shot_mutations;
+    into.retry_count += from.retry_count;
+    into.duration_ms += from.duration_ms;
+}
