@@ -195,6 +195,11 @@ pub struct RangeReport {
     /// for exactly this reason, and a CLI that quietly summed them would
     /// disagree with it while looking tidier.
     pub cost_by_currency: BTreeMap<String, f64>,
+    /// The same totals restated in the user's display currency, where that
+    /// can be done honestly (issue #42). Additive: `cost_by_currency` stays
+    /// the authoritative figure, and this is a restatement carrying its own
+    /// rate and provenance. Empty when no display currency is configured.
+    pub converted: Vec<ConvertedTotal>,
     /// Models excluded from `cost` because no rate resolved for them, so a
     /// total is never quietly a floor presented as complete.
     pub unpriced_models: Vec<String>,
@@ -284,6 +289,7 @@ pub fn range_report(
         });
     }
 
+    let converted = convert_totals(rates, &cost_by_currency);
     Ok(RangeReport {
         schema_version: RANGE_REPORT_SCHEMA_VERSION,
         from,
@@ -293,6 +299,7 @@ pub fn range_report(
         tokens,
         by_model: models,
         cost_by_currency,
+        converted,
         unpriced_models: unpriced.into_iter().collect(),
     })
 }
@@ -953,4 +960,66 @@ pub fn activity_heatmap(
         peak_total_tokens: (peak > 0).then_some(peak),
         cells,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Display-currency conversion (issue #42)
+// ---------------------------------------------------------------------------
+
+/// One total restated in the user's display currency (issue #42).
+///
+/// Carries the rate, when it was taken, and where it came from, because a
+/// converted figure without those is not a number anyone can check — and
+/// Odometer never fetches a rate, so `source` is always the user's own
+/// account of it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConvertedTotal {
+    /// The original currency this was converted *from*. Kept so the
+    /// original total stays the authoritative one and the conversion reads
+    /// as a restatement rather than a replacement.
+    pub from_currency: String,
+    pub target_currency: String,
+    pub amount: f64,
+    pub rate: f64,
+    pub as_of: DateTime<Utc>,
+    pub source: String,
+}
+
+/// Restates whatever in `totals` can honestly be converted.
+///
+/// #42: "Currency conversion never combines credits with money or different
+/// original currencies." Two rules follow, and both are refusals:
+///
+/// - Only totals already in the card's own `currency` are converted. The
+///   card carries a single rate, defined as multiplying "an amount already
+///   in the card's original currency", so applying it to anything else
+///   would be arithmetic on unrelated units.
+/// - Plan credits are never converted. Credits are an entitlement, not
+///   money at an exchange rate, and turning them into euros would invent a
+///   price the provider never charged.
+///
+/// Each converted amount stays keyed to the currency it came from, so
+/// nothing is ever summed across originals.
+pub fn convert_totals(rates: &RateCard, totals: &BTreeMap<String, f64>) -> Vec<ConvertedTotal> {
+    let Some(conversion) = rates.display_currency.as_ref() else {
+        return Vec::new();
+    };
+    totals
+        .iter()
+        .filter(|(currency, _)| {
+            // Same currency in and out is not a conversion, it is noise.
+            currency.as_str() == rates.currency
+                && !currency.eq_ignore_ascii_case(&conversion.target_currency)
+        })
+        .filter_map(|(currency, amount)| {
+            conversion.convert(*amount).map(|converted| ConvertedTotal {
+                from_currency: currency.clone(),
+                target_currency: conversion.target_currency.clone(),
+                amount: converted,
+                rate: conversion.rate,
+                as_of: conversion.as_of,
+                source: conversion.source.clone(),
+            })
+        })
+        .collect()
 }

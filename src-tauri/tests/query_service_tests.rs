@@ -2476,3 +2476,134 @@ fn a_report_with_a_failed_check_is_not_ok() {
         "the rendering must not congratulate on a failure"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Display-currency conversion (issue #42)
+// ---------------------------------------------------------------------------
+
+fn card_with_conversion(target: &str, rate: f64) -> RateCard {
+    let mut rates = card();
+    rates.currency = "USD".into();
+    rates.display_currency = Some(odometer_lib::rates::CurrencyConversion {
+        target_currency: target.to_string(),
+        rate,
+        as_of: Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
+        source: "user-entered".into(),
+    });
+    rates
+}
+
+#[test]
+fn a_display_currency_restates_the_total_without_replacing_it() {
+    let rates = card_with_conversion("EUR", 0.9);
+    let totals = std::collections::BTreeMap::from([("USD".to_string(), 100.0)]);
+
+    let converted = odometer_lib::query::convert_totals(&rates, &totals);
+
+    assert_eq!(converted.len(), 1);
+    assert_eq!(converted[0].from_currency, "USD");
+    assert_eq!(converted[0].target_currency, "EUR");
+    assert!((converted[0].amount - 90.0).abs() < 1e-9);
+    // Provenance travels with it: Odometer never fetched this rate, and a
+    // converted figure without its date and source cannot be checked.
+    assert_eq!(converted[0].source, "user-entered");
+    assert_eq!(converted[0].rate, 0.9);
+}
+
+/// #42: "Currency conversion never combines credits with money."
+///
+/// Plan credits are an entitlement, not money at an exchange rate. Turning
+/// them into euros would invent a price the provider never charged.
+#[test]
+fn plan_credits_are_never_converted() {
+    let rates = card_with_conversion("EUR", 0.9);
+    let totals = std::collections::BTreeMap::from([
+        ("credits".to_string(), 87_910.0),
+        ("USD".to_string(), 126.0),
+    ]);
+
+    let converted = odometer_lib::query::convert_totals(&rates, &totals);
+
+    assert_eq!(converted.len(), 1, "only the USD total converts");
+    assert_eq!(converted[0].from_currency, "USD");
+    assert!(
+        converted
+            .iter()
+            .all(|entry| entry.from_currency != "credits"),
+        "credits must never be restated as money"
+    );
+}
+
+/// The card carries one rate, defined as multiplying an amount already in
+/// the card's own currency. Applying it to a different original currency
+/// would be arithmetic on unrelated units.
+#[test]
+fn a_total_in_another_currency_is_not_converted_with_the_cards_rate() {
+    let rates = card_with_conversion("EUR", 0.9);
+    let totals = std::collections::BTreeMap::from([("GBP".to_string(), 100.0)]);
+
+    assert!(odometer_lib::query::convert_totals(&rates, &totals).is_empty());
+}
+
+#[test]
+fn no_display_currency_means_no_conversion() {
+    let totals = std::collections::BTreeMap::from([("USD".to_string(), 100.0)]);
+
+    assert!(odometer_lib::query::convert_totals(&card(), &totals).is_empty());
+}
+
+#[test]
+fn converting_a_currency_into_itself_is_omitted_rather_than_duplicated() {
+    let rates = card_with_conversion("USD", 1.0);
+    let totals = std::collections::BTreeMap::from([("USD".to_string(), 100.0)]);
+
+    // Same currency in and out is not a conversion, it is noise.
+    assert!(odometer_lib::query::convert_totals(&rates, &totals).is_empty());
+}
+
+#[test]
+fn an_unusable_rate_produces_no_conversion_rather_than_a_wrong_one() {
+    let totals = std::collections::BTreeMap::from([("USD".to_string(), 100.0)]);
+
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        let rates = card_with_conversion("EUR", bad);
+        assert!(
+            odometer_lib::query::convert_totals(&rates, &totals).is_empty(),
+            "a rate of {bad} must not produce a converted figure"
+        );
+    }
+}
+
+#[test]
+fn a_report_carries_its_conversion_alongside_the_original_total() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut rates = card_with_conversion("EUR", 0.5);
+    rates.currencies.clear();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "c",
+            "real-model",
+            when.timestamp_millis(),
+            1_000_000,
+            0,
+        )],
+    );
+
+    let report = range_report(
+        &store,
+        &rates,
+        |_| codex_provider_id().as_str().to_owned(),
+        None,
+        None,
+        Utc::now(),
+    )
+    .expect("report");
+
+    assert_eq!(report.cost_by_currency.get("USD"), Some(&1.0));
+    assert_eq!(report.converted.len(), 1);
+    assert!((report.converted[0].amount - 0.5).abs() < 1e-9);
+    // The original is still there and still authoritative.
+    assert!(!report.cost_by_currency.is_empty());
+}
