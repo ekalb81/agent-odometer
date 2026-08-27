@@ -350,6 +350,21 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
                     report.unpriced_models.join(", ")
                 ));
             }
+            for converted in &report.converted {
+                // Shown beneath the original, never instead of it, and
+                // always with the rate's date and where it came from —
+                // Odometer never fetched it (issue #42).
+                out.push_str(&format!(
+                    "  = {:.4} {} (from {} at {:.6}, {} as of {})
+",
+                    converted.amount,
+                    converted.target_currency,
+                    converted.from_currency,
+                    converted.rate,
+                    converted.source,
+                    converted.as_of.format("%Y-%m-%d")
+                ));
+            }
             out
         }
     })
@@ -1033,6 +1048,7 @@ mod tests {
                 ("USD".to_string(), 3.25),
             ]),
             unpriced_models: vec!["mystery".into()],
+            converted: Vec::new(),
         }
     }
 
