@@ -1952,7 +1952,20 @@ pub fn spawn_history_rebuild(
             let _ = app.emit("history-rebuild-progress", &status);
         };
 
+        // Issue #185: the rebuild rewrites the whole ledger and was, until
+        // now, the one multi-minute operation in this app that left no trace
+        // in a performance recording — so a ledger-size change between two
+        // runs could not be attributed to it rather than to natural
+        // re-parse. Bracketed like every other phase in `memory.rs`.
+        crate::memory::record_phase_sample(&state.performance, "history_rebuild", "before");
         let Some(history) = state.history_ready() else {
+            state.performance.record_backend(
+                "history.rebuild",
+                started,
+                false,
+                BTreeMap::from([("outcome".into(), "unavailable".to_string())]),
+            );
+            crate::memory::record_phase_sample(&state.performance, "history_rebuild", "after");
             finish(HistoryRebuildSnapshot {
                 phase: HistoryRebuildPhase::Failed,
                 elapsed_ms: Some(0),
@@ -2035,8 +2048,31 @@ pub fn spawn_history_rebuild(
                     };
                     state.set_history_rebuild_status(vacuuming.clone());
                     let _ = app.emit("history-rebuild-progress", &vacuuming);
-                    match history.vacuum() {
-                        Ok(()) => (history.database_footprint().total_bytes(), None),
+                    // Timed separately from the re-parse (issue #185): they
+                    // are different kinds of work — one walks transcripts,
+                    // the other rewrites the file — and only a split makes a
+                    // ledger-size change attributable to the compaction that
+                    // caused it.
+                    let vacuum_started = Instant::now();
+                    let vacuum_outcome = history.vacuum();
+                    let footprint_after_vacuum = history.database_footprint();
+                    state.performance.record_backend(
+                        "history.rebuild.vacuum",
+                        vacuum_started,
+                        vacuum_outcome.is_ok(),
+                        BTreeMap::from([
+                            (
+                                "db_bytes_before".into(),
+                                metric_bytes(footprint_before.total_bytes()),
+                            ),
+                            (
+                                "db_bytes_after".into(),
+                                metric_bytes(footprint_after_vacuum.total_bytes()),
+                            ),
+                        ]),
+                    );
+                    match vacuum_outcome {
+                        Ok(()) => (footprint_after_vacuum.total_bytes(), None),
                         Err(error) => (None, Some(error.to_string())),
                     }
                 };
@@ -2072,8 +2108,121 @@ pub fn spawn_history_rebuild(
                 ..Default::default()
             },
         };
+        // Recorded from the finished status rather than from the raw result,
+        // so the recording and what the user was shown can never disagree
+        // (issue #185). `outcome` distinguishes the three ways this ends —
+        // a cancelled rebuild is a legitimate outcome, not a failure, and
+        // `done` says how far it got, which is what makes a partial run
+        // interpretable instead of merely absent.
+        state.performance.record_backend(
+            "history.rebuild",
+            started,
+            rebuild_succeeded(status.phase),
+            rebuild_metric_metadata(&status),
+        );
+        crate::memory::record_phase_sample(&state.performance, "history_rebuild", "after");
         finish(status);
     });
+}
+
+/// How a finished rebuild is labelled in a recording (issue #185).
+///
+/// A cancelled rebuild is a legitimate outcome, not a failure — everything
+/// already rewritten stays rewritten — so it is named rather than folded
+/// into either neighbour. The running/idle arms are unreachable once the
+/// rebuild has resolved, but are recorded honestly instead of mapped onto a
+/// real outcome, so a recording never claims a rebuild completed when the
+/// code reached a state that says otherwise.
+fn rebuild_outcome_label(phase: HistoryRebuildPhase) -> &'static str {
+    match phase {
+        HistoryRebuildPhase::Complete => "complete",
+        HistoryRebuildPhase::Cancelled => "cancelled",
+        HistoryRebuildPhase::Failed => "failed",
+        HistoryRebuildPhase::Running | HistoryRebuildPhase::Vacuuming => "interrupted",
+        HistoryRebuildPhase::Idle => "interrupted",
+    }
+}
+
+/// Whether a finished rebuild counts as a success for its metric. Cancelled
+/// does: the user asked it to stop and it stopped cleanly, which is not the
+/// same event as a failure and must not be searched for as one.
+fn rebuild_succeeded(phase: HistoryRebuildPhase) -> bool {
+    matches!(
+        phase,
+        HistoryRebuildPhase::Complete | HistoryRebuildPhase::Cancelled
+    )
+}
+
+/// Metadata for the `history.rebuild` event (issue #185).
+///
+/// Built from the finished status rather than the raw result, so the
+/// recording and what the user was shown in Settings can never disagree.
+/// Counts, bytes and durations only — the same privacy contract as the rest
+/// of `performance.rs`.
+///
+/// Stays under `sanitize_metadata`'s 16-key cap, which silently drops the
+/// rest; `rebuild_metric_metadata_stays_within_the_metadata_cap` pins that.
+fn rebuild_metric_metadata(status: &HistoryRebuildSnapshot) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "outcome".into(),
+            rebuild_outcome_label(status.phase).to_string(),
+        ),
+        ("sessions_considered".into(), status.total.to_string()),
+        ("sessions_done".into(), status.done.to_string()),
+        (
+            "sessions_reparsed".into(),
+            metric_count(status.sessions_reparsed),
+        ),
+        (
+            "sessions_missing_transcript".into(),
+            metric_count(status.sessions_missing_transcript),
+        ),
+        (
+            "sessions_failed".into(),
+            metric_count(status.sessions_failed),
+        ),
+        (
+            "session_json_bytes_before".into(),
+            metric_count(status.session_json_bytes_before),
+        ),
+        (
+            "session_json_bytes_after".into(),
+            metric_count(status.session_json_bytes_after),
+        ),
+        (
+            "rate_limit_points_before".into(),
+            metric_count(status.rate_limit_points_before),
+        ),
+        (
+            "rate_limit_points_after".into(),
+            metric_count(status.rate_limit_points_after),
+        ),
+        (
+            "db_bytes_before".into(),
+            metric_bytes(status.file_size_before),
+        ),
+        (
+            "db_bytes_after".into(),
+            metric_bytes(status.file_size_after),
+        ),
+    ])
+}
+
+/// Renders an optional byte count for a performance metric.
+///
+/// `"unavailable"` rather than `"0"` when absent, matching
+/// `memory::database_footprint_metadata`: a fabricated zero would read as
+/// "the database is empty" in a recording rather than "this was not
+/// measured", and the two lead to opposite conclusions.
+fn metric_bytes(value: Option<u64>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), |bytes| bytes.to_string())
+}
+
+/// Renders an optional count for a performance metric, on the same
+/// absent-is-not-zero contract as [`metric_bytes`].
+fn metric_count<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "unavailable".to_string(), |count| count.to_string())
 }
 
 /// Returns the rate card, preferring the user's on-disk copy over the bundled defaults.
@@ -2551,16 +2700,103 @@ mod tests {
         configured_defender_roots, defender_elevation_script, defender_root_is_scoped,
         defender_verification_script, newest_subscription_usage_by_harness,
         powershell_encoded_command, powershell_encoded_path, preserve_backend_owned_config,
-        range_has_data, resolve_projects_from, shorten_display_path, valid_session_id,
-        working_directory_info, write_export_file, PerformanceLiveStatus,
+        range_has_data, rebuild_metric_metadata, rebuild_outcome_label, rebuild_succeeded,
+        resolve_projects_from, shorten_display_path, valid_session_id, working_directory_info,
+        write_export_file, HistoryRebuildPhase, HistoryRebuildSnapshot, PerformanceLiveStatus,
     };
     use crate::config::{Config, DefenderExclusionReceipt, DEFENDER_EXCLUSION_RECEIPT_VERSION};
     use crate::model::{
         Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SessionSummary,
         SourceAvailability, TokenTotals, ToolMetrics,
     };
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+
+    /// Issue #185: the rebuild's own recording. A cancelled rebuild is a
+    /// legitimate outcome — everything already rewritten stays rewritten —
+    /// so it must be distinguishable from a failure rather than folded into
+    /// one, and it must not be recorded as unsuccessful.
+    #[test]
+    fn a_cancelled_rebuild_is_recorded_as_its_own_outcome_not_a_failure() {
+        assert_eq!(
+            rebuild_outcome_label(HistoryRebuildPhase::Cancelled),
+            "cancelled"
+        );
+        assert!(rebuild_succeeded(HistoryRebuildPhase::Cancelled));
+
+        assert_eq!(rebuild_outcome_label(HistoryRebuildPhase::Failed), "failed");
+        assert!(!rebuild_succeeded(HistoryRebuildPhase::Failed));
+
+        assert_eq!(
+            rebuild_outcome_label(HistoryRebuildPhase::Complete),
+            "complete"
+        );
+        assert!(rebuild_succeeded(HistoryRebuildPhase::Complete));
+    }
+
+    /// A rebuild that stopped partway must say how far it got, or a partial
+    /// run is indistinguishable from one that never started — which the
+    /// issue calls out as the thing a recording has to answer.
+    #[test]
+    fn a_partial_rebuild_records_how_far_it_got() {
+        let status = HistoryRebuildSnapshot {
+            phase: HistoryRebuildPhase::Cancelled,
+            done: 1_204,
+            total: 4_946,
+            sessions_reparsed: Some(1_204),
+            ..Default::default()
+        };
+
+        let metadata = rebuild_metric_metadata(&status);
+
+        assert_eq!(metadata["outcome"], "cancelled");
+        assert_eq!(metadata["sessions_done"], "1204");
+        assert_eq!(metadata["sessions_considered"], "4946");
+        assert_eq!(metadata["sessions_reparsed"], "1204");
+    }
+
+    /// Absent is not zero. A fabricated `0` for an unmeasured byte count
+    /// reads as "the ledger is empty" rather than "this was not measured",
+    /// and those lead to opposite conclusions — the same contract
+    /// `memory::database_footprint_metadata` already holds itself to.
+    #[test]
+    fn unmeasured_rebuild_fields_are_unavailable_rather_than_zero() {
+        let unmeasured = rebuild_metric_metadata(&HistoryRebuildSnapshot {
+            phase: HistoryRebuildPhase::Failed,
+            ..Default::default()
+        });
+        assert_eq!(unmeasured["db_bytes_before"], "unavailable");
+        assert_eq!(unmeasured["session_json_bytes_after"], "unavailable");
+        assert_eq!(unmeasured["sessions_failed"], "unavailable");
+
+        // A genuine zero still renders as a zero.
+        let measured = rebuild_metric_metadata(&HistoryRebuildSnapshot {
+            phase: HistoryRebuildPhase::Complete,
+            sessions_failed: Some(0),
+            file_size_before: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(measured["sessions_failed"], "0");
+        assert_eq!(measured["db_bytes_before"], "0");
+    }
+
+    /// `sanitize_metadata` keeps only the first 16 keys and silently drops
+    /// the rest, so a recording could lose fields without any error. Pinned
+    /// here rather than discovered from a short event in the field.
+    #[test]
+    fn rebuild_metric_metadata_stays_within_the_metadata_cap() {
+        let metadata: BTreeMap<String, String> =
+            rebuild_metric_metadata(&HistoryRebuildSnapshot::default());
+        assert!(
+            metadata.len() <= 16,
+            "history.rebuild records {} keys; sanitize_metadata keeps 16",
+            metadata.len()
+        );
+        assert!(metadata.keys().all(|key| key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))));
+    }
 
     /// Path literals in these tests use the platform separator, since the
     /// display form deliberately keeps it.
