@@ -2607,3 +2607,94 @@ fn a_report_carries_its_conversion_alongside_the_original_total() {
     // The original is still there and still authoritative.
     assert!(!report.cost_by_currency.is_empty());
 }
+
+#[test]
+fn a_conversion_is_rendered_beneath_the_original_never_instead_of_it() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{report_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut rates = card_with_conversion("EUR", 0.5);
+    rates.currencies.clear();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "r",
+            "real-model",
+            when.timestamp_millis(),
+            1_000_000,
+            0,
+        )],
+    );
+
+    let rendered =
+        report_from(&store, &rates, &Config::default(), &[], Format::Text).expect("renders");
+
+    assert!(rendered.contains("total USD: 1.0000"), "{rendered}");
+    assert!(rendered.contains("EUR"), "{rendered}");
+    // Provenance is on screen, not just in the payload: a converted figure
+    // whose rate and date are invisible cannot be checked by the person
+    // reading it.
+    assert!(rendered.contains("user-entered"), "{rendered}");
+    assert!(rendered.contains("2026-08-01"), "{rendered}");
+}
+
+#[test]
+fn a_report_without_a_display_currency_renders_no_conversion_line() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{report_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "n",
+            "real-model",
+            when.timestamp_millis(),
+            1_000_000,
+            0,
+        )],
+    );
+
+    let rendered =
+        report_from(&store, &card(), &Config::default(), &[], Format::Text).expect("renders");
+
+    assert!(
+        !rendered.contains(" = "),
+        "no conversion configured: {rendered}"
+    );
+}
+
+#[test]
+fn report_json_carries_the_conversion_with_its_provenance() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::{report_from, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut rates = card_with_conversion("EUR", 0.5);
+    rates.currencies.clear();
+    let store = ledger(
+        directory.path(),
+        &[session_at(
+            "j",
+            "real-model",
+            when.timestamp_millis(),
+            1_000_000,
+            0,
+        )],
+    );
+
+    let rendered =
+        report_from(&store, &rates, &Config::default(), &[], Format::Json).expect("renders");
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    let converted = &parsed["converted"][0];
+    assert_eq!(converted["target_currency"], "EUR");
+    assert_eq!(converted["from_currency"], "USD");
+    assert_eq!(converted["source"], "user-entered");
+    // The original total is untouched.
+    assert_eq!(parsed["cost_by_currency"]["USD"], 1.0);
+}
