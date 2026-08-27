@@ -1587,3 +1587,155 @@ fn metrics_json_output_parses_and_keeps_absent_values_null() {
             .is_some_and(|d| !d.is_empty()));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Mirrored-history detection (issue #40)
+// ---------------------------------------------------------------------------
+
+/// The same underlying run recorded by two tools must be detected, or its
+/// usage is counted twice in every total.
+///
+/// Synthetic by necessity: the corpus this was written against contains no
+/// cross-provider duplicates at all, so there is no local evidence to test
+/// with. That is a reason to build the fixture, not a reason to skip the
+/// feature.
+#[test]
+fn a_run_recorded_by_two_providers_is_detected_as_mirrored() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+
+    // Identical content, stored under two providers: same start time, same
+    // first turn id, same first usage event — which is what the first-event
+    // fingerprint hashes.
+    let codex = session_at(
+        "shared-run",
+        "real-model",
+        when.timestamp_millis(),
+        1_000,
+        100,
+    );
+    let mut claude = codex.clone();
+    claude.harness = odometer_lib::provider::claude_code_provider_id();
+
+    let store = ledger(directory.path(), &[codex, claude]);
+
+    let groups = store.mirrored_session_groups().expect("groups");
+
+    assert_eq!(groups.len(), 1, "the two copies form one group: {groups:?}");
+    assert_eq!(groups[0].session_keys.len(), 2);
+    assert_eq!(
+        groups[0].providers,
+        vec!["claude_code".to_string(), "codex".to_string()],
+        "the group names both providers so a reader knows which tools disagree"
+    );
+}
+
+/// Two sessions under the *same* provider sharing a fingerprint are the
+/// existing collision case, already flagged by `collision`. Reporting them
+/// as mirrors would be a false positive on ordinary data — this corpus has
+/// eight such same-provider pairs and zero real mirrors.
+#[test]
+fn a_same_provider_fingerprint_collision_is_not_reported_as_a_mirror() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let first = session_at("collide", "real-model", when.timestamp_millis(), 1_000, 100);
+    let mut second = first.clone();
+    second.id = "collide-2".into();
+
+    let store = ledger(directory.path(), &[first, second]);
+
+    assert!(
+        store.mirrored_session_groups().expect("groups").is_empty(),
+        "a single-provider collision is not a mirror"
+    );
+}
+
+#[test]
+fn distinct_runs_are_not_reported_as_mirrored() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let codex = session_at("one", "real-model", when.timestamp_millis(), 1_000, 100);
+    let mut claude = session_at(
+        "two",
+        "real-model",
+        when.timestamp_millis() + 60_000,
+        2_000,
+        200,
+    );
+    claude.harness = odometer_lib::provider::claude_code_provider_id();
+
+    let store = ledger(directory.path(), &[codex, claude]);
+
+    assert!(store.mirrored_session_groups().expect("groups").is_empty());
+}
+
+#[test]
+fn the_mirrors_command_says_so_when_none_are_found() {
+    use odometer_lib::report_cli::{render_mirrors, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = render_mirrors(&store, Format::Text).expect("renders");
+
+    // "None found" is a result. Blank output reads as a broken command.
+    assert!(rendered.contains("no mirrored sessions"), "{rendered}");
+}
+
+#[test]
+fn the_mirrors_command_explains_why_a_group_matters() {
+    use odometer_lib::report_cli::{render_mirrors, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let codex = session_at("shared", "real-model", when.timestamp_millis(), 1_000, 100);
+    let mut claude = codex.clone();
+    claude.harness = odometer_lib::provider::claude_code_provider_id();
+    let store = ledger(directory.path(), &[codex, claude]);
+
+    let rendered = render_mirrors(&store, Format::Text).expect("renders");
+
+    assert!(
+        rendered.contains("double counted"),
+        "a detection is only useful if it says what it means: {rendered}"
+    );
+    assert!(rendered.contains("codex"), "{rendered}");
+    assert!(rendered.contains("claude_code"), "{rendered}");
+}
+
+#[test]
+fn mirrors_csv_and_json_carry_one_entry_per_copy() {
+    use odometer_lib::report_cli::{render_mirrors, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let codex = session_at("shared", "real-model", when.timestamp_millis(), 1_000, 100);
+    let mut claude = codex.clone();
+    claude.harness = odometer_lib::provider::claude_code_provider_id();
+    let store = ledger(directory.path(), &[codex, claude]);
+
+    let csv = render_mirrors(&store, Format::Csv).expect("csv");
+    let mut lines = csv.lines();
+    assert_eq!(lines.next().unwrap(), "fingerprint,providers,session_key");
+    let rows: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    assert_eq!(rows.len(), 2, "one row per copy, not per group: {rows:?}");
+
+    let json = render_mirrors(&store, Format::Json).expect("json");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    let groups = parsed.as_array().expect("array of groups");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["session_keys"].as_array().map(Vec::len), Some(2));
+}
+
+#[test]
+fn mirrors_csv_is_empty_apart_from_its_header_when_none_are_found() {
+    use odometer_lib::report_cli::{render_mirrors, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let csv = render_mirrors(&store, Format::Csv).expect("csv");
+
+    // A header with no rows is a valid, parseable "none" for a script.
+    assert_eq!(csv.trim(), "fingerprint,providers,session_key");
+}
