@@ -31,6 +31,27 @@ pub struct ModelRate {
 }
 
 impl ModelRate {
+    /// Whether every dimension of this rate is a number that can be priced
+    /// with: finite and non-negative (issue #42).
+    ///
+    /// Parsing is not validation. `-5.0` and `NaN` are both valid JSON
+    /// numbers, so a corrupt or hostile card deserializes cleanly and then
+    /// produces negative costs or — worse — NaN totals that propagate
+    /// silently through every sum downstream.
+    pub fn is_usable(&self) -> bool {
+        let dimensions = [
+            Some(self.input),
+            Some(self.cached_input),
+            Some(self.output),
+            Some(self.reasoning),
+            self.cache_creation_input,
+        ];
+        dimensions
+            .into_iter()
+            .flatten()
+            .all(|value| value.is_finite() && value >= 0.0)
+    }
+
     /// Resolves the effective cache-creation rate: the published premium
     /// when stated, otherwise the ordinary `input` rate. Never zero by
     /// default — see `cache_creation_input`'s docs. Every cache-creation
@@ -535,7 +556,21 @@ pub fn apply_refresh_candidate(
     // previous card had. Refuse it exactly like a validation failure.
     let dropped_models = !previous.models.is_empty() && refreshed.models.is_empty();
     let dropped_api_models = !previous.api_models.is_empty() && refreshed.api_models.is_empty();
-    if structurally_valid && !dropped_models && !dropped_api_models {
+    // Every rate must be a finite, non-negative number (issue #42's
+    // "invalid/partial remote price data fails closed"). Parsing is not
+    // validation: `-5.0` and `NaN` are both valid JSON numbers, and both
+    // used to be accepted here.
+    //
+    // NaN is the dangerous one. It propagates silently through every sum
+    // that touches it, so a single poisoned rate turns whole-corpus totals
+    // into NaN with no error anywhere — and unlike a wrong number, it cannot
+    // even be spotted as implausible in a table.
+    let unusable_rate = refreshed
+        .models
+        .values()
+        .chain(refreshed.api_models.values())
+        .any(|rate| !rate.is_usable());
+    if structurally_valid && !dropped_models && !dropped_api_models && !unusable_rate {
         refreshed.refresh.last_success_at = Some(now);
         refreshed.refresh.last_attempt_at = Some(now);
         refreshed.refresh.last_failure_reason = None;
@@ -545,6 +580,8 @@ pub fn apply_refresh_candidate(
         rolled_back.refresh.last_attempt_at = Some(now);
         rolled_back.refresh.last_failure_reason = Some(if !structurally_valid {
             "candidate pricing catalog failed validation".to_owned()
+        } else if unusable_rate {
+            "candidate contained a negative or non-finite rate".to_owned()
         } else {
             "candidate price tables were empty or partial".to_owned()
         });
@@ -1919,6 +1956,103 @@ mod tests {
         let resolution = card.resolve_model_pricing("a", "codex", &card.models, now);
         assert_eq!(resolution.basis, PricingBasis::Fallback);
         assert_eq!(resolution.resolved_model, "fallback-model");
+    }
+
+    /// #42: "Invalid/partial remote price data fails closed to the last
+    /// valid or bundled card."
+    ///
+    /// A negative rate produces negative costs. Before this check, both it
+    /// and the NaN case below were accepted, because parsing is not
+    /// validation — they are valid JSON numbers.
+    #[test]
+    fn a_candidate_with_a_negative_rate_is_rolled_back() {
+        let previous = card_with(HashMap::from([("m".into(), rate(3.0))]), HashMap::new());
+        let mut candidate = previous.clone();
+        candidate.models.insert("m".into(), rate(-5.0));
+
+        let applied = apply_refresh_candidate(&previous, candidate, Utc::now());
+
+        assert_eq!(applied.models["m"].input, 3.0, "the old card must stand");
+        assert!(applied.refresh.last_success_at.is_none());
+        assert!(
+            applied
+                .refresh
+                .last_failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("non-finite")),
+            "the rollback must say why: {:?}",
+            applied.refresh.last_failure_reason
+        );
+    }
+
+    /// NaN is the dangerous one: it propagates silently through every sum
+    /// that touches it, so one poisoned rate turns whole-corpus totals into
+    /// NaN with no error raised anywhere — and unlike a merely wrong number,
+    /// it cannot be spotted as implausible in a table.
+    #[test]
+    fn a_candidate_with_a_non_finite_rate_is_rolled_back() {
+        let previous = card_with(HashMap::from([("m".into(), rate(3.0))]), HashMap::new());
+        for poison in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut candidate = previous.clone();
+            candidate.models.insert("m".into(), rate(poison));
+
+            let applied = apply_refresh_candidate(&previous, candidate, Utc::now());
+
+            assert_eq!(
+                applied.models["m"].input, 3.0,
+                "{poison} must not reach the applied card"
+            );
+        }
+    }
+
+    /// The API table is priced from too, so it gets the same guard — a
+    /// candidate whose plan rates are clean and whose API rates are not is
+    /// still not safe to apply.
+    #[test]
+    fn a_candidate_with_a_poisoned_api_rate_is_rolled_back() {
+        let mut previous = card_with(HashMap::from([("m".into(), rate(3.0))]), HashMap::new());
+        previous.api_models.insert("m".into(), rate(1.0));
+        let mut candidate = previous.clone();
+        candidate.api_models.insert("m".into(), rate(f64::NAN));
+
+        let applied = apply_refresh_candidate(&previous, candidate, Utc::now());
+
+        assert_eq!(applied.api_models["m"].input, 1.0);
+        assert!(applied.refresh.last_success_at.is_none());
+    }
+
+    /// A published cache-write premium is priced from just like the others,
+    /// so it cannot be exempt from the check.
+    #[test]
+    fn a_candidate_with_a_poisoned_cache_creation_rate_is_rolled_back() {
+        let previous = card_with(HashMap::from([("m".into(), rate(3.0))]), HashMap::new());
+        let mut poisoned = rate(3.0);
+        poisoned.cache_creation_input = Some(-1.0);
+        let mut candidate = previous.clone();
+        candidate.models.insert("m".into(), poisoned);
+
+        let applied = apply_refresh_candidate(&previous, candidate, Utc::now());
+
+        assert_eq!(
+            applied.models["m"].cache_creation_input, previous.models["m"].cache_creation_input,
+            "the previous card's premium must stand, whatever it was"
+        );
+        assert!(applied.refresh.last_success_at.is_none());
+    }
+
+    /// A zero rate is legitimate — a provider can genuinely price a
+    /// dimension at nothing — so the guard must reject the unusable without
+    /// also rejecting the free.
+    #[test]
+    fn a_candidate_with_a_zero_rate_is_still_accepted() {
+        let previous = card_with(HashMap::from([("m".into(), rate(3.0))]), HashMap::new());
+        let mut candidate = previous.clone();
+        candidate.models.insert("m".into(), rate(0.0));
+
+        let applied = apply_refresh_candidate(&previous, candidate, Utc::now());
+
+        assert_eq!(applied.models["m"].input, 0.0);
+        assert!(applied.refresh.last_success_at.is_some());
     }
 
     #[test]
