@@ -1166,6 +1166,21 @@ impl HistoryStore {
     /// the oracle also compares at. Returns one map per window containing
     /// only sessions with data in that window (the `sessions_in_ranges` wire
     /// contract).
+    /// Every durable session key, cheaply.
+    ///
+    /// Keys only, never a snapshot blob — a UI-independent caller (issue
+    /// #47's CLI/statusline path) needs the key list to drive
+    /// [`Self::range_totals_multi`], and materializing sessions to get it
+    /// would defeat the point of reading rollups in the first place.
+    pub fn session_keys(&self) -> Result<Vec<String>> {
+        let connection = self.open_reader()?;
+        let mut statement = connection.prepare(BACKFILL_PROJECT_IDENTITY_KEYS_SQL)?;
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
     pub fn range_totals_multi(
         &self,
         session_keys: &[String],

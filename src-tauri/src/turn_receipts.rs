@@ -1,13 +1,10 @@
 use crate::config::Config;
-use crate::model::{
-    Harness, RateLimitSnapshotPoint, RateLimitWindow, Session, TokenTotals, TurnInfo,
-};
+use crate::model::{Harness, RateLimitSnapshotPoint, RateLimitWindow, Session, TurnInfo};
 use crate::provider::{claude_code_provider_id, codex_provider_id};
-use crate::rates::{ModelRate, RateCard};
+use crate::rates::RateCard;
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -218,22 +215,24 @@ fn validate_transcript_path(path: &Path, harness: &Harness, config: &Config) -> 
 
 pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> String {
     let turn_model = turn.model.as_deref().or(session.model.as_deref());
-    let turn_plan = price_tokens(
-        &turn.tokens,
-        turn_model,
-        turn.service_tier.as_deref(),
-        &session.harness,
-        rates,
-        false,
-    );
-    let turn_api = price_tokens(
-        &turn.tokens,
-        turn_model,
-        turn.service_tier.as_deref(),
-        &session.harness,
-        rates,
-        true,
-    );
+    // A turn with no model at all is unpriceable; the shared service prices
+    // a named model, so the absence is handled here rather than by passing
+    // an empty string it would then try to resolve.
+    let price_turn = |table: crate::query::RateTable| -> Option<f64> {
+        let model = turn_model?;
+        crate::query::price_tokens(
+            rates,
+            session.harness.as_str(),
+            model,
+            turn.service_tier.as_deref(),
+            &turn.tokens,
+            table,
+            Utc::now(),
+        )
+        .amount
+    };
+    let turn_plan = price_turn(crate::query::RateTable::Plan);
+    let turn_api = price_turn(crate::query::RateTable::Api);
     let session_plan = price_session(session, rates, false);
     let session_api = price_session(session, rates, true);
 
@@ -285,92 +284,30 @@ struct SessionPrice {
     omitted_models: Vec<String>,
 }
 
+/// Prices a session's usage through the shared query service (issue #47).
+///
+/// This used to be a private pricing implementation here: a direct table
+/// lookup with a harness fallback and nothing else. It ignored
+/// `model_aliases`, `floating_model_aliases`, `free_local_models` and card
+/// staleness, so a receipt for an aliased model was priced at the fallback
+/// rate while the desktop priced the same usage correctly — two answers for
+/// one question, which is exactly what #47's DRY boundary forbids.
 fn price_session(session: &Session, rates: &RateCard, api_table: bool) -> SessionPrice {
-    let mut total = 0.0;
-    let mut priced = false;
-    let mut omitted_models = BTreeSet::new();
-    for bucket in session.tier_buckets() {
-        if let Some(cost) = price_tokens(
-            &bucket.tokens,
-            Some(&bucket.model),
-            bucket.service_tier.as_deref(),
-            &session.harness,
-            rates,
-            api_table,
-        ) {
-            total += cost;
-            priced = true;
-        } else {
-            omitted_models.insert(bucket.model);
-        }
-    }
-    SessionPrice {
-        amount: priced.then_some(total),
-        omitted_models: omitted_models.into_iter().collect(),
-    }
-}
-
-fn price_tokens(
-    tokens: &TokenTotals,
-    model: Option<&str>,
-    service_tier: Option<&str>,
-    harness: &Harness,
-    rates: &RateCard,
-    api_table: bool,
-) -> Option<f64> {
-    if model.is_some_and(|model| rates.unpriced_models.iter().any(|value| value == model)) {
-        return None;
-    }
     let table = if api_table {
-        if *harness != codex_provider_id() || rates.api_models.is_empty() {
-            return None;
-        }
-        &rates.api_models
+        crate::query::RateTable::Api
     } else {
-        &rates.models
+        crate::query::RateTable::Plan
     };
-    let fallback = rates
-        .fallback_models
-        .get(harness.as_str())
-        .unwrap_or(&rates.fallback_model);
-    let rate = model
-        .and_then(|model| table.get(model))
-        .or_else(|| table.get(fallback))?;
-    Some(token_cost(
-        tokens,
-        rate,
-        service_tier_multiplier(model, service_tier),
-    ))
-}
-
-fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f64 {
-    // Cached-read and cache-creation are both disjoint subsets of
-    // input_tokens; both must be subtracted before pricing the remainder at
-    // the plain input rate, and neither subset may be priced twice.
-    let non_cached_input = tokens
-        .input_tokens
-        .saturating_sub(tokens.cached_input_tokens)
-        .saturating_sub(tokens.cache_creation_input_tokens);
-    let non_reasoning_output = tokens
-        .output_tokens
-        .saturating_sub(tokens.reasoning_output_tokens);
-    ((non_cached_input as f64 * rate.input)
-        + (tokens.cached_input_tokens as f64 * rate.cached_input)
-        + (tokens.cache_creation_input_tokens as f64 * rate.cache_creation_rate())
-        + (non_reasoning_output as f64 * rate.output)
-        + (tokens.reasoning_output_tokens as f64 * rate.reasoning))
-        / 1_000_000.0
-        * multiplier
-}
-
-fn service_tier_multiplier(model: Option<&str>, service_tier: Option<&str>) -> f64 {
-    if service_tier != Some("fast") {
-        return 1.0;
-    }
-    match model {
-        Some("gpt-5.5") => 2.5,
-        Some("gpt-5.4") => 2.0,
-        _ => 1.0,
+    let (amount, omitted_models) = crate::query::price_buckets(
+        rates,
+        session.harness.as_str(),
+        &session.tier_buckets(),
+        table,
+        Utc::now(),
+    );
+    SessionPrice {
+        amount,
+        omitted_models,
     }
 }
 
@@ -630,7 +567,13 @@ fn load_run_record_in_dir(dir: &Path, harness: Harness) -> HookRunRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{RateLimitSnapshotPoint, TurnStatus};
+    use crate::model::{RateLimitSnapshotPoint, TokenTotals, TurnStatus};
+    // `token_cost` moved to the shared query service (issue #47); the two
+    // rate-arithmetic tests below still exercise it directly, since that is
+    // the function whose cache-creation and reasoning subset handling they
+    // pin.
+    use crate::query::token_cost;
+    use crate::rates::ModelRate;
     use std::collections::{BTreeMap, HashMap};
 
     fn rate(value: f64) -> ModelRate {
@@ -824,14 +767,16 @@ mod tests {
         let mut rates = fixture().1;
         rates.models.insert("gpt-5.5".into(), rate(1.0));
         assert_eq!(
-            price_tokens(
-                &tokens,
-                Some("gpt-5.5"),
-                Some("fast"),
-                &codex_provider_id(),
+            crate::query::price_tokens(
                 &rates,
-                false,
-            ),
+                codex_provider_id().as_str(),
+                "gpt-5.5",
+                Some("fast"),
+                &tokens,
+                crate::query::RateTable::Plan,
+                Utc::now(),
+            )
+            .amount,
             Some(2.5)
         );
     }
