@@ -25,6 +25,40 @@ use crate::scan_cache::{self, ScanCache};
 /// sessions instead of paying it once per session.
 pub(crate) const SCAN_WRITE_BATCH_SIZE: usize = 64;
 
+/// Environment override for [`SCAN_WRITE_BATCH_SIZE`], for the batch-size
+/// sweep issue #182 calls for (16 / 64 / 256).
+///
+/// The two candidate explanations for the ~1,491 MB scan peak make opposite
+/// predictions about this knob — the queue model says the peak scales with
+/// batch size, the in-flight-window model says it flattens once the window
+/// saturates — so varying it is the experiment that separates them. An
+/// environment variable rather than a setting: this exists to run an
+/// experiment against a real corpus, not as a knob to present to users, and
+/// it must not become a supported configuration surface by accident.
+const SCAN_WRITE_BATCH_SIZE_ENV: &str = "ODOMETER_SCAN_WRITE_BATCH_SIZE";
+
+/// [`SCAN_WRITE_BATCH_SIZE`], or a valid override from
+/// [`SCAN_WRITE_BATCH_SIZE_ENV`].
+///
+/// Invalid or zero values fall back to the default rather than failing:
+/// a typo in an experiment's environment must not make the app scan
+/// one-session-at-a-time (the exact pathology #132 fixed) or not at all.
+/// The effective value is recorded on the scan's write-lock metric, so a
+/// recording always says which value produced it rather than leaving it to
+/// be remembered.
+pub(crate) fn scan_write_batch_size() -> usize {
+    parse_write_batch_size_override(std::env::var(SCAN_WRITE_BATCH_SIZE_ENV).ok().as_deref())
+}
+
+/// The parsing half of [`scan_write_batch_size`], separated so it can be
+/// tested without mutating process-wide environment state that every other
+/// concurrently-running test would also see.
+fn parse_write_batch_size_override(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|size| *size > 0)
+        .unwrap_or(SCAN_WRITE_BATCH_SIZE)
+}
+
 pub fn scan_jsonl_files(root: &Path) -> Vec<PathBuf> {
     scan_files(root, |path| {
         path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
@@ -90,6 +124,13 @@ pub struct ScanReport {
     /// hits fetching/deserializing bigger cached `Session` snapshots" as an
     /// explanation for `cache_lookup_total_ms` growth.
     pub cache_hit_bytes_total: u64,
+    /// Batch size this scan actually used, so a recording says which value
+    /// produced it rather than leaving it to be remembered (issue #182).
+    pub write_batch_size: usize,
+    /// Worker parallelism available to the scan. The repo sets no
+    /// `num_threads`, so this is rayon's default and was previously
+    /// unrecorded — leaving the waiter counts alongside it uninterpretable.
+    pub available_parallelism: usize,
     pub per_provider: HashMap<ProviderId, ProviderScanCounts>,
 }
 
@@ -189,7 +230,11 @@ where
     let cache_hit_bytes_total = AtomicU64::new(0);
     let processing_started = Instant::now();
 
-    work.par_chunks(SCAN_WRITE_BATCH_SIZE).for_each(|chunk| {
+    // Read once, not per chunk: an environment change mid-scan must not
+    // produce a run whose batches were different sizes, which would make the
+    // sweep's own numbers uninterpretable.
+    let write_batch_size = scan_write_batch_size();
+    work.par_chunks(write_batch_size).for_each(|chunk| {
         let mut batch: Vec<(PathBuf, crate::model::Session)> = Vec::with_capacity(chunk.len());
         for (path, adapter, kind) in chunk {
             let provider_counters = provider_atomics.get(&adapter.descriptor().id);
@@ -315,6 +360,10 @@ where
             cache_lookup_deserialize_ns.load(Ordering::Relaxed),
         ),
         cache_hit_bytes_total: cache_hit_bytes_total.load(Ordering::Relaxed),
+        write_batch_size,
+        available_parallelism: std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(0),
         per_provider,
     }
 }
@@ -325,4 +374,33 @@ fn elapsed_ns(started: Instant) -> u64 {
 
 fn nanos_to_ms(value: u64) -> f64 {
     value as f64 / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_write_batch_size_override, SCAN_WRITE_BATCH_SIZE};
+
+    /// Issue #182: the batch-size override exists to run a sweep against a
+    /// real corpus, so a typo in an experiment's environment must degrade to
+    /// the shipped default rather than to a pathological value. Zero in
+    /// particular would mean `par_chunks(0)`, and one-session-at-a-time is
+    /// the exact pattern #132 fixed.
+    #[test]
+    fn an_invalid_batch_size_override_falls_back_to_the_default() {
+        for invalid in ["", "0", "-1", "sixty-four", "64.0"] {
+            assert_eq!(
+                parse_write_batch_size_override(Some(invalid)),
+                SCAN_WRITE_BATCH_SIZE,
+                "{invalid:?} must not change the batch size"
+            );
+        }
+        assert_eq!(parse_write_batch_size_override(None), SCAN_WRITE_BATCH_SIZE);
+    }
+
+    #[test]
+    fn a_valid_batch_size_override_is_used() {
+        for (raw, expected) in [("16", 16), ("256", 256), (" 128 ", 128)] {
+            assert_eq!(parse_write_batch_size_override(Some(raw)), expected);
+        }
+    }
 }

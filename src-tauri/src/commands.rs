@@ -1339,6 +1339,10 @@ pub fn spawn_scan(
                 total: Some(progress_state.scan_total.load(Ordering::Acquire) as u64),
             }),
         );
+        // Reset here rather than at thread spawn: a superseded scan can still
+        // be inside `reconcile_scanned_batch_if_current` when this one
+        // starts, and these counters describe one scan's contention.
+        state.scan_write_lock.reset();
         let report = crate::scanner::scan_all(
             &provider_sources,
             cache,
@@ -1614,6 +1618,33 @@ pub fn spawn_scan(
                 ),
             ]),
         );
+        // Its own operation rather than more metadata on `startup.bulk_scan`
+        // (issue #182): that event already carries 15 keys against
+        // `sanitize_metadata`'s 16-key cap, which drops the rest silently —
+        // so folding these in would have lost fields with no error, in a
+        // recording whose entire purpose is to answer a question the current
+        // data cannot.
+        let mut write_lock_metadata: BTreeMap<String, String> =
+            state.scan_write_lock.metadata().into_iter().collect();
+        write_lock_metadata.insert(
+            "write_batch_size".into(),
+            report.write_batch_size.to_string(),
+        );
+        write_lock_metadata.insert(
+            "available_parallelism".into(),
+            if report.available_parallelism == 0 {
+                "unavailable".into()
+            } else {
+                report.available_parallelism.to_string()
+            },
+        );
+        state.performance.record_backend(
+            "startup.bulk_scan.write_lock",
+            started,
+            true,
+            write_lock_metadata,
+        );
+
         // Startup's background work (history open/hydrate, this bulk scan,
         // rollup rebuild, session-index overlay, config watcher refresh) is
         // now done, so this is the app's first opportunity to look like it
