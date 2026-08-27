@@ -1,5 +1,6 @@
 import type {
   CurrencyConversion,
+  FloatingAlias,
   Harness,
   ModelRate,
   PricingBasis,
@@ -109,7 +110,7 @@ function downgradeForCacheCreationFallback(
   cacheCreationTokens: number,
 ): PricingBasis {
   if (
-    (basis === 'direct' || basis === 'aliased')
+    (basis === 'direct' || basis === 'aliased' || basis === 'floating_alias')
     && cacheCreationTokens > 0
     && cacheCreationRateIsFallback(rate)
   ) {
@@ -168,6 +169,22 @@ function cardFreshness(rates: RateCard, now: number): 'fresh' | 'stale' | 'unkno
 }
 
 /**
+ * Whether a floating alias's trust window has passed as of `now` (issue
+ * #177). `expires_at` is an inclusive `YYYY-MM-DD` UTC date, so the
+ * comparison is made in UTC rather than local time — otherwise the same card
+ * would expire on different days either side of the date line.
+ *
+ * An unparseable date is treated as expired: refusing to trust a mapping we
+ * cannot date is the safe direction, since the failure it guards against is
+ * pricing silently against a stale target.
+ */
+export function floatingAliasExpired(alias: FloatingAlias, now: number = Date.now()): boolean {
+  const expires = Date.parse(`${alias.expires_at}T23:59:59.999Z`);
+  if (!Number.isFinite(expires)) return true;
+  return now > expires;
+}
+
+/**
  * Resolves a raw model id to a rate-table key and records why that key was
  * chosen — the one place every surface should call instead of re-deriving
  * direct/alias/fallback lookup (mirrors `RateCard::resolve_model_pricing` in
@@ -197,6 +214,18 @@ export function resolveModelPricing(
   }
   if (Object.hasOwn(table, model)) {
     return { resolvedModel: model, basis: downgradeIfStale('direct') };
+  }
+  // Before `model_aliases`, and only while unexpired: past its date the
+  // mapping is deliberately ignored so resolution reaches the fallback below
+  // and the UI's warning fires, rather than pricing a repointed alias
+  // against its old target with provenance that raises nothing (issue #177).
+  const floating = (rates.floating_model_aliases ?? {})[model];
+  if (
+    floating
+    && !floatingAliasExpired(floating, now)
+    && Object.hasOwn(table, floating.target)
+  ) {
+    return { resolvedModel: floating.target, basis: downgradeIfStale('floating_alias') };
   }
   const { resolved, hopped } = resolveAlias(model, rates.model_aliases ?? {});
   if (hopped && Object.hasOwn(table, resolved)) {
