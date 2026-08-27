@@ -219,7 +219,7 @@
                     </label>
                     <input
                       id="project-alias-{project.project_key}"
-                      class="bg-card border border-edge rounded px-2 py-1 text-ink min-w-64"
+                      class="bg-card border border-edge rounded-sm px-2 py-1 text-ink min-w-64"
                       bind:value={renameDraft}
                       onkeydown={(event) => {
                         if (event.key === 'Enter') void saveRename(project);
@@ -253,7 +253,7 @@
                     </label>
                     <select
                       id="project-merge-{project.project_key}"
-                      class="bg-card border border-edge rounded px-2 py-1 text-ink"
+                      class="bg-card border border-edge rounded-sm px-2 py-1 text-ink"
                       bind:value={mergeTargetKey}
                     >
                       <option value="">Choose a project&hellip;</option>
