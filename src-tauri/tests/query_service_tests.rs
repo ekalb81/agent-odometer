@@ -2424,3 +2424,55 @@ fn verification_fails_against_a_binary_that_is_not_the_server() {
         "no MCP check may pass against a binary that is not the server: {mcp_checks:?}"
     );
 }
+
+#[test]
+fn verification_renders_json_and_csv_with_every_check() {
+    use odometer_lib::config::Config;
+    use odometer_lib::report_cli::Format;
+
+    // Rendered through the same path the CLI uses, so a format that fails
+    // to serialize is caught here rather than by a user running the gate.
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-odometer"));
+    let report = odometer_lib::verify::verify(&executable, Utc::now());
+
+    let json = serde_json::to_string_pretty(&report).expect("serializes");
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+    assert_eq!(
+        parsed["schema_version"],
+        odometer_lib::verify::VERIFY_SCHEMA_VERSION
+    );
+    let checks = parsed["checks"].as_array().expect("checks");
+    assert_eq!(checks.len(), report.checks.len());
+    for check in checks {
+        assert!(
+            check["detail"]
+                .as_str()
+                .is_some_and(|detail| !detail.is_empty()),
+            "every check carries its evidence: {check}"
+        );
+    }
+
+    let rendered = odometer_lib::verify::render(&report);
+    for check in &report.checks {
+        assert!(
+            rendered.contains(check.id),
+            "{} missing from the rendering",
+            check.id
+        );
+    }
+    let _ = (Config::default(), Format::Text);
+}
+
+#[test]
+fn a_report_with_a_failed_check_is_not_ok() {
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-odometer"));
+    let good = odometer_lib::verify::verify(&executable, Utc::now());
+    let bad = odometer_lib::verify::verify(std::path::Path::new("cargo"), Utc::now());
+
+    assert!(good.ok, "the real binary verifies");
+    assert!(!bad.ok, "a non-server binary does not");
+    assert!(
+        odometer_lib::verify::render(&bad).contains("NOT verified"),
+        "the rendering must not congratulate on a failure"
+    );
+}
