@@ -1637,6 +1637,11 @@ pub(crate) mod tests {
         const SESSIONS: usize = 4_400;
         const HOT_SESSIONS: usize = 440;
 
+        // Held for the whole probe: the byte deltas below are only its own
+        // if no other heap test is mutating the shared counters (#180).
+        // Necessary but not sufficient — see the `#[ignore]` note above on
+        // running this filtered to a single test name.
+        let _heap = crate::memory::lock_heap_for_test();
         crate::memory::configure_heap_tracking(true);
 
         // Measures two disjoint deltas in sequence: building `sessions`

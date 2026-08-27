@@ -8704,6 +8704,9 @@ mod tests {
         const SESSIONS: usize = 300;
         const HOT_SESSIONS: usize = 30;
 
+        // Held for the whole probe so the heap deltas below are its own
+        // and not another concurrently-running heap test's (#180).
+        let _heap = crate::memory::lock_heap_for_test();
         crate::memory::configure_heap_tracking(true);
 
         fn old_style_load_sessions(store: &HistoryStore) -> Result<(Vec<StoredSession>, u64)> {
@@ -8963,6 +8966,9 @@ mod tests {
         const HOT_SESSIONS: usize = 30;
         const CHANGED: usize = 30;
 
+        // Held for the whole probe so the heap deltas below are its own
+        // and not another concurrently-running heap test's (#180).
+        let _heap = crate::memory::lock_heap_for_test();
         crate::memory::configure_heap_tracking(true);
 
         let sessions: Vec<Session> = (0..SESSIONS)
