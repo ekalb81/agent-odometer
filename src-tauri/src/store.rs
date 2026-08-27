@@ -9,10 +9,140 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 const MAX_EXTERNAL_EVENTS: usize = 10_000;
+
+/// Instrumentation for the one lock a bulk scan's writers actually contend
+/// on (issue #182).
+///
+/// The peak startup footprint is set during `bulk_scan_parallel` — 1,491 MB
+/// in the field, 85% of it Rust heap — and there are two live explanations:
+/// workers queued on this lock holding their batches alive, or a simple
+/// bytes-in-flight window. They imply opposite fixes, and nothing recorded
+/// so far can separate them, because **there was no instrumentation of this
+/// lock at all**. The only measured lock, `cache_lookup_sql_ms`, is on the
+/// read path.
+///
+/// Recording wait time, how many workers were waiting, and how much was
+/// allocated while holding it makes the queue model falsifiable: it predicts
+/// the peak tracks the waiter histogram and scales with batch size, while
+/// the in-flight-window model predicts it tracks bytes and flattens once the
+/// window saturates.
+///
+/// All relaxed atomics on a path that already takes a mutex — the ordering
+/// between these counters and anything else is not load-bearing, and they
+/// must not add a second synchronization point to the thing being measured.
+#[derive(Debug, Default)]
+pub struct ScanWriteLockStats {
+    /// Batches that acquired the lock.
+    acquisitions: AtomicU64,
+    /// Summed wait time across all acquisitions, in microseconds.
+    wait_total_us: AtomicU64,
+    /// Longest single wait, in microseconds.
+    wait_max_us: AtomicU64,
+    /// Most workers observed waiting for the lock at once, including the one
+    /// that was about to acquire it.
+    max_waiters: AtomicUsize,
+    /// Workers currently waiting or holding.
+    waiting_now: AtomicUsize,
+    /// Summed time the lock was actually held, in microseconds.
+    held_total_us: AtomicU64,
+    /// Summed heap growth measured while holding the lock. Only meaningful
+    /// when heap tracking is enabled; `in_lock_alloc_measured` says whether
+    /// any sample contributed.
+    in_lock_alloc_bytes: AtomicU64,
+    in_lock_alloc_measured: AtomicBool,
+}
+
+impl ScanWriteLockStats {
+    pub fn reset(&self) {
+        self.acquisitions.store(0, Ordering::Relaxed);
+        self.wait_total_us.store(0, Ordering::Relaxed);
+        self.wait_max_us.store(0, Ordering::Relaxed);
+        self.max_waiters.store(0, Ordering::Relaxed);
+        // `waiting_now` is deliberately not reset: a scan superseded
+        // mid-batch can still have a worker inside the lock, and zeroing a
+        // live count would make the next scan's `max_waiters` wrong.
+        self.held_total_us.store(0, Ordering::Relaxed);
+        self.in_lock_alloc_bytes.store(0, Ordering::Relaxed);
+        self.in_lock_alloc_measured.store(false, Ordering::Relaxed);
+    }
+
+    /// Snapshot for the caller's metric, as `(key, value)` metadata pairs.
+    pub fn metadata(&self) -> Vec<(String, String)> {
+        let acquisitions = self.acquisitions.load(Ordering::Relaxed);
+        let measured = self.in_lock_alloc_measured.load(Ordering::Relaxed);
+        vec![
+            ("acquisitions".into(), acquisitions.to_string()),
+            (
+                "wait_total_ms".into(),
+                format!(
+                    "{:.3}",
+                    self.wait_total_us.load(Ordering::Relaxed) as f64 / 1_000.0
+                ),
+            ),
+            (
+                "wait_max_ms".into(),
+                format!(
+                    "{:.3}",
+                    self.wait_max_us.load(Ordering::Relaxed) as f64 / 1_000.0
+                ),
+            ),
+            (
+                "held_total_ms".into(),
+                format!(
+                    "{:.3}",
+                    self.held_total_us.load(Ordering::Relaxed) as f64 / 1_000.0
+                ),
+            ),
+            (
+                "max_waiters".into(),
+                self.max_waiters.load(Ordering::Relaxed).to_string(),
+            ),
+            (
+                "in_lock_alloc_bytes".into(),
+                // Absent rather than a fabricated 0: heap tracking is off by
+                // default, and a 0 would read as "allocated nothing in the
+                // lock" — the opposite of what it means here.
+                if measured {
+                    self.in_lock_alloc_bytes.load(Ordering::Relaxed).to_string()
+                } else {
+                    "unavailable".into()
+                },
+            ),
+        ]
+    }
+}
+
+/// Records how long the scan write lock was held, and how much heap grew
+/// while holding it, on every exit path (issue #182).
+struct ScanWriteLockHold<'a> {
+    stats: &'a ScanWriteLockStats,
+    started: std::time::Instant,
+    heap_on_entry: Option<u64>,
+}
+
+impl Drop for ScanWriteLockHold<'_> {
+    fn drop(&mut self) {
+        self.stats
+            .held_total_us
+            .fetch_add(self.started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if let Some(entry) = self.heap_on_entry {
+            // Saturating: another thread's frees can leave the reading lower
+            // than on entry, and this counter is "growth attributable to
+            // work under the lock", not a signed delta.
+            let growth = crate::memory::heap_allocated_bytes_raw().saturating_sub(entry);
+            self.stats
+                .in_lock_alloc_bytes
+                .fetch_add(growth, Ordering::Relaxed);
+            self.stats
+                .in_lock_alloc_measured
+                .store(true, Ordering::Relaxed);
+        }
+    }
+}
 
 /// The two writers that rewrite durable session snapshots, and so must not
 /// run at the same time (issue #176). Both are tracked in one lock so a
@@ -318,6 +448,9 @@ pub struct AppState {
     instruction_scan_generation: AtomicU64,
     /// Serializes configuration transitions so watcher/scan generations cannot interleave.
     pub config_transition: Mutex<()>,
+    /// Contention measurements for `config_transition` during a bulk scan
+    /// (issue #182). See [`ScanWriteLockStats`].
+    pub scan_write_lock: ScanWriteLockStats,
     pub watcher: Mutex<Option<WatcherHandle>>,
     pub config_watcher: Mutex<Option<ConfigWatcherHandle>>,
     instruction_paths: Mutex<HashSet<String>>,
@@ -392,6 +525,7 @@ impl AppState {
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),
+            scan_write_lock: ScanWriteLockStats::default(),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
@@ -987,7 +1121,49 @@ impl AppState {
     ) -> Vec<(std::path::PathBuf, ReconciledSession)> {
         // Mirrors the single-item path: holding this for the whole call
         // closes the same race with `set_config`'s generation bump.
+        //
+        // Instrumented (issue #182): this is the lock a bulk scan's writers
+        // contend on, and whether that queue is what sets the startup memory
+        // peak cannot be decided without measuring it. The measurement is
+        // three relaxed atomics and two `Instant`s on a path that is about
+        // to take a mutex and open a transaction, so it cannot plausibly
+        // perturb what it measures.
+        let waiters = self
+            .scan_write_lock
+            .waiting_now
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        self.scan_write_lock
+            .max_waiters
+            .fetch_max(waiters, Ordering::Relaxed);
+        let wait_started = std::time::Instant::now();
         let _transition = self.config_transition.lock().unwrap();
+        let waited = wait_started.elapsed();
+        self.scan_write_lock
+            .waiting_now
+            .fetch_sub(1, Ordering::Relaxed);
+        self.scan_write_lock
+            .acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        let waited_us = waited.as_micros() as u64;
+        self.scan_write_lock
+            .wait_total_us
+            .fetch_add(waited_us, Ordering::Relaxed);
+        self.scan_write_lock
+            .wait_max_us
+            .fetch_max(waited_us, Ordering::Relaxed);
+        let held_started = std::time::Instant::now();
+        let heap_on_entry =
+            crate::memory::heap_tracking_enabled().then(crate::memory::heap_allocated_bytes_raw);
+        // Records the held duration and in-lock heap growth however this
+        // function returns — including the superseded-generation early
+        // return immediately below, which is itself a lock acquisition worth
+        // counting.
+        let _held = ScanWriteLockHold {
+            stats: &self.scan_write_lock,
+            started: held_started,
+            heap_on_entry,
+        };
         if self.current_scan_generation() != app_generation {
             return Vec::new();
         }
@@ -1738,6 +1914,7 @@ mod tests {
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),
+            scan_write_lock: ScanWriteLockStats::default(),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
@@ -2075,6 +2252,121 @@ mod tests {
     /// making the final state depend on interleaving — and the rebuild's
     /// before/after byte evidence would be measuring a ledger another
     /// writer is changing underneath it.
+    /// Issue #182: the scan write lock had no instrumentation at all, which
+    /// is why the two explanations for the ~1,491 MB scan peak could not be
+    /// separated. This pins that the counters actually observe contention
+    /// rather than merely existing — a `max_waiters` stuck at 1 would look
+    /// exactly like "no queueing happens", which is one of the two answers
+    /// the recording is supposed to distinguish.
+    #[test]
+    fn the_scan_write_lock_records_contention_it_actually_sees() {
+        let state = Arc::new(AppState::new());
+        let stats = &state.scan_write_lock;
+
+        // One holder, several waiters, released only once they are all
+        // queued — so `max_waiters` has something real to observe.
+        let held = state.config_transition.lock().unwrap();
+
+        const WAITERS: usize = 3;
+        let handles: Vec<_> = (0..WAITERS)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                std::thread::spawn(move || {
+                    // Same instrumented sequence `reconcile_scanned_batch_if_current`
+                    // performs around its acquisition.
+                    let waiters = state
+                        .scan_write_lock
+                        .waiting_now
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    state
+                        .scan_write_lock
+                        .max_waiters
+                        .fetch_max(waiters, Ordering::Relaxed);
+                    let started = std::time::Instant::now();
+                    let guard = state.config_transition.lock().unwrap();
+                    state
+                        .scan_write_lock
+                        .waiting_now
+                        .fetch_sub(1, Ordering::Relaxed);
+                    state
+                        .scan_write_lock
+                        .acquisitions
+                        .fetch_add(1, Ordering::Relaxed);
+                    state
+                        .scan_write_lock
+                        .wait_total_us
+                        .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    drop(guard);
+                })
+            })
+            .collect();
+
+        // Wait for all of them to be queued before releasing, so the
+        // observation is deterministic rather than a race the test usually
+        // wins.
+        while stats.waiting_now.load(Ordering::Relaxed) < WAITERS {
+            std::thread::yield_now();
+        }
+        drop(held);
+        for handle in handles {
+            handle.join().expect("waiter thread");
+        }
+
+        assert_eq!(stats.acquisitions.load(Ordering::Relaxed), WAITERS as u64);
+        assert_eq!(
+            stats.max_waiters.load(Ordering::Relaxed),
+            WAITERS,
+            "the waiter count must reflect workers actually queued at once"
+        );
+        assert!(
+            stats.wait_total_us.load(Ordering::Relaxed) > 0,
+            "waiting behind a held lock must register as wait time"
+        );
+    }
+
+    /// In-lock allocation is absent, not zero, when heap tracking is off —
+    /// which is the default. A `0` would read as "allocated nothing under
+    /// the lock", the opposite of what an unmeasured field means, and it is
+    /// one of the two numbers the queue-versus-window question turns on.
+    #[test]
+    fn write_lock_metadata_reports_unmeasured_allocation_as_unavailable() {
+        let state = AppState::new();
+        let metadata: std::collections::BTreeMap<String, String> =
+            state.scan_write_lock.metadata().into_iter().collect();
+
+        assert_eq!(metadata["in_lock_alloc_bytes"], "unavailable");
+        assert_eq!(metadata["acquisitions"], "0");
+        assert_eq!(metadata["max_waiters"], "0");
+    }
+
+    /// The counters describe one scan, so a new scan must not inherit the
+    /// previous one's totals.
+    #[test]
+    fn resetting_the_write_lock_stats_clears_the_previous_scans_totals() {
+        let state = AppState::new();
+        state
+            .scan_write_lock
+            .acquisitions
+            .store(41, Ordering::Relaxed);
+        state
+            .scan_write_lock
+            .wait_total_us
+            .store(1_000, Ordering::Relaxed);
+        state
+            .scan_write_lock
+            .max_waiters
+            .store(7, Ordering::Relaxed);
+
+        state.scan_write_lock.reset();
+
+        let metadata: std::collections::BTreeMap<String, String> =
+            state.scan_write_lock.metadata().into_iter().collect();
+        assert_eq!(metadata["acquisitions"], "0");
+        assert_eq!(metadata["wait_total_ms"], "0.000");
+        assert_eq!(metadata["max_waiters"], "0");
+    }
+
     #[test]
     fn a_rebuild_is_refused_while_a_bulk_scan_holds_the_write_path() {
         let state = Arc::new(AppState::new());
