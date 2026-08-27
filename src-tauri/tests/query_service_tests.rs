@@ -780,3 +780,82 @@ fn quota_text_output_never_renders_unlimited_as_a_number() {
     assert!(rendered.contains("no quota observations"), "{rendered}");
     assert!(!rendered.contains("0 used"), "{rendered}");
 }
+
+#[test]
+fn quota_csv_output_has_a_stable_header_and_one_row_per_window() {
+    use odometer_lib::report_cli::{render_quota, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let store = ledger(
+        directory.path(),
+        &[session_with_quota(
+            "csv",
+            (now - chrono::Duration::minutes(10)).timestamp_millis(),
+            55.0,
+        )],
+    );
+
+    let rendered =
+        render_quota(&store, chrono::Duration::hours(6), now, Format::Csv).expect("renders");
+    let mut lines = rendered.lines();
+
+    assert_eq!(
+        lines.next().unwrap(),
+        "provider,window,unit,used,remaining,limit,unlimited,resets_at,stale,unavailable"
+    );
+    let rows: Vec<&str> = lines.filter(|line| !line.is_empty()).collect();
+    assert!(
+        rows.iter().any(|row| row.contains("55")),
+        "the reading must appear in the rows: {rows:?}"
+    );
+}
+
+#[test]
+fn quota_text_output_renders_a_reading_with_its_reset_time() {
+    use odometer_lib::report_cli::{render_quota, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let now = Utc::now();
+    let store = ledger(
+        directory.path(),
+        &[session_with_quota(
+            "text",
+            (now - chrono::Duration::minutes(10)).timestamp_millis(),
+            55.0,
+        )],
+    );
+
+    let rendered =
+        render_quota(&store, chrono::Duration::hours(6), now, Format::Text).expect("renders");
+
+    assert!(rendered.contains("55 used"), "{rendered}");
+    assert!(rendered.contains("resets "), "{rendered}");
+    assert!(
+        !rendered.contains("[stale]"),
+        "a ten-minute-old reading is current: {rendered}"
+    );
+}
+
+#[test]
+fn quota_json_output_is_parseable_and_names_every_provider() {
+    use odometer_lib::report_cli::{render_quota, Format};
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = ledger(directory.path(), &[]);
+
+    let rendered = render_quota(&store, chrono::Duration::hours(1), Utc::now(), Format::Json)
+        .expect("renders");
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+    let providers: Vec<&str> = parsed
+        .as_array()
+        .expect("an array of snapshots")
+        .iter()
+        .filter_map(|snapshot| snapshot["provider"].as_str())
+        .collect();
+    assert!(
+        providers.contains(&codex_provider_id().as_str()),
+        "every provider gets a row: {providers:?}"
+    );
+}
