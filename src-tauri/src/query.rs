@@ -355,3 +355,41 @@ pub fn price_buckets(
     }
     (priced.then_some(total), omitted.into_iter().collect())
 }
+
+/// How far back a quota query loads sessions.
+///
+/// Provider windows run from a few hours to a week; a fortnight of
+/// *last-observed* history covers the longest of them with room for a
+/// late-arriving or clock-skewed observation, while still loading a handful
+/// of sessions rather than the corpus. Issue #43's honest-state requirement cuts both ways here — too
+/// short a lookback would report "no data" for a window that has evidence,
+/// which is a wrong answer rather than a missing one.
+pub const QUOTA_LOOKBACK_DAYS: i64 = 14;
+
+/// Provider quota snapshots, built from recently-active sessions only
+/// (issue #43).
+///
+/// Rate-limit observations live inside `session_json`, so this is the one
+/// query in this module that materializes sessions. It bounds that by
+/// `last_seen_at_ms` through the index #168 added, so a quota answer costs
+/// a few sessions rather than the whole ledger — which is what lets one
+/// quota service feed a CLI or statusline as well as the desktop, per #43's
+/// DRY boundary.
+///
+/// `max_cache_age` marks a reading stale rather than hiding it. A stale
+/// number is a different and more honest fact than no number, and both are
+/// different from zero usage — the distinction #43's first acceptance
+/// criterion is about.
+pub fn quota_snapshots(
+    store: &HistoryStore,
+    now: DateTime<Utc>,
+    max_cache_age: chrono::Duration,
+) -> Result<Vec<crate::quota::QuotaSnapshot>> {
+    let cutoff = now - chrono::Duration::days(QUOTA_LOOKBACK_DAYS);
+    let keys = store.session_keys_since(cutoff.timestamp_millis())?;
+    let index = crate::quota::QuotaPointsIndex::new();
+    for stored in store.load_many(&keys)? {
+        index.update_session(&stored.key, &stored.session);
+    }
+    Ok(index.snapshots(now, max_cache_age))
+}

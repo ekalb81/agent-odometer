@@ -1181,6 +1181,35 @@ impl HistoryStore {
         Ok(keys)
     }
 
+    /// Session keys last seen at or after `cutoff_ms`, newest first.
+    ///
+    /// Served by the `durable_sessions(last_seen_at_ms DESC, session_key)`
+    /// index #168 added, so this stays cheap on a multi-GB ledger.
+    ///
+    /// Exists for quota (issue #43): rate-limit observations live inside
+    /// `session_json`, so a quota answer needs the handful of recently-seen
+    /// sessions rather than the whole corpus. Loading every session to find
+    /// them would cost exactly what #141 and #168 spent this year removing.
+    ///
+    /// The axis is when Odometer last *observed* the session, not when the
+    /// work happened — a re-observed year-old transcript has a recent
+    /// `last_seen_at_ms`. That is the right axis for quota anyway: a session
+    /// Odometer has not seen in a fortnight cannot hold an observation
+    /// relevant to a window measured in hours or days, and the quota code
+    /// filters the points themselves by age regardless.
+    pub fn session_keys_since(&self, cutoff_ms: i64) -> Result<Vec<String>> {
+        let connection = self.open_reader()?;
+        let mut statement = connection.prepare(
+            "SELECT session_key FROM durable_sessions
+              WHERE last_seen_at_ms >= ?1
+              ORDER BY last_seen_at_ms DESC, session_key",
+        )?;
+        let keys = statement
+            .query_map([cutoff_ms], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(keys)
+    }
+
     pub fn range_totals_multi(
         &self,
         session_keys: &[String],
