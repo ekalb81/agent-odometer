@@ -54,7 +54,7 @@ pub fn try_run_cli() -> bool {
     let Some(command) = args.first().map(String::as_str) else {
         return false;
     };
-    if !matches!(command, "status" | "report" | "quota") {
+    if !matches!(command, "status" | "report" | "quota" | "projects") {
         return false;
     }
 
@@ -79,6 +79,7 @@ fn run(command: &str, args: &[String]) -> Result<String> {
         "status" => run_status(format),
         "report" => run_report(args, format),
         "quota" => run_quota(format),
+        "projects" => run_projects(args, format),
         other => bail!("unknown command '{other}'"),
     }
 }
@@ -125,6 +126,26 @@ fn parse_date(value: &str, end_of_day: bool) -> Result<DateTime<Utc>> {
     }
     .context("date is not a valid instant")?;
     Ok(Utc.from_utc_datetime(&time))
+}
+
+/// An inclusive reporting window: `(from, to)`, either end open.
+type Window = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// `--from`/`--to` as an inclusive window, shared by every command that
+/// takes one so they cannot drift apart in how they read a date.
+fn parse_window(args: &[String]) -> Result<Window> {
+    let from = flag_value(args, "--from")?
+        .map(|value| parse_date(&value, false))
+        .transpose()?;
+    let to = flag_value(args, "--to")?
+        .map(|value| parse_date(&value, true))
+        .transpose()?;
+    if let (Some(from), Some(to)) = (from, to) {
+        if to < from {
+            bail!("--to ({to}) is before --from ({from})");
+        }
+    }
+    Ok((from, to))
 }
 
 /// The user's rate card, falling back to the bundled one and then to an
@@ -220,17 +241,7 @@ pub fn report_from(
     args: &[String],
     format: Format,
 ) -> Result<String> {
-    let from = flag_value(args, "--from")?
-        .map(|value| parse_date(&value, false))
-        .transpose()?;
-    let to = flag_value(args, "--to")?
-        .map(|value| parse_date(&value, true))
-        .transpose()?;
-    if let (Some(from), Some(to)) = (from, to) {
-        if to < from {
-            bail!("--to ({to}) is before --from ({from})");
-        }
-    }
+    let (from, to) = parse_window(args)?;
 
     let harness_for = harness_resolver(config);
     let report = range_report(store, rates, harness_for, from, to, Utc::now())?;
@@ -326,6 +337,114 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
             out
         }
     })
+}
+
+fn run_projects(args: &[String], format: Format) -> Result<String> {
+    let store = open_ledger()?;
+    let rates = load_rates();
+    let config = Config::load().unwrap_or_default();
+    projects_from(&store, &rates, &config, args, format)
+}
+
+/// The testable half of `projects`.
+pub fn projects_from(
+    store: &HistoryStore,
+    rates: &RateCard,
+    config: &Config,
+    args: &[String],
+    format: Format,
+) -> Result<String> {
+    let (from, to) = parse_window(args)?;
+    // Off by default, mirroring the diagnostics export's own checkbox: CLI
+    // output gets piped into files, pasted into issues, and read by agents,
+    // and a `fallback_path_identity` label is an absolute local path.
+    let include_paths = args.iter().any(|arg| arg == "--include-paths");
+    let report =
+        crate::query::project_report(store, rates, harness_resolver(config), from, to, Utc::now())?;
+
+    Ok(match format {
+        Format::Json => {
+            let mut report = report.clone();
+            if !include_paths {
+                for project in &mut report.projects {
+                    project.label = project.redacted_label().to_owned();
+                }
+            }
+            serde_json::to_string_pretty(&report)?
+        }
+        Format::Csv => {
+            let mut out = String::from(
+                "project_key,label,sessions,total_tokens,cost,currency
+",
+            );
+            for project in &report.projects {
+                // One row per currency, so a project that somehow spans two
+                // never has them added together in a spreadsheet either.
+                if project.cost_by_currency.is_empty() {
+                    out.push_str(&format!(
+                        "{},{},{},{},,
+",
+                        project.project_key,
+                        csv_field(project.label_for(include_paths)),
+                        project.sessions,
+                        project.tokens.total_tokens
+                    ));
+                }
+                for (currency, cost) in &project.cost_by_currency {
+                    out.push_str(&format!(
+                        "{},{},{},{},{cost:.6},{currency}
+",
+                        project.project_key,
+                        csv_field(project.label_for(include_paths)),
+                        project.sessions,
+                        project.tokens.total_tokens
+                    ));
+                }
+            }
+            out
+        }
+        Format::Text => {
+            let mut out = String::new();
+            for project in &report.projects {
+                out.push_str(&format!(
+                    "{:<32} {:>4} sessions  {:>14} tokens",
+                    project.label_for(include_paths),
+                    project.sessions,
+                    project.tokens.total_tokens
+                ));
+                for (currency, cost) in &project.cost_by_currency {
+                    out.push_str(&format!("  {cost:.4} {currency}"));
+                }
+                out.push('\n');
+            }
+            if report.sessions_without_project > 0 {
+                // Reported, not dropped: otherwise per-project totals
+                // silently fail to reconcile with the overall report.
+                out.push_str(&format!(
+                    "({} session(s) with usage belong to no project)
+",
+                    report.sessions_without_project
+                ));
+            }
+            if out.is_empty() {
+                out.push_str(
+                    "no project activity in this window
+",
+                );
+            }
+            out
+        }
+    })
+}
+
+/// Quotes a CSV field that could contain a comma. Project labels are
+/// user-supplied aliases, so this is not hypothetical.
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
 }
 
 fn run_quota(format: Format) -> Result<String> {
