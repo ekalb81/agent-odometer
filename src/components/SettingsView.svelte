@@ -5,6 +5,7 @@
   import { updaterStore } from '../lib/stores/updater.svelte';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations, rebuildHistory, cancelHistoryRebuild, getHistoryRebuildStatus, onHistoryRebuildProgress } from '../lib/ipc';
+  import ProjectManagement from './ProjectManagement.svelte';
 
   /**
    * Matches `provider::gemini_cli_provider_id()`. Gemini CLI's roots live in
@@ -12,6 +13,7 @@
    * this is the only key that reaches them (issue #40).
    */
   const GEMINI_CLI_PROVIDER_ID = 'gemini_cli';
+
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
@@ -1791,6 +1793,9 @@
       <p class="text-xs text-ink-faint italic">Loading…</p>
     </section>
   {/if}
+
+  <!-- Issue #41: local alias/merge management for the project dimension -->
+  <ProjectManagement />
 
   <!-- Issue #162: user-triggered history rebuild -->
   <section>
