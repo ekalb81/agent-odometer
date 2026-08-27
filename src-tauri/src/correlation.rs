@@ -415,11 +415,13 @@ fn correlate_at<S: Borrow<Session>>(
             .iter()
             .flat_map(|index| [windows[*index].0, windows[*index].1])
             .collect();
-        for (position, pair) in session
-            .range_totals_multi(&requested)
-            .chunks_exact(2)
-            .enumerate()
-        {
+        // `as_chunks::<2>()` rather than `chunks_exact(2)`: the pair count
+        // is a compile-time constant here (each matched event contributes
+        // exactly its before and after window), so this yields `&[_; 2]` and
+        // the indexing below cannot panic. Required by clippy 1.98's
+        // `chunks_exact_to_as_chunks`.
+        let totals = session.range_totals_multi(&requested);
+        for (position, pair) in totals.as_chunks::<2>().0.iter().enumerate() {
             let index = matched[position];
             add_range(
                 &mut observations[index].0,
