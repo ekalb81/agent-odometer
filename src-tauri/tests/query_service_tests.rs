@@ -2351,3 +2351,76 @@ fn activity_rejects_a_reversed_window() {
 
     assert!(activity_from(&store, utc_offset(0), &args, Format::Text).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end integration verification (issue #57)
+// ---------------------------------------------------------------------------
+
+/// #57's whole premise: "A configuration file or running process alone must
+/// never be presented as proof that the integration works."
+///
+/// So this drives the real binary — launching it, handshaking, listing its
+/// tools, and running a live query — rather than asserting against a mock.
+/// A mock would pass while the shipped binary was broken, which is the exact
+/// failure this gate exists to catch.
+#[test]
+fn verification_drives_the_real_binary_end_to_end() {
+    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-odometer"));
+    let report = odometer_lib::verify::verify(&executable, Utc::now());
+
+    let by_id = |id: &str| {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .unwrap_or_else(|| panic!("no check {id}"))
+    };
+
+    assert_eq!(
+        by_id("mcp_launch").status,
+        odometer_lib::verify::CheckStatus::Pass,
+        "{}",
+        by_id("mcp_launch").detail
+    );
+    assert_eq!(
+        by_id("mcp_initialize").status,
+        odometer_lib::verify::CheckStatus::Pass,
+        "{}",
+        by_id("mcp_initialize").detail
+    );
+    assert_eq!(
+        by_id("mcp_tools").status,
+        odometer_lib::verify::CheckStatus::Pass,
+        "{}",
+        by_id("mcp_tools").detail
+    );
+    // The evidence, not just the verdict: a check that passed without
+    // observing anything is what #57 forbids.
+    assert!(
+        by_id("mcp_initialize").detail.contains("protocol"),
+        "{}",
+        by_id("mcp_initialize").detail
+    );
+}
+
+/// A binary that is not an Odometer build must fail verification rather than
+/// pass it — otherwise "verified" would mean "something launched".
+#[test]
+fn verification_fails_against_a_binary_that_is_not_the_server() {
+    // `cargo` exists on any machine that can run this test and will not
+    // answer an MCP handshake.
+    let report = odometer_lib::verify::verify(std::path::Path::new("cargo"), Utc::now());
+
+    assert!(!report.ok, "a non-server binary must not verify");
+    let mcp_checks: Vec<_> = report
+        .checks
+        .iter()
+        .filter(|check| check.id.starts_with("mcp_") && check.id != "mcp_launch")
+        .collect();
+    assert!(
+        mcp_checks
+            .iter()
+            .all(|check| check.status != odometer_lib::verify::CheckStatus::Pass),
+        "no MCP check may pass against a binary that is not the server: {mcp_checks:?}"
+    );
+}

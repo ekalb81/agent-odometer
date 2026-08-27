@@ -64,6 +64,7 @@ pub fn try_run_cli() -> bool {
             | "mirrors"
             | "sessions"
             | "activity"
+            | "verify"
     ) {
         return false;
     }
@@ -94,6 +95,7 @@ fn run(command: &str, args: &[String]) -> Result<String> {
         "mirrors" => run_mirrors(format),
         "sessions" => run_sessions(args, format),
         "activity" => run_activity(args, format),
+        "verify" => run_verify(format),
         other => bail!("unknown command '{other}'"),
     }
 }
@@ -357,6 +359,34 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
 /// thousands-session corpus is unusable in a terminal; `--limit 0` shows
 /// everything for a script that wants it.
 const DEFAULT_SESSION_LIMIT: usize = 20;
+
+fn run_verify(format: Format) -> Result<String> {
+    // The running binary verifies itself: what a client would launch is
+    // exactly what gets launched, so the check cannot pass against a
+    // different build than the one installed (issue #57).
+    let executable = std::env::current_exe().context("could not locate this executable")?;
+    let report = crate::verify::verify(&executable, Utc::now());
+    Ok(match format {
+        Format::Json => serde_json::to_string_pretty(&report)?,
+        Format::Csv => {
+            let mut out = String::from(
+                "check,status,detail
+",
+            );
+            for check in &report.checks {
+                out.push_str(&format!(
+                    "{},{:?},{}
+",
+                    check.id,
+                    check.status,
+                    csv_field(&check.detail)
+                ));
+            }
+            out
+        }
+        Format::Text => crate::verify::render(&report),
+    })
+}
 
 fn run_activity(args: &[String], format: Format) -> Result<String> {
     let store = open_ledger()?;

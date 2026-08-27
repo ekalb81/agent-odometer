@@ -336,6 +336,18 @@ fn error_response(id: Value, code: i64, message: &str) -> String {
     .to_string()
 }
 
+/// Names of the tools this server advertises.
+///
+/// Exposed so `verify` can check its expectations against what is actually
+/// advertised (issue #57). A rename on either side would otherwise show up
+/// as an agent quietly choosing no tool at all.
+pub fn advertised_tool_names() -> Vec<String> {
+    tool_descriptors()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
