@@ -1,0 +1,875 @@
+{
+  "_note": "Cross-engine pricing conformance fixture (issue #47). One shared synthetic rate card plus cases that each exercise a distinct pricing path. Both `src/lib/credits.ts` (desktop) and `src-tauri/src/query.rs` (CLI/MCP) are asserted against the SAME `expected` block, so agreement with this file is agreement with each other. Regenerate expectations with UPDATE_PRICING_CONFORMANCE=1 npx vitest run src/lib/pricingConformance.test.ts -- see that file for why the desktop engine is the current baseline. Floating-alias expiry dates are deliberately far past / far future: the desktop engine takes no injectable clock, so a date near today would make this fixture depend on when it runs. Synthetic rates throughout: no real published price belongs here, so a rate-card refresh can never silently change what this pins.",
+  "schema_version": 1,
+  "rate_card": {
+    "version": 1,
+    "currency": "credits",
+    "unit": "per_1m_tokens",
+    "source_url": "https://example.test/rates",
+    "fetched_at": "2026-08-01",
+    "fallback_model": "fallback-model",
+    "fallback_models": {
+      "codex": "fallback-model",
+      "claude_code": "fallback-model"
+    },
+    "models": {
+      "base-model": {
+        "input": 10,
+        "cached_input": 1,
+        "cache_creation_input": 12.5,
+        "output": 30,
+        "reasoning": 30
+      },
+      "no-premium-model": {
+        "input": 10,
+        "cached_input": 1,
+        "output": 30,
+        "reasoning": 30
+      },
+      "alias-target": {
+        "input": 20,
+        "cached_input": 2,
+        "output": 60,
+        "reasoning": 60
+      },
+      "fallback-model": {
+        "input": 99,
+        "cached_input": 9.9,
+        "output": 99,
+        "reasoning": 99
+      },
+      "gpt-5.5": {
+        "input": 10,
+        "cached_input": 1,
+        "output": 30,
+        "reasoning": 30
+      },
+      "gpt-5.4": {
+        "input": 10,
+        "cached_input": 1,
+        "output": 30,
+        "reasoning": 30
+      }
+    },
+    "api_models": {
+      "base-model": {
+        "input": 5,
+        "cached_input": 0.5,
+        "cache_creation_input": 6.25,
+        "output": 15,
+        "reasoning": 15
+      },
+      "fallback-model": {
+        "input": 50,
+        "cached_input": 5,
+        "output": 50,
+        "reasoning": 50
+      }
+    },
+    "model_aliases": {
+      "aliased-model": "alias-target"
+    },
+    "floating_model_aliases": {
+      "floating-model": {
+        "target": "base-model",
+        "expires_at": "2099-12-31",
+        "source_url": "https://example.test/floating"
+      },
+      "floating-expired": {
+        "target": "base-model",
+        "expires_at": "2020-01-01",
+        "source_url": "https://example.test/floating"
+      }
+    },
+    "unpriced_models": [
+      "unpriced-model"
+    ],
+    "free_local_models": [
+      "local-model"
+    ]
+  },
+  "cases": [
+    {
+      "name": "direct model, plain input and output",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 1000000,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 2000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 40,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 40,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "cached input is priced at the cached rate and never double-counted",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 400000,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 6.4,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 6.4,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "cache creation with a published premium keeps direct provenance",
+      "harness": "claude_code",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 200000,
+            "cache_creation_input_tokens": 300000,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 8.95,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 8.95,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "cache creation without a published premium falls back to the input rate",
+      "harness": "claude_code",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "no-premium-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 500000,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 10,
+        "by_model": [
+          {
+            "model": "no-premium-model",
+            "cost": 10,
+            "basis": "estimated",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "reasoning output is a subset of output and priced at the reasoning rate",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 1000000,
+            "reasoning_output_tokens": 600000,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 30,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 30,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "static alias resolves to its target",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "aliased-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 20,
+        "by_model": [
+          {
+            "model": "aliased-model",
+            "cost": 20,
+            "basis": "aliased",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "floating alias inside its trust window",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "floating-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 10,
+        "by_model": [
+          {
+            "model": "floating-model",
+            "cost": 10,
+            "basis": "floating_alias",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "floating alias past its expiry falls through to the harness fallback",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "floating-expired",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 99,
+        "by_model": [
+          {
+            "model": "floating-expired",
+            "cost": 99,
+            "basis": "fallback",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [
+          "floating-expired"
+        ],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "unknown model uses the configured fallback",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "never-heard-of-it",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 99,
+        "by_model": [
+          {
+            "model": "never-heard-of-it",
+            "cost": 99,
+            "basis": "fallback",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [
+          "never-heard-of-it"
+        ],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "explicitly unpriced model is excluded, not fallback-priced",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "unpriced-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 1000000,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 2000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 0,
+        "by_model": [
+          {
+            "model": "unpriced-model",
+            "cost": 0,
+            "basis": "unavailable",
+            "unpriced": true
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": [
+          "unpriced-model"
+        ]
+      },
+      "backend_expected": {
+        "total": null,
+        "by_model": [
+          {
+            "model": "unpriced-model",
+            "cost": 0.0,
+            "basis": "unavailable",
+            "unpriced": true
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": [
+          "unpriced-model"
+        ]
+      },
+      "divergence_disposition": "representational",
+      "divergence_reason": "The desktop returns cost 0 plus an `unpriced` flag; the backend returns no amount at all. Both refuse to price the model and both flag it, so no user-visible number disagrees today. Resolve when IPC starts serving priced results, by choosing one wire representation for 'not answerable'."
+    },
+    {
+      "name": "free or locally hosted model is a declared zero",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "local-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 1000000,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 2000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 0,
+        "by_model": [],
+        "missing_models": [],
+        "unpriced_models": []
+      },
+      "backend_expected": {
+        "total": 0.0,
+        "by_model": [
+          {
+            "model": "local-model",
+            "cost": 0.0,
+            "basis": "free_local",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      },
+      "divergence_disposition": "fix_desktop",
+      "divergence_reason": "The desktop drops free/local models from the per-model breakdown entirely: bucketsCost sets the basis then continues before recording a byModel entry, so a locally hosted model's usage vanishes from the table. The backend lists it at a declared zero, which is the information the user actually wants."
+    },
+    {
+      "name": "fast service tier multiplies gpt-5.5 by 2.5",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "gpt-5.5",
+          "service_tier": "fast",
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 25,
+        "by_model": [
+          {
+            "model": "gpt-5.5",
+            "cost": 25,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "fast service tier multiplies gpt-5.4 by 2",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "gpt-5.4",
+          "service_tier": "fast",
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 20,
+        "by_model": [
+          {
+            "model": "gpt-5.4",
+            "cost": 20,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "fast service tier does not multiply a model without a published premium",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": "fast",
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 10,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 10,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "one model across two service tiers sums both buckets",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "gpt-5.5",
+          "service_tier": "fast",
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        },
+        {
+          "model": "gpt-5.5",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 35,
+        "by_model": [
+          {
+            "model": "gpt-5.5",
+            "cost": 35,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "several distinct models in one window",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        },
+        {
+          "model": "alias-target",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 500000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 500000
+          }
+        },
+        {
+          "model": "unpriced-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 1000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 20,
+        "by_model": [
+          {
+            "model": "alias-target",
+            "cost": 10,
+            "basis": "direct",
+            "unpriced": false
+          },
+          {
+            "model": "base-model",
+            "cost": 10,
+            "basis": "direct",
+            "unpriced": false
+          },
+          {
+            "model": "unpriced-model",
+            "cost": 0,
+            "basis": "unavailable",
+            "unpriced": true
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": [
+          "unpriced-model"
+        ]
+      }
+    },
+    {
+      "name": "api table for a codex session",
+      "harness": "codex",
+      "table": "api",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 1000000,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 2000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 20,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 20,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "api table for a non-codex session",
+      "harness": "claude_code",
+      "table": "api",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 1000000,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 2000000
+          }
+        }
+      ],
+      "expected": {
+        "total": 20,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 20,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      },
+      "backend_expected": {
+        "total": null,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 0.0,
+            "basis": "unavailable",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [
+          "base-model"
+        ],
+        "unpriced_models": []
+      },
+      "divergence_disposition": "fix_desktop",
+      "divergence_reason": "The desktop prices ANY harness against api_models whenever that table is non-empty -- apiCostFromBuckets never checks the harness. api_models holds OpenAI API USD rates for Codex, so a Claude session can be priced from OpenAI's price list and reported as a direct match. The backend refuses, which is correct. Latent rather than active on the shipped card, since a Claude model would have to also appear in api_models (or its fallback would), but it is wrong by construction."
+    },
+    {
+      "name": "no buckets at all",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [],
+      "expected": {
+        "total": 0,
+        "by_model": [],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "a bucket with zero usage",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 0
+          }
+        }
+      ],
+      "expected": {
+        "total": 0,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 0,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "cached and cache-creation together exceed input, so the remainder floors at zero",
+      "harness": "claude_code",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 100000,
+            "cached_input_tokens": 80000,
+            "cache_creation_input_tokens": 80000,
+            "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "total_tokens": 100000
+          }
+        }
+      ],
+      "expected": {
+        "total": 1.08,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 1.08,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    },
+    {
+      "name": "reasoning output exceeding total output floors the plain-output remainder at zero",
+      "harness": "codex",
+      "table": "plan",
+      "buckets": [
+        {
+          "model": "base-model",
+          "service_tier": null,
+          "tokens": {
+            "input_tokens": 0,
+            "cached_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 100000,
+            "reasoning_output_tokens": 150000,
+            "total_tokens": 100000
+          }
+        }
+      ],
+      "expected": {
+        "total": 4.5,
+        "by_model": [
+          {
+            "model": "base-model",
+            "cost": 4.5,
+            "basis": "direct",
+            "unpriced": false
+          }
+        ],
+        "missing_models": [],
+        "unpriced_models": []
+      }
+    }
+  ]
+}
