@@ -23,7 +23,26 @@ use crate::scan_cache::{self, ScanCache};
 /// one-transaction-per-session write pattern by roughly two orders of
 /// magnitude; batching amortizes that fixed per-commit cost across this many
 /// sessions instead of paying it once per session.
-pub(crate) const SCAN_WRITE_BATCH_SIZE: usize = 64;
+///
+/// Lowered 64 -> 16 on the field sweep in issue #182. That sweep measured
+/// this constant as very nearly a direct multiplier on the scan's memory
+/// peak, at no throughput cost, against a 5,044-file corpus on 16 cores:
+///
+///   batch  scan wall  peak RSS   max_waiters
+///      16     27.6 s   346.5 MB           15
+///      64     25.2 s   681.8 MB           15
+///     256     26.1 s  1297.3 MB           13
+///
+/// The commit-amortization argument above still holds — 16 sessions per
+/// transaction is two orders of magnitude better than one, which is the gap
+/// #132 actually closed. Going from 16 to 64 buys a further ~1% of wall time
+/// and costs 335 MB of peak.
+///
+/// `max_waiters` staying pinned at 13-15 across every arm is what settled
+/// #182's open question: the peak is bytes in flight, not batches
+/// accumulating behind the write mutex. Had it been queueing, the peak would
+/// track the waiter count, which does not move.
+pub(crate) const SCAN_WRITE_BATCH_SIZE: usize = 16;
 
 /// Environment override for [`SCAN_WRITE_BATCH_SIZE`], for the batch-size
 /// sweep issue #182 calls for (16 / 64 / 256).
