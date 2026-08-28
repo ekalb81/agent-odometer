@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  apiCostFromBuckets,
+  computeSessionApiCost,
   computeSessionApiCostScenarios,
   computeSessionCredits,
   creditsFromBuckets,
@@ -358,6 +360,73 @@ describe('unknown models', () => {
     expect(result.unpriced).toBe(true);
     expect(result.cost).toBe(0);
     expect(result.basis).toBe('unavailable');
+  });
+});
+
+describe('API-rate pricing is Codex-only (issue #47)', () => {
+  const card: RateCard = {
+    ...rateCard,
+    api_models: { 'gpt-5.6-sol': rate(5, 0.5, 30, 30), 'claude-opus-5': rate(5, 0.5, 25, 25) },
+  };
+  const buckets = [
+    { model: 'claude-opus-5', service_tier: null, tokens: totals(1_000_000, 0, 0, 0) },
+  ];
+
+  it('refuses to price a non-Codex session against the OpenAI API table', () => {
+    // `api_models` holds OpenAI API USD rates. Pricing a Claude session from
+    // it produced a real number reported as a `direct` match — provenance
+    // that raises no warning anywhere in the UI. The guard lived in
+    // `usesApiPricing` and most callers went through it, so this was latent
+    // rather than firing on the shipped card; it was still wrong by
+    // construction, and the cross-engine fixture caught it.
+    expect(apiCostFromBuckets(buckets, card, 'claude_code')).toBeNull();
+  });
+
+  it('still prices a Codex session against it', () => {
+    const codex = [
+      { model: 'gpt-5.6-sol', service_tier: null, tokens: totals(1_000_000, 0, 0, 0) },
+    ];
+    expect(apiCostFromBuckets(codex, card, 'codex')?.total).toBe(5);
+  });
+
+  it('refuses a full session too, not only the bucket path', () => {
+    expect(computeSessionApiCost(session([], 'claude_code'), card)).toBeNull();
+  });
+});
+
+describe('free and locally hosted models (issue #47)', () => {
+  it('appears in the per-model breakdown as a declared zero', () => {
+    // Previously `bucketsCost` set the basis and then continued before
+    // recording an entry, so usage on a local model vanished from the very
+    // table that is supposed to account for it.
+    const card: RateCard = { ...rateCard, free_local_models: ['local-llama'] };
+    const credits = creditsFromBuckets(
+      [{ model: 'local-llama', service_tier: null, tokens: totals(5_000_000, 0, 0, 0) }],
+      card,
+      'codex',
+    );
+
+    expect(credits.byModel).toHaveLength(1);
+    expect(credits.byModel[0]).toMatchObject({ model: 'local-llama', cost: 0, basis: 'free_local' });
+    expect(credits.total).toBe(0);
+    // A declared zero is not a missing rate, and must not raise the
+    // fallback warning.
+    expect(credits.missingModels).toEqual([]);
+  });
+
+  it('does not give an unpriceable model a misleading zero row', () => {
+    // The complement: a model with genuinely no rate stays out of the
+    // breakdown, because a 0 row would read as "this was free". It is
+    // already surfaced through `missingModels`.
+    const card: RateCard = { ...rateCard, models: {}, api_models: {}, fallback_models: {}, fallback_model: 'nope' };
+    const credits = creditsFromBuckets(
+      [{ model: 'unknown-model', service_tier: null, tokens: totals(1_000_000, 0, 0, 0) }],
+      card,
+      'codex',
+    );
+
+    expect(credits.byModel).toEqual([]);
+    expect(credits.missingModels).toEqual(['unknown-model']);
   });
 });
 

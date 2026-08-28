@@ -419,7 +419,7 @@
         "by_model": [
           {
             "model": "unpriced-model",
-            "cost": 0.0,
+            "cost": 0,
             "basis": "unavailable",
             "unpriced": true
           }
@@ -430,7 +430,7 @@
         ]
       },
       "divergence_disposition": "representational",
-      "divergence_reason": "The desktop returns cost 0 plus an `unpriced` flag; the backend returns no amount at all. Both refuse to price the model and both flag it, so no user-visible number disagrees today. Resolve when IPC starts serving priced results, by choosing one wire representation for 'not answerable'."
+      "divergence_reason": "The desktop returns cost 0 plus an unpriced flag; the backend returns no amount at all. Both refuse to price the model and both flag it, so no user-visible number disagrees. Resolve when IPC starts serving priced results, by choosing one wire representation for 'not answerable'."
     },
     {
       "name": "free or locally hosted model is a declared zero",
@@ -452,25 +452,17 @@
       ],
       "expected": {
         "total": 0,
-        "by_model": [],
-        "missing_models": [],
-        "unpriced_models": []
-      },
-      "backend_expected": {
-        "total": 0.0,
         "by_model": [
           {
             "model": "local-model",
-            "cost": 0.0,
+            "cost": 0,
             "basis": "free_local",
             "unpriced": false
           }
         ],
         "missing_models": [],
         "unpriced_models": []
-      },
-      "divergence_disposition": "fix_desktop",
-      "divergence_reason": "The desktop drops free/local models from the per-model breakdown entirely: bucketsCost sets the basis then continues before recording a byModel entry, so a locally hosted model's usage vanishes from the table. The backend lists it at a declared zero, which is the information the user actually wants."
+      }
     },
     {
       "name": "fast service tier multiplies gpt-5.5 by 2.5",
@@ -733,15 +725,8 @@
         }
       ],
       "expected": {
-        "total": 20,
-        "by_model": [
-          {
-            "model": "base-model",
-            "cost": 20,
-            "basis": "direct",
-            "unpriced": false
-          }
-        ],
+        "total": null,
+        "by_model": [],
         "missing_models": [],
         "unpriced_models": []
       },
@@ -750,7 +735,7 @@
         "by_model": [
           {
             "model": "base-model",
-            "cost": 0.0,
+            "cost": 0,
             "basis": "unavailable",
             "unpriced": false
           }
@@ -760,8 +745,8 @@
         ],
         "unpriced_models": []
       },
-      "divergence_disposition": "fix_desktop",
-      "divergence_reason": "The desktop prices ANY harness against api_models whenever that table is non-empty -- apiCostFromBuckets never checks the harness. api_models holds OpenAI API USD rates for Codex, so a Claude session can be priced from OpenAI's price list and reported as a direct match. The backend refuses, which is correct. Latent rather than active on the shipped card, since a Claude model would have to also appear in api_models (or its fallback would), but it is wrong by construction."
+      "divergence_disposition": "representational",
+      "divergence_reason": "Both engines now refuse to price a non-Codex session against api_models, so no number disagrees; only the shape of 'not applicable' differs. The desktop returns null for the whole result (the caller hides the column), while the backend reports per-bucket unavailable and lists the model as missing. Resolve when IPC starts serving priced results, by choosing one wire representation for a table that does not apply to this harness."
     },
     {
       "name": "no buckets at all",
