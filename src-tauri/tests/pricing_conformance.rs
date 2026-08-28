@@ -253,9 +253,18 @@ fn every_recorded_divergence_is_explained_and_the_set_has_not_grown() {
         );
     }
 
+    for case in &diverging {
+        assert_eq!(
+            case.divergence_disposition.as_deref(),
+            Some("representational"),
+            "{}: a divergence that changes a number must be fixed, not recorded (issue #47)",
+            case.name
+        );
+    }
+
     assert_eq!(
         diverging.len(),
-        3,
+        2,
         "the known desktop/backend pricing divergences changed; update this count \
          deliberately and say why in the fixture (issue #47)"
     );

@@ -307,7 +307,7 @@ export function apiCostFromBuckets(
   rates: RateCard,
   harness: Harness,
 ): SessionCredits | null {
-  if (Object.keys(rates.api_models ?? {}).length === 0) return null;
+  if (!hasApiPricing(rates, harness)) return null;
   return bucketsCost(buckets, rates, harness, rates.api_models);
 }
 
@@ -336,6 +336,14 @@ function bucketsCost(
     const rate = table[resolvedModel];
     if (!rate) {
       if (basisByModel.get(b.model) !== 'estimated') basisByModel.set(b.model, basis);
+      // A free/local model has no rate row by design, and its cost is a
+      // declared zero rather than an absence. Without an entry here it
+      // vanished from the per-model breakdown entirely, so usage on a
+      // locally hosted model was invisible in the table that is supposed to
+      // account for it (issue #47). Genuinely unpriceable models stay out:
+      // they are already surfaced through `missingModels`, and a 0 row would
+      // read as "this was free".
+      if (basis === 'free_local') byModelMap.set(b.model, byModelMap.get(b.model) ?? 0);
       continue;
     }
     // A model can appear in multiple buckets (one per service tier); once
@@ -367,6 +375,24 @@ function bucketsCost(
   };
 }
 
+/**
+ * Whether API-rate pricing applies at all.
+ *
+ * `api_models` holds OpenAI API USD rates for Codex models, so it is only
+ * meaningful for a Codex session. Without the harness check, any harness
+ * priced against that table whenever it was non-empty — so a Claude session
+ * could be costed from OpenAI's price list and reported as a `direct` match,
+ * which raises no warning in the UI at all (issue #47).
+ *
+ * `usesApiPricing` in `sessionProjection.ts` already encoded this rule, and
+ * most call sites went through it. Enforcing it here means a caller cannot
+ * skip it — which is exactly how the two drifted apart. Mirrors
+ * `query::price_tokens`'s `RateTable::Api` guard in the backend.
+ */
+function hasApiPricing(rates: RateCard, harness: Harness): boolean {
+  return harness === 'codex' && Object.keys(rates.api_models ?? {}).length > 0;
+}
+
 /** All-time credits for a list-view summary. */
 export function computeSummaryCredits(summary: SessionSummary, rates: RateCard): SessionCredits {
   return creditsFromBuckets(summary.buckets, rates, summary.harness);
@@ -374,7 +400,7 @@ export function computeSummaryCredits(summary: SessionSummary, rates: RateCard):
 
 /** All-time OpenAI-API-rate cost for a full session (drawer). Null when unconfigured. */
 export function computeSessionApiCost(session: Session, rates: RateCard): SessionCredits | null {
-  if (Object.keys(rates.api_models ?? {}).length === 0) return null;
+  if (!hasApiPricing(rates, session.harness)) return null;
   return historyCost(session, rates, rates.api_models);
 }
 
@@ -621,6 +647,9 @@ function historyCost(
     const rate = table[resolvedModel];
     if (!rate) {
       if (basisByModel.get(ev.model) !== 'estimated') basisByModel.set(ev.model, basis);
+      // Same declared-zero rule as `bucketsCost` — the per-event path had
+      // the identical omission.
+      if (basis === 'free_local') byModelMap.set(ev.model, byModelMap.get(ev.model) ?? 0);
       continue;
     }
     // Multiple events can share a model across a session's history; once any
