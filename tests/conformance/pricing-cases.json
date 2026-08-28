@@ -1,5 +1,5 @@
 {
-  "_note": "Cross-engine pricing conformance fixture (issue #47). One shared synthetic rate card plus cases that each exercise a distinct pricing path. Both `src/lib/credits.ts` (desktop) and `src-tauri/src/query.rs` (CLI/MCP) are asserted against the SAME `expected` block, so agreement with this file is agreement with each other. Regenerate expectations with UPDATE_PRICING_CONFORMANCE=1 npx vitest run src/lib/pricingConformance.test.ts -- see that file for why the desktop engine is the current baseline. Floating-alias expiry dates are deliberately far past / far future: the desktop engine takes no injectable clock, so a date near today would make this fixture depend on when it runs. Synthetic rates throughout: no real published price belongs here, so a rate-card refresh can never silently change what this pins.",
+  "_note": "Cross-engine pricing conformance fixture (issue #47). One shared synthetic rate card plus cases that each exercise a distinct pricing path. Both `src/lib/credits.ts` (desktop) and `query::price_buckets_detailed` (backend) are asserted against the SAME `expected` block, so agreement with this file is agreement with each other. As of #47 phase 1 there are NO divergences: every case produces an identical result on both sides. Regenerate expectations with UPDATE_PRICING_CONFORMANCE=1 npx vitest run src/lib/pricingConformance.test.ts -- see that file for why the desktop engine is the current baseline. Floating-alias expiry dates are deliberately far past / far future: the desktop engine takes no injectable clock, so a date near today would make this fixture depend on when it runs. Synthetic rates throughout: no real published price belongs here, so a rate-card refresh can never silently change what this pins.",
   "schema_version": 1,
   "rate_card": {
     "version": 1,
@@ -413,24 +413,7 @@
         "unpriced_models": [
           "unpriced-model"
         ]
-      },
-      "backend_expected": {
-        "total": null,
-        "by_model": [
-          {
-            "model": "unpriced-model",
-            "cost": 0,
-            "basis": "unavailable",
-            "unpriced": true
-          }
-        ],
-        "missing_models": [],
-        "unpriced_models": [
-          "unpriced-model"
-        ]
-      },
-      "divergence_disposition": "representational",
-      "divergence_reason": "The desktop returns cost 0 plus an unpriced flag; the backend returns no amount at all. Both refuse to price the model and both flag it, so no user-visible number disagrees. Resolve when IPC starts serving priced results, by choosing one wire representation for 'not answerable'."
+      }
     },
     {
       "name": "free or locally hosted model is a declared zero",
@@ -729,24 +712,7 @@
         "by_model": [],
         "missing_models": [],
         "unpriced_models": []
-      },
-      "backend_expected": {
-        "total": null,
-        "by_model": [
-          {
-            "model": "base-model",
-            "cost": 0,
-            "basis": "unavailable",
-            "unpriced": false
-          }
-        ],
-        "missing_models": [
-          "base-model"
-        ],
-        "unpriced_models": []
-      },
-      "divergence_disposition": "representational",
-      "divergence_reason": "Both engines now refuse to price a non-Codex session against api_models, so no number disagrees; only the shape of 'not applicable' differs. The desktop returns null for the whole result (the caller hides the column), while the backend reports per-bucket unavailable and lists the model as missing. Resolve when IPC starts serving priced results, by choosing one wire representation for a table that does not apply to this harness."
+      }
     },
     {
       "name": "no buckets at all",

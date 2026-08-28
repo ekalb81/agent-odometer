@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Timelike, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::history_store::HistoryStore;
 use crate::model::{RangeTotals, TierBucket, TokenTotals};
@@ -323,6 +323,141 @@ pub fn price_range_totals(
     now: DateTime<Utc>,
 ) -> (Option<f64>, Vec<String>) {
     price_buckets(rates, harness, &range.buckets, table, now)
+}
+
+/// One model's priced usage in a window, shaped exactly like the desktop's
+/// `ModelCredit` (issue #47).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PricedModel {
+    pub model: String,
+    pub cost: f64,
+    pub basis: PricingBasis,
+    /// The model is declared unpriceable, so `cost` is a placeholder rather
+    /// than a measurement. Distinct from a fallback-priced model, whose cost
+    /// is real but approximate.
+    pub unpriced: bool,
+}
+
+/// A window's usage priced against one rate table, with the provenance the
+/// desktop needs to render it (issue #47).
+///
+/// `price_buckets` returns only a total and a list of omitted models, which
+/// is enough for a CLI line but loses the per-model breakdown, the
+/// per-model basis, and the difference between "no rate published" and
+/// "explicitly unpriceable" — all of which the desktop renders. That gap is
+/// why the two engines could not share an aggregation, so this closes it:
+/// the shape here is the one `credits.ts`'s `bucketsCost` produces, and
+/// `tests/pricing_conformance.rs` asserts they agree case for case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PricedSurface {
+    pub total: f64,
+    pub by_model: Vec<PricedModel>,
+    /// Models priced from a fallback rate, or not priced at all — the set
+    /// the UI warns about. Excludes explicitly unpriced models, which are a
+    /// different and quieter state.
+    pub missing_models: Vec<String>,
+    pub unpriced_models: Vec<String>,
+}
+
+/// Prices a window's buckets against one rate table, with full provenance.
+///
+/// `None` means the table does not apply to this harness at all — the API
+/// table for a non-Codex session — which is a different answer from "priced
+/// at zero" and lets a caller hide the column rather than render a nought.
+/// Mirrors `apiCostFromBuckets` returning null.
+pub fn price_buckets_detailed(
+    rates: &RateCard,
+    harness: &str,
+    buckets: &[TierBucket],
+    table: RateTable,
+    now: DateTime<Utc>,
+) -> Option<PricedSurface> {
+    if table == RateTable::Api
+        && (harness != codex_provider_id().as_str() || rates.api_models.is_empty())
+    {
+        return None;
+    }
+
+    let rate_table = match table {
+        RateTable::Api => &rates.api_models,
+        RateTable::Plan => &rates.models,
+    };
+
+    let mut by_model: BTreeMap<String, (f64, PricingBasis, bool)> = BTreeMap::new();
+    let mut missing: BTreeSet<String> = BTreeSet::new();
+    let mut unpriced: BTreeSet<String> = BTreeSet::new();
+    let mut total = 0.0;
+
+    for bucket in buckets {
+        let is_unpriced = rates.unpriced_models.contains(&bucket.model);
+        let resolution = rates.resolve_model_pricing(&bucket.model, harness, rate_table, now);
+
+        if is_unpriced && resolution.basis == PricingBasis::Unavailable {
+            unpriced.insert(bucket.model.clone());
+            by_model
+                .entry(bucket.model.clone())
+                .or_insert((0.0, PricingBasis::Unavailable, true));
+            continue;
+        }
+        if matches!(
+            resolution.basis,
+            PricingBasis::Fallback | PricingBasis::Unavailable
+        ) {
+            missing.insert(bucket.model.clone());
+        }
+
+        let Some(rate) = rate_table.get(&resolution.resolved_model) else {
+            // No rate row. A free/local model is a declared zero worth
+            // showing; anything else is already reported through
+            // `missing_models`, and a zero row would read as "this was
+            // free".
+            if resolution.basis == PricingBasis::FreeLocal {
+                by_model.entry(bucket.model.clone()).or_insert((
+                    0.0,
+                    PricingBasis::FreeLocal,
+                    false,
+                ));
+            }
+            continue;
+        };
+
+        let cost = token_cost(
+            &bucket.tokens,
+            rate,
+            service_tier_multiplier(&bucket.model, bucket.service_tier.as_deref()),
+        );
+        total += cost;
+        let basis = crate::rates::downgrade_for_cache_creation_fallback(
+            resolution.basis,
+            rate,
+            bucket.tokens.cache_creation_input_tokens,
+        );
+        let entry = by_model
+            .entry(bucket.model.clone())
+            .or_insert((0.0, basis, false));
+        entry.0 += cost;
+        // A model can appear in several buckets, one per service tier. Once
+        // any of them downgrades to `Estimated`, a later cleaner bucket must
+        // not paper back over it.
+        if entry.1 != PricingBasis::Estimated {
+            entry.1 = basis;
+        }
+    }
+
+    Some(PricedSurface {
+        total,
+        by_model: by_model
+            .into_iter()
+            .map(|(model, (cost, basis, unpriced))| PricedModel {
+                model,
+                cost,
+                basis,
+                unpriced,
+            })
+            .collect(),
+        missing_models: missing.into_iter().collect(),
+        unpriced_models: unpriced.into_iter().collect(),
+    })
 }
 
 /// Sums the priceable buckets in `buckets`, returning the total and the
