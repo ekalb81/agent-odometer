@@ -15,10 +15,8 @@
 //! users see today. A failure here therefore means "the CLI would report a
 //! different number than the app", which is the thing #47 exists to prevent.
 
-use std::collections::BTreeMap;
-
 use odometer_lib::model::TierBucket;
-use odometer_lib::query::{price_tokens, RateTable};
+use odometer_lib::query::{price_buckets_detailed, RateTable};
 use odometer_lib::rates::{PricingBasis, RateCard};
 use serde::Deserialize;
 
@@ -83,8 +81,13 @@ fn basis_name(basis: PricingBasis) -> &'static str {
     }
 }
 
-/// Prices one case through the backend engine, shaped like the desktop's
-/// `SessionCredits` so the two are directly comparable.
+/// Prices one case through the backend engine.
+///
+/// Calls `query::price_buckets_detailed` — the production aggregation —
+/// rather than reimplementing the fold here. An oracle that reimplements
+/// what it is checking proves only that the test agrees with itself; this
+/// way a passing run means the code the app will actually call agrees with
+/// the desktop.
 fn evaluate(fixture: &Fixture, case: &Case) -> Expectation {
     let table = if case.table == "api" {
         RateTable::Api
@@ -98,72 +101,33 @@ fn evaluate(fixture: &Fixture, case: &Case) -> Expectation {
         .expect("fixed clock")
         .with_timezone(&chrono::Utc);
 
-    let mut by_model: BTreeMap<String, (f64, PricingBasis, bool)> = BTreeMap::new();
-    let mut missing: Vec<String> = Vec::new();
-    let mut unpriced: Vec<String> = Vec::new();
-    let mut total = 0.0;
-    let mut any_answerable = false;
-
-    for bucket in &case.buckets {
-        let priced = price_tokens(
-            &fixture.rate_card,
-            &case.harness,
-            &bucket.model,
-            bucket.service_tier.as_deref(),
-            &bucket.tokens,
-            table,
-            now,
-        );
-        let is_unpriced = fixture.rate_card.unpriced_models.contains(&bucket.model);
-        if is_unpriced && !unpriced.contains(&bucket.model) {
-            unpriced.push(bucket.model.clone());
-        }
-        if matches!(
-            priced.basis,
-            PricingBasis::Fallback | PricingBasis::Unavailable
-        ) && !is_unpriced
-            && !missing.contains(&bucket.model)
-        {
-            missing.push(bucket.model.clone());
-        }
-        let amount = priced.amount.unwrap_or(0.0);
-        if priced.amount.is_some() {
-            any_answerable = true;
-        }
-        total += amount;
-        let entry =
-            by_model
-                .entry(bucket.model.clone())
-                .or_insert((0.0, priced.basis, is_unpriced));
-        entry.0 += amount;
-        // Once any bucket for a model downgrades to `estimated`, a later
-        // cleaner bucket must not paper back over it — the desktop engine
-        // has the same rule.
-        if entry.1 != PricingBasis::Estimated {
-            entry.1 = priced.basis;
-        }
-    }
-
-    missing.sort();
-    unpriced.sort();
+    let Some(priced) =
+        price_buckets_detailed(&fixture.rate_card, &case.harness, &case.buckets, table, now)
+    else {
+        // The table does not apply to this harness at all, which the
+        // desktop expresses as a null result.
+        return Expectation {
+            total: None,
+            by_model: Vec::new(),
+            missing_models: Vec::new(),
+            unpriced_models: Vec::new(),
+        };
+    };
 
     Expectation {
-        total: if case.buckets.is_empty() || any_answerable {
-            Some(round(total))
-        } else {
-            None
-        },
-        by_model: by_model
+        total: Some(round(priced.total)),
+        by_model: priced
+            .by_model
             .into_iter()
-            .map(|(model, (cost, basis, is_unpriced))| ModelExpectation {
-                model,
-                cost: round(cost),
-                basis: basis_name(basis).to_owned(),
-                unpriced: is_unpriced,
+            .map(|entry| ModelExpectation {
+                model: entry.model,
+                cost: round(entry.cost),
+                basis: basis_name(entry.basis).to_owned(),
+                unpriced: entry.unpriced,
             })
             .collect(),
-        missing_models: missing,
-        unpriced_models: unpriced,
+        missing_models: priced.missing_models,
+        unpriced_models: priced.unpriced_models,
     }
 }
 
@@ -217,12 +181,19 @@ fn backend_pricing_matches_the_desktop_engine() {
     );
 }
 
-/// Every recorded divergence must carry a disposition and a reason.
+/// There are no recorded divergences, and adding one must be a decision.
 ///
-/// Without this, `backend_expected` becomes a way to silence a real
-/// disagreement by writing down whatever the backend happens to do — which
-/// would turn the oracle into a rubber stamp. Three are known today, and the
-/// count is pinned so a fourth cannot appear unnoticed.
+/// The fixture started with three. Two were real desktop defects, fixed in
+/// #218. The last two dissolved once the backend gained the desktop's own
+/// aggregation shape (`price_buckets_detailed`) instead of the test
+/// approximating it — so all 22 cases now produce an identical result on
+/// both sides.
+///
+/// `backend_expected` stays supported so a genuine, argued difference can be
+/// recorded. But it is empty, and adding an entry has to be deliberate:
+/// without this test it would be the path of least resistance to write down
+/// whatever the backend happens to do, and the oracle becomes a rubber
+/// stamp.
 #[test]
 fn every_recorded_divergence_is_explained_and_the_set_has_not_grown() {
     let fixture = load();
@@ -264,8 +235,8 @@ fn every_recorded_divergence_is_explained_and_the_set_has_not_grown() {
 
     assert_eq!(
         diverging.len(),
-        2,
-        "the known desktop/backend pricing divergences changed; update this count \
-         deliberately and say why in the fixture (issue #47)"
+        0,
+        "a desktop/backend pricing divergence was recorded; the engines agree on every \
+         case today, so adding one needs an argument in the fixture (issue #47)"
     );
 }
