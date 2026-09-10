@@ -111,7 +111,11 @@ pub fn price_tokens(
                     resolved_model: resolution.resolved_model,
                 };
             };
-            let amount = token_cost(tokens, rate, service_tier_multiplier(model, service_tier));
+            let amount = token_cost(
+                tokens,
+                rate,
+                service_tier_multiplier(model, service_tier, table),
+            );
             PricedAmount {
                 amount: Some(amount),
                 basis: crate::rates::downgrade_for_cache_creation_fallback(
@@ -148,12 +152,17 @@ pub fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f6
         * multiplier
 }
 
-/// Service-tier price multiplier for a model, where the provider charges one.
-pub fn service_tier_multiplier(model: &str, service_tier: Option<&str>) -> f64 {
+/// Service-tier price multiplier for a model and pricing surface.
+/// Astra fast mode uses 2.5x Codex credits but 2x OpenAI API USD rates.
+pub fn service_tier_multiplier(model: &str, service_tier: Option<&str>, table: RateTable) -> f64 {
     if service_tier != Some("fast") {
         return 1.0;
     }
     match model {
+        "gpt-6-astra" => match table {
+            RateTable::Plan => 2.5,
+            RateTable::Api => 2.0,
+        },
         "gpt-5.5" => 2.5,
         "gpt-5.4" => 2.0,
         _ => 1.0,
@@ -545,7 +554,7 @@ pub(crate) fn price_buckets_detailed_controlled(
         let cost = token_cost(
             &bucket.tokens,
             rate,
-            service_tier_multiplier(&bucket.model, bucket.service_tier.as_deref()),
+            service_tier_multiplier(&bucket.model, bucket.service_tier.as_deref(), table),
         );
         total += cost;
         let basis = crate::rates::downgrade_for_cache_creation_fallback(

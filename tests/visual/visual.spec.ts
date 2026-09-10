@@ -404,6 +404,28 @@ visualTest('updater-error', 'updater installation error', async (page) => {
   await expectSessionRollup(page, 15);
 });
 
+test('project reassignment and restore stay usable in the narrow detail drawer', async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 600 });
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: 'Select session Add dark mode toggle', exact: true }).click();
+  const editor = page.getByRole('region', { name: 'Session project', exact: true });
+  await editor.getByRole('button', { name: 'Change project' }).click();
+  await editor.getByRole('button', { name: 'Make standalone project' }).click();
+  await expect(editor).toContainText('Standalone project');
+  await editor.getByRole('button', { name: 'Change project' }).click();
+  const destination = editor.getByLabel('Destination project');
+  await destination.focus();
+  await expect(destination).toBeFocused();
+  await destination.selectOption({ label: 'demo' });
+  await editor.getByRole('button', { name: 'Move session' }).click();
+  await expect(editor).not.toContainText('Standalone project');
+  await editor.getByRole('button', { name: 'Change project' }).click();
+  await editor.getByRole('button', { name: 'Restore detected project' }).click();
+  await editor.getByRole('button', { name: 'Change project' }).click();
+  await expect(editor.getByRole('button', { name: 'Restore detected project' })).toHaveCount(0);
+  await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {

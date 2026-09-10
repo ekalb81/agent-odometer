@@ -302,6 +302,7 @@
   let turnReceiptsEnabled = $state(false);
   let turnReceiptsCodex = $state(true);
   let turnReceiptsClaude = $state(true);
+  let turnReceiptsGemini = $state(false);
   let turnReceiptsDirty = $state(false);
   let turnReceiptsSaving = $state(false);
   let turnReceiptsSavedAt = $state<string | null>(null);
@@ -314,6 +315,7 @@
       turnReceiptsEnabled = current.turn_receipts_enabled ?? false;
       turnReceiptsCodex = current.turn_receipts_codex ?? true;
       turnReceiptsClaude = current.turn_receipts_claude ?? true;
+      turnReceiptsGemini = current.turn_receipts_gemini ?? false;
     }
   });
 
@@ -332,7 +334,7 @@
   }
 
   async function saveTurnReceipts() {
-    if (turnReceiptsEnabled && !turnReceiptsCodex && !turnReceiptsClaude) {
+    if (turnReceiptsEnabled && !turnReceiptsCodex && !turnReceiptsClaude && !turnReceiptsGemini) {
       turnReceiptsError = 'Select at least one harness, or turn the feature off.';
       return;
     }
@@ -344,6 +346,7 @@
         turn_receipts_enabled: turnReceiptsEnabled,
         turn_receipts_codex: turnReceiptsCodex,
         turn_receipts_claude: turnReceiptsClaude,
+        turn_receipts_gemini: turnReceiptsGemini,
       };
       await setConfig(updatedConfig);
       config.set(updatedConfig);
@@ -403,6 +406,7 @@
       case 'codex_inline_toml': return 'Inline Codex config.toml';
       case 'codex_hooks_json': return 'Codex hooks.json';
       case 'claude_settings_json': return 'Claude Code user settings.json';
+      case 'gemini_settings_json': return 'Gemini CLI user settings.json';
       default: return 'Harness configuration';
     }
   }
@@ -413,6 +417,7 @@
     if (value.restart_recommended) {
       steps.push(harness === 'claude'
         ? 'Start a fresh CLI or local Desktop Code task to load and verify it.'
+        : harness === 'gemini' ? 'Start a fresh Gemini CLI session to load and verify it.'
         : 'Start a fresh Codex task to load and verify it.');
     }
     return steps.length > 0 ? steps.join(' ') : null;
@@ -1260,7 +1265,7 @@
     <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Turn receipts</h2>
     <p class="text-xs text-ink-faint mb-3 max-w-3xl">
       Show a compact token, estimated cost, and available subscription-usage receipt after each
-      completed agent turn. Odometer adds an identifiable <span class="font-mono">Stop</span> hook
+      completed agent turn. Odometer adds an identifiable completion hook
       only for the harnesses you select. This is off by default; while off, Odometer does not run a
       receipt helper, read extra transcript data, poll accounts, or change harness behavior.
     </p>
@@ -1299,10 +1304,14 @@
           />
           Claude Code (CLI + local Desktop Code)
         </label>
+        <label class="flex items-center gap-2 text-xs text-ink-2">
+          <input type="checkbox" bind:checked={turnReceiptsGemini} onchange={markTurnReceiptsDirty} disabled={!turnReceiptsEnabled} />
+          Gemini CLI
+        </label>
       </div>
       <p class="text-[11px] text-ink-faint pl-5">
         Local Desktop Code sessions share Claude Code user settings. Direct setup requires Claude
-        Code 2.1.139 or later. Remote and SSH sessions use the settings on that host.
+        Code 2.1.139 or later. Gemini CLI receipts use AfterAgent and require JSONL sessions (0.39+); quota usage is unavailable. Remote and SSH sessions use the settings on that host.
       </p>
 
       <div class="flex items-center gap-3 flex-wrap">
@@ -1335,6 +1344,7 @@
           {#each [
             { label: 'Codex', harness: 'codex', value: turnReceiptStatus.codex },
             { label: 'Claude Code', harness: 'claude', value: turnReceiptStatus.claude_code },
+            ...(turnReceiptStatus.gemini_cli ? [{ label: 'Gemini CLI', harness: 'gemini', value: turnReceiptStatus.gemini_cli }] : []),
           ] as item}
             <div class="bg-app border border-edgerow rounded-md px-3 py-2 min-w-0">
               <div class="flex items-center justify-between gap-2">

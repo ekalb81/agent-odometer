@@ -1461,14 +1461,58 @@ mod tests {
     fn bundled_card_version_is_ahead_of_the_last_shipped_card() {
         let card = RateCard::load_bundled().expect("bundled rate card should parse");
         assert!(
-            card.version >= 10,
+            card.version >= 11,
             "adding models or aliases requires a version bump to propagate; got {}",
             card.version
         );
     }
 
     #[test]
-    fn catalog_uses_half_open_period_boundaries_for_sonnet_five() {
+    fn version_ten_override_gains_new_releases_without_losing_custom_prices() {
+        let bundled = RateCard::load_bundled().unwrap();
+        let mut disk = bundled.clone();
+        disk.version = 10;
+        disk.models.remove("gpt-6-astra");
+        disk.api_models.remove("gpt-6-astra");
+        disk.models.remove("claude-fable-5-1");
+        disk.floating_model_aliases
+            .remove("gpt-daybreak-red-latest");
+        disk.model_aliases.remove("claude-opus-4-5");
+        disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
+        let merged = merge_older_override(disk, bundled);
+        assert_eq!(merged.version, 11);
+        assert_eq!(merged.models["gpt-6-astra"].input, 250.0);
+        assert_eq!(merged.api_models["gpt-6-astra"].input, 10.0);
+        assert_eq!(merged.models["claude-fable-5-1"].cached_input, 0.25);
+        assert_eq!(merged.models["gpt-5.5"].input, 123.0);
+        assert_eq!(
+            merged.floating_model_aliases["gpt-daybreak-red-latest"].target,
+            "gpt-5.6-cyber"
+        );
+        assert_eq!(
+            merged.model_aliases["claude-opus-4-5"],
+            "claude-opus-4-5-20251101"
+        );
+    }
+
+    #[test]
+    fn sol_refresh_preserves_previous_scenario_before_verification_boundary() {
+        let card = RateCard::load_bundled().unwrap();
+        for (at, input, output) in [
+            ("2026-09-09T23:59:59Z", 5.0, 30.0),
+            ("2026-09-10T00:00:00Z", 4.0, 20.0),
+        ] {
+            let period = card
+                .pricing_catalog
+                .rate_at(PricingSurface::OpenaiApiUsd, "gpt-5.6-sol", instant(at))
+                .unwrap();
+            assert_eq!(period.rate.input, input);
+            assert_eq!(period.rate.output, output);
+        }
+    }
+
+    #[test]
+    fn catalog_preserves_sonnet_five_price_after_cancelled_increase() {
         let card = RateCard::load_bundled().expect("bundled rate card should parse");
         let introductory = card
             .pricing_catalog
@@ -1489,10 +1533,10 @@ mod tests {
                 instant("2026-09-01T00:00:00Z"),
             )
             .expect("standard period at its inclusive start");
-        assert_eq!(standard.rate.input, 3.0);
-        assert_eq!(standard.rate.cached_input, 0.3);
-        assert_eq!(standard.rate.output, 15.0);
-        assert_eq!(standard.rate.reasoning, 15.0);
+        assert_eq!(standard.rate.input, 2.0);
+        assert_eq!(standard.rate.cached_input, 0.2);
+        assert_eq!(standard.rate.output, 10.0);
+        assert_eq!(standard.rate.reasoning, 10.0);
         assert_eq!(standard.cache_write_input_multiplier, Some(1.25));
     }
 

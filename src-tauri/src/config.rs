@@ -108,6 +108,9 @@ pub struct Config {
     /// Install the receipt hook for Claude Code when the feature is enabled.
     #[serde(default = "default_true")]
     pub turn_receipts_claude: bool,
+    /// Explicit opt-in for Gemini CLI AfterAgent receipts.
+    #[serde(default)]
+    pub turn_receipts_gemini: bool,
     /// Top-level fields written by a newer schema. Preserved verbatim so a
     /// round-trip through this build never strips them.
     #[serde(default, flatten)]
@@ -183,6 +186,7 @@ impl Default for Config {
             turn_receipts_enabled: false,
             turn_receipts_codex: true,
             turn_receipts_claude: true,
+            turn_receipts_gemini: false,
             extra: BTreeMap::new(),
         }
         // Deliberately NOT normalized: struct-update construction
@@ -425,6 +429,7 @@ mod tests {
             turn_receipts_enabled: true,
             turn_receipts_codex: true,
             turn_receipts_claude: false,
+            turn_receipts_gemini: true,
         };
 
         let json = serde_json::to_string_pretty(&cfg).unwrap();
@@ -449,6 +454,7 @@ mod tests {
         assert!(loaded.turn_receipts_enabled);
         assert!(loaded.turn_receipts_codex);
         assert!(!loaded.turn_receipts_claude);
+        assert!(loaded.turn_receipts_gemini);
     }
 
     #[test]
@@ -473,6 +479,7 @@ mod tests {
         assert!(!cfg.turn_receipts_enabled);
         assert!(cfg.turn_receipts_codex);
         assert!(cfg.turn_receipts_claude);
+        assert!(!cfg.turn_receipts_gemini);
     }
 
     #[test]

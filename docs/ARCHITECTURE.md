@@ -48,14 +48,22 @@ This is the first durable-history slice, not the complete normalized ledger trac
 
 Turn receipts are a separate, default-off freshness path; they do not replace the watcher:
 
-1. Settings transactionally reconciles one identifiable `Stop` command per selected harness while
+1. Settings transactionally reconciles one identifiable completion command per selected harness while
    retaining unrelated settings and handlers. Codex preserves an existing Odometer source; for a
    new integration it edits the `[[hooks.Stop]]` representation in inline `config.toml` when those
    hooks already exist, otherwise `hooks.json`. Other valid inline-array TOML shapes and symlinked
    config files fail closed rather than being rewritten or duplicated. Repair removes Odometer-owned
    duplicates across both sources. Claude Code uses a direct executable `command` plus explicit
    `args` in the user-level `settings.json`, shared by Claude Code 2.1.139+ CLI and local Desktop Code
-   sessions; remote and SSH sessions use configuration on their host. For AppImage launches, the installed hook
+   sessions; remote and SSH sessions use configuration on their host. Gemini CLI uses a named
+   `AfterAgent` command in `~/.gemini/settings.json` with a 5000 ms timeout, following its
+   [official hook contract](https://geminicli.com/docs/hooks/reference/). It has a separate
+   default-off selection, including for already-enabled receipt setups. Only supported JSONL
+   transcripts under its configured live roots are accepted; old JSON sessions remain unsupported.
+   Its API estimate uses shared Rust pricing, and no quota is invented. `hooksConfig.enabled` and
+   the disabled-handler list are preserved and reflected in status; project/system overrides may
+   still prevent execution, so configuration is not reported as an observed receipt.
+   For AppImage launches, the installed hook
    uses the absolute `APPIMAGE` path only when the running executable resolves inside the matching
    absolute `APPDIR`; otherwise status and setup both use the current executable. Disable owns only
    handlers whose parsed command or argument list contains the exact
@@ -87,7 +95,7 @@ Turn receipts are a separate, default-off freshness path; they do not replace th
    cleanup or rollback failures are surfaced or logged with the retained recovery path rather than
    silently ignored. Config-save failure paths call the fallible rollback explicitly so incomplete
    restoration is included in the settings IPC error rather than only appearing in logs.
-2. Codex/Claude passes bounded JSON on stdin, including the session and transcript path. The helper
+2. The selected harness passes bounded JSON on stdin, including the session and transcript path. The helper
    exits before Tauri startup, checks that the feature and harness remain enabled, and validates the
    canonical transcript path against the configured roots.
 3. The helper parses the exact transcript synchronously, selects the supplied Codex `turn_id` or the
@@ -257,6 +265,23 @@ Optimization findings are timestamped at the observation that triggered them. `R
 
 `sessionsStore` is the canonical reactive session collection. `sessionProjection.ts` owns the pure selection, projection of backend prices, model aggregation, and export rows used by every scope. `SessionsView.svelte` derives ordering, day groups, analytics, comparison, export, event correlation, and selection from that projection; its fixed-height virtual list keeps DOM size bounded for large corpora. `DetailPane.svelte` fetches full details only on demand, including normalized observations, categories, findings, and prices.
 
+## Local project assignments
+
+The session detail pane can move one session into an existing project, split it into a
+standalone project, or restore its detected project. Settings retains project alias and
+merge management. These edits use the existing local override store and durable session
+keys; they do not modify source transcripts or session summaries.
+
+`resolve_projects` returns additive `overridden_session_keys` on each `ProjectInfo`,
+covering explicitly reassigned sessions. The frontend joins this mapping before the
+detected `project_key`; older responses without it remain valid. Every edit forces one
+batched resolve, and request epochs reject obsolete successes and failures. Failed
+refreshes retain the previous mapping with a retry message. Explicit reassignment affects
+only the selected session, including when it belongs to a parent/subagent family.
+Scan completion refreshes the shared mapping once so an early partial lookup cannot hide
+saved assignments. Opening the editor refreshes destination choices and shares any active
+lookup; transcript appends do not cause per-session project requests.
+
 ## Performance measurements
 
 Application performance tracking is local-only, explicitly opt-in, and disabled by default through `Config.performance_tracking_enabled`. `PerformanceRecorder` starts its bounded writer lazily when enabled, so the off path performs only an atomic flag check. Backend measurements cover setup, watcher/config discovery, bulk discovery and scanning, cache hit/miss/open time, aggregate parser time, incremental parsing, range rollups, correlations, Git evaluation, detail/list IPC, and exports. `src/lib/performance.ts` records frontend initialization, batched store updates and paints, virtual-list paints, range fetches, detail fetches, and export projection work.
@@ -291,7 +316,7 @@ Claude Code sessions are resolved below `$CLAUDE_CONFIG_DIR`, falling back to `~
 
 - `$CLAUDE_CONFIG_DIR/projects`
 
-User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`. Durable parsed session history lives separately under the platform local-data directory in `agent-odometer/history-v1.sqlite3`; it is retained independently of transcript availability and scan-cache eviction. Enabled turn receipts also keep independent bounded `turn-receipt-status-codex.json` and `turn-receipt-status-claude-code.json` health records under the OS local-data directory; they contain no session IDs or paths. Reads retain compatibility with the earlier shared development-format file.
+User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`. Durable parsed session history lives separately under the platform local-data directory in `agent-odometer/history-v1.sqlite3`; it is retained independently of transcript availability and scan-cache eviction. Enabled turn receipts also keep independent bounded `turn-receipt-status-codex.json` and `turn-receipt-status-claude-code.json`, and `turn-receipt-status-gemini_cli.json` health records under the OS local-data directory; they contain no session IDs or paths. Reads retain compatibility with the earlier shared development-format file.
 
 Session files can contain full prompts, responses, system/developer instructions, local paths, and tool output. Keep processing local, avoid logging message bodies, and use synthetic/redacted test data. Tauri capabilities in `src-tauri/capabilities/default.json` should remain narrowly scoped.
 

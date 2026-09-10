@@ -5,7 +5,11 @@ import { rates } from '../lib/stores/rates';
 import { zeroTotals, zeroToolMetrics } from '../lib/sessionProjection';
 import type { RateCard, Session, PricedSurface } from '../lib/types';
 
-vi.mock('../lib/ipc', () => ({ openTaskInChatGPT: vi.fn(), revealInFileManager: vi.fn() }));
+vi.mock('../lib/ipc', () => ({
+  openTaskInChatGPT: vi.fn(), revealInFileManager: vi.fn(),
+  resolveProjects: vi.fn().mockResolvedValue([]),
+  reassignSessionProject: vi.fn(), clearSessionProjectOverride: vi.fn(),
+}));
 
 function surface(total: number): PricedSurface {
   return { total, by_model: [{ model: 'synthetic', cost: total, basis: 'direct', unpriced: false }], missing_models: [], unpriced_models: [] };

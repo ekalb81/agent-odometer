@@ -3418,8 +3418,81 @@ mod tests {
             .find(|p| p.project_key == "manual:standalone")
             .unwrap();
         assert_eq!(standalone.session_count, 1);
+        assert_eq!(standalone.label, "Standalone project");
+        assert_eq!(standalone.overridden_session_keys, ["codex:thread:a1"]);
         let remaining = projects.iter().find(|p| p.project_key == "repo:a").unwrap();
         assert_eq!(remaining.session_count, 1);
+        assert!(remaining.overridden_session_keys.is_empty());
+
+        session_overrides.clear();
+        let restored = resolve_projects_from(sessions.iter(), &session_overrides, &HashMap::new());
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].session_count, 2);
+        assert!(restored[0].overridden_session_keys.is_empty());
+    }
+
+    #[test]
+    fn resolve_projects_maps_missing_directory_assignments_through_merged_destinations() {
+        let sessions = [
+            project_fixture_session("z", None, None),
+            project_fixture_session("a", Some("repo:source"), Some("Source")),
+        ];
+        let overrides = HashMap::from([
+            ("codex:thread:z".into(), "repo:intermediate".into()),
+            ("codex:thread:a".into(), "repo:target".into()),
+        ]);
+        let projects = HashMap::from([
+            (
+                "repo:intermediate".into(),
+                crate::history_store::ProjectOverrideRow {
+                    project_key: "repo:intermediate".into(),
+                    display_label: None,
+                    canonical_project_key: Some("repo:target".into()),
+                },
+            ),
+            (
+                "repo:target".into(),
+                crate::history_store::ProjectOverrideRow {
+                    project_key: "repo:target".into(),
+                    display_label: Some("Destination".into()),
+                    canonical_project_key: None,
+                },
+            ),
+        ]);
+        let resolved = resolve_projects_from(sessions.iter(), &overrides, &projects);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].label, "Destination");
+        assert_eq!(resolved[0].project_key, "repo:target");
+        assert_eq!(resolved[0].session_count, 2);
+        assert_eq!(
+            resolved[0].overridden_session_keys,
+            ["codex:thread:a", "codex:thread:z"]
+        );
+        let payload = serde_json::to_value(&resolved[0]).unwrap();
+        assert_eq!(
+            payload["overridden_session_keys"],
+            serde_json::json!(["codex:thread:a", "codex:thread:z"])
+        );
+    }
+
+    #[test]
+    fn resolve_projects_preserves_detected_destination_label_when_its_session_was_reassigned() {
+        let sessions = [
+            project_fixture_session("source", Some("repo:source"), Some("Source")),
+            project_fixture_session("target", Some("repo:target"), Some("Destination")),
+        ];
+        let overrides = HashMap::from([
+            ("codex:thread:source".into(), "repo:target".into()),
+            ("codex:thread:target".into(), "manual:standalone".into()),
+        ]);
+        let resolved = resolve_projects_from(sessions.iter(), &overrides, &HashMap::new());
+        let destination = resolved
+            .iter()
+            .find(|project| project.project_key == "repo:target")
+            .unwrap();
+        assert_eq!(destination.label, "Destination");
+        assert_eq!(destination.session_count, 1);
+        assert_eq!(destination.overridden_session_keys, ["codex:thread:source"]);
     }
 
     /// `PerformanceLiveStatus` wraps `MemoryLiveStatus` behind
@@ -3580,6 +3653,9 @@ pub struct ProjectInfo {
     pub label: String,
     pub provenance: crate::project_identity::ProjectProvenance,
     pub member_keys: Vec<String>,
+    /// Durable session keys explicitly reassigned into this resolved project.
+    /// Raw summaries keep their detected identity; consumers apply this map first.
+    pub overridden_session_keys: Vec<String>,
     pub session_count: usize,
 }
 
@@ -3599,9 +3675,21 @@ fn resolve_projects_from<'a>(
         label: String,
         provenance: crate::project_identity::ProjectProvenance,
         count: usize,
+        overridden_session_keys: Vec<String>,
     }
     let mut raw: BTreeMap<String, RawInfo> = BTreeMap::new();
+    let mut detected = HashMap::new();
     for session in sessions {
+        if let Some(key) = &session.project_key {
+            detected.entry(key.clone()).or_insert_with(|| {
+                (
+                    session.project_label.clone().unwrap_or_default(),
+                    session.project_provenance.unwrap_or(
+                        crate::project_identity::ProjectProvenance::FallbackPathIdentity,
+                    ),
+                )
+            });
+        }
         let effective_raw = session_overrides
             .get(&session.storage_id)
             .cloned()
@@ -3610,13 +3698,33 @@ fn resolve_projects_from<'a>(
             continue;
         };
         let record = raw.entry(raw_key).or_insert_with(|| RawInfo {
-            label: session.project_label.clone().unwrap_or_default(),
+            label: String::new(),
             provenance: session
                 .project_provenance
                 .unwrap_or(crate::project_identity::ProjectProvenance::FallbackPathIdentity),
             count: 0,
+            overridden_session_keys: Vec::new(),
         });
         record.count += 1;
+        if session_overrides.contains_key(&session.storage_id) {
+            record
+                .overridden_session_keys
+                .push(session.storage_id.clone());
+        }
+    }
+    for (key, info) in &mut raw {
+        if let Some((label, provenance)) = detected.get(key) {
+            info.label = label.clone();
+            info.provenance = *provenance;
+        } else {
+            info.label = if key.starts_with("manual:") {
+                "Standalone project"
+            } else {
+                "Assigned project"
+            }
+            .to_owned();
+            info.provenance = crate::project_identity::ProjectProvenance::FallbackPathIdentity;
+        }
     }
 
     let mut grouped: HashMap<String, ProjectInfo> = HashMap::new();
@@ -3630,16 +3738,26 @@ fn resolve_projects_from<'a>(
                 label: String::new(),
                 provenance: info.provenance,
                 member_keys: Vec::new(),
+                overridden_session_keys: Vec::new(),
                 session_count: 0,
             });
         target.member_keys.push(raw_key.clone());
         target.session_count += info.count;
+        target
+            .overridden_session_keys
+            .extend(info.overridden_session_keys.iter().cloned());
         if *raw_key == canonical {
             target.label = info.label.clone();
             target.provenance = info.provenance;
         }
     }
     for project in grouped.values_mut() {
+        project.overridden_session_keys.sort();
+        project.overridden_session_keys.dedup();
+        if let Some((label, provenance)) = detected.get(&project.project_key) {
+            project.label = label.clone();
+            project.provenance = *provenance;
+        }
         if let Some(alias) = project_overrides
             .get(&project.project_key)
             .and_then(|row| row.display_label.clone())

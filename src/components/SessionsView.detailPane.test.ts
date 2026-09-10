@@ -3,6 +3,8 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sessionsStore } from '../lib/stores/sessions.svelte';
 import { sessionDetailPaneStore } from '../lib/stores/sessionDetailPane.svelte';
+import { projectStore } from '../lib/stores/projects.svelte';
+import { sessionGridStore } from '../lib/stores/sessionGrid.svelte';
 import { defaultFilters } from '../lib/sessionProjection';
 import { rates } from '../lib/stores/rates';
 import type { RateCard, RangeTotals, Session, SessionSummary, TokenTotals } from '../lib/types';
@@ -137,8 +139,11 @@ function stubLayoutApis(): void {
 }
 
 describe('SessionsView wide-layout detail pane', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     localStorage.clear();
+    sessionGridStore.reset();
+    ipcMocks.resolveProjects.mockResolvedValue([]);
+    await projectStore.refresh();
     getSessionDetails.mockClear();
     sessionDetailPaneStore.setOpen(false);
     sessionsStore.replaceAll([
@@ -153,6 +158,22 @@ describe('SessionsView wide-layout detail pane', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     sessionsStore.replaceAll([]);
+    sessionGridStore.reset();
+  });
+
+  it('updates only the assigned row, including a session without a detected project', async () => {
+    renderView();
+    const alpha = await screen.findByRole('button', { name: 'Select session Fix login bug' });
+    const beta = screen.getByRole('button', { name: 'Select session Refactor exporter' });
+    ipcMocks.resolveProjects.mockResolvedValue([{ project_key: 'manual:alpha', label: 'Standalone project',
+      provenance: 'fallback_path_identity', member_keys: ['manual:alpha'], session_count: 1,
+      overridden_session_keys: ['codex:thread:alpha'] }] as never);
+    await projectStore.refresh();
+    await waitFor(() => expect(alpha).toHaveTextContent('Standalone project'));
+    expect(beta).not.toHaveTextContent('Standalone project');
+    ipcMocks.resolveProjects.mockResolvedValue([]);
+    await projectStore.refresh();
+    await waitFor(() => expect(alpha).not.toHaveTextContent('Standalone project'));
   });
 
   function renderView() {
@@ -165,6 +186,33 @@ describe('SessionsView wide-layout detail pane', () => {
       },
     });
   }
+
+  it.each(['parent', 'child'])('keeps another project visible when collapsing a reassigned %s', async (assigned) => {
+    const parent = { ...summary('codex:thread:parent', 'Parent task'),
+      project_key: 'repo:original', project_label: 'Original project' };
+    const child = { ...summary('codex:thread:child', 'Child task'),
+      parent_thread_id: parent.id, source: 'subagent',
+      project_key: 'repo:original', project_label: 'Original project' };
+    sessionsStore.replaceAll([parent, child]);
+    ipcMocks.resolveProjects.mockResolvedValue([
+      { project_key: 'repo:original', label: 'Original project', provenance: 'repository_root',
+        member_keys: ['repo:original'], session_count: 1, overridden_session_keys: [] },
+      { project_key: 'manual:separate', label: 'Separate project', provenance: 'fallback_path_identity',
+        member_keys: ['manual:separate'], session_count: 1,
+        overridden_session_keys: [`codex:thread:${assigned}`] },
+    ] as never);
+    await projectStore.refresh();
+    sessionGridStore.setGroupByRepository(true);
+    renderView();
+    await screen.findByRole('button', { name: 'Select session Child task' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Collapse subagent rows for Parent task' }));
+    expect(screen.getByRole('button', { name: 'Select session Child task' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Select session Parent task' })).toBeInTheDocument();
+
+    // Ordinary lineage collapse still applies when project grouping is off.
+    sessionGridStore.setGroupByRepository(false);
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Select session Child task' })).not.toBeInTheDocument());
+  });
 
   it('starts closed, reserving no width for the placeholder pane', async () => {
     renderView();

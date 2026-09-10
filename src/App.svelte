@@ -9,6 +9,7 @@
   import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, getHistoryStatus, onHistoryProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
+  import { projectStore } from './lib/stores/projects.svelte';
   import { historyStore } from './lib/stores/history.svelte';
   import { instructionScanStore } from './lib/stores/instructionScan.svelte';
   import { updaterStore } from './lib/stores/updater.svelte';
@@ -33,6 +34,10 @@
   let activeView: AppView = $state('all');
   let appVersion = $state('');
   const appStarted = performance.now();
+
+  $effect(() => {
+    void projectStore.observeScanComplete(scanStore.status.complete);
+  });
 
   // Filter state lives here per view scope so the toolbar can drive the
   // active tab while every sessions view remains mounted. 'all' is always

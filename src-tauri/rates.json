@@ -1,9 +1,10 @@
 {
-  "version": 10,
+  "version": 11,
   "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
-  "fetched_at": "2026-08-15",
+  "fetched_at": "2026-09-10",
+  "_refresh_note": "Verified 2026-09-10 against https://learn.chatgpt.com/docs/pricing, https://developers.openai.com/api/docs/pricing and https://platform.claude.com/docs/en/about-claude/pricing. Current flat estimates supersede the older verification notes below. Fable/Mythos 5.1 cache reads cost 0.025x input. Sonnet 5's scheduled increase was cancelled. Sol promotional pricing is available at least through November 21, 2026; no future increase is assumed.",
   "_note": "Codex models are priced in credits per the OpenAI Codex rate card; reasoning is billed at the output rate. api_models holds the same Codex models at OpenAI API USD prices (developers.openai.com/api/docs/pricing, verified 2026-07-27) for the est.-cost column; gpt-5.5-cyber, gpt-5.2, and codex-auto-review are not on the public API page and are derived via the exact 25-credits-per-USD ratio the rest of the card follows. Claude models are priced in USD per the Anthropic API price list (verified 2026-07-27; cached_input is the 0.1x cache-read rate; cache_creation_input is the published 1.25x cache-write premium over input, now its own priced dimension distinct from cached_input -- see issue #42; thinking is billed as ordinary output). Codex/OpenAI models omit cache_creation_input (absent, not zero) because Codex does not report a cache-write token category -- parser.rs hard-codes cache_creation_input_tokens to 0 for Codex, so the dimension is always empty and the omission is moot. OpenAI DOES now publish a cache-write premium on the API pricing page (gpt-5.6-sol: $6.25 short-context against $5.00 input, the same 1.25x shape as Anthropic's), verified 2026-08-15; it is deliberately not encoded here because no code path can produce a nonzero value for it today, and a rate nothing consumes is dead weight that would silently rot. Revisit if the Codex parser ever surfaces that token category. daybreak-blue-latest is a FLOATING alias: OpenAI repoints it as new frontier models ship and prices follow the underlying model, so it lives in floating_model_aliases rather than model_aliases (issue #177). That mapping carries an expires_at (fetched_at + 90 days), resolves with a distinct 'floating_alias' provenance the UI shows as a soft note rather than a warning, and is IGNORED once the date passes -- after which resolution falls through to the harness fallback and raises the ordinary fallback warning. Pricing a repointed alias against its old target would be silently wrong in the worst direction, since alias provenance raises no warning at all; expiring it makes that failure loud. Re-verify the target against the pricing page and move the date forward when refreshing the card. The pricing_catalog contains explicitly scoped, effective-dated scenario rules; it does not change the existing flat legacy rate maps until a caller opts into that calculation. gpt-5.3-codex-spark is explicitly unpriced because OpenAI lists its research-preview rates as not final; its usage is excluded instead of fallback-priced. api_models and unpriced_models are not editable in the Settings UI yet; edit this file or the on-disk rates.json override. model_aliases (as distinct from floating_model_aliases), free_local_models, and subscription_plans ship empty: Odometer does not fabricate unverified id renames, free-tier claims, or plan entitlements -- each is a mechanism for the user (or a future, reviewed, cited update to this file) to populate, not inferred data. gemini-2.5-flash is priced in USD per the Gemini API price list (ai.google.dev/gemini-api/docs/pricing, verified 2026-08-04; cached_input is the published context-caching storage-free per-token rate; thinking/thoughts tokens are billed at the output rate, matching the provider's own billing, so reasoning equals output). Gemini 2.5 Pro is intentionally not priced here: its published rate depends on a >200k-token prompt-size threshold this flat per-model rate table cannot represent, and a flat number would misprice long-context calls; it stays fallback-priced (visibly flagged) instead of guessing which tier applies. Gemini CLI omits cache_creation_input because Gemini has no published cache-write premium distinct from ordinary input.",
   "currencies": {
     "codex": "credits",
@@ -18,16 +19,24 @@
   "unpriced_models": [
     "gpt-5.3-codex-spark"
   ],
-  "model_aliases": {},
+  "model_aliases": {
+    "claude-opus-4-5": "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5": "claude-sonnet-4-5-20250929"
+  },
   "floating_model_aliases": {
+    "gpt-daybreak-red-latest": {
+      "target": "gpt-5.6-cyber",
+      "expires_at": "2026-12-09",
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
     "gpt-daybreak-blue-latest": {
       "target": "gpt-5.6-sol",
-      "expires_at": "2026-11-13",
+      "expires_at": "2026-12-09",
       "source_url": "https://developers.openai.com/api/docs/pricing"
     },
     "daybreak-blue-latest": {
       "target": "gpt-5.6-sol",
-      "expires_at": "2026-11-13",
+      "expires_at": "2026-12-09",
       "source_url": "https://developers.openai.com/api/docs/pricing"
     }
   },
@@ -40,11 +49,27 @@
     ],
     "rate_periods": [
       {
+        "id": "openai/gpt-5.6-sol/api/verified-2026-09-10",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.6-sol",
+        "from": "2026-09-10T00:00:00Z",
+        "to": null,
+        "rate": { "input": 4.0, "cached_input": 0.4, "output": 20.0, "reasoning": 20.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published current API pricing",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-09-10T00:00:00Z",
+          "note": "Verification-time boundary, not a claimed historical effective start. Promotional pricing is available at least through November 21, 2026; no future increase is assumed."
+        },
+        "label": "GPT-5.6 Sol current API pricing"
+      },
+      {
         "id": "openai/gpt-5.6-sol/api/base",
         "surface": "openai_api_usd",
         "model": "gpt-5.6-sol",
         "from": "2026-01-01T00:00:00Z",
-        "to": null,
+        "to": "2026-09-10T00:00:00Z",
         "rate": { "input": 5.0, "cached_input": 0.5, "output": 30.0, "reasoning": 30.0 },
         "cache_write_input_multiplier": 1.25,
         "provenance": {
@@ -77,12 +102,12 @@
         "model": "claude-sonnet-5",
         "from": "2026-09-01T00:00:00Z",
         "to": null,
-        "rate": { "input": 3.0, "cached_input": 0.3, "output": 15.0, "reasoning": 15.0 },
+        "rate": { "input": 2.0, "cached_input": 0.2, "output": 10.0, "reasoning": 10.0 },
         "cache_write_input_multiplier": 1.25,
         "provenance": {
-          "evidence": "Published standard API pricing beginning 2026-09-01",
+          "evidence": "Published cancellation of the September increase; introductory pricing is permanent",
           "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
-          "verified_at": "2026-07-28T00:00:00Z",
+          "verified_at": "2026-09-10T00:00:00Z",
           "note": "The catalog records the 1.25x five-minute cache-write premium, but cache writes are not represented by ModelRate."
         },
         "label": "Claude Sonnet 5 standard API pricing"
@@ -108,9 +133,11 @@
     ]
   },
   "models": {
-    "gpt-5.6-sol":    { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
-    "gpt-5.6-terra":  { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
-    "gpt-5.6-luna":   { "input":  25.0,  "cached_input":  2.500, "output": 150.0, "reasoning": 150.0 },
+    "gpt-6-astra":    { "input": 250.0, "cached_input": 25.0, "output": 1250.0, "reasoning": 1250.0 },
+    "gpt-5.6-cyber":  { "input": 312.5, "cached_input": 31.25, "output": 1875.0, "reasoning": 1875.0 },
+    "gpt-5.6-sol":    { "input": 100.0, "cached_input": 10.0, "output": 500.0, "reasoning": 500.0 },
+    "gpt-5.6-terra":  { "input": 50.0, "cached_input": 5.0, "output": 300.0, "reasoning": 300.0 },
+    "gpt-5.6-luna":   { "input": 5.0, "cached_input": 0.5, "output": 30.0, "reasoning": 30.0 },
     "gpt-5.5-cyber":  { "input": 500.0,  "cached_input": 50.000, "output": 3000.0, "reasoning": 3000.0 },
     "gpt-5.5":        { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
     "gpt-5.4":        { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
@@ -124,7 +151,12 @@
     "claude-opus-4-8":   { "input":  5.0, "cached_input": 0.50, "cache_creation_input":  6.25, "output": 25.0, "reasoning": 25.0 },
     "claude-opus-4-7":   { "input":  5.0, "cached_input": 0.50, "cache_creation_input":  6.25, "output": 25.0, "reasoning": 25.0 },
     "claude-opus-4-6":   { "input":  5.0, "cached_input": 0.50, "cache_creation_input":  6.25, "output": 25.0, "reasoning": 25.0 },
-    "claude-sonnet-5":   { "input":  3.0, "cached_input": 0.30, "cache_creation_input":  3.75, "output": 15.0, "reasoning": 15.0 },
+    "claude-fable-5-1":  { "input": 10.0, "cached_input": 0.25, "cache_creation_input": 12.50, "output": 50.0, "reasoning": 50.0 },
+    "claude-mythos-5-1": { "input": 10.0, "cached_input": 0.25, "cache_creation_input": 12.50, "output": 50.0, "reasoning": 50.0 },
+    "claude-mythos-5":   { "input": 10.0, "cached_input": 1.00, "cache_creation_input": 12.50, "output": 50.0, "reasoning": 50.0 },
+    "claude-opus-4-5-20251101": { "input": 5.0, "cached_input": 0.50, "cache_creation_input": 6.25, "output": 25.0, "reasoning": 25.0 },
+    "claude-sonnet-4-5-20250929": { "input": 3.0, "cached_input": 0.30, "cache_creation_input": 3.75, "output": 15.0, "reasoning": 15.0 },
+    "claude-sonnet-5":   { "input":  2.0, "cached_input": 0.20, "cache_creation_input":  2.50, "output": 10.0, "reasoning": 10.0 },
     "claude-sonnet-4-6": { "input":  3.0, "cached_input": 0.30, "cache_creation_input":  3.75, "output": 15.0, "reasoning": 15.0 },
     "claude-haiku-4-5":          { "input":  1.0, "cached_input": 0.10, "cache_creation_input": 1.25, "output":  5.0, "reasoning":  5.0 },
     "claude-haiku-4-5-20251001": { "input":  1.0, "cached_input": 0.10, "cache_creation_input": 1.25, "output":  5.0, "reasoning":  5.0 },
@@ -132,9 +164,11 @@
     "gemini-2.5-flash":  { "input": 0.30, "cached_input": 0.03, "output": 2.50, "reasoning": 2.50 }
   },
   "api_models": {
-    "gpt-5.6-sol":    { "input": 5.00, "cached_input": 0.500, "output": 30.0, "reasoning": 30.0 },
-    "gpt-5.6-terra":  { "input": 2.50, "cached_input": 0.250, "output": 15.0, "reasoning": 15.0 },
-    "gpt-5.6-luna":   { "input": 1.00, "cached_input": 0.100, "output":  6.0, "reasoning":  6.0 },
+    "gpt-6-astra":    { "input": 10.0, "cached_input": 1.0, "output": 50.0, "reasoning": 50.0 },
+    "gpt-5.6-cyber":  { "input": 12.5, "cached_input": 1.25, "output": 75.0, "reasoning": 75.0 },
+    "gpt-5.6-sol":    { "input": 4.0, "cached_input": 0.4, "output": 20.0, "reasoning": 20.0 },
+    "gpt-5.6-terra":  { "input": 2.0, "cached_input": 0.2, "output": 12.0, "reasoning": 12.0 },
+    "gpt-5.6-luna":   { "input": 0.2, "cached_input": 0.02, "output": 1.2, "reasoning": 1.2 },
     "gpt-5.5-cyber":  { "input": 20.00, "cached_input": 2.000, "output": 120.0, "reasoning": 120.0 },
     "gpt-5.5":        { "input": 5.00, "cached_input": 0.500, "output": 30.0, "reasoning": 30.0 },
     "gpt-5.4":        { "input": 2.50, "cached_input": 0.250, "output": 15.0, "reasoning": 15.0 },

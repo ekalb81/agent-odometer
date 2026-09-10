@@ -11,7 +11,7 @@ import SettingsView from './SettingsView.svelte';
 // authoritative `providers` map. That makes the assertion that matters a
 // structural one: the edit must arrive under `providers.gemini_cli`, and it
 // must not flatten away the other providers' entries on the way.
-const { setConfig, getHistoryRebuildStatus, configPayload } = vi.hoisted(() => {
+const { setConfig, getTurnReceiptStatus, getHistoryRebuildStatus, configPayload } = vi.hoisted(() => {
   globalThis.matchMedia = ((query: string) => ({
     matches: false,
     media: query,
@@ -57,6 +57,7 @@ const { setConfig, getHistoryRebuildStatus, configPayload } = vi.hoisted(() => {
   });
   return {
     setConfig: vi.fn().mockResolvedValue(undefined),
+    getTurnReceiptStatus: vi.fn().mockResolvedValue(undefined),
     getHistoryRebuildStatus,
     configPayload,
   };
@@ -64,9 +65,9 @@ const { setConfig, getHistoryRebuildStatus, configPayload } = vi.hoisted(() => {
 
 vi.mock('../lib/ipc', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/ipc')>();
-  const mocked: Record<string, unknown> = { ...actual, setConfig, getHistoryRebuildStatus };
+  const mocked: Record<string, unknown> = { ...actual, setConfig, getTurnReceiptStatus, getHistoryRebuildStatus };
   for (const [key, value] of Object.entries(actual)) {
-    if (key === 'setConfig' || key === 'getHistoryRebuildStatus' || typeof value !== 'function') {
+    if (key === 'setConfig' || key === 'getTurnReceiptStatus' || key === 'getHistoryRebuildStatus' || typeof value !== 'function') {
       continue;
     }
     mocked[key] = key.startsWith('on')
@@ -80,6 +81,7 @@ vi.mock('@tauri-apps/api/app', () => ({ getVersion: vi.fn().mockResolvedValue('0
 
 vi.mock('../lib/stores/config', () => {
   const store = {
+    set: vi.fn(),
     subscribe(run: (value: typeof configPayload) => void) {
       run(configPayload);
       return () => {};
@@ -94,8 +96,46 @@ async function saveRoots() {
 }
 
 describe('SettingsView — Gemini CLI roots (issue #40)', () => {
+  it('shows Gemini receipt health independently from other harnesses', async () => {
+    const status = {
+      requested: false, configured: false, receipt_observed: false,
+      config_source: 'codex_hooks_json', config_path: '/synthetic/codex/hooks.json',
+      diagnostic_code: 'hook_not_requested', detail: 'Off.',
+      restart_recommended: false, trust_review_recommended: false,
+      last_run_at: null, last_run_success: null, last_receipt: null, last_run_detail: null,
+    };
+    getTurnReceiptStatus.mockResolvedValue({
+      enabled: true, executable_path: '/synthetic/odometer', codex: status, claude_code: status,
+      gemini_cli: { ...status, requested: true, configured: true,
+        config_source: 'gemini_settings_json', config_path: '/synthetic/gemini/settings.json',
+        detail: 'Gemini hook awaits its first receipt.', restart_recommended: true },
+    });
+    render(SettingsView);
+    expect(await screen.findByText('Gemini hook awaits its first receipt.')).toBeInTheDocument();
+    expect(screen.getByText('Gemini CLI user settings.json')).toBeInTheDocument();
+    expect(screen.getByText('Start a fresh Gemini CLI session to load and verify it.')).toBeInTheDocument();
+  });
+
+  it('keeps Gemini receipts opt-in and saves Gemini-only setup', async () => {
+    render(SettingsView);
+    const gemini = await screen.findByRole('checkbox', { name: /^Gemini CLI$/ });
+    expect(gemini).not.toBeChecked();
+    expect(gemini).toBeDisabled();
+    await userEvent.click(screen.getByRole('checkbox', { name: /Enable turn receipts/ }));
+    await userEvent.click(gemini);
+    await userEvent.click(screen.getByRole('button', { name: 'Save setup' }));
+    await waitFor(() => expect(setConfig).toHaveBeenCalled());
+    expect(setConfig.mock.calls.at(-1)?.[0]).toMatchObject({
+      turn_receipts_enabled: true,
+      turn_receipts_codex: false,
+      turn_receipts_claude: false,
+      turn_receipts_gemini: true,
+    });
+  });
+
   beforeEach(() => {
     setConfig.mockClear().mockResolvedValue(undefined);
+    getTurnReceiptStatus.mockReset().mockResolvedValue(undefined);
   });
 
   it('shows the configured Gemini CLI root', async () => {

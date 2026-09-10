@@ -129,15 +129,15 @@ pub fn price_turn(
     let Some(model) = model.filter(|_| !unpriced) else {
         return result;
     };
-    let table = match table {
+    let rate_table = match table {
         RateTable::Plan => &rates.models,
         RateTable::Api => &rates.api_models,
     };
-    let resolution = rates.resolve_model_pricing(model, harness, table, now);
+    let resolution = rates.resolve_model_pricing(model, harness, rate_table, now);
     result.basis = resolution.basis;
     result.fallback_used = resolution.basis == PricingBasis::Fallback;
-    if let Some(rate) = table.get(&resolution.resolved_model) {
-        result.cost = token_cost(tokens, rate, service_tier_multiplier(model, tier));
+    if let Some(rate) = rate_table.get(&resolution.resolved_model) {
+        result.cost = token_cost(tokens, rate, service_tier_multiplier(model, tier, table));
     }
     result
 }
@@ -323,7 +323,7 @@ pub fn time_aware_pricing(session: &Session, rates: &RateCard) -> Option<TimeAwa
         let cost = token_cost(
             &event.delta,
             &rate,
-            service_tier_multiplier(model, event.service_tier.as_deref()),
+            service_tier_multiplier(model, event.service_tier.as_deref(), RateTable::Api),
         );
         result.pricing.total += cost;
         let basis = if period.rate.cache_creation_rate_is_fallback()

@@ -1,6 +1,6 @@
 use crate::config::{claude_config_dir, codex_home_dir, Config};
 use crate::model::Harness;
-use crate::provider::{claude_code_provider_id, codex_provider_id};
+use crate::provider::{claude_code_provider_id, codex_provider_id, gemini_cli_provider_id};
 use crate::turn_receipts::{load_run_record, HookRunRecord};
 use anyhow::{anyhow, Context};
 use serde::Serialize;
@@ -36,6 +36,7 @@ pub struct TurnReceiptIntegrationStatus {
     pub executable_path: String,
     pub codex: HarnessIntegrationStatus,
     pub claude_code: HarnessIntegrationStatus,
+    pub gemini_cli: HarnessIntegrationStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,7 @@ enum ConfigSource {
     CodexHooksJson,
     CodexInlineToml,
     ClaudeSettingsJson,
+    GeminiSettingsJson,
 }
 
 impl ConfigSource {
@@ -51,6 +53,7 @@ impl ConfigSource {
             Self::CodexHooksJson => "codex_hooks_json",
             Self::CodexInlineToml => "codex_inline_toml",
             Self::ClaudeSettingsJson => "claude_settings_json",
+            Self::GeminiSettingsJson => "gemini_settings_json",
         }
     }
 
@@ -59,6 +62,7 @@ impl ConfigSource {
             Self::CodexHooksJson => "Codex hooks.json",
             Self::CodexInlineToml => "the existing inline Codex config",
             Self::ClaudeSettingsJson => "Claude Code user settings",
+            Self::GeminiSettingsJson => "Gemini CLI user settings",
         }
     }
 }
@@ -67,9 +71,24 @@ impl ConfigSource {
 enum JsonHookSpec {
     Codex { command: String },
     Claude { executable: String },
+    Gemini { command: String },
 }
 
 impl JsonHookSpec {
+    fn gemini(executable: &Path) -> Self {
+        Self::Gemini {
+            command: shell_hook_command(executable, "gemini"),
+        }
+    }
+
+    fn event(&self) -> &str {
+        if matches!(self, Self::Gemini { .. }) {
+            "AfterAgent"
+        } else {
+            "Stop"
+        }
+    }
+
     fn codex(command: &str) -> Self {
         Self::Codex {
             command: command.to_owned(),
@@ -84,6 +103,10 @@ impl JsonHookSpec {
 
     fn handler(&self) -> Value {
         match self {
+            Self::Gemini { command } => json!({
+                "type": "command", "name": INTEGRATION_ID, "command": command, "timeout": 5000,
+                "description": STATUS_MESSAGE
+            }),
             Self::Codex { command } => json!({
                 "type": "command",
                 "command": command,
@@ -101,6 +124,9 @@ impl JsonHookSpec {
     }
 
     fn is_current(&self, handler: &Value) -> bool {
+        if matches!(self, Self::Gemini { .. }) {
+            return *handler == self.handler();
+        }
         if handler.get("type").and_then(Value::as_str) != Some("command")
             || handler.get("timeout").and_then(Value::as_u64) != Some(5)
             || handler.get("statusMessage").and_then(Value::as_str) != Some(STATUS_MESSAGE)
@@ -111,6 +137,7 @@ impl JsonHookSpec {
             return false;
         }
         match self {
+            Self::Gemini { .. } => unreachable!(),
             Self::Codex { command } => {
                 if handler.get("command").and_then(Value::as_str) != Some(command) {
                     return false;
@@ -229,15 +256,22 @@ pub fn receipt_settings_changed(previous: &Config, next: &Config) -> bool {
     previous.turn_receipts_enabled != next.turn_receipts_enabled
         || previous.turn_receipts_codex != next.turn_receipts_codex
         || previous.turn_receipts_claude != next.turn_receipts_claude
+        || previous.turn_receipts_gemini != next.turn_receipts_gemini
 }
 
-/// Installs or removes only Odometer-owned Stop-hook handlers. Existing hook
+/// Installs or removes only Odometer-owned completion-hook handlers. Existing hook
 /// groups and unrelated settings are retained. Codex keeps using an existing
 /// Odometer source; otherwise an existing inline hook table wins over creating
 /// a second hooks.json source.
 pub fn sync(config: &Config) -> anyhow::Result<IntegrationTransaction> {
     let executable = integration_executable()?;
-    sync_at(config, &executable, &codex_home_dir(), &claude_config_dir())
+    sync_at(
+        config,
+        &executable,
+        &codex_home_dir(),
+        &claude_config_dir(),
+        &gemini_config_dir(),
+    )
 }
 
 fn sync_at(
@@ -245,6 +279,7 @@ fn sync_at(
     executable: &Path,
     codex_home: &Path,
     claude_config: &Path,
+    gemini_config: &Path,
 ) -> anyhow::Result<IntegrationTransaction> {
     let codex_enabled = config.turn_receipts_enabled && config.turn_receipts_codex;
     let claude_enabled = config.turn_receipts_enabled && config.turn_receipts_claude;
@@ -255,6 +290,13 @@ fn sync_at(
         &claude_config.join("settings.json"),
         &claude_spec,
         claude_enabled,
+    )? {
+        plans.push(plan);
+    }
+    if let Some(plan) = plan_json_hook_file(
+        &gemini_config.join("settings.json"),
+        &JsonHookSpec::gemini(executable),
+        config.turn_receipts_enabled && config.turn_receipts_gemini,
     )? {
         plans.push(plan);
     }
@@ -380,6 +422,10 @@ fn finalize_backup(write: &AppliedWrite) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn gemini_config_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(".gemini")
+}
+
 pub fn status(config: &Config) -> TurnReceiptIntegrationStatus {
     let executable = integration_executable().unwrap_or_else(|_| PathBuf::from("agent-odometer"));
     let codex_command = codex_hook_command(&executable);
@@ -391,6 +437,13 @@ pub fn status(config: &Config) -> TurnReceiptIntegrationStatus {
             config.turn_receipts_enabled && config.turn_receipts_codex,
             &codex_home_dir(),
             &codex_command,
+        ),
+        gemini_cli: json_status(
+            gemini_cli_provider_id(),
+            config.turn_receipts_enabled && config.turn_receipts_gemini,
+            ConfigSource::GeminiSettingsJson,
+            &gemini_config_dir().join("settings.json"),
+            &JsonHookSpec::gemini(&executable),
         ),
         claude_code: json_status(
             claude_code_provider_id(),
@@ -460,7 +513,7 @@ fn codex_status(
     let path = match source {
         ConfigSource::CodexHooksJson => &json_path,
         ConfigSource::CodexInlineToml => &inline_path,
-        ConfigSource::ClaudeSettingsJson => unreachable!(),
+        ConfigSource::ClaudeSettingsJson | ConfigSource::GeminiSettingsJson => unreachable!(),
     };
     build_status(
         codex_provider_id(),
@@ -476,6 +529,42 @@ fn codex_status(
     )
 }
 
+// User settings can disable all Gemini hooks or this named handler. Preserve
+// those choices; installation never silently re-enables a disabled hook.
+fn gemini_hooks_disabled(root: &Value) -> anyhow::Result<bool> {
+    let Some(config) = root.get("hooksConfig") else {
+        return Ok(false);
+    };
+    let config = config
+        .as_object()
+        .ok_or_else(|| anyhow!("hooksConfig must be an object"))?;
+    let enabled = config
+        .get("enabled")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("hooksConfig.enabled must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(true);
+    let disabled = config
+        .get("disabled")
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| anyhow!("hooksConfig.disabled must be an array"))
+        })
+        .transpose()?;
+    let mut named_disabled = false;
+    for name in disabled.into_iter().flatten() {
+        let name = name
+            .as_str()
+            .ok_or_else(|| anyhow!("hooksConfig.disabled entries must be strings"))?;
+        named_disabled |= name == INTEGRATION_ID;
+    }
+    Ok(!enabled || named_disabled)
+}
+
 fn json_status(
     harness: Harness,
     requested: bool,
@@ -489,11 +578,15 @@ fn json_status(
         };
         let root = parse_json(path, &bytes)?;
         let inspection = inspect_json_value(path, &root, spec)?;
-        let hooks_disabled = match root.get("disableAllHooks") {
-            None => false,
-            Some(value) => value
-                .as_bool()
-                .ok_or_else(|| anyhow!("{}.disableAllHooks must be a boolean", path.display()))?,
+        let hooks_disabled = if matches!(spec, JsonHookSpec::Gemini { .. }) {
+            gemini_hooks_disabled(&root)?
+        } else {
+            match root.get("disableAllHooks") {
+                None => false,
+                Some(value) => value.as_bool().ok_or_else(|| {
+                    anyhow!("{}.disableAllHooks must be a boolean", path.display())
+                })?,
+            }
         };
         Ok((inspection, hooks_disabled))
     });
@@ -559,6 +652,8 @@ fn build_status(
             "Configured, but Codex hooks are disabled in config.toml. Enable [features].hooks (or remove the deprecated [features].codex_hooks = false), review /hooks, then start a fresh task."
         } else if harness == claude_code_provider_id() {
             "Configured, but disableAllHooks is true in Claude Code user settings. Re-enable hooks, inspect /hooks, then start a fresh task."
+        } else if harness == gemini_cli_provider_id() {
+            "Configured, but Gemini CLI hooksConfig disables hooks or the Odometer handler. Review /hooks and user settings, then start a fresh session."
         } else {
             // Neutral fallback for a provider without dedicated guidance text.
             "Configured, but hooks are disabled for this provider. Re-enable them, review /hooks, then start a fresh task."
@@ -674,12 +769,16 @@ fn error_status(
 }
 
 fn codex_hook_command(executable: &Path) -> String {
+    shell_hook_command(executable, "codex")
+}
+
+fn shell_hook_command(executable: &Path, provider: &str) -> String {
     let path = executable.to_string_lossy();
     #[cfg(windows)]
     let quoted = format!("\"{}\"", path.replace('"', ""));
     #[cfg(not(windows))]
     let quoted = format!("'{}'", path.replace('\'', "'\\''"));
-    format!("{quoted} hook codex --integration-id {INTEGRATION_ID}")
+    format!("{quoted} hook {provider} --integration-id {INTEGRATION_ID}")
 }
 
 fn plan_codex_hook_files(
@@ -735,7 +834,7 @@ fn plan_codex_hook_files(
                 plans.push(plan);
             }
         }
-        ConfigSource::ClaudeSettingsJson => unreachable!(),
+        ConfigSource::ClaudeSettingsJson | ConfigSource::GeminiSettingsJson => unreachable!(),
     }
     Ok(plans)
 }
@@ -834,16 +933,22 @@ fn plan_json_hook_bytes(
         .as_object_mut()
         .ok_or_else(|| anyhow!("{}.hooks must be a JSON object", path.display()))?;
     let stop = hooks
-        .entry("Stop")
+        .entry(spec.event())
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
-        .ok_or_else(|| anyhow!("{}.hooks.Stop must be an array", path.display()))?;
+        .ok_or_else(|| anyhow!("{}.hooks.{} must be an array", path.display(), spec.event()))?;
 
     for group in stop.iter_mut() {
         let handlers = group
             .get_mut("hooks")
             .and_then(Value::as_array_mut)
-            .ok_or_else(|| anyhow!("{}.hooks.Stop[].hooks must be an array", path.display()))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.hooks.{}[].hooks must be an array",
+                    path.display(),
+                    spec.event()
+                )
+            })?;
         handlers.retain(|handler| !is_odometer_json_handler(handler));
     }
     stop.retain(|group| {
@@ -858,7 +963,7 @@ fn plan_json_hook_bytes(
         }));
     }
     if stop.is_empty() {
-        hooks.remove("Stop");
+        hooks.remove(spec.event());
     }
     if hooks.is_empty() {
         object.remove("hooks");
@@ -977,6 +1082,9 @@ fn inspect_json_value(
     root: &Value,
     spec: &JsonHookSpec,
 ) -> anyhow::Result<HookInspection> {
+    if matches!(spec, JsonHookSpec::Gemini { .. }) {
+        gemini_hooks_disabled(root)?;
+    }
     let object = root
         .as_object()
         .ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))?;
@@ -996,18 +1104,24 @@ fn inspect_json_value(
     let hooks = hooks
         .as_object()
         .ok_or_else(|| anyhow!("{}.hooks must be a JSON object", path.display()))?;
-    let Some(stop) = hooks.get("Stop") else {
+    let Some(stop) = hooks.get(spec.event()) else {
         return Ok(HookInspection::default());
     };
     let stop = stop
         .as_array()
-        .ok_or_else(|| anyhow!("{}.hooks.Stop must be an array", path.display()))?;
+        .ok_or_else(|| anyhow!("{}.hooks.{} must be an array", path.display(), spec.event()))?;
     let mut inspection = HookInspection::default();
     for group in stop {
         let handlers = group
             .get("hooks")
             .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("{}.hooks.Stop[].hooks must be an array", path.display()))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}.hooks.{}[].hooks must be an array",
+                    path.display(),
+                    spec.event()
+                )
+            })?;
         for handler in handlers {
             if !is_odometer_json_handler(handler) {
                 continue;
@@ -2060,6 +2174,75 @@ mod tests {
     }
 
     #[test]
+    fn gemini_disabled_controls_are_preserved_and_reported() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let spec = JsonHookSpec::gemini(Path::new("odometer"));
+        for controls in [
+            json!({"enabled": false}),
+            json!({"disabled": [INTEGRATION_ID]}),
+        ] {
+            let root = json!({"hooksConfig": controls});
+            let plan =
+                plan_json_hook_bytes(&path, Some(serde_json::to_vec(&root).unwrap()), &spec, true)
+                    .unwrap()
+                    .unwrap();
+            let updated: Value = serde_json::from_slice(&plan.updated).unwrap();
+            assert_eq!(updated["hooksConfig"], controls);
+            std::fs::write(&path, plan.updated).unwrap();
+            let status = json_status(
+                gemini_cli_provider_id(),
+                true,
+                ConfigSource::GeminiSettingsJson,
+                &path,
+                &spec,
+            );
+            assert_eq!(status.diagnostic_code, "hooks_disabled");
+            assert!(!status.receipt_observed);
+        }
+        assert!(gemini_hooks_disabled(&json!({"hooksConfig":{"enabled":"false"}})).is_err());
+    }
+
+    #[test]
+    fn gemini_after_agent_install_remove_preserves_other_hooks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = br#"{"theme":"mine","hooks":{"Stop":[{"hooks":[{"type":"command","command":"keep-stop"}]}],"AfterAgent":[{"hooks":[{"type":"command","command":"keep-after"}]}]}}"#;
+        let spec = JsonHookSpec::gemini(Path::new("/synthetic/Odometer App/odometer"));
+        let plan = plan_json_hook_bytes(&path, Some(original.to_vec()), &spec, true)
+            .unwrap()
+            .unwrap();
+        let installed: Value = serde_json::from_slice(&plan.updated).unwrap();
+        assert_eq!(
+            installed["hooks"]["AfterAgent"][1]["hooks"][0]["timeout"],
+            5000
+        );
+        assert_eq!(
+            installed["hooks"]["AfterAgent"][1]["hooks"][0]["name"],
+            INTEGRATION_ID
+        );
+        assert!(installed["hooks"]["AfterAgent"][1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(" hook gemini "));
+        assert!(inspect_json_value(&path, &installed, &spec)
+            .unwrap()
+            .current());
+        assert!(
+            plan_json_hook_bytes(&path, Some(plan.updated.clone()), &spec, true)
+                .unwrap()
+                .is_none()
+        );
+        let removed = plan_json_hook_bytes(&path, Some(plan.updated), &spec, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&removed.updated).unwrap(),
+            serde_json::from_slice::<Value>(original).unwrap()
+        );
+    }
+
+    #[test]
     fn json_install_and_remove_preserve_unrelated_hooks() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hooks.json");
@@ -2250,6 +2433,7 @@ timeout = 12
             Path::new("odometer"),
             &codex_home,
             &claude_home,
+            &root.path().join("gemini"),
         )
         .err()
         .unwrap()
