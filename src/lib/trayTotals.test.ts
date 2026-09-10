@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import { computeTrayTotals, type TraySessionLike } from './trayTotals';
-import type { RangeTotals, RateCard, TokenTotals } from './types';
+import type { PricedSurface, RangeTotals, RateCard, TokenTotals } from './types';
 
 const zero: TokenTotals = {
   input_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0,
   reasoning_output_tokens: 0, total_tokens: 0,
 };
 
-function range(model: string, input: number, output: number): RangeTotals {
+function surface(total: number, overrides: Partial<PricedSurface> = {}): PricedSurface {
+  return { total, by_model: [], missing_models: [], unpriced_models: [], ...overrides };
+}
+
+function range(model: string, input: number, output: number, plan = 17, api: number | null = 29): RangeTotals {
   return {
+    // Intentionally unrelated to the local rate card or token quantities.
+    pricing: { plan: surface(plan), api: api === null ? null : surface(api) },
     tokens: { ...zero, input_tokens: input, output_tokens: output, total_tokens: input + output },
     buckets: [{
       model,
@@ -50,19 +56,16 @@ function session(id: string, harness: TraySessionLike['harness'], unlimited: boo
 }
 
 describe('computeTrayTotals', () => {
-  it('sums tokens and prices codex + claude sessions from their rollups', () => {
+  it('sums tokens and authoritative backend prices for codex + claude sessions', () => {
     const totals = computeTrayTotals(
       [session('c1', 'codex'), session('a1', 'claude_code')],
-      { c1: range('m', 3, 1), a1: range('m', 2, 2) },
+      { c1: range('m', 3, 1, 17, 29), a1: range('m', 2, 2, 43, null) },
       rateCard,
     );
     expect(totals.tokens).toBe('8');
-    // c1: 3 input × 1 credit + 1 output × 2 credits = 5.00 credits
-    expect(totals.codex_credits).toBe('5.00');
-    // c1 API: 3 × 0.5 + 1 × 1 = $2.50
-    expect(totals.codex_api_usd).toBe('$2.50');
-    // a1: 2 × 1 + 2 × 2 = $6.00 (claude prices its plan table in USD)
-    expect(totals.claude_usd).toBe('$6.00');
+    expect(totals.codex_credits).toBe('17.00');
+    expect(totals.codex_api_usd).toBe('$29.00');
+    expect(totals.claude_usd).toBe('$43.00');
   });
 
   it('skips sessions with no rollup in the window', () => {
@@ -72,7 +75,7 @@ describe('computeTrayTotals', () => {
       rateCard,
     );
     expect(totals.tokens).toBe('1');
-    expect(totals.codex_credits).toBe('1.00');
+    expect(totals.codex_credits).toBe('17.00');
   });
 
   it('reports unlimited sessions without billing them', () => {
@@ -81,7 +84,7 @@ describe('computeTrayTotals', () => {
       { u1: range('m', 5, 5), c1: range('m', 1, 0) },
       rateCard,
     );
-    expect(totals.codex_credits).toBe('1.00 + 1 unlimited');
+    expect(totals.codex_credits).toBe('17.00 + 1 unlimited');
     const onlyUnlimited = computeTrayTotals(
       [session('u1', 'codex', true)],
       { u1: range('m', 5, 5) },
@@ -90,14 +93,52 @@ describe('computeTrayTotals', () => {
     expect(onlyUnlimited.codex_credits).toBe('unlimited (1)');
   });
 
-  it('marks the API estimate unavailable when no API table is configured', () => {
-    const noApi: RateCard = { ...rateCard, api_models: {} };
+  it('honors a null backend API surface even when local API rates exist', () => {
     const totals = computeTrayTotals(
       [session('c1', 'codex')],
-      { c1: range('m', 1, 0) },
-      noApi,
+      { c1: range('m', 1, 0, 17, null) },
+      rateCard,
     );
     expect(totals.codex_api_usd).toBe('unavailable · missing direct rate');
+  });
+
+  it('keeps absent backend prices unavailable rather than calculating from raw buckets', () => {
+    const unpriced = range('m', 1, 0);
+    delete unpriced.pricing;
+    const totals = computeTrayTotals(
+      [session('c1', 'codex'), session('a1', 'claude_code')],
+      { c1: unpriced, a1: unpriced },
+      rateCard,
+    );
+    expect(totals.tokens).toBe('2');
+    expect(totals.codex_credits).toBe('unavailable');
+    expect(totals.codex_api_usd).toBe('unavailable · missing direct rate');
+    expect(totals.claude_usd).toBe('unavailable');
+  });
+
+  it('preserves backend fallback and excluded-unpriced distinctions', () => {
+    const codex = range('unknown', 1, 0);
+    codex.pricing = {
+      plan: surface(12, { missing_models: ['unknown'] }),
+      api: surface(3, { unpriced_models: ['unpublished'] }),
+    };
+    const claude = range('unpublished', 1, 0);
+    claude.pricing = { plan: surface(7, { unpriced_models: ['unpublished'] }), api: null };
+    const totals = computeTrayTotals(
+      [session('c1', 'codex'), session('a1', 'claude_code')],
+      { c1: codex, a1: claude },
+      rateCard,
+    );
+    expect(totals.codex_credits).toBe('12.00 · fallback');
+    expect(totals.codex_api_usd).toBe('$3.00 · excludes unpriced');
+    expect(totals.claude_usd).toBe('$7.00 · excludes unpriced');
+  });
+
+  it('retains server prices when a same-version rate replacement has different local prices', () => {
+    const ranges = { c1: range('m', 1, 0) };
+    const changedRates: RateCard = { ...rateCard, models: {}, api_models: {} };
+    expect(computeTrayTotals([session('c1', 'codex')], ranges, changedRates))
+      .toEqual(computeTrayTotals([session('c1', 'codex')], ranges, rateCard));
   });
 
   it('carries a quota label through unmodified, or an empty string when none is available', () => {

@@ -5,6 +5,8 @@ import { sessionsStore } from '../lib/stores/sessions.svelte';
 import { zeroToolMetrics, zeroTotals } from '../lib/sessionProjection';
 import type { EventCorrelation, ExternalEvent, SessionSummary } from '../lib/types';
 import ConfigTimeline from './ConfigTimeline.svelte';
+import { rates } from '../lib/stores/rates';
+import type { RateCard } from '../lib/types';
 
 const { correlateEvents } = vi.hoisted(() => ({ correlateEvents: vi.fn() }));
 
@@ -62,6 +64,7 @@ describe('ConfigTimeline', () => {
   });
 
   afterEach(() => {
+    rates.set(null);
     vi.useRealTimers();
   });
 
@@ -106,5 +109,43 @@ describe('ConfigTimeline', () => {
     await flushRequest();
 
     expect(correlateEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it('displays server price differences and keeps missing API prices unavailable', async () => {
+    const item = correlation();
+    const price = (total: number) => ({ total, by_model: [], missing_models: [], unpriced_models: [] });
+    item.before.pricing_by_harness = { codex: { plan: price(7), api: null }, claude_code: { plan: price(20), api: null } };
+    item.after.pricing_by_harness = { codex: { plan: price(18), api: null }, claude_code: { plan: price(35), api: null } };
+    correlateEvents.mockResolvedValue({ results: [item] });
+    render(ConfigTimeline, { props: { events: [event] } });
+    await flushRequest();
+    expect(screen.getByText(/credits \+11.00 · Codex flat API unavailable · Claude \$15.00/)).toBeInTheDocument();
+  });
+
+  it('clears obsolete correlations on rate replacement and ignores their late completion', async () => {
+    let complete!: (result: { results: EventCorrelation[] }) => void;
+    correlateEvents.mockReturnValueOnce(new Promise((resolve) => { complete = resolve; }));
+    correlateEvents.mockResolvedValue({ results: [correlation({ token_delta: 901 })] });
+    render(ConfigTimeline, { props: { events: [event] } });
+    await flushRequest();
+    rates.set({ version: 1, currency: 'credits', currencies: {} } as RateCard);
+    await flushRequest();
+    expect(correlateEvents).toHaveBeenCalledTimes(2);
+    complete({ results: [correlation({ token_delta: 123 })] });
+    await tick();
+    expect(screen.getByText(/Tokens \+901/)).toBeInTheDocument();
+    expect(screen.queryByText(/Tokens \+123/)).not.toBeInTheDocument();
+  });
+
+  it('hides previously displayed prices while their replacement is loading', async () => {
+    correlateEvents.mockResolvedValueOnce({ results: [correlation()] });
+    correlateEvents.mockReturnValue(new Promise(() => {}));
+    render(ConfigTimeline, { props: { events: [event] } });
+    await flushRequest();
+    expect(screen.getByText(/Tokens \+300/)).toBeInTheDocument();
+    rates.set({ version: 1, currency: 'credits', currencies: {} } as RateCard);
+    await flushRequest();
+    expect(screen.queryByText(/Tokens \+300/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Loading local change history/)).toBeInTheDocument();
   });
 });

@@ -35,9 +35,12 @@ indexes.
   Rust serialization, TypeScript types, and UI state.
 - Keep `SessionSummary` small and free of turns and token history. Fetch full
   session details only for the selected session.
-- Reuse `sessions_in_ranges`, `SessionProjection`, and shared credit helpers
-  for tables, analytics, comparisons, exports, tray totals, and correlation.
-  Do not create a second frontend history scanner.
+- Reuse backend-priced `sessions_in_ranges`, `get_session_pricing`, detail,
+  and correlation responses. Keep table, analytics, comparison, and export
+  projections shared through `SessionProjection`. Keep pricing in Rust's shared
+  query service; frontend code only sums already-priced values and formats amounts
+  through `currency.ts`. Do not create a frontend history scanner or pricing
+  calculator, including in tests and browser mocks.
 - Preserve the established Svelte 5 rune style and module-level state
   placement.
 
@@ -97,9 +100,10 @@ indexes.
 - Convert local `datetime-local` values to UTC before comparison. Session
   filters use interval overlap; date-scoped totals use the documented inclusive
   event bounds; all-time totals use cumulative summary buckets.
-- Cached input is a subset of input and reasoning output is a subset of
-  output. Subtract each subset before applying ordinary rates, then price the
-  subset at its own rate exactly once.
+- Cached input and cache-creation input are disjoint subsets of input;
+  reasoning output is a subset of output. In the shared Rust pricing service,
+  subtract each subset before applying ordinary rates, then price the subset
+  at its own rate exactly once.
 - Keep Codex plan credits, Anthropic API USD, and OpenAI API-equivalent
   estimates separate in code, labels, and documentation. An API-equivalent
   number is not an invoice.
@@ -113,8 +117,14 @@ indexes.
   them, and label fallback, unpriced, unavailable, and scenario states
   distinctly.
 - Add reconciliation tests for direct rates, fallback rates, unlimited rates,
-  cached input, reasoning output, service tiers, model switches, date windows,
-  unknown models, and collapsed model rows.
+  cached input, cache-creation input, reasoning output, service tiers, model
+  switches, date windows, unknown models, and collapsed model rows. Preserve
+  the frozen bucket and detail pricing expectations rather than regenerating
+  them from the implementation under test.
+- Treat a saved rate-card object replacement as a price invalidation even if
+  its version is unchanged. Retain raw totals, mark old costs unavailable,
+  and refetch in batches. Guard both stale successes and failures; ordinary
+  transcript updates must retain changed-session-only fetching.
 
 ## 6. Keep privacy and authority boundaries fail-closed
 

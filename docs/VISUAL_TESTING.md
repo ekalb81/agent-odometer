@@ -30,7 +30,26 @@ primary-settings-{light,dark}-desktop
 
 The manifest also covers relevant empty, filtered-empty, loading/progress, selected-detail, error, archived/source-missing, pricing fallback/unpriced, narrow-window, disabled/busy, and validation-error states. Keep state data synthetic and stable; freeze time, locale, timezone, theme, and network/IPC responses. Add a scenario when a new screen or state becomes user-visible, and remove its baseline when the scenario is intentionally deleted. `scripts/validate-visual-baselines.mjs` fails for duplicate IDs, missing references, or orphaned PNGs, while Playwright test discovery fails when a declared ID has no registered screenshot case.
 
+Browser mocks use committed prices generated from synthetic inputs through the shared Rust query service. They do not contain a second pricing engine. Range fixtures interpolate those canned costs using the synthetic session's overlap with the requested window; this is a UI fixture approximation, not ledger accounting. Stress fixtures reuse the same priced templates. Browser mode rejects unsupported custom pricing edits instead of calculating a new price locally; presentation metadata edits remain available. Test custom rate calculations in the native app and Rust suite.
+
+The frozen bucket and detail expectations under `tests/conformance/` are separate correctness oracles, not generated visual data. Preserve their numeric expectations when refreshing browser fixtures. A screenshot proves presentation of the returned price, while Rust conformance and ledger reconciliation tests prove the calculation. Ordinary Rust source changes may skip the visual CI lane, so its status alone cannot validate pricing changes.
+
 ## Local workflow
+
+Ordinary `npm run dev` and visual tests use the committed pricing JSON and do not need a Rust runtime. After changing synthetic inputs or Rust pricing, verify that fixture output remains current:
+
+```powershell
+npm run mock:pricing:check
+```
+
+If the change intentionally alters browser fixture prices, regenerate and review the JSON diff before running visual comparisons:
+
+```powershell
+npm run mock:pricing:generate
+npm run mock:pricing:check
+```
+
+Both commands require Cargo. The generator exports raw synthetic inputs from `src/dev-mock/fixtures.ts`, prices them through the production Rust query service, and writes the generated JSON committed with the fixtures. Frontend tests verify raw-input freshness; Rust tests verify the generated prices against production output. These commands never regenerate the frozen conformance oracles.
 
 Install dependencies and run the complete visual suite:
 

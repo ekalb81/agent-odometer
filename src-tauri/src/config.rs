@@ -328,6 +328,26 @@ impl Config {
         }
     }
 
+    /// Read-only headless loading: an absent file means defaults without
+    /// creating directories or files. A present malformed file is an error.
+    pub fn load_read_only() -> anyhow::Result<Self> {
+        match config_path() {
+            Some(path) => Self::load_read_only_from(&path),
+            None => Ok(Self::default()),
+        }
+    }
+
+    pub fn load_read_only_from(path: &std::path::Path) -> anyhow::Result<Self> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Ok(serde_json::from_str::<Self>(&raw)?.normalized())
+    }
+
     /// Persists config to `<config_dir>/agent-odometer/config.json`.
     /// Uses a `.tmp` → rename dance for an atomic-ish write.
     pub fn save(&self) -> anyhow::Result<()> {
@@ -356,6 +376,22 @@ impl Config {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn read_only_loading_never_creates_or_repairs_configuration() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("not-created").join("config.json");
+        Config::load_read_only_from(&path).unwrap();
+        assert!(!path.parent().unwrap().exists());
+        let path = directory.path().join("config.json");
+        std::fs::write(&path, "{malformed").unwrap();
+        assert!(Config::load_read_only_from(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{malformed");
+        let before = serde_json::to_string(&Config::default()).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        Config::load_read_only_from(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
 
     #[test]
     fn round_trip_config() {

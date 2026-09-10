@@ -723,7 +723,7 @@
   /** The cache-write rate is the one field where blank is a valid, distinct
    * value: it means "no published premium for this model", which prices
    * cache-creation tokens at the ordinary input rate rather than at zero
-   * (see credits.ts cacheCreationRate). Typing `0` is a different, explicit
+   * (see Rust ModelRate::cache_creation_rate). Typing `0` is a different, explicit
    * "this is free" claim. Returns the sentinel string 'invalid' for
    * anything else that doesn't parse as a non-negative number. */
   function parseCacheCreationRate(s: string): number | null | 'invalid' {

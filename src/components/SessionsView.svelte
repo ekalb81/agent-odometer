@@ -6,9 +6,9 @@
   import { projectStore } from '../lib/stores/projects.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
-  import { apiCostFromBuckets, creditsFromBuckets, formatCredits, harnessCurrency } from '../lib/credits';
-  import { getSessionDetails, listExternalEvents, onConfigEvent, sessionsInRanges, writeExport } from '../lib/ipc';
-  import type { ExternalEvent, Harness, RangeTotals, RateCard, Session } from '../lib/types';
+  import { formatCredits, harnessCurrency } from '../lib/currency';
+  import { getSessionPricing, getSessionDetails, listExternalEvents, onConfigEvent, sessionsInRanges, writeExport } from '../lib/ipc';
+  import type { ExternalEvent, Harness, RangeTotals, RateCard, SummaryPricing, Session } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
   import { rangeLabelFor } from '../lib/dateRange';
   import { findingRuleTitle, optimizationSummaryOrCount } from '../lib/optimization';
@@ -66,6 +66,7 @@
   /** Plain-number money cells: 2 decimals, but sub-cent amounts keep enough
    *  significant digits to stay honest (same rule as formatCredits). */
   function fmtAmount(n: number): string {
+    if (!Number.isFinite(n)) return 'unavailable';
     return n !== 0 && Math.abs(n) < 0.005 ? fmt4.format(n) : fmt2.format(n);
   }
 
@@ -257,6 +258,9 @@
   // histories). Refetched, debounced, when the range or the session set changes.
   // ---------------------------------------------------------------------------
   let rangeTotals = $state<Record<string, RangeTotals>>({});
+  let summaryPricing = $state<Record<string, SummaryPricing>>({});
+  let tableReady = $state(false);
+  let analyticsReady = $state(false);
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
   // Debounce is only for coalescing live store flushes. A changed range is a
   // discrete user action (preset click, committed input) and fetches
@@ -267,9 +271,22 @@
   // Bumped alongside cache invalidation so an in-flight job discards its
   // fetch instead of applying stale-range data over freshly cleared state.
   let tableEpoch = 0;
+  let lastTableRates: RateCard | null = null;
   let tableQueue: Promise<void> = Promise.resolve();
   const tableCache = new RangeDataCache();
   const tableMutations = new MutationAccumulator();
+
+  function withoutPricing(data: Record<string, RangeTotals>): Record<string, RangeTotals> {
+    return Object.fromEntries(Object.entries(data).map(([id, total]) => [id, { ...total, pricing: undefined }]));
+  }
+
+  async function fetchTableBatch(from: string | null, to: string | null, ids: string[]) {
+    const [summaries, ranges] = await Promise.all([
+      getSessionPricing(ids),
+      from || to ? sessionsInRanges([{ from, to }], ids) : Promise.resolve([{}]),
+    ]);
+    return { summaries, ranges };
+  }
 
   // Jobs are serialized so a drain/plan never races an unapplied fetch; a job
   // superseded by a range change or tab switch skips before draining, leaving
@@ -296,25 +313,33 @@
       if (plan.mode === 'full') {
         const fetched = await measureAsync(
           'frontend.table_range_fetch',
-          () => sessionsInRanges([{ from, to }], sessionIds),
+          () => fetchTableBatch(from, to, sessionIds),
           { sessions: sessionIds.length, ranges: 1, fetched: sessionIds.length, mode: 'full' },
         );
         if (epoch !== tableEpoch) return;
-        results = tableCache.applyFull(rangesKey, sessionIds, fetched);
+        results = tableCache.applyFull(rangesKey, sessionIds, fetched.ranges);
+        summaryPricing = fetched.summaries;
       } else {
         const fetched = plan.fetchIds.length > 0
           ? await measureAsync(
               'frontend.table_range_fetch',
-              () => sessionsInRanges([{ from, to }], plan.fetchIds),
+              () => fetchTableBatch(from, to, plan.fetchIds),
               { sessions: sessionIds.length, ranges: 1, fetched: plan.fetchIds.length, mode: 'delta' },
             )
           : null;
         if (epoch !== tableEpoch) return;
-        results = tableCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
+        results = tableCache.applyDelta(plan.fetchIds, drained.removedIds, fetched?.ranges ?? null);
+        const next = { ...summaryPricing };
+        for (const id of [...plan.fetchIds, ...drained.removedIds]) delete next[id];
+        Object.assign(next, fetched?.summaries ?? {});
+        summaryPricing = next;
       }
       rangeTotals = results[0];
+      tableReady = true;
     } catch (e) {
+      if (epoch !== tableEpoch) return;
       tableCache.invalidate();
+      tableReady = false;
       console.error('sessions_in_ranges failed:', e);
     }
   }
@@ -324,15 +349,9 @@
     const to = toUtc;
     const sessionIds = filteredIds;
     tableMutations.observe(sessionsStore.mutationLog);
+    const ratesChanged = $rates !== lastTableRates;
+    lastTableRates = $rates;
     if (!active) {
-      rangeTotals = {};
-      lastTableRange = null;
-      tableCache.invalidate();
-      tableJobGeneration += 1;
-      tableEpoch += 1;
-      return;
-    }
-    if (!from && !to) {
       rangeTotals = {};
       lastTableRange = null;
       tableCache.invalidate();
@@ -342,9 +361,13 @@
     }
     const key = `${from}|${to}`;
     const rangeChanged = key !== lastTableRange;
-    const delay = rangeChanged ? 0 : 250;
+    const delay = rangeChanged || ratesChanged ? 0 : 250;
     if (rangeChanged) {
       rangeTotals = {};
+    }
+    if (rangeChanged || ratesChanged) {
+      tableReady = false;
+      summaryPricing = {};
       tableCache.invalidate();
       tableJobGeneration += 1;
       tableEpoch += 1;
@@ -370,7 +393,7 @@
   // filter when one is active so the row numbers add up to the totals row.
   // Export and the model comparison consume this exact projection too.
   const sessionDisplayMap = $derived(
-    projectSessions(filtered, $rates, rangeTotals, dateScoped),
+    projectSessions(filtered, $rates, tableReady ? rangeTotals : withoutPricing(rangeTotals), dateScoped, tableReady ? summaryPricing : {}, tableReady),
   );
 
   /** The money-column value for a session (Est.$ on Codex, Cost elsewhere). */
@@ -491,7 +514,8 @@
         break;
       }
       case 'cost':
-        cmp = costOf(a.storage_id) - costOf(b.storage_id);
+        cmp = (Number.isFinite(costOf(a.storage_id)) ? costOf(a.storage_id) : -Infinity) - (Number.isFinite(costOf(b.storage_id)) ? costOf(b.storage_id) : -Infinity);
+        if (Number.isNaN(cmp)) cmp = 0;
         break;
     }
     return sortDir === 'asc' ? cmp : -cmp;
@@ -810,7 +834,7 @@
   // ---------------------------------------------------------------------------
   // Analytics band: spend-by-day series + window totals for the delta pills.
   // Day buckets come from sessions_in_ranges (summaries carry no history);
-  // pricing happens client-side so rate-card edits recompute without refetch.
+  // Backend prices arrive with each batch; saved rate changes refetch them.
   // ---------------------------------------------------------------------------
   interface DayBucket {
     label: string;
@@ -841,6 +865,7 @@
   // in-flight job from an older epoch discards its fetch instead of applying
   // stale-range data over the freshly cleared state.
   let analyticsEpoch = 0;
+  let lastAnalyticsRates: RateCard | null = null;
   let analyticsQueue: Promise<void> = Promise.resolve();
   const analyticsCache = new RangeDataCache();
   const analyticsMutations = new MutationAccumulator();
@@ -997,11 +1022,14 @@
         results = analyticsCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
       }
       analyticsCurrent = results[0];
+      analyticsReady = true;
       analyticsPrev = includePrev ? results[1] : null;
       const days = results.slice(includePrev ? 2 : 1);
       analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
     } catch (e) {
+      if (epoch !== analyticsEpoch) return;
       analyticsCache.invalidate();
+      analyticsReady = false;
       console.error('analytics sessions_in_ranges failed:', e);
     }
   }
@@ -1011,6 +1039,8 @@
     const sessionIds = analyticsSessionIds;
     const includePrev = dateScoped;
     analyticsMutations.observe(sessionsStore.mutationLog);
+    const ratesChanged = $rates !== lastAnalyticsRates;
+    lastAnalyticsRates = $rates;
     if (!active) {
       analyticsBuckets = [];
       analyticsPrev = null;
@@ -1024,11 +1054,14 @@
     const key = `${fromUtc}|${toUtc}`;
     const openEnded = !toUtc;
     const rangeChanged = key !== lastAnalyticsRange;
-    const delay = rangeChanged ? 0 : 250;
+    const delay = rangeChanged || ratesChanged ? 0 : 250;
     if (rangeChanged) {
       analyticsBuckets = [];
       analyticsPrev = null;
       analyticsCurrent = null;
+    }
+    if (rangeChanged || ratesChanged) {
+      analyticsReady = false;
       analyticsCache.invalidate();
       analyticsJobGeneration += 1;
       analyticsEpoch += 1;
@@ -1093,21 +1126,19 @@
     const totals = data[session.storage_id];
     if (!totals || totals.tokens.total_tokens === 0) return null;
     const cached = rangePriceCache.get(totals);
-    if (cached && cached.rates === rateCard) return cached.value;
-    const plan = creditsFromBuckets(totals.buckets, rateCard, session.harness);
-    const api = session.harness === 'codex'
-      ? apiCostFromBuckets(totals.buckets, rateCard, session.harness)
-      : null;
+    if (analyticsReady && cached && cached.rates === rateCard) return cached.value;
+    const plan = analyticsReady ? totals.pricing?.plan : undefined;
+    const api = analyticsReady ? totals.pricing?.api : undefined;
     const value: RangeSessionPrice = {
       tokens: totals.tokens.total_tokens,
-      planCost: plan.total,
-      planFallbackModels: plan.missingModels,
-      planUnpricedModels: plan.unpricedModels,
+      planCost: plan?.total ?? Number.NaN,
+      planFallbackModels: plan?.missing_models ?? [],
+      planUnpricedModels: plan?.unpriced_models ?? [],
       apiCost: api?.total ?? null,
-      apiFallbackModels: api?.missingModels ?? [],
-      apiUnpricedModels: api?.unpricedModels ?? [],
+      apiFallbackModels: api?.missing_models ?? [],
+      apiUnpricedModels: api?.unpriced_models ?? [],
     };
-    rangePriceCache.set(totals, { rates: rateCard, value });
+    if (analyticsReady) rangePriceCache.set(totals, { rates: rateCard, value });
     return value;
   }
 
@@ -1122,14 +1153,18 @@
       fallbackModels: [],
       unpricedModels: [],
     };
-    if (!data || !r) return out;
+    if (!data || !r || !analyticsReady) {
+      out.tokens = data ? filteredNoDate.reduce((sum, session) => sum + (data[session.storage_id]?.tokens.total_tokens ?? 0), 0) : 0;
+      out.cost = out.codexCredits = out.codexApiUsd = out.claudeUsd = Number.NaN;
+      return out;
+    }
     for (const s of filteredNoDate) {
       const priced = priceRangeSession(data, s, r);
       if (!priced) continue;
       out.tokens += priced.tokens;
       if (s.harness === 'codex') {
         out.codexCredits += priced.planCost;
-        out.codexApiUsd += priced.apiCost ?? 0;
+        out.codexApiUsd += priced.apiCost ?? Number.NaN;
         out.fallbackModels.push(...priced.apiFallbackModels);
         out.unpricedModels.push(...priced.apiUnpricedModels);
       } else {
@@ -1192,7 +1227,7 @@
         }
       }
     }
-    out.byModel = allUsdAvailable ? aggregateModelMetrics(filteredNoDate, data, r) : [];
+    out.byModel = allUsdAvailable && analyticsReady ? aggregateModelMetrics(filteredNoDate, data, r) : [];
     const codexCount = filteredNoDate.filter((session) => data[session.storage_id]?.tokens.total_tokens && session.harness === 'codex').length;
     out.allUnlimited = codexCount > 0 && out.credits.unlimitedCount === codexCount;
     return out;
@@ -1243,12 +1278,12 @@
     // A near-empty previous window produces junk percentages — not worth a pill.
     return Math.abs(pct) > 500 ? null : pct;
   }
-  const costDelta = $derived(dateScoped ? deltaPct(windowTotals.cost, prevTotals.cost) : null);
+  const costDelta = $derived(dateScoped && Number.isFinite(windowTotals.cost) && Number.isFinite(prevTotals.cost) ? deltaPct(windowTotals.cost, prevTotals.cost) : null);
   const tokensDelta = $derived(dateScoped ? deltaPct(windowTotals.tokens, prevTotals.tokens) : null);
 
   // Area-chart geometry (viewBox 0 0 700 72, preserveAspectRatio none).
   const chart = $derived((() => {
-    const vals = spendSeries.map((p) => p.cost);
+    const vals = spendSeries.every((p) => Number.isFinite(p.cost)) ? spendSeries.map((p) => p.cost) : [];
     const max = vals.reduce((m, v) => Math.max(m, v), 0);
     const n = vals.length;
     if (n === 0) return { line: '', area: '', endX: 700, endY: 66 };
@@ -1296,7 +1331,7 @@
     const rows = (showAllCostModels ? sorted : sorted.slice(0, 4)).map((m) => ({
       model: `${harness === 'all' ? `${providersStore.displayName(m.harness)} · ` : ''}${m.model}`,
       cost: m.cost,
-      pct: max > 0 ? Math.max(2, Math.round((m.cost / max) * 100)) : 0,
+      pct: Number.isFinite(m.cost) && max > 0 ? Math.max(2, Math.round((m.cost / max) * 100)) : 0,
     }));
     return { rows, hidden: Math.max(0, sorted.length - 4) };
   })());
@@ -1307,6 +1342,7 @@
     harness === 'all' || showApiCost || ($rates ? /^[A-Z]{3}$/.test(harnessCurrency($rates, harness)) : false),
   );
   function fmtMoney(n: number): string {
+    if (!Number.isFinite(n)) return 'unavailable';
     return moneyIsUsd ? fmtUsd(n) : fmtAmount(n);
   }
 
@@ -1389,10 +1425,10 @@
         row.turns += metric.turns;
         row.calls += metric.tool_calls;
         addTotals(row.tokens, metric.tokens);
+        const pricing = tableReady ? summaryPricing[session.storage_id]?.categories[category] : undefined;
         const priced = session.harness === 'codex' && Object.keys(rateCard.api_models ?? {}).length > 0
-          ? apiCostFromBuckets(metric.buckets, rateCard, session.harness)
-          : creditsFromBuckets(metric.buckets, rateCard, session.harness);
-        row.cost += priced?.total ?? 0;
+          ? pricing?.api : pricing?.plan;
+        row.cost += priced?.total ?? Number.NaN;
       }
     }
     return [...grouped.values()].sort((a, b) => b.tokens.total_tokens - a.tokens.total_tokens);
@@ -1403,19 +1439,29 @@
   let includeWorkingDirectory = $state(false);
   let analyticsOpen = $state(false);
 
+  async function pricedExportProjection(exportSessions: TrackedSession[]) {
+    const rateCard = $rates;
+    const scoped = dateScoped;
+    const from = fromUtc;
+    const to = toUtc;
+    const { ranges, summaries } = await fetchTableBatch(from, to, exportSessions.map((session) => session.storage_id));
+    if (!rateCard || rateCard !== $rates) throw new Error('Rates changed during export. Please retry.');
+    if (exportSessions.some((session) => sessionsStore.map.get(session.storage_id) !== session)) {
+      throw new Error('Sessions changed during export. Please retry.');
+    }
+    const projections = projectSessions(exportSessions, rateCard, ranges[0], scoped, summaries, true);
+    if ([...projections.values()].some((projection) => !projection.pricingAvailable)) {
+      throw new Error('Pricing is unavailable. Please retry when pricing has loaded.');
+    }
+    return projections;
+  }
+
   async function exportView(format: 'csv' | 'json') {
     exportBusy = true;
     exportError = null;
     try {
       const exportSessions = filtered;
-      const exportRanges = dateScoped
-        ? (await measureAsync(
-            'frontend.session_export_range_fetch',
-            () => sessionsInRanges([{ from: fromUtc, to: toUtc }], exportSessions.map((session) => session.storage_id)),
-            { sessions: exportSessions.length, ranges: 1 },
-          ))[0]
-        : rangeTotals;
-      const exportProjection = projectSessions(exportSessions, $rates, exportRanges, dateScoped);
+      const exportProjection = await pricedExportProjection(exportSessions);
       const rows = measureSync(
         'frontend.session_export_build',
         () => exportRows(exportProjection.values(), includeWorkingDirectory),
@@ -1501,17 +1547,7 @@
     sessionExportBusy = true;
     sessionExportError = null;
     try {
-      const exportRanges = dateScoped
-        ? (await measureAsync(
-            'frontend.single_session_export_range_fetch',
-            () => sessionsInRanges(
-              [{ from: fromUtc, to: toUtc }],
-              exportSessions.map((session) => session.storage_id),
-            ),
-            { sessions: exportSessions.length, ranges: 1 },
-          ))[0]
-        : {};
-      const projections = projectSessions(exportSessions, $rates, exportRanges, dateScoped);
+      const projections = await pricedExportProjection(exportSessions);
       const rows = measureSync(
         'frontend.single_session_export_build',
         () => exportRows(projections.values(), false),
@@ -1542,6 +1578,7 @@
   let selectedSession = $state<Session | null>(null);
   let detailsFetchTimer: ReturnType<typeof setTimeout> | null = null;
   let detailsRequestGeneration = 0;
+  let lastDetailsRates: RateCard | null = null;
 
   // Value-memoized so the fetch effect reruns only when the selected
   // session's own summary changes — a derived on the raw map would refire on
@@ -1554,6 +1591,11 @@
 
   $effect(() => {
     const generation = ++detailsRequestGeneration;
+    const ratesChanged = $rates !== lastDetailsRates;
+    lastDetailsRates = $rates;
+    if (ratesChanged) {
+      untrack(() => { if (selectedSession) selectedSession = { ...selectedSession, pricing: undefined }; });
+    }
     const id = selectedSessionId;
     if (!active) {
       selectedSession = null;
@@ -1571,12 +1613,12 @@
         .then((s) => {
           if (!cancelled && active && generation === detailsRequestGeneration) selectedSession = s;
         })
-        .catch((e) => console.error('get_session_details failed:', e));
+        .catch((e) => { if (!cancelled && generation === detailsRequestGeneration) console.error('get_session_details failed:', e); });
     };
     // Untracked: the fetch below assigns selectedSession, and tracking it
     // here would turn every completed fetch into a rerun — a permanent
     // ~400ms self-polling loop while a session is selected.
-    if (untrack(() => selectedSession?.storage_id) === id) {
+    if (!ratesChanged && untrack(() => selectedSession?.storage_id) === id) {
       // Refresh of an already-selected session: debounce.
       detailsFetchTimer = setTimeout(fetchDetails, 400);
     } else {
@@ -1680,7 +1722,9 @@
       <div class="text-[11px] text-ink-muted font-medium mb-3">
         {harness === 'codex' ? 'Cost by model' : harness === 'all' ? 'USD spend by model' : 'Spend by model'} · {windowLabel}
       </div>
-      {#if harness === 'all' && !allUsdAvailable}
+      {#if !Number.isFinite(windowTotals.cost)}
+        <div class="text-[11px] text-ink-faint">Pricing unavailable</div>
+      {:else if harness === 'all' && !allUsdAvailable}
         <div class="text-[11px] text-ink-faint">Combined USD unavailable · configure USD rates for both harnesses</div>
       {:else if costByModel.rows.length === 0}
         <div class="text-[11px] text-ink-faint">No priced usage in this window</div>
@@ -1737,9 +1781,11 @@
       {#if harness === 'codex' || harness === 'all'}
         <div>
           <div class="text-[11px] text-ink-muted font-medium">Credits · {windowLabel}</div>
-          {#if windowStats.credits.billedTotal > 0}
+          {#if !analyticsReady || !Number.isFinite(windowStats.credits.billedTotal)}
+            <div class="text-xl font-bold font-mono mt-0.5 text-ink">unavailable</div>
+          {:else if windowStats.credits.billedTotal > 0}
             <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-              {fmtAmount(windowStats.credits.billedTotal)}
+              {fmtAmount(analyticsReady ? windowStats.credits.billedTotal : Number.NaN)}
               {#if windowStats.credits.unlimitedCount > 0}
                 <span class="text-[11px] text-ink-faint font-normal">{windowStats.credits.unlimitedCount} unlimited excluded</span>
               {/if}
@@ -1759,7 +1805,7 @@
           <div class="text-xl font-bold font-mono mt-0.5 text-ink">
             {windowStats.subagents.count}
             {#if windowStats.subagents.count > 0}
-              <span class="text-[11px] text-ink-faint font-normal">{allUsdAvailable ? `${fmtMoney(windowStats.subagents.cost)} total` : 'cost unavailable'}</span>
+              <span class="text-[11px] text-ink-faint font-normal">{allUsdAvailable ? `${fmtMoney(analyticsReady ? windowStats.subagents.cost : Number.NaN)} total` : 'cost unavailable'}</span>
             {/if}
           </div>
         </div>
@@ -1783,9 +1829,9 @@
       />
       {#if harness === 'all'}
       <div class="grid grid-cols-3 gap-2 text-xs">
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex credits</span><div class="font-mono font-semibold">{fmtAmount(windowTotals.codexCredits)}</div></div>
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex est. API USD</span><div class="font-mono font-semibold">{allUsdAvailable ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex credits</span><div class="font-mono font-semibold">{fmtAmount(analyticsReady ? windowTotals.codexCredits : Number.NaN)}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex est. API USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.codexApiUsd) ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.claudeUsd) ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
       </div>
       {/if}
 
@@ -1812,8 +1858,8 @@
                   <td class="text-right">{metric.tools.mutation_targets > 0 ? `${((metric.tools.one_shot_mutations / metric.tools.mutation_targets) * 100).toFixed(0)}%` : '—'}</td>
                   <td class="text-right">{fmt.format(metric.tools.retry_count)}</td>
                   <td class="text-right">{metric.tools.calls > 0 ? `${((metric.tools.failures / metric.tools.calls) * 100).toFixed(0)}%` : '—'}</td>
-                  <td class="text-right">{metric.tools.calls > 0 ? formatCredits(metric.cost / metric.tools.calls, metric.currency) : '—'}</td>
-                  <td class="text-right">{formatCredits(metric.cost, metric.currency)}</td>
+                  <td class="text-right">{metric.tools.calls > 0 && Number.isFinite(metric.cost) ? formatCredits(metric.cost / metric.tools.calls, metric.currency) : '—'}</td>
+                  <td class="text-right">{Number.isFinite(metric.cost) ? formatCredits(metric.cost, metric.currency) : 'unavailable'}</td>
                   <td class="text-right">{modelComparisonCostTotal > 0 ? `${((metric.cost / modelComparisonCostTotal) * 100).toFixed(1)}%` : '—'}</td>
                 </tr>
               {/each}
@@ -1839,7 +1885,7 @@
           <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
             <div class="section-label col-span-2">Harness / category</div><div class="section-label text-right">Turns</div><div class="section-label text-right">Tokens</div><div class="section-label text-right">Tools</div><div class="section-label text-right">Cost</div>
             {#each categoryRows as row (`${row.harness}:${row.category}`)}
-              <div class="col-span-2 border-t border-edgerow pt-1"><span class="text-ink-faint">{providersStore.displayName(row.harness)}</span> · {row.category}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.turns}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{fmt.format(row.tokens.total_tokens)}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.calls}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{formatCredits(row.cost, row.currency)}</div>
+              <div class="col-span-2 border-t border-edgerow pt-1"><span class="text-ink-faint">{providersStore.displayName(row.harness)}</span> · {row.category}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.turns}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{fmt.format(row.tokens.total_tokens)}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{row.calls}</div><div class="text-right border-t border-edgerow pt-1 font-mono">{Number.isFinite(row.cost) ? formatCredits(row.cost, row.currency) : 'unavailable'}</div>
             {/each}
           </div>
         {/if}

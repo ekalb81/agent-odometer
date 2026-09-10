@@ -1,9 +1,7 @@
 #[cfg(windows)]
 use crate::config::DEFENDER_EXCLUSION_RECEIPT_VERSION;
 use crate::config::{Config, DefenderExclusionReceipt};
-use crate::model::{
-    Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, Session, SessionSummary,
-};
+use crate::model::{Harness, RangeTotals, RateLimitSnapshotPoint, RateLimitWindow, SessionSummary};
 use crate::rates::RateCard;
 use crate::scan_cache;
 use crate::store::{
@@ -365,10 +363,9 @@ pub async fn correlate_events(
             &query,
         );
         let sessions = blocking_state.full_sessions(&candidate_ids)?;
-        Ok::<_, String>((
-            sessions.len(),
-            crate::correlation::correlate(&sessions, query),
-        ))
+        let mut correlation = crate::correlation::correlate(&sessions, query);
+        crate::query::enrich_correlation_pricing(&mut correlation, &get_rates(), Utc::now());
+        Ok::<_, String>((sessions.len(), correlation))
     })
     .await
     .map_err(|error| error.to_string())
@@ -535,18 +532,90 @@ pub fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<SessionSummary> {
 /// loaded right now (#116: never silently substituted with an empty/zero
 /// session).
 #[tauri::command]
-pub fn get_session_details(
+pub async fn get_session_details(
     state: State<'_, Arc<AppState>>,
     session_id: String,
-) -> Result<Option<Session>, String> {
+) -> Result<Option<crate::query::SessionDetails>, String> {
     let started = Instant::now();
-    let result = state.full_session(&session_id);
+    let blocking_state = state.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        blocking_state.full_session(&session_id).map(|session| {
+            session.map(|session| {
+                crate::query::price_session_details(session, &get_rates(), Utc::now())
+            })
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|inner| inner);
     let found = result.as_ref().map(|s| s.is_some()).unwrap_or(false);
     state.performance.record_backend(
         "ipc.get_session_details",
         started,
         result.is_ok(),
         BTreeMap::from([("found".into(), found.to_string())]),
+    );
+    result
+}
+
+/// Batched, response-only all-time pricing from lightweight resident buckets.
+#[tauri::command]
+pub async fn get_session_pricing(
+    state: State<'_, Arc<AppState>>,
+    session_ids: Vec<String>,
+) -> Result<HashMap<String, crate::query::SummaryPricing>, String> {
+    let started = Instant::now();
+    let app_state = state.inner().clone();
+    let session_ids: std::collections::HashSet<_> = session_ids.into_iter().collect();
+    let session_count = session_ids.len();
+    if matches!(app_state.history_readiness(), HistoryReadinessKind::Pending) {
+        app_state.performance.record_backend(
+            "ipc.get_session_pricing",
+            started,
+            false,
+            BTreeMap::from([
+                ("sessions".into(), session_count.to_string()),
+                ("priced".into(), "0".into()),
+                ("source".into(), "pending".into()),
+            ]),
+        );
+        return Err("durable history is still preparing; retry shortly".into());
+    }
+    let blocking_state = app_state.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let rates = get_rates();
+        let now = Utc::now();
+        let mut prices = HashMap::new();
+        for id in session_ids {
+            // Pricing categories may take longer than cloning the resident
+            // Arc; release the map shard before doing that work.
+            let resident = blocking_state
+                .sessions
+                .get(&id)
+                .map(|entry| entry.value().clone());
+            if let Some(entry) = resident {
+                prices.insert(id, crate::query::price_summary(&entry.summary, &rates, now));
+            }
+        }
+        prices
+    })
+    .await
+    .map_err(|error| error.to_string());
+    app_state.performance.record_backend(
+        "ipc.get_session_pricing",
+        started,
+        result.is_ok(),
+        BTreeMap::from([
+            ("sessions".into(), session_count.to_string()),
+            (
+                "priced".into(),
+                result.as_ref().map_or(0, HashMap::len).to_string(),
+            ),
+            (
+                "source".into(),
+                if result.is_ok() { "resident" } else { "failed" }.into(),
+            ),
+        ]),
     );
     result
 }
@@ -749,6 +818,14 @@ pub async fn sessions_in_ranges(
                 }
             }
         }
+        let rates = get_rates();
+        let now = Utc::now();
+        crate::query::enrich_range_pricing(&mut out, &rates, now, |key| {
+            blocking_state
+                .sessions
+                .get(key)
+                .map(|entry| entry.summary.harness.clone())
+        });
         Ok((out, source))
     })
     .await
@@ -2953,6 +3030,7 @@ mod tests {
     #[test]
     fn range_filter_keeps_tool_only_observations() {
         let range = RangeTotals {
+            pricing: None,
             tokens: TokenTotals::default(),
             buckets: Vec::new(),
             tool_metrics: ToolMetrics {

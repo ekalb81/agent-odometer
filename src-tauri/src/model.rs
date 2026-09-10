@@ -699,6 +699,9 @@ pub type RangeWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 /// `sessions_in_ranges` command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RangeTotals {
+    /// Response-only derived pricing; raw aggregates and older payloads omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::query::RangePricing>,
     /// Sum of all event deltas in range (including events with no model yet).
     pub tokens: TokenTotals,
     /// Priceable usage in range, grouped by (model, tier). Events without a
@@ -1102,6 +1105,7 @@ impl Session {
                 )
             };
             results.push(RangeTotals {
+                pricing: None,
                 tokens,
                 buckets,
                 tool_metrics,

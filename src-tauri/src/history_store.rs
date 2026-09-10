@@ -15,11 +15,14 @@ use crate::model::{
 use crate::provider::{
     claude_code_provider_id, codex_provider_id, ProviderRegistry, ProviderSourceKind,
 };
+use crate::query_control::QueryControl;
 use crate::scan_cache::{self, ScanCache};
 use crate::scanner::SCAN_WRITE_BATCH_SIZE;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::TimeZone;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -31,6 +34,24 @@ const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
 /// migration's SQL use identically so the two never disagree on bucketing.
 const HOUR_MS: i64 = 3_600_000;
+
+// CROSS JOIN retains the session-first index access path. Both edge branches
+// use a separate bounded seek, avoiding an OR that only indexes session_key.
+const TOKEN_TOTALS_BY_PROVIDER_SQL: &str = "WITH usage AS (
+    SELECT r.session_key, COALESCE(r.model, '') AS model, COALESCE(r.service_tier, '') AS service_tier, r.input_tokens, r.cached_input_tokens, r.output_tokens, r.reasoning_output_tokens, r.total_tokens, r.cache_creation_input_tokens
+    FROM durable_sessions d CROSS JOIN rollup_token_totals r INDEXED BY rollup_token_totals_key_idx
+    WHERE r.session_key = d.session_key AND r.hour_bucket BETWEEN ?1 AND ?2
+    UNION ALL
+    SELECT r.session_key, COALESCE(r.model, '') AS model, COALESCE(r.service_tier, '') AS service_tier, r.input_tokens, r.cached_input_tokens, r.output_tokens, r.reasoning_output_tokens, r.total_tokens, r.cache_creation_input_tokens
+    FROM durable_sessions d CROSS JOIN durable_token_events r INDEXED BY durable_token_events_session_timestamp_idx
+    WHERE r.session_key = d.session_key AND r.timestamp_ms BETWEEN ?3 AND ?4
+    UNION ALL
+    SELECT r.session_key, COALESCE(r.model, '') AS model, COALESCE(r.service_tier, '') AS service_tier, r.input_tokens, r.cached_input_tokens, r.output_tokens, r.reasoning_output_tokens, r.total_tokens, r.cache_creation_input_tokens
+    FROM durable_sessions d CROSS JOIN durable_token_events r INDEXED BY durable_token_events_session_timestamp_idx
+    WHERE r.session_key = d.session_key AND r.timestamp_ms BETWEEN ?5 AND ?6
+) SELECT CASE WHEN instr(session_key, ':') > 1 AND instr(session_key, ':') < length(session_key) THEN substr(session_key, 1, instr(session_key, ':') - 1) ELSE 'unknown' END AS provider,
+    model, service_tier, SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens), SUM(reasoning_output_tokens), SUM(total_tokens), SUM(cache_creation_input_tokens)
+FROM usage GROUP BY provider, model, service_tier ORDER BY provider, model, service_tier";
 
 /// Caps how large the WAL is left *after* any checkpoint completes —
 /// ordinary auto-checkpoints, not just [`HistoryStore::vacuum`]'s explicit
@@ -195,10 +216,29 @@ pub struct HistoryStats {
     pub collisions: usize,
 }
 
+#[derive(Debug)]
+pub struct CategorySnapshot {
+    pub session_key: String,
+    pub harness: Option<crate::provider::ProviderId>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub last_event_at: chrono::DateTime<chrono::Utc>,
+    pub category_totals: BTreeMap<crate::model::TaskCategory, crate::model::CategoryMetric>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ProviderLedgerStats {
+    pub provider: String,
+    pub durable_sessions: u64,
+    pub available_sessions: u64,
+    pub collision_sessions: u64,
+    pub models: Vec<String>,
+}
+
 /// Durable archive database. Errors are deliberately surfaced to callers: a
 /// failed archive must not quietly behave like a disposable cache.
 pub struct HistoryStore {
     connection: Mutex<Connection>,
+    query_control: Option<QueryControl>,
     /// Retained so aggregation can open dedicated read connections instead
     /// of serializing behind the writer mutex (WAL permits concurrent reads).
     path: PathBuf,
@@ -207,6 +247,21 @@ pub struct HistoryStore {
     /// compiled-in defaults (see `memory.rs`'s doc comment for why that
     /// matters to this app's memory investigation).
     pragmas: crate::memory::SqlitePragmaSnapshot,
+}
+
+enum QueryReader<'a> {
+    Shared(std::sync::MutexGuard<'a, Connection>),
+    Independent(Connection),
+}
+
+impl std::ops::Deref for QueryReader<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(connection) => connection,
+            Self::Independent(connection) => connection,
+        }
+    }
 }
 
 impl HistoryStore {
@@ -240,6 +295,214 @@ impl HistoryStore {
     /// migrations. Nothing here is keyed to `CARGO_PKG_VERSION`.
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_progress(path, |_| {})
+    }
+
+    /// Opens an existing, current ledger without migrations, recovery, or
+    /// application-data writes. SQLite may create or update WAL coordination sidecars.
+    pub fn open_read_only(path: &Path, control: QueryControl) -> Result<Self> {
+        control.check()?;
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .context("could not open existing history ledger read-only")?;
+        configure_query_reader(&connection, Some(&control))?;
+        validate_query_ledger(&connection)?;
+        let pragmas = crate::memory::query_sqlite_pragmas(&connection);
+        Ok(Self {
+            connection: Mutex::new(connection),
+            query_control: Some(control),
+            path: path.to_path_buf(),
+            pragmas,
+        })
+    }
+
+    pub fn check_query(&self) -> Result<()> {
+        self.query_control
+            .as_ref()
+            .map_or(Ok(()), QueryControl::check)
+    }
+
+    pub fn check_query_rows(&self, count: usize) -> Result<()> {
+        self.check_query()?;
+        if self
+            .query_control
+            .as_ref()
+            .is_some_and(|control| count > control.max_rows)
+        {
+            bail!("query row limit exceeded");
+        }
+        Ok(())
+    }
+
+    fn check_session_count(&self, connection: &Connection) -> Result<()> {
+        if let Some(control) = &self.query_control {
+            let count: i64 =
+                connection.query_row("SELECT COUNT(*) FROM durable_sessions", [], |row| {
+                    row.get(0)
+                })?;
+            if count > control.max_sessions as i64 {
+                bail!("query session limit exceeded ({})", control.max_sessions);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn session_count(&self) -> Result<u64> {
+        let connection = self.open_reader()?;
+        Ok(connection
+            .query_row("SELECT COUNT(*) FROM durable_sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })?
+            .try_into()?)
+    }
+
+    /// Projects categories without deserializing histories, turns, or prompts.
+    /// The borrowed SQLite blob is visited once and never copied into a Session.
+    pub fn stream_category_snapshots(
+        &self,
+        mut visit: impl FnMut(CategorySnapshot) -> Result<()>,
+    ) -> Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Fields {
+            started_at: chrono::DateTime<chrono::Utc>,
+            last_event_at: chrono::DateTime<chrono::Utc>,
+            #[serde(default)]
+            category_totals: BTreeMap<crate::model::TaskCategory, crate::model::CategoryMetric>,
+        }
+        let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
+        let mut statement = connection.prepare("SELECT d.session_key, s.session_json FROM durable_sessions d LEFT JOIN session_snapshots s ON s.session_key = d.session_key AND s.version = d.current_snapshot_version ORDER BY d.session_key")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            self.check_query()?;
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+            }
+            let session_key: String = row.get(0)?;
+            let raw = row.get_ref(1)?.as_bytes()?;
+            if self.query_control.is_some() && raw.len() > 64 * 1024 * 1024 {
+                bail!("query snapshot size limit exceeded (64 MiB)");
+            }
+            let fields: Fields =
+                serde_json::from_slice(raw).context("invalid category snapshot")?;
+            self.check_query()?;
+            let harness = session_key
+                .split_once(':')
+                .and_then(|(provider, suffix)| (!suffix.is_empty()).then_some(provider))
+                .and_then(|provider| crate::provider::ProviderId::new(provider).ok());
+            visit(CategorySnapshot {
+                harness,
+                session_key,
+                started_at: fields.started_at,
+                last_event_at: fields.last_event_at,
+                category_totals: fields.category_totals,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Provider diagnostics from ledger columns only, never snapshot JSON.
+    pub fn provider_stats(&self) -> Result<Vec<ProviderLedgerStats>> {
+        let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
+        let mut statement = connection.prepare("SELECT CASE WHEN instr(d.session_key, ':') > 1 AND instr(d.session_key, ':') < length(d.session_key) THEN substr(d.session_key, 1, instr(d.session_key, ':') - 1) ELSE 'unknown' END AS provider, COUNT(*), SUM(EXISTS(SELECT 1 FROM source_locations l WHERE l.session_key = d.session_key AND l.present = 1)), SUM(d.collision) FROM durable_sessions d GROUP BY provider ORDER BY provider")?;
+        let mut providers: BTreeMap<String, ProviderLedgerStats> = BTreeMap::new();
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+            }
+            let provider: String = row.get(0)?;
+            providers.insert(
+                provider.clone(),
+                ProviderLedgerStats {
+                    provider,
+                    durable_sessions: row.get::<_, i64>(1)?.try_into()?,
+                    available_sessions: row.get::<_, i64>(2)?.try_into()?,
+                    collision_sessions: row.get::<_, i64>(3)?.try_into()?,
+                    models: Vec::new(),
+                },
+            );
+        }
+        let mut statement = connection.prepare("SELECT DISTINCT CASE WHEN instr(session_key, ':') > 1 AND instr(session_key, ':') < length(session_key) THEN substr(session_key, 1, instr(session_key, ':') - 1) ELSE 'unknown' END AS provider, model FROM rollup_token_totals WHERE model != '' ORDER BY provider, model")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+            }
+            let provider: String = row.get(0)?;
+            if let Some(entry) = providers.get_mut(&provider) {
+                entry.models.push(row.get(1)?);
+            }
+        }
+        Ok(providers.into_values().collect())
+    }
+
+    /// Token-only exact window aggregation for a statusline. No snapshot, tool,
+    /// or finding rows are read; complete hours and partial edges are disjoint.
+    pub fn token_totals_by_provider(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<BTreeMap<String, RangeTotals>> {
+        if matches!((from, to), (Some(from), Some(to)) if from > to) {
+            bail!("query end precedes start");
+        }
+        let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
+        let plan = plan_window(
+            from.map(|v| v.timestamp_millis()),
+            to.map(|v| v.timestamp_millis()),
+        );
+        let (first, last) = plan
+            .full_buckets
+            .map_or((None, None), |(a, b)| (Some(a), Some(b)));
+        let first_edge = plan.edges.first().copied();
+        let last_edge = plan.edges.get(1).copied();
+        let mut statement = connection.prepare(TOKEN_TOTALS_BY_PROVIDER_SQL)?;
+        let mut rows = statement.query(params![
+            first,
+            last,
+            first_edge.map(|v| v.0),
+            first_edge.map(|v| v.1),
+            last_edge.map(|v| v.0),
+            last_edge.map(|v| v.1)
+        ])?;
+        let mut out: BTreeMap<String, RangeTotals> = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            self.check_query()?;
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+            }
+            let provider: String = row.get(0)?;
+            let model: String = row.get(1)?;
+            let tier: String = row.get(2)?;
+            let tokens = TokenTotals {
+                input_tokens: row.get::<_, i64>(3)?.try_into()?,
+                cached_input_tokens: row.get::<_, i64>(4)?.try_into()?,
+                output_tokens: row.get::<_, i64>(5)?.try_into()?,
+                reasoning_output_tokens: row.get::<_, i64>(6)?.try_into()?,
+                total_tokens: row.get::<_, i64>(7)?.try_into()?,
+                cache_creation_input_tokens: row.get::<_, i64>(8)?.try_into()?,
+            };
+            let range = out.entry(provider).or_insert_with(|| RangeTotals {
+                pricing: None,
+                tokens: TokenTotals::default(),
+                buckets: Vec::new(),
+                tool_metrics: ToolMetrics::default(),
+                tool_metrics_by_model: BTreeMap::new(),
+                optimization_findings_count: 0,
+                optimization_summary: OptimizationSummary::default(),
+                tool_dimensions: BTreeMap::new(),
+            });
+            range.tokens += &tokens;
+            if !model.is_empty() {
+                range.buckets.push(TierBucket {
+                    model,
+                    service_tier: sentinel_to_option(&tier),
+                    tokens,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Like [`Self::open`], but reports migration progress through
@@ -291,6 +554,7 @@ impl HistoryStore {
         }
         Ok(Self {
             connection: Mutex::new(connection),
+            query_control: None,
             path: path.to_path_buf(),
             pragmas,
         })
@@ -1048,7 +1312,8 @@ impl HistoryStore {
         // proceed concurrently with an in-progress writer transaction).
         // Mirrors `range_totals_multi`'s existing pattern.
         let connection = self.open_reader()?;
-        load_project_overrides(&connection).map(|map| map.into_values().collect())
+        load_project_overrides_controlled(&connection, self.query_control.as_ref())
+            .map(|map| map.into_values().collect())
     }
 
     /// Sets (`Some`) or clears (`None`) a local display-label alias for
@@ -1169,7 +1434,7 @@ impl HistoryStore {
             .query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect_bounded(self.query_control.as_ref())?;
         Ok(rows.into_iter().collect())
     }
 
@@ -1212,10 +1477,11 @@ impl HistoryStore {
     /// would defeat the point of reading rollups in the first place.
     pub fn session_keys(&self) -> Result<Vec<String>> {
         let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
         let mut statement = connection.prepare(BACKFILL_PROJECT_IDENTITY_KEYS_SQL)?;
         let keys = statement
             .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect_bounded(self.query_control.as_ref())?;
         Ok(keys)
     }
 
@@ -1255,6 +1521,7 @@ impl HistoryStore {
     /// content is read.
     pub fn mirrored_session_groups(&self) -> Result<Vec<MirroredSessionGroup>> {
         let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
         let mut statement = connection.prepare(
             "SELECT first_event_fingerprint, session_key
              FROM durable_sessions
@@ -1270,6 +1537,10 @@ impl HistoryStore {
             std::collections::BTreeMap::new();
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
+            self.check_query()?;
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+            }
             let fingerprint: String = row.get(0)?;
             let key: String = row.get(1)?;
             grouped.entry(fingerprint).or_default().push(key);
@@ -1330,12 +1601,13 @@ impl HistoryStore {
                     sessions: row.get::<_, i64>(4)?.max(0) as u64,
                 })
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect_bounded(self.query_control.as_ref())?;
         Ok(rows)
     }
 
     pub fn session_keys_since(&self, cutoff_ms: i64) -> Result<Vec<String>> {
         let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
         let mut statement = connection.prepare(
             "SELECT session_key FROM durable_sessions
               WHERE last_seen_at_ms >= ?1
@@ -1343,7 +1615,7 @@ impl HistoryStore {
         )?;
         let keys = statement
             .query_map([cutoff_ms], |row| row.get::<_, String>(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect_bounded(self.query_control.as_ref())?;
         Ok(keys)
     }
 
@@ -1359,6 +1631,7 @@ impl HistoryStore {
     /// corpus to answer a grouping question.
     pub fn session_project_rows(&self) -> Result<Vec<SessionProjectRow>> {
         let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
         let mut statement = connection.prepare(
             "SELECT session_key, project_key, project_label, project_provenance
              FROM durable_sessions",
@@ -1372,7 +1645,7 @@ impl HistoryStore {
                     provenance: row.get(3)?,
                 })
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .collect_bounded(self.query_control.as_ref())?;
         Ok(rows)
     }
 
@@ -1381,6 +1654,27 @@ impl HistoryStore {
         session_keys: &[String],
         windows: &[RangeWindow],
     ) -> Result<Vec<HashMap<String, RangeTotals>>> {
+        self.check_query()?;
+        if let Some(control) = &self.query_control {
+            if session_keys.len() > control.max_sessions {
+                bail!("query session limit exceeded ({})", control.max_sessions);
+            }
+            if windows.len() > control.max_windows {
+                bail!("query window limit exceeded ({})", control.max_windows);
+            }
+            if session_keys
+                .len()
+                .checked_mul(windows.len())
+                .is_none_or(|cells| cells > control.max_rows)
+            {
+                bail!("query result cardinality limit exceeded");
+            }
+            for (from, to) in windows {
+                if matches!((from, to), (Some(from), Some(to)) if from > to) {
+                    bail!("query end precedes start");
+                }
+            }
+        }
         let connection = self.open_reader()?;
         let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); windows.len()];
 
@@ -1408,30 +1702,41 @@ impl HistoryStore {
                 }
             }
         }
+        let full_bucket_ranges: Vec<_> =
+            plans.iter().filter_map(|plan| plan.full_buckets).collect();
+        let bucket_predicate = interval_predicate_sql("hour_bucket", &full_bucket_ranges);
+        let finding_ranges: Vec<_> = window_ms
+            .iter()
+            .map(|(from, to)| (from.unwrap_or(i64::MIN), to.unwrap_or(i64::MAX)))
+            .collect();
+        let mut finding_predicate = interval_predicate_sql("timestamp_ms", &finding_ranges);
+        if window_ms.contains(&(None, None)) {
+            finding_predicate.push_str(" OR timestamp_ms IS NULL");
+        }
 
-        let mut token_rollup_query = connection.prepare(
+        let mut token_rollup_query = connection.prepare(&format!(
             "SELECT hour_bucket, model, service_tier, input_tokens, cached_input_tokens,
                     output_tokens, reasoning_output_tokens, total_tokens, cache_creation_input_tokens
-             FROM rollup_token_totals WHERE session_key = ?1",
-        )?;
-        let mut tool_rollup_query = connection.prepare(
+             FROM rollup_token_totals WHERE session_key = ?1 AND ({bucket_predicate})",
+        ))?;
+        let mut tool_rollup_query = connection.prepare(&format!(
             "SELECT hour_bucket, model, calls, reads, searches, mutations, commands, other,
                     successes, failures, unknown, duration_ms, output_bytes,
                     core_origin_calls, mcp_origin_calls, provider_origin_calls, unknown_origin_calls
-             FROM rollup_tool_metrics WHERE session_key = ?1",
-        )?;
-        let mut chain_rollup_query = connection.prepare(
+             FROM rollup_tool_metrics WHERE session_key = ?1 AND ({bucket_predicate})",
+        ))?;
+        let mut chain_rollup_query = connection.prepare(&format!(
             "SELECT hour_bucket, model, turn_id, target, mutation_count
-             FROM rollup_mutation_chains WHERE session_key = ?1",
-        )?;
-        let mut finding_query = connection.prepare(
+             FROM rollup_mutation_chains WHERE session_key = ?1 AND ({bucket_predicate})",
+        ))?;
+        let mut finding_query = connection.prepare(&format!(
             "SELECT timestamp_ms, rule_id, severity, avoidable_calls
-             FROM durable_finding_events WHERE session_key = ?1",
-        )?;
-        let mut dimension_rollup_query = connection.prepare(
+             FROM durable_finding_events WHERE session_key = ?1 AND ({finding_predicate})",
+        ))?;
+        let mut dimension_rollup_query = connection.prepare(&format!(
             "SELECT hour_bucket, dimension_kind, dimension_value, calls, failures, output_bytes, duration_ms
-             FROM rollup_tool_dimensions WHERE session_key = ?1",
-        )?;
+             FROM rollup_tool_dimensions WHERE session_key = ?1 AND ({bucket_predicate})",
+        ))?;
         let edge_predicate = edge_predicate_sql(&edge_ranges);
         let mut token_edge_query = (!edge_ranges.is_empty())
             .then(|| {
@@ -1465,8 +1770,15 @@ impl HistoryStore {
             .transpose()?;
 
         for key in session_keys {
+            self.check_query()?;
+            let bucket_params = interval_params(key, &full_bucket_ranges);
+            let bucket_refs: Vec<&dyn rusqlite::ToSql> =
+                bucket_params.iter().map(|value| value.as_ref()).collect();
+            let finding_params = interval_params(key, &finding_ranges);
+            let finding_refs: Vec<&dyn rusqlite::ToSql> =
+                finding_params.iter().map(|value| value.as_ref()).collect();
             let token_rows: Vec<(i64, String, String, TokenTotals)> = token_rollup_query
-                .query_map([key.as_str()], |row| {
+                .query_map(bucket_refs.as_slice(), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -1481,9 +1793,9 @@ impl HistoryStore {
                         },
                     ))
                 })?
-                .collect::<std::result::Result<_, _>>()?;
+                .collect_bounded(self.query_control.as_ref())?;
             let tool_rows: Vec<(i64, String, ToolMetrics)> = tool_rollup_query
-                .query_map([key.as_str()], |row| {
+                .query_map(bucket_refs.as_slice(), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -1507,9 +1819,9 @@ impl HistoryStore {
                         },
                     ))
                 })?
-                .collect::<std::result::Result<_, _>>()?;
+                .collect_bounded(self.query_control.as_ref())?;
             let chain_rows: Vec<(i64, String, String, String, u64)> = chain_rollup_query
-                .query_map([key.as_str()], |row| {
+                .query_map(bucket_refs.as_slice(), |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
@@ -1518,10 +1830,10 @@ impl HistoryStore {
                         row.get::<_, i64>(4)? as u64,
                     ))
                 })?
-                .collect::<std::result::Result<_, _>>()?;
+                .collect_bounded(self.query_control.as_ref())?;
             let dimension_rows: Vec<(i64, String, String, ToolDimensionMetrics)> =
                 dimension_rollup_query
-                    .query_map([key.as_str()], |row| {
+                    .query_map(bucket_refs.as_slice(), |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
                             row.get::<_, String>(1)?,
@@ -1535,17 +1847,8 @@ impl HistoryStore {
                             },
                         ))
                     })?
-                    .collect::<std::result::Result<_, _>>()?;
-            let edge_params = |key: &str| -> Vec<Box<dyn rusqlite::ToSql>> {
-                let mut params: Vec<Box<dyn rusqlite::ToSql>> =
-                    Vec::with_capacity(1 + edge_ranges.len() * 2);
-                params.push(Box::new(key.to_owned()));
-                for (a, b) in &edge_ranges {
-                    params.push(Box::new(*a));
-                    params.push(Box::new(*b));
-                }
-                params
-            };
+                    .collect_bounded(self.query_control.as_ref())?;
+            let edge_params = |key: &str| interval_params(key, &edge_ranges);
             let edge_tokens: Vec<TokenHistoryPoint> = match token_edge_query.as_mut() {
                 Some(query) => {
                     let params = edge_params(key);
@@ -1574,7 +1877,7 @@ impl HistoryStore {
                                 },
                             })
                         })?
-                        .collect::<std::result::Result<_, _>>()?
+                        .collect_bounded(self.query_control.as_ref())?
                 }
                 None => Vec::new(),
             };
@@ -1621,7 +1924,7 @@ impl HistoryStore {
                                 output_bytes: row.get::<_, i64>(7)? as u64,
                             })
                         })?
-                        .collect::<std::result::Result<_, _>>()?
+                        .collect_bounded(self.query_control.as_ref())?
                 }
                 None => Vec::new(),
             };
@@ -1643,12 +1946,12 @@ impl HistoryStore {
                                     .map(|value| value as u64),
                             })
                         })?
-                        .collect::<std::result::Result<_, _>>()?
+                        .collect_bounded(self.query_control.as_ref())?
                 }
                 None => Vec::new(),
             };
             let findings: Vec<OptimizationFinding> = finding_query
-                .query_map([key.as_str()], |row| {
+                .query_map(finding_refs.as_slice(), |row| {
                     Ok(OptimizationFinding {
                         timestamp: row
                             .get::<_, Option<i64>>(0)?
@@ -1659,7 +1962,7 @@ impl HistoryStore {
                         ..OptimizationFinding::default()
                     })
                 })?
-                .collect::<std::result::Result<_, _>>()?;
+                .collect_bounded(self.query_control.as_ref())?;
 
             for (window_index, ((from_ms, to_ms), plan)) in window_ms.iter().zip(&plans).enumerate()
             {
@@ -1726,6 +2029,7 @@ impl HistoryStore {
         mut on_session: impl FnMut(StoredSession),
     ) -> Result<HydrationStats> {
         let connection = self.connection()?;
+        self.check_session_count(&connection)?;
 
         let mut location_statement = connection.prepare(
             "SELECT session_key, path, present, first_seen_at_ms, last_seen_at_ms
@@ -1734,6 +2038,10 @@ impl HistoryStore {
         let mut locations_by_key: HashMap<String, Vec<SourceLocation>> = HashMap::new();
         let mut rows = location_statement.query([])?;
         while let Some(row) = rows.next()? {
+            self.check_query()?;
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+            }
             let key: String = row.get(0)?;
             locations_by_key
                 .entry(key)
@@ -1759,6 +2067,12 @@ impl HistoryStore {
         let mut rows = snapshot_statement.query([])?;
         let mut stats = HydrationStats::default();
         while let Some(row) = rows.next()? {
+            self.check_query()?;
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+                let bytes = row.get_ref(4)?.as_bytes()?.len();
+                control.consume_snapshot_bytes(bytes)?;
+            }
             let key: String = row.get(0)?;
             let identity_key: String = row.get(1)?;
             let first_event_fingerprint: String = row.get(2)?;
@@ -1868,7 +2182,16 @@ impl HistoryStore {
     /// must not queue behind an in-progress bulk-scan write.
     pub(crate) fn load_one(&self, key: &str) -> Result<StoredSession> {
         let connection = self.open_reader()?;
-        load_one(&connection, key)
+        self.check_snapshot_size(&connection, key)?;
+        load_one_controlled(&connection, key, self.query_control.as_ref())
+    }
+
+    fn check_snapshot_size(&self, connection: &Connection, key: &str) -> Result<()> {
+        if let Some(control) = &self.query_control {
+            let bytes: i64 = connection.query_row("SELECT length(s.session_json) FROM durable_sessions d JOIN session_snapshots s ON s.session_key = d.session_key AND s.version = d.current_snapshot_version WHERE d.session_key = ?1", [key], |row| row.get(0))?;
+            control.consume_snapshot_bytes(bytes.try_into()?)?;
+        }
+        Ok(())
     }
 
     /// Batched variant of [`Self::load_one`] (issue #139): opens one reader
@@ -1881,15 +2204,30 @@ impl HistoryStore {
     /// Callers that must distinguish "some keys could not be loaded" from
     /// "nothing was asked for" compare the result's length against `keys`.
     pub(crate) fn load_many(&self, keys: &[String]) -> Result<Vec<StoredSession>> {
+        self.check_query()?;
+        if self
+            .query_control
+            .as_ref()
+            .is_some_and(|control| keys.len() > control.max_sessions)
+        {
+            bail!("query session limit exceeded");
+        }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
         let connection = self.open_reader()?;
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            match load_one(&connection, key) {
+            self.check_query()?;
+            self.check_snapshot_size(&connection, key)?;
+            match load_one_controlled(&connection, key, self.query_control.as_ref()) {
                 Ok(stored) => out.push(stored),
                 Err(error) => {
+                    if self.query_control.is_some() {
+                        return Err(
+                            error.context("query could not read a complete session snapshot")
+                        );
+                    }
                     tracing::warn!("could not load durable session {} in batch: {}", key, error);
                 }
             }
@@ -1898,6 +2236,7 @@ impl HistoryStore {
     }
 
     fn connection(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.check_query()?;
         self.connection
             .lock()
             .map_err(|_| anyhow!("history-store connection lock poisoned"))
@@ -1908,13 +2247,73 @@ impl HistoryStore {
     /// mutex (issue #132; `range_totals_multi` established this pattern
     /// before this change). WAL permits a reader connection to proceed
     /// concurrently with an in-progress writer transaction on `self.connection`.
-    fn open_reader(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.path)
+    fn open_reader(&self) -> Result<QueryReader<'_>> {
+        self.check_query()?;
+        // Each headless request owns its own read-only store. Reusing its
+        // validated transaction keeps keys, metadata and range totals on one
+        // snapshot even when a desktop writer commits between helper calls.
+        if self.query_control.is_some() {
+            return Ok(QueryReader::Shared(self.connection()?));
+        }
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("could not open history reader {}", self.path.display()))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        Ok(connection)
+        configure_query_reader(&connection, self.query_control.as_ref())?;
+        if self.query_control.is_some() {
+            validate_query_ledger(&connection)?;
+        }
+        Ok(QueryReader::Independent(connection))
     }
 }
+
+fn configure_query_reader(connection: &Connection, control: Option<&QueryControl>) -> Result<()> {
+    connection.busy_timeout(control.map_or(Duration::from_secs(5), |c| {
+        c.remaining().min(Duration::from_millis(50))
+    }))?;
+    if let Some(control) = control {
+        let control = control.clone();
+        connection.progress_handler(1000, Some(move || control.check().is_err()))?;
+    }
+    // A compound range query must see one committed snapshot across its facts
+    // and rollups. Dropping the read connection rolls this transaction back.
+    connection.execute_batch("BEGIN DEFERRED")?;
+    Ok(())
+}
+
+fn validate_query_ledger(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version > SCHEMA_VERSION {
+        bail!("history schema {version} is newer than supported schema {SCHEMA_VERSION}; update Odometer before querying");
+    }
+    if version != SCHEMA_VERSION {
+        bail!("history schema {version} is not supported by this read-only query; open the desktop to prepare schema {SCHEMA_VERSION}");
+    }
+    if rollups_are_stale(connection)? {
+        bail!("history rollups are still preparing; open the desktop to finish recovery");
+    }
+    let dirty: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM durable_sessions WHERE ledger_dirty = 1)",
+        [],
+        |row| row.get(0),
+    )?;
+    if dirty {
+        bail!("history contains unreconciled usage; open the desktop to finish recovery");
+    }
+    Ok(())
+}
+
+trait QueryRowsExt<T>: Iterator<Item = rusqlite::Result<T>> + Sized {
+    fn collect_bounded(self, control: Option<&QueryControl>) -> Result<Vec<T>> {
+        let mut out = Vec::new();
+        for row in self {
+            if let Some(control) = control {
+                control.consume_row()?;
+            }
+            out.push(row?);
+        }
+        Ok(out)
+    }
+}
+impl<T, I: Iterator<Item = rusqlite::Result<T>>> QueryRowsExt<T> for I {}
 
 /// A source location has the same identity rules as the live path overlay:
 /// notify and scanners may disagree on separators, verbatim prefixes, and
@@ -2020,10 +2419,18 @@ fn plan_window(from_ms: Option<i64>, to_ms: Option<i64>) -> WindowPlan {
 /// union of edge ranges, with parameter placeholders starting at `?2` (`?1`
 /// is reserved for `session_key`).
 fn edge_predicate_sql(edge_ranges: &[(i64, i64)]) -> String {
-    (0..edge_ranges.len())
+    interval_predicate_sql("timestamp_ms", edge_ranges)
+}
+
+/// Internal column names only; all range values remain bound parameters.
+fn interval_predicate_sql(column: &str, ranges: &[(i64, i64)]) -> String {
+    if ranges.is_empty() {
+        return "0".into();
+    }
+    (0..ranges.len())
         .map(|index| {
             format!(
-                "(timestamp_ms BETWEEN ?{} AND ?{})",
+                "({column} BETWEEN ?{} AND ?{})",
                 index * 2 + 2,
                 index * 2 + 3
             )
@@ -2032,14 +2439,24 @@ fn edge_predicate_sql(edge_ranges: &[(i64, i64)]) -> String {
         .join(" OR ")
 }
 
+fn interval_params(key: &str, ranges: &[(i64, i64)]) -> Vec<Box<dyn rusqlite::ToSql>> {
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(1 + ranges.len() * 2);
+    params.push(Box::new(key.to_owned()));
+    for (from, to) in ranges {
+        params.push(Box::new(*from));
+        params.push(Box::new(*to));
+    }
+    params
+}
+
 /// Merges one session's hour-bucket rollup rows with its exact sub-hour edge
 /// events into the `RangeTotals` for one window. The additive fields are
 /// plain sums; `mutation_targets`/`one_shot_mutations`/`retry_count` are
 /// always derived from merged `(turn_id, target)` chain counts via
 /// `telemetry::mutation_chain_fields`, never summed across buckets, so a
 /// chain that straddles a bucket or day boundary is still counted exactly
-/// once. `token_rows`/`tool_rows`/`chain_rows` hold every rollup row for the
-/// session (a handful, cheap to filter in Rust); `edge_tokens`/`edge_tools`
+/// once. `token_rows`/`tool_rows`/`chain_rows` hold rollup rows in the union of
+/// the batch's complete-hour windows; `edge_tokens`/`edge_tools`
 /// hold the pooled edge events for every window in the batch, so a row that
 /// belongs to a *different* window's edge but happens to fall inside *this*
 /// window's full-bucket range is excluded — it is already counted via that
@@ -2246,6 +2663,7 @@ fn compute_range_totals(
     }
 
     RangeTotals {
+        pricing: None,
         tokens,
         buckets,
         tool_metrics: all_counters,
@@ -4806,6 +5224,17 @@ fn refresh_collision_flags(transaction: &Transaction<'_>, identity: &str) -> Res
 }
 
 fn load_one(connection: &Connection, key: &str) -> Result<StoredSession> {
+    load_one_controlled(connection, key, None)
+}
+
+fn load_one_controlled(
+    connection: &Connection,
+    key: &str,
+    control: Option<&QueryControl>,
+) -> Result<StoredSession> {
+    if let Some(control) = control {
+        control.consume_row()?;
+    }
     let (identity_key, fingerprint, collision, raw, thread_name_overlay_set, thread_name_overlay): (
         String,
         String,
@@ -4848,7 +5277,7 @@ fn load_one(connection: &Connection, key: &str) -> Result<StoredSession> {
                 last_seen_at_ms: row.get(3)?,
             })
         })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect_bounded(control)?;
     let available = locations.iter().any(|location| location.present);
     session.storage_id = key.to_owned();
     session.source_availability = if available {
@@ -5008,6 +5437,13 @@ fn stable_hash_bytes(bytes: &[u8]) -> String {
 }
 
 fn load_project_overrides(connection: &Connection) -> Result<HashMap<String, ProjectOverrideRow>> {
+    load_project_overrides_controlled(connection, None)
+}
+
+fn load_project_overrides_controlled(
+    connection: &Connection,
+    control: Option<&QueryControl>,
+) -> Result<HashMap<String, ProjectOverrideRow>> {
     let mut statement = connection.prepare(
         "SELECT project_key, display_label, canonical_project_key FROM project_overrides",
     )?;
@@ -5019,7 +5455,7 @@ fn load_project_overrides(connection: &Connection) -> Result<HashMap<String, Pro
                 canonical_project_key: row.get(2)?,
             })
         })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect_bounded(control)?;
     Ok(rows
         .into_iter()
         .map(|row| (row.project_key.clone(), row))
@@ -5176,6 +5612,656 @@ mod tests {
     use chrono::{DateTime, Utc};
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use tempfile::tempdir;
+
+    #[test]
+    fn readonly_queries_do_not_create_migrate_or_write() {
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("missing").join("history.sqlite3");
+        assert!(HistoryStore::open_read_only(&missing, QueryControl::default()).is_err());
+        assert!(!missing.parent().unwrap().exists());
+        let path = directory.path().join("history.sqlite3");
+        drop(HistoryStore::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let reader = HistoryStore::open_read_only(&path, QueryControl::default()).unwrap();
+        assert_eq!(reader.session_count().unwrap(), 0);
+        assert!(reader
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO history_meta(key,value) VALUES ('not-allowed','1')",
+                []
+            )
+            .is_err());
+        drop(reader);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA user_version = 9").unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+        let error = HistoryStore::open_read_only(&path, QueryControl::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("schema 9"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn readonly_queries_reject_unreconciled_ledger() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let store = HistoryStore::open(&path).unwrap();
+        store
+            .observe(Path::new("synthetic.jsonl"), &session("one", 100), 1)
+            .unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute("UPDATE durable_sessions SET ledger_dirty = 1", [])
+            .unwrap();
+        let error = HistoryStore::open_read_only(&path, QueryControl::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("unreconciled"));
+    }
+
+    #[test]
+    fn readonly_queries_do_not_recover_stale_rollups_or_downgrade_newer_schema() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        writer
+            .observe_bulk(Path::new("stale.jsonl"), &session("stale", 100), 1)
+            .unwrap();
+        let error = HistoryStore::open_read_only(&path, QueryControl::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("rollups are still preparing"));
+        assert!(writer.rollups_are_stale().unwrap());
+        writer
+            .connection()
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 11")
+            .unwrap();
+        let error = HistoryStore::open_read_only(&path, QueryControl::default())
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("update Odometer"));
+        assert_eq!(
+            writer
+                .connection()
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            11
+        );
+    }
+
+    #[test]
+    fn mirror_listing_cannot_bypass_query_budgets() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let mut fixture = session("mirror", 100);
+        writer
+            .observe(Path::new("codex.jsonl"), &fixture, 1)
+            .unwrap();
+        fixture.harness = claude_code_provider_id();
+        fixture.storage_id = crate::model::storage_id_for_session(&fixture.harness, &fixture.id);
+        writer
+            .observe(Path::new("claude.jsonl"), &fixture, 1)
+            .unwrap();
+        writer.connection().unwrap().execute("UPDATE durable_sessions SET first_event_fingerprint = 'synthetic-shared-fingerprint'", []).unwrap();
+        let mut control = QueryControl::default();
+        control.max_sessions = 1;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        assert!(reader
+            .mirrored_session_groups()
+            .unwrap_err()
+            .to_string()
+            .contains("session limit"));
+        let mut control = QueryControl::default();
+        control.max_rows = 1;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        assert!(reader
+            .mirrored_session_groups()
+            .unwrap_err()
+            .to_string()
+            .contains("row limit"));
+    }
+
+    #[test]
+    fn query_reader_keeps_a_snapshot_while_writer_commits() {
+        let directory = tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        store
+            .observe(Path::new("first.jsonl"), &session("first", 100), 1)
+            .unwrap();
+        let reader = store.open_reader().unwrap();
+        let count = || {
+            reader
+                .query_row("SELECT COUNT(*) FROM durable_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(), 1);
+        store
+            .observe(Path::new("second.jsonl"), &session("second", 200), 1)
+            .unwrap();
+        assert_eq!(count(), 1, "one read transaction must not mix two commits");
+        assert_eq!(store.session_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn readonly_request_reuses_one_snapshot_across_query_helpers() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let first = writer
+            .observe(Path::new("first.jsonl"), &session("first", 100), 1)
+            .unwrap();
+        let reader = HistoryStore::open_read_only(&path, QueryControl::default()).unwrap();
+        let keys = reader.session_keys().unwrap();
+        writer
+            .observe(Path::new("second.jsonl"), &session("second", 200), 1)
+            .unwrap();
+        assert_eq!(reader.session_count().unwrap(), 1);
+        assert_eq!(reader.session_keys().unwrap(), keys);
+        let ranges = reader.range_totals_multi(&keys, &[(None, None)]).unwrap();
+        assert_eq!(ranges[0].len(), 1);
+        assert!(ranges[0].contains_key(&first.key));
+        assert_eq!(reader.provider_stats().unwrap()[0].durable_sessions, 1);
+        assert_eq!(writer.session_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn quota_snapshot_reads_bound_source_locations_too() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let fixture = session("locations", 100);
+        let stored = writer
+            .observe(Path::new("first.jsonl"), &fixture, 1)
+            .unwrap();
+        writer
+            .observe(Path::new("second.jsonl"), &fixture, 1)
+            .unwrap();
+        let mut control = QueryControl::default();
+        control.max_rows = 2;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        assert!(reader
+            .load_many(&[stored.key])
+            .unwrap_err()
+            .chain()
+            .any(|e| e.to_string().contains("row limit")));
+    }
+
+    #[test]
+    fn query_sql_progress_interrupts_cancellation_and_deadline() {
+        const SLOW: &str = "WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000000) SELECT SUM(x) FROM n";
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        drop(HistoryStore::open(&path).unwrap());
+        let control = QueryControl::default();
+        let store = HistoryStore::open_read_only(&path, control.clone()).unwrap();
+        let connection = store.open_reader().unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(10));
+                control.cancel();
+            });
+            let error = connection
+                .query_row(SLOW, [], |row| row.get::<_, i64>(0))
+                .unwrap_err();
+            assert!(error.to_string().contains("interrupted"));
+        });
+        assert!(store
+            .session_count()
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled"));
+        let store = HistoryStore::open_read_only(
+            &path,
+            QueryControl::with_timeout(Duration::from_millis(50)),
+        )
+        .unwrap();
+        let error = store
+            .open_reader()
+            .unwrap()
+            .query_row(SLOW, [], |row| row.get::<_, i64>(0))
+            .unwrap_err();
+        assert!(error.to_string().contains("interrupted"));
+        assert_eq!(
+            HistoryStore::open_read_only(&path, QueryControl::default())
+                .unwrap()
+                .session_count()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn bounded_queries_reject_sessions_windows_and_large_histories() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let mut fixture = session("bounded", 100);
+        let point = fixture.tokens_history[0].clone();
+        fixture.tokens_history = (0..100)
+            .map(|hour| {
+                let mut event = point.clone();
+                event.timestamp += chrono::Duration::hours(hour);
+                event
+            })
+            .collect();
+        let stored = writer
+            .observe(Path::new("bounded.jsonl"), &fixture, 1)
+            .unwrap();
+        let mut control = QueryControl::default();
+        control.max_sessions = 0;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        assert!(reader
+            .session_keys()
+            .unwrap_err()
+            .to_string()
+            .contains("session limit"));
+        let mut control = QueryControl::default();
+        control.max_windows = 1;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        assert!(reader
+            .range_totals_multi(
+                std::slice::from_ref(&stored.key),
+                &[(None, None), (None, None)]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("window limit"));
+        let mut control = QueryControl::default();
+        control.max_rows = 4;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        assert!(reader
+            .range_totals_multi(&[stored.key], &[(None, None)])
+            .unwrap_err()
+            .to_string()
+            .contains("row limit"));
+    }
+
+    #[test]
+    fn narrow_windows_budget_only_selected_rows_and_preserve_window_semantics() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let base = timestamp("2026-01-01T00:00:00Z");
+        let mut fixture = session("long-history", 100);
+        let template = fixture.tokens_history[0].clone();
+        fixture.tokens_history.clear();
+        for hour in 0..120 {
+            let at = base + chrono::Duration::hours(hour) + chrono::Duration::minutes(30);
+            let mut point = template.clone();
+            point.timestamp = at;
+            fixture.tokens_history.push(point);
+            fixture.tool_observations.push(tool_with_dimensions(
+                &at.to_rfc3339(),
+                ToolKind::Mutation,
+                ToolOutcome::Success,
+                Some("gpt-test"),
+                Some("turn"),
+                Some("synthetic.rs"),
+                ToolOrigin::Mcp,
+                &["synthetic-server"],
+                None,
+                Some("rust"),
+            ));
+            fixture.optimization_findings.push(OptimizationFinding {
+                timestamp: Some(at),
+                rule_id: "synthetic-rule".into(),
+                ..Default::default()
+            });
+        }
+        fixture.optimization_findings.push(OptimizationFinding {
+            timestamp: None,
+            rule_id: "undated-rule".into(),
+            ..Default::default()
+        });
+        let mut tool_only = session("tool-only", 0);
+        tool_only.tokens_history.clear();
+        tool_only.tool_observations.push(tool(
+            &(base + chrono::Duration::hours(150) + chrono::Duration::minutes(30)).to_rfc3339(),
+            ToolKind::Read,
+            ToolOutcome::Success,
+            None,
+            None,
+            None,
+        ));
+        let fixtures = [fixture, tool_only];
+        let keys: Vec<_> = fixtures
+            .iter()
+            .enumerate()
+            .map(|(index, fixture)| {
+                writer
+                    .observe(Path::new(&format!("window-{index}.jsonl")), fixture, 1)
+                    .unwrap()
+                    .key
+            })
+            .collect();
+        let window = |first, last| {
+            (
+                Some(base + chrono::Duration::minutes(first)),
+                Some(base + chrono::Duration::minutes(last)),
+            )
+        };
+        let windows = [
+            window(15, 225),
+            window(5775, 5985),
+            window(9015, 9045),
+            window(18000, 18060),
+        ];
+        let mut control = QueryControl::default();
+        control.max_rows = 100;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        let actual = reader.range_totals_multi(&keys, &windows).unwrap();
+        for (key, fixture) in keys.iter().zip(&fixtures) {
+            for (window, expected) in actual.iter().zip(fixture.range_totals_multi(&windows)) {
+                if crate::commands::range_has_data(&expected) {
+                    assert_eq!(
+                        serde_json::to_value(&window[key]).unwrap(),
+                        serde_json::to_value(expected).unwrap()
+                    );
+                } else {
+                    assert!(!window.contains_key(key));
+                }
+            }
+        }
+        assert!(actual[3].is_empty());
+        assert_eq!(actual[2][&keys[1]].tool_metrics.calls, 1);
+        let all = HistoryStore::open_read_only(&path, QueryControl::default())
+            .unwrap()
+            .range_totals_multi(&keys, &[(None, None)])
+            .unwrap();
+        assert_eq!(
+            all[0][&keys[0]].optimization_summary.by_rule["undated-rule"],
+            1
+        );
+    }
+
+    #[test]
+    fn project_override_listing_observes_row_budget() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        for key in ["project-one", "project-two", "project-three"] {
+            writer
+                .set_project_alias(key, Some("synthetic-alias"))
+                .unwrap();
+        }
+        let mut control = QueryControl::default();
+        control.max_rows = 2;
+        let reader = HistoryStore::open_read_only(&path, control).unwrap();
+        assert!(reader
+            .list_project_overrides()
+            .unwrap_err()
+            .to_string()
+            .contains("row limit"));
+    }
+
+    #[test]
+    fn token_aggregate_does_not_price_a_key_without_session_identity() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let mut invalid = session("invalid-storage-key", 100);
+        invalid.storage_id = "codex:".into();
+        writer
+            .observe(Path::new("invalid-key.jsonl"), &invalid, 1)
+            .unwrap();
+        writer
+            .observe(Path::new("valid-key.jsonl"), &session("valid", 200), 1)
+            .unwrap();
+        let reader = HistoryStore::open_read_only(&path, QueryControl::default()).unwrap();
+        let ranges = reader.token_totals_by_provider(None, None).unwrap();
+        assert_eq!(ranges["codex"].tokens, totals(200));
+        assert_eq!(ranges["unknown"].tokens, totals(100));
+        let stats = reader.provider_stats().unwrap();
+        assert_eq!(
+            stats
+                .iter()
+                .find(|row| row.provider == "unknown")
+                .unwrap()
+                .durable_sessions,
+            1
+        );
+        let report = crate::query::statusline_report(
+            &reader,
+            &crate::rates::RateCard::default(),
+            timestamp("2026-01-01T12:00:00Z"),
+            chrono::FixedOffset::east_opt(0).unwrap(),
+        )
+        .unwrap();
+        let unknown = report
+            .providers
+            .iter()
+            .find(|row| row.harness.is_none())
+            .unwrap();
+        assert!(unknown.pricing.is_none());
+        assert!(!unknown.pricing_complete);
+    }
+
+    #[test]
+    fn statusline_and_provider_stats_never_parse_large_snapshot_blobs() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let fixture = session("opaque-snapshot", 100);
+        writer
+            .observe(Path::new("opaque.jsonl"), &fixture, 1)
+            .unwrap();
+        let expected = writer.token_totals_by_provider(None, None).unwrap();
+        writer
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE session_snapshots SET session_json = zeroblob(1048576)",
+                [],
+            )
+            .unwrap();
+        let reader = HistoryStore::open_read_only(&path, QueryControl::default()).unwrap();
+        assert_eq!(reader.session_count().unwrap(), 1);
+        assert_eq!(reader.provider_stats().unwrap()[0].models, vec!["gpt-test"]);
+        assert_eq!(
+            reader.token_totals_by_provider(None, None).unwrap()["codex"].tokens,
+            expected["codex"].tokens
+        );
+    }
+
+    #[test]
+    fn category_projection_ignores_full_session_fields_and_defaults_old_categories() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        writer
+            .observe(Path::new("category.jsonl"), &session("category", 100), 1)
+            .unwrap();
+        let raw = br#"{"started_at":"2026-01-01T00:00:00Z","last_event_at":"2026-01-01T01:00:00Z","tokens_history":"not a Session history","turns":false}"#;
+        writer
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE session_snapshots SET session_json = ?1",
+                [raw.as_slice()],
+            )
+            .unwrap();
+        let reader = HistoryStore::open_read_only(&path, QueryControl::default()).unwrap();
+        let mut visited = 0;
+        reader
+            .stream_category_snapshots(|snapshot| {
+                visited += 1;
+                assert!(snapshot.category_totals.is_empty());
+                assert_eq!(snapshot.harness, Some(codex_provider_id()));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn statusline_token_aggregate_matches_partial_edges_and_interior_buckets() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let store = HistoryStore::open(&path).unwrap();
+        let from = Some(timestamp("2026-01-01T00:30:00Z"));
+        let to = Some(timestamp("2026-01-01T03:30:00Z"));
+        let mut expected = BTreeMap::new();
+        for (index, provider) in [codex_provider_id(), claude_code_provider_id()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut fixture = session(&format!("aggregate-{index}"), 100);
+            fixture.harness = provider.clone();
+            fixture.storage_id = crate::model::storage_id_for_session(&provider, &fixture.id);
+            let template = fixture.tokens_history[0].clone();
+            fixture.tokens_history = [20, 40, 75, 140, 200, 220]
+                .into_iter()
+                .enumerate()
+                .map(|(n, minute)| {
+                    let mut point = template.clone();
+                    point.timestamp =
+                        timestamp("2026-01-01T00:00:00Z") + chrono::Duration::minutes(minute);
+                    point.model = Some(
+                        if n % 2 == 0 {
+                            "gpt-test"
+                        } else {
+                            "other-model"
+                        }
+                        .to_owned(),
+                    );
+                    point.service_tier = (n % 2 == 0).then(|| "fast".to_owned());
+                    point.delta = totals(100 + n as u64);
+                    point
+                })
+                .collect();
+            expected.insert(
+                provider.to_string(),
+                fixture.range_totals_multi(&[(from, to)]).remove(0),
+            );
+            store
+                .observe(Path::new(&format!("aggregate-{index}.jsonl")), &fixture, 1)
+                .unwrap();
+        }
+        let actual = HistoryStore::open_read_only(&path, QueryControl::default())
+            .unwrap()
+            .token_totals_by_provider(from, to)
+            .unwrap();
+        for (provider, expected) in expected {
+            assert_eq!(actual[&provider].tokens, expected.tokens);
+            let encode = |buckets: &[TierBucket]| {
+                let mut rows = buckets
+                    .iter()
+                    .map(|b| {
+                        (
+                            b.model.clone(),
+                            b.service_tier.clone(),
+                            serde_json::to_string(&b.tokens).unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                rows.sort();
+                rows
+            };
+            assert_eq!(
+                encode(&actual[&provider].buckets),
+                encode(&expected.buckets)
+            );
+        }
+    }
+
+    #[test]
+    fn statusline_queries_seek_existing_time_indexes() {
+        let directory = tempdir().unwrap();
+        let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
+        let connection = store.open_reader().unwrap();
+        let mut explain = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {TOKEN_TOTALS_BY_PROVIDER_SQL}"
+            ))
+            .unwrap();
+        let plan: Vec<String> = explain
+            .query_map(params![1, 2, 3, 4, 5, 6], |row| row.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            plan.iter().any(|line| line
+                .contains("SEARCH r USING INDEX rollup_token_totals_key_idx")
+                && line.contains("hour_bucket>?")
+                && line.contains("hour_bucket<?")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            plan.iter()
+                .filter(|line| line
+                    .contains("SEARCH r USING INDEX durable_token_events_session_timestamp_idx")
+                    && line.contains("timestamp_ms>?")
+                    && line.contains("timestamp_ms<?"))
+                .count(),
+            2,
+            "both edges must seek their time range: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN r")),
+            "must not scan historical fact tables: {plan:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "synthetic statusline timing probe; run with --release --ignored --nocapture"]
+    fn benchmark_statusline_cold_and_warm_large_ledger() {
+        const SESSIONS: u64 = 10_000;
+        const HOURS: u64 = 48;
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let writer = HistoryStore::open(&path).unwrap();
+        let base = timestamp("2026-01-01T00:00:00Z");
+        {
+            let mut connection = writer.connection().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction.execute_batch("CREATE TEMP TABLE benchmark_sessions(n INTEGER PRIMARY KEY);
+                INSERT INTO benchmark_sessions WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT x FROM n;
+                CREATE TEMP TABLE benchmark_hours(n INTEGER PRIMARY KEY);
+                INSERT INTO benchmark_hours WITH RECURSIVE n(x) AS (SELECT 0 UNION ALL SELECT x+1 FROM n WHERE x<47) SELECT x FROM n;
+                INSERT INTO durable_sessions(session_key,identity_key,first_event_fingerprint,fingerprint_is_final,current_snapshot_version,created_at_ms,last_seen_at_ms)
+                  SELECT 'codex:benchmark-'||n, 'codex:benchmark-'||n, 'synthetic-'||n, 1, 1, 0, 0 FROM benchmark_sessions;
+                INSERT INTO session_snapshots(session_key,version,format_version,snapshot_hash,captured_at_ms,session_json)
+                  SELECT session_key,1,1,'invalid-by-design',0,X'ff' FROM durable_sessions;").unwrap();
+            transaction.execute("INSERT INTO durable_token_events(session_key,event_key,event_index,timestamp_ms,model,service_tier,cumulative_total_tokens,input_tokens,cached_input_tokens,cache_creation_input_tokens,output_tokens,reasoning_output_tokens,total_tokens)
+                SELECT d.session_key,'event-'||h.n,h.n,?1+h.n*3600000+1800000,'gpt-test','',(h.n+1)*150,100,25,6,50,12,150 FROM durable_sessions d CROSS JOIN benchmark_hours h", [base.timestamp_millis()]).unwrap();
+            transaction.execute_batch("INSERT INTO rollup_token_totals(session_key,hour_bucket,model,service_tier,input_tokens,cached_input_tokens,cache_creation_input_tokens,output_tokens,reasoning_output_tokens,total_tokens)
+                SELECT session_key,timestamp_ms/3600000,model,service_tier,input_tokens,cached_input_tokens,cache_creation_input_tokens,output_tokens,reasoning_output_tokens,total_tokens FROM durable_token_events;").unwrap();
+            transaction.commit().unwrap();
+        }
+        drop(writer);
+        let from = Some(base + chrono::Duration::hours(24) + chrono::Duration::minutes(15));
+        let to = Some(base + chrono::Duration::hours(27) + chrono::Duration::minutes(45));
+        let query = || {
+            let started = Instant::now();
+            let reader = HistoryStore::open_read_only(
+                &path,
+                QueryControl::with_timeout(Duration::from_millis(250)),
+            )
+            .unwrap();
+            assert_eq!(reader.session_count().unwrap(), SESSIONS);
+            let ranges = reader.token_totals_by_provider(from, to).unwrap();
+            assert_eq!(ranges["codex"].tokens.total_tokens, SESSIONS * 4 * 150);
+            reader.check_query().unwrap();
+            started.elapsed()
+        };
+        // Cold means a newly opened SQLite connection. This deliberately does
+        // not claim to evict the OS page cache (the fixture was just written).
+        let cold = query();
+        let warm: Vec<Duration> = (0..5).map(|_| query()).collect();
+        let warm_mean = warm.iter().sum::<Duration>() / warm.len() as u32;
+        let warm_max = warm.iter().max().unwrap();
+        eprintln!("synthetic statusline: sessions={SESSIONS}, historical_token_rows={}, queried_hours=4, cold_connection={cold:?}, warm_mean={warm_mean:?}, warm_max={warm_max:?}, deadline=250ms, snapshot_parses=0", SESSIONS * HOURS);
+    }
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()

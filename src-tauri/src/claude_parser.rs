@@ -16,7 +16,7 @@
 //!   input = input + cache_read + cache_creation, cached = cache_read,
 //!   cache_creation = cache_creation. `cache_creation_input_tokens` is a
 //!   second, disjoint subset of `input_tokens` (distinct from
-//!   `cached_input_tokens`) so credit math (`src/lib/credits.ts`) can price
+//!   `cached_input_tokens`) so shared pricing (`query::token_cost`) can price
 //!   cache-write tokens at their own rate — typically Anthropic's 1.25x
 //!   cache-write premium over ordinary input — instead of folding the write
 //!   premium into the plain input rate.
@@ -677,7 +677,7 @@ fn usage_to_totals(usage: &Value) -> TokenTotals {
         input_tokens: input,
         cached_input_tokens: cache_read,
         // A distinct subset of input_tokens from cached_input_tokens: never
-        // add both a second time when pricing (see credits.ts eventCost).
+        // add both a second time when pricing (see query::token_cost).
         cache_creation_input_tokens: cache_creation,
         output_tokens: output,
         // Anthropic bills thinking as output and does not break it out.

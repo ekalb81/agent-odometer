@@ -1,202 +1,49 @@
-//! Read-only stdio MCP server (issue #47).
-//!
-//! Issue #47 asks for "a read-only stdio MCP server exposing the same
-//! bounded query methods to local agents", with the constraints that
-//! "mutating config/guard actions are not exposed through MCP" and that
-//! "MCP descriptions warn about sensitive session metadata and default to
-//! aggregate/read-only results".
-//!
-//! Every tool here adapts [`crate::query`], the same service the desktop and
-//! the CLI use, so an agent and the app can never disagree about the same
-//! corpus. Nothing in this module writes: it opens the ledger, answers, and
-//! exits.
-//!
-//! ## Transport
-//!
-//! JSON-RPC 2.0 over stdio, line-delimited: one JSON object per line in,
-//! one per line out. This is hand-rolled rather than pulled from a crate —
-//! the surface is three methods, and the alternative is a dependency on the
-//! app's trust boundary for a protocol shim.
-//!
-//! ## Why stdio and not a socket
-//!
-//! A local HTTP API is a separate item in #47 with its own authentication
-//! and lifecycle requirements. stdio has neither problem: the process is
-//! spawned by the client that talks to it, there is nothing to bind, nothing
-//! to discover, and nothing to authenticate.
+//! Read-only stdio MCP adapter over the shared bounded query service.
+//! Input lines, output responses, active queries, and ledger work are bounded.
+//! The input thread remains available for cancellation while workers query.
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
+use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
-use chrono::{DateTime, TimeZone, Utc};
-use serde::Serialize;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use crate::config::Config;
+use crate::headless::{self, QueryKind, Request};
 use crate::history_store::HistoryStore;
+use crate::query_control::QueryControl;
 use crate::rates::RateCard;
 
-/// MCP protocol version this server implements.
 const PROTOCOL_VERSION: &str = "2025-06-18";
-
-/// JSON-RPC error codes used here, from the JSON-RPC 2.0 spec.
+const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+const SERVER_BUSY: i64 = -32001;
+pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_CONCURRENT_QUERIES: usize = 2;
 
-/// Runs the MCP server if `argv` asks for it.
-///
-/// Returns `false` so the caller falls through to the desktop app, matching
-/// `turn_receipts::try_run_cli`'s contract.
 pub fn try_run_cli() -> bool {
     if std::env::args().nth(1).as_deref() != Some("mcp") {
         return false;
     }
-    let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    serve(stdin.lock(), stdout.lock());
+    serve(std::io::stdin().lock(), std::io::stdout());
     true
 }
 
-/// Reads line-delimited JSON-RPC requests from `input` and writes responses
-/// to `output` until the input closes.
-///
-/// Split from [`try_run_cli`] so tests drive it with in-memory buffers
-/// rather than a real process.
-pub fn serve<R: BufRead, W: Write>(input: R, mut output: W) {
-    for line in input.lines() {
-        let Ok(line) = line else { break };
-        if line.trim().is_empty() {
-            continue;
-        }
-        let Some(response) = handle_line(&line) else {
-            // A notification (no `id`) gets no reply, per JSON-RPC. Sending
-            // one anyway makes well-behaved clients complain.
-            continue;
-        };
-        if writeln!(output, "{response}").is_err() {
-            break;
-        }
-        let _ = output.flush();
-    }
+/// Drain accepted work on EOF. At most two queries run, with no pending
+/// queue; excess calls receive an explicit busy error and may be retried.
+pub fn serve<R: BufRead, W: Write + Send>(input: R, output: W) {
+    serve_with_executor(input, output, execute_local);
 }
 
-/// Handles one request line, returning the response to write, or `None` for
-/// a notification.
-fn handle_line(line: &str) -> Option<String> {
-    let request: Value = match serde_json::from_str(line) {
-        Ok(value) => value,
-        // A parse failure has no id to answer against, so this replies with
-        // a null id rather than staying silent — a client waiting on a
-        // response would otherwise hang.
-        Err(error) => {
-            return Some(error_response(
-                Value::Null,
-                INVALID_REQUEST,
-                &format!("could not parse request: {error}"),
-            ))
-        }
-    };
-    let id = request.get("id").cloned();
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = request.get("params").cloned().unwrap_or(Value::Null);
-
-    // No id means a notification: act on it if meaningful, never reply.
-    let id = id?;
-
-    Some(match method {
-        "initialize" => success(id, initialize_result()),
-        "tools/list" => success(id, json!({ "tools": tool_descriptors() })),
-        "tools/call" => match call_tool(&params) {
-            Ok(text) => success(
-                id,
-                json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": false,
-                }),
-            ),
-            Err(ToolError::UnknownTool(name)) => {
-                error_response(id, INVALID_PARAMS, &format!("unknown tool '{name}'"))
-            }
-            Err(ToolError::BadArguments(message)) => error_response(id, INVALID_PARAMS, &message),
-            // A query failure is reported as a tool result rather than a
-            // protocol error: the request was well-formed, the answer just
-            // could not be produced, and an agent should see why.
-            Err(ToolError::Failed(message)) => success(
-                id,
-                json!({
-                    "content": [{ "type": "text", "text": message }],
-                    "isError": true,
-                }),
-            ),
-        },
-        other => error_response(id, METHOD_NOT_FOUND, &format!("unknown method '{other}'")),
-    })
-}
-
-fn initialize_result() -> Value {
-    json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": { "tools": {} },
-        "serverInfo": {
-            "name": "agent-odometer",
-            "version": env!("CARGO_PKG_VERSION"),
-        },
-        // Stated up front, not buried in one tool's description: an agent
-        // deciding whether to call these should know the shape of what comes
-        // back before it asks.
-        "instructions": "Read-only local usage analytics for agent sessions. \
-                         Every tool answers from the local durable ledger and \
-                         never writes, scans, or reaches the network. Results \
-                         are aggregates — token counts, costs, and per-project \
-                         or per-session totals — not prompts, replies, or tool \
-                         output. Session keys and project labels can identify \
-                         local work, so treat results as sensitive metadata.",
-    })
-}
-
-/// The tools this server exposes.
-///
-/// Read-only by construction: every one maps to a `query` function, and no
-/// mutating command is reachable from here at all — not gated behind a flag,
-/// simply absent, which is what #47's DRY boundary requires.
-fn tool_descriptors() -> Vec<Value> {
-    let window_properties = json!({
-        "from": { "type": "string", "description": "Inclusive start date, YYYY-MM-DD (UTC). Omit for all time." },
-        "to": { "type": "string", "description": "Inclusive end date, YYYY-MM-DD (UTC). Omit for all time." },
-    });
-    vec![
-        json!({
-            "name": "usage_report",
-            "description": "Token usage and cost over a date range, grouped by model. \
-                            Costs are reported per currency and never summed across them \
-                            (Codex bills in plan credits, Claude in USD). Aggregates only.",
-            "inputSchema": { "type": "object", "properties": window_properties },
-        }),
-        json!({
-            "name": "project_report",
-            "description": "Token usage and cost grouped by project. Project labels derived \
-                            from a directory path are redacted to a stable hash; this tool \
-                            never returns local filesystem paths.",
-            "inputSchema": { "type": "object", "properties": window_properties },
-        }),
-        json!({
-            "name": "workflow_metrics",
-            "description": "Versioned workflow metrics (tool failure rate, mutation rework \
-                            rate, context-to-output ratio, cached-input share, pricing \
-                            coverage). Each carries its numerator, denominator, and what \
-                            the denominator counts; a metric with no evidence reports no \
-                            value rather than zero.",
-            "inputSchema": { "type": "object", "properties": window_properties },
-        }),
-        json!({
-            "name": "quota_status",
-            "description": "Current provider quota windows: used, remaining, reset time, \
-                            staleness, and pace forecast where evidence supports one. \
-                            Reports transcript-derived state only; performs no network call.",
-            "inputSchema": { "type": "object", "properties": {} },
-        }),
-    ]
+#[derive(Debug, Clone)]
+struct PreparedCall {
+    kind: QueryKind,
+    request: Request,
+    envelope_key: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -206,315 +53,807 @@ pub enum ToolError {
     Failed(String),
 }
 
-fn call_tool(params: &Value) -> std::result::Result<String, ToolError> {
-    let store = open_ledger().map_err(|error| ToolError::Failed(error.to_string()))?;
-    call_tool_with(&store, &load_rates(), params, Utc::now())
+impl ToolError {
+    fn failed(error: impl std::fmt::Display) -> Self {
+        Self::Failed(error.to_string())
+    }
 }
 
-/// The testable half of `tools/call`, taking the ledger and clock rather
-/// than resolving them from the user's directories.
+fn serve_with_executor<R, W, F>(mut input: R, output: W, executor: F)
+where
+    R: BufRead,
+    W: Write + Send,
+    F: Fn(PreparedCall, QueryControl) -> Result<String, ToolError> + Sync,
+{
+    let output = Mutex::new(output);
+    let active = Arc::new(Mutex::new(HashMap::<String, QueryControl>::new()));
+    std::thread::scope(|scope| {
+        let mut workers: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
+        loop {
+            // Finished workers are reaped continuously, so even an unlimited
+            // number of sequential requests cannot grow the handle list.
+            let mut index = 0;
+            while index < workers.len() {
+                if workers[index].is_finished() {
+                    let _ = workers.swap_remove(index).join();
+                } else {
+                    index += 1;
+                }
+            }
+            let line = match read_bounded_line(&mut input) {
+                Ok(Some(line)) => line,
+                Ok(None) | Err(_) => break,
+            };
+            let line = match line {
+                Ok(line) => line,
+                Err(message) => {
+                    if !write_response(
+                        &output,
+                        &error_response(Value::Null, INVALID_REQUEST, message),
+                    ) {
+                        cancel_all(&active);
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let request: Value = match serde_json::from_slice(&line) {
+                Ok(request) => request,
+                Err(_) => {
+                    if !write_response(
+                        &output,
+                        &error_response(Value::Null, PARSE_ERROR, "invalid JSON"),
+                    ) {
+                        cancel_all(&active);
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let valid_id = request
+                .get("id")
+                .is_none_or(|id| id.is_null() || id.is_string() || id.is_number());
+            let valid = request.is_object()
+                && request.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+                && request.get("method").and_then(Value::as_str).is_some()
+                && request
+                    .get("params")
+                    .is_none_or(|value| value.is_object() || value.is_array())
+                && valid_id;
+            if !valid {
+                let id = if valid_id {
+                    request.get("id").cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                };
+                if !write_response(
+                    &output,
+                    &error_response(id, INVALID_REQUEST, "invalid JSON-RPC request"),
+                ) {
+                    cancel_all(&active);
+                    break;
+                }
+                continue;
+            }
+            let method = request["method"].as_str().expect("validated method");
+            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            let Some(id) = request.get("id").cloned() else {
+                if method == "notifications/cancelled" {
+                    if let Some(cancel_id) = params.get("requestId") {
+                        if let Some(control) = active
+                            .lock()
+                            .expect("active queries")
+                            .get(&cancel_id.to_string())
+                        {
+                            control.cancel();
+                        }
+                    }
+                }
+                continue;
+            };
+            let immediate = match method {
+                "initialize" => Some(success(id.clone(), initialize_result())),
+                "ping" => Some(success(id.clone(), json!({}))),
+                "tools/list" => Some(success(id.clone(), json!({"tools": tool_descriptors()}))),
+                "tools/call" => match prepare_call(&params) {
+                    Err(error) => Some(tool_response(id.clone(), Err(error))),
+                    Ok(call) => {
+                        let key = id.to_string();
+                        let mut active_guard = active.lock().expect("active queries");
+                        if active_guard.contains_key(&key) {
+                            Some(error_response(
+                                id.clone(),
+                                INVALID_REQUEST,
+                                "request id is already active",
+                            ))
+                        } else if active_guard.len() >= MAX_CONCURRENT_QUERIES {
+                            Some(error_response(
+                                id.clone(),
+                                SERVER_BUSY,
+                                "query capacity reached; retry after an active query completes",
+                            ))
+                        } else {
+                            let control = if call.kind == QueryKind::Statusline {
+                                QueryControl::with_timeout(std::time::Duration::from_millis(250))
+                            } else {
+                                QueryControl::default()
+                            };
+                            active_guard.insert(key.clone(), control.clone());
+                            drop(active_guard);
+                            let active = Arc::clone(&active);
+                            let executor = &executor;
+                            let output = &output;
+                            workers.push(scope.spawn(move || {
+                                let limit = control.max_output_bytes().min(MAX_OUTPUT_BYTES);
+                                let result = control.check().map_err(ToolError::failed)
+                                    .and_then(|()| executor(call, control.clone()))
+                                    .and_then(|result| control.check().map(|()| result).map_err(ToolError::failed));
+                                let mut response = tool_response(id.clone(), result);
+                                if response.len() > limit {
+                                    response = tool_response(id, Err(ToolError::Failed("query output exceeds the response limit; request a narrower range".into())));
+                                }
+                                if !write_response(output, &response) {
+                                    cancel_all(&active);
+                                }
+                                active.lock().expect("active queries").remove(&key);
+                            }));
+                            None
+                        }
+                    }
+                },
+                _ => Some(error_response(
+                    id.clone(),
+                    METHOD_NOT_FOUND,
+                    "unknown method",
+                )),
+            };
+            if immediate.is_some_and(|response| !write_response(&output, &response)) {
+                cancel_all(&active);
+                break;
+            }
+        }
+        for worker in workers {
+            let _ = worker.join();
+        }
+    });
+}
+
+type BoundedLine = Result<Vec<u8>, &'static str>;
+
+/// Discard an oversized line through its delimiter without allocating it.
+/// A following valid line remains usable; a huge line cannot become a queue.
+fn read_bounded_line<R: BufRead>(input: &mut R) -> std::io::Result<Option<BoundedLine>> {
+    let mut line = Vec::new();
+    let mut oversized = false;
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if oversized {
+                Some(Err("request exceeds 64 KiB line limit"))
+            } else if line.is_empty() {
+                None
+            } else {
+                Some(Ok(line))
+            });
+        }
+        let end = available.iter().position(|byte| *byte == b'\n');
+        let consumed = end.map_or(available.len(), |index| index + 1);
+        let data = &available[..end.unwrap_or(consumed)];
+        if !oversized {
+            if line.len().saturating_add(data.len()) > MAX_INPUT_BYTES {
+                oversized = true;
+                line.clear();
+            } else {
+                line.extend_from_slice(data);
+            }
+        }
+        input.consume(consumed);
+        if end.is_some() {
+            return Ok(Some(if oversized {
+                Err("request exceeds 64 KiB line limit")
+            } else {
+                Ok(line)
+            }));
+        }
+    }
+}
+
+fn cancel_all(active: &Mutex<HashMap<String, QueryControl>>) {
+    for control in active.lock().expect("active queries").values() {
+        control.cancel();
+    }
+}
+
+fn write_response<W: Write>(output: &Mutex<W>, response: &str) -> bool {
+    let mut output = output.lock().expect("response writer");
+    writeln!(output, "{response}")
+        .and_then(|()| output.flush())
+        .is_ok()
+}
+
+fn initialize_result() -> Value {
+    json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "agent-odometer", "version": env!("CARGO_PKG_VERSION")},
+        "instructions": "Read-only local usage analytics. Every tool answers from the durable ledger and never changes application records or settings, scans transcripts, or reaches the network. SQLite may maintain WAL coordination sidecars. Results are aggregates, not prompts, replies, or tool output. Session keys and project labels are sensitive metadata. Project paths are always redacted. At most two queries run concurrently; requests are limited to 64 KiB and responses to 8 MiB. Cancel running work with notifications/cancelled and requestId. Activity and statusline use UTC.",
+    })
+}
+
+fn tool_specs() -> &'static [(&'static str, QueryKind, &'static str)] {
+    &[
+        ("usage_report", QueryKind::Report, "Token usage and cost by model, with separate currency totals and pricing provenance. Aggregates only."),
+        ("model_report", QueryKind::Models, "Model usage, tier-aware cost, and pricing provenance. Aggregates only."),
+        ("project_report", QueryKind::Projects, "Usage and costs by project. Local filesystem paths are always redacted to stable identifiers; labels can still identify sensitive work."),
+        ("workflow_metrics", QueryKind::Metrics, "Workflow ratios with their numerators, denominators, and coverage. Absent evidence is unavailable rather than zero."),
+        ("session_report", QueryKind::Sessions, "Bounded usage by session, default 20 and maximum 1000 rows. Session keys are sensitive local metadata; no prompts, titles, paths, or transcript contents are returned."),
+        ("activity_report", QueryKind::Activity, "Aggregate hourly usage in UTC over an optional date range."),
+        ("category_report", QueryKind::Categories, "Aggregate usage and prices by task category, with separate currencies."),
+        ("tools_report", QueryKind::Tools, "Aggregate tool calls, failures, and tool dimensions. No tool arguments or output."),
+        ("context_report", QueryKind::Context, "Aggregate recorded context-source dimensions without message content."),
+        ("findings_report", QueryKind::Findings, "Aggregate optimization finding counts by rule, severity, and provider; no evidence text or transcript content."),
+        ("diagnostics_report", QueryKind::Diagnostics, "Read-only provider and ledger availability diagnostics. Local paths are redacted and no credentials or response bodies are returned."),
+        ("quota_status", QueryKind::Quota, "Legacy quota snapshot array. Transcript-derived provider quotas and forecasts only; no network call."),
+        ("quota_report", QueryKind::Quota, "Versioned quota snapshot envelope. Transcript-derived state with staleness and provenance; no network call."),
+        ("mirrored_sessions", QueryKind::Mirrors, "Versioned mirrored-session metadata. Session keys can identify sensitive local work; usage is not silently deduplicated."),
+        ("ledger_status", QueryKind::Status, "Read-only ledger availability, count, size, and rate-card version; no session metadata."),
+        ("statusline", QueryKind::Statusline, "Small UTC-day usage summary read from durable aggregates without scanning transcripts."),
+    ]
+}
+
+fn tool_descriptors() -> Vec<Value> {
+    tool_specs().iter().map(|(name, kind, description)| {
+        let mut properties = serde_json::Map::new();
+        if kind.accepts_window() {
+            properties.insert("from".into(), json!({"type":"string", "pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "description":"Inclusive start date in UTC; omit for all time."}));
+            properties.insert("to".into(), json!({"type":"string", "pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", "description":"Inclusive end date in UTC; omit for all time."}));
+        }
+        if *kind == QueryKind::Sessions {
+            properties.insert("limit".into(), json!({"type":"integer", "minimum":1, "maximum":1000, "default":20}));
+        }
+        json!({"name":name, "description":description, "inputSchema":{"type":"object", "properties":properties, "additionalProperties":false}, "annotations":{"readOnlyHint":true, "destructiveHint":false, "idempotentHint":true, "openWorldHint":false}})
+    }).collect()
+}
+
+fn prepare_call(params: &Value) -> Result<PreparedCall, ToolError> {
+    let params = params
+        .as_object()
+        .ok_or_else(|| ToolError::BadArguments("tools/call params must be an object".into()))?;
+    if params
+        .keys()
+        .any(|key| !matches!(key.as_str(), "name" | "arguments" | "_meta"))
+    {
+        return Err(ToolError::BadArguments(
+            "unknown tools/call parameter".into(),
+        ));
+    }
+    if params.get("_meta").is_some_and(|value| !value.is_object()) {
+        return Err(ToolError::BadArguments("'_meta' must be an object".into()));
+    }
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::BadArguments("tools/call needs a string 'name'".into()))?;
+    let kind = tool_specs()
+        .iter()
+        .find_map(|(tool, kind, _)| (*tool == name).then_some(*kind))
+        .ok_or_else(|| ToolError::UnknownTool(name.into()))?;
+    let mut request = Request::default();
+    if let Some(arguments) = params.get("arguments") {
+        let arguments = arguments
+            .as_object()
+            .ok_or_else(|| ToolError::BadArguments("'arguments' must be an object".into()))?;
+        for (key, value) in arguments {
+            match key.as_str() {
+                "from" | "to" if kind.accepts_window() => {
+                    let raw = value.as_str().ok_or_else(|| {
+                        ToolError::BadArguments(format!("'{key}' must be a YYYY-MM-DD string"))
+                    })?;
+                    let parsed = headless::parse_date(raw, key == "to")
+                        .map_err(|error| ToolError::BadArguments(error.to_string()))?;
+                    if key == "from" {
+                        request.from = Some(parsed);
+                    } else {
+                        request.to = Some(parsed);
+                    }
+                }
+                "limit" if kind == QueryKind::Sessions => {
+                    let limit = value
+                        .as_u64()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .ok_or_else(|| {
+                            ToolError::BadArguments(
+                                "'limit' must be an integer from 1 to 1000".into(),
+                            )
+                        })?;
+                    request.limit = Some(limit);
+                }
+                _ => {
+                    return Err(ToolError::BadArguments(format!(
+                        "unsupported argument '{key}' for '{name}'"
+                    )))
+                }
+            }
+        }
+    }
+    request
+        .validate_for(kind)
+        .map_err(|error| ToolError::BadArguments(error.to_string()))?;
+    Ok(PreparedCall {
+        kind,
+        request,
+        envelope_key: match name {
+            "quota_report" => Some("snapshots"),
+            "mirrored_sessions" => Some("groups"),
+            _ => None,
+        },
+    })
+}
+
+fn execute_local(call: PreparedCall, control: QueryControl) -> Result<String, ToolError> {
+    // Validation happened before this point: invalid tools or arguments never
+    // touch a user's ledger, config, or rate card.
+    control.check().map_err(ToolError::failed)?;
+    let path = HistoryStore::default_path().map_err(ToolError::failed)?;
+    let rates = RateCard::load_from_disk()
+        .or_else(|_| RateCard::load_bundled())
+        .unwrap_or_default();
+    let config = Config::load_read_only()
+        .map_err(|_| ToolError::Failed("local configuration is unreadable or malformed".into()))?;
+    execute_at_path(&path, call, control, &rates, &config, Utc::now())
+}
+
+fn execute_at_path(
+    path: &std::path::Path,
+    call: PreparedCall,
+    control: QueryControl,
+    rates: &RateCard,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> Result<String, ToolError> {
+    control.check().map_err(ToolError::failed)?;
+    let store = HistoryStore::open_read_only(path, control.clone()).ok();
+    // Opening can fail because the request expired or was cancelled. Preserve
+    // those failures instead of turning them into a successful availability report.
+    control.check().map_err(ToolError::failed)?;
+    let result = execute_with(store.as_ref(), rates, config, call, now, Some(&control))?;
+    control.check().map_err(ToolError::failed)?;
+    Ok(result)
+}
+
+fn execute_with(
+    store: Option<&HistoryStore>,
+    rates: &RateCard,
+    config: &Config,
+    call: PreparedCall,
+    now: DateTime<Utc>,
+    control: Option<&QueryControl>,
+) -> Result<String, ToolError> {
+    let result =
+        headless::execute_optional(call.kind, store, rates, config, &call.request, now, control)
+            .map_err(ToolError::failed)?;
+    let result = if let Some(key) = call.envelope_key {
+        json!({"schema_version":1, key:result})
+    } else {
+        result
+    };
+    serde_json::to_string_pretty(&result).map_err(ToolError::failed)
+}
+
+/// Execute a validated tool with supplied data, without resolving the ledger
+/// or configuration from a user's directories. Kept for existing consumers.
 pub fn call_tool_with(
     store: &HistoryStore,
     rates: &RateCard,
     params: &Value,
     now: DateTime<Utc>,
-) -> std::result::Result<String, ToolError> {
-    let name = params
-        .get("name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ToolError::BadArguments("tools/call needs a 'name'".into()))?;
-    let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-
-    let config = Config::load().unwrap_or_default();
-
-    let (from, to) = window_from(&arguments)?;
-    let harness_for = |key: &str| {
-        key.split_once(':')
-            .map(|(provider, _)| provider.to_owned())
-            .unwrap_or_default()
-    };
-    let _ = &config;
-
-    let value = match name {
-        "usage_report" => serialize(
-            crate::query::range_report(store, rates, harness_for, from, to, now)
-                .map_err(|error| ToolError::Failed(error.to_string()))?,
-        ),
-        "project_report" => {
-            let mut report = crate::query::project_report(store, rates, harness_for, from, to, now)
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
-            // Redaction is not optional here. The CLI has `--include-paths`
-            // because a person can consent to seeing their own paths; an
-            // agent asking over MCP is a different audience, and there is no
-            // one present to make that call.
-            for project in &mut report.projects {
-                project.label = project.redacted_label().to_owned();
-            }
-            serialize(report)
-        }
-        "workflow_metrics" => serialize(
-            crate::query::workflow_metrics(store, rates, harness_for, from, to, now)
-                .map_err(|error| ToolError::Failed(error.to_string()))?,
-        ),
-        "quota_status" => {
-            let quota_store = crate::quota_store::QuotaStoreFile::load();
-            let max_cache_age = chrono::Duration::seconds(quota_store.max_cache_age_secs);
-            serialize(
-                crate::query::quota_snapshots(store, now, max_cache_age)
-                    .map_err(|error| ToolError::Failed(error.to_string()))?,
-            )
-        }
-        other => return Err(ToolError::UnknownTool(other.to_owned())),
-    };
-    Ok(value)
+) -> Result<String, ToolError> {
+    call_tool_with_config(store, rates, &Config::default(), params, now)
 }
 
-fn serialize<T: Serialize>(value: T) -> String {
-    serde_json::to_string_pretty(&value).unwrap_or_else(|error| {
-        // Unreachable for these types, and reported rather than panicking
-        // inside a server loop if it ever were.
-        format!("{{\"error\":\"could not serialize result: {error}\"}}")
-    })
+pub fn call_tool_with_config(
+    store: &HistoryStore,
+    rates: &RateCard,
+    config: &Config,
+    params: &Value,
+    now: DateTime<Utc>,
+) -> Result<String, ToolError> {
+    execute_with(Some(store), rates, config, prepare_call(params)?, now, None)
 }
 
-/// An inclusive reporting window parsed from tool arguments.
-type ToolWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
-
-/// Reads optional `from`/`to` date arguments.
-///
-/// A malformed date is rejected rather than ignored: silently widening a
-/// requested window to all time would hand an agent a much larger number
-/// than it asked for, with nothing to indicate the difference.
-fn window_from(arguments: &Value) -> std::result::Result<ToolWindow, ToolError> {
-    let parse =
-        |key: &str, end_of_day: bool| -> std::result::Result<Option<DateTime<Utc>>, ToolError> {
-            let Some(raw) = arguments.get(key).and_then(Value::as_str) else {
-                return Ok(None);
-            };
-            let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| {
-                ToolError::BadArguments(format!("'{key}' must be a YYYY-MM-DD date, got '{raw}'"))
-            })?;
-            let time = if end_of_day {
-                date.and_hms_milli_opt(23, 59, 59, 999)
-            } else {
-                date.and_hms_opt(0, 0, 0)
-            }
-            .ok_or_else(|| ToolError::BadArguments(format!("'{raw}' is not a valid instant")))?;
-            Ok(Some(Utc.from_utc_datetime(&time)))
-        };
-    let from = parse("from", false)?;
-    let to = parse("to", true)?;
-    if let (Some(from), Some(to)) = (from, to) {
-        if to < from {
-            return Err(ToolError::BadArguments("'to' is before 'from'".to_owned()));
+fn tool_response(id: Value, result: Result<String, ToolError>) -> String {
+    match result {
+        Ok(text) => success(
+            id,
+            json!({"content":[{"type":"text", "text":text}], "isError":false}),
+        ),
+        Err(ToolError::UnknownTool(name)) => {
+            error_response(id, INVALID_PARAMS, &format!("unknown tool '{name}'"))
         }
+        Err(ToolError::BadArguments(message)) => error_response(id, INVALID_PARAMS, &message),
+        Err(ToolError::Failed(message)) => success(
+            id,
+            json!({"content":[{"type":"text", "text":message}], "isError":true}),
+        ),
     }
-    Ok((from, to))
-}
-
-fn open_ledger() -> Result<HistoryStore> {
-    let path = HistoryStore::default_path()?;
-    HistoryStore::open(&path)
-}
-
-fn load_rates() -> RateCard {
-    RateCard::load_from_disk()
-        .or_else(|_| RateCard::load_bundled())
-        .unwrap_or_default()
 }
 
 fn success(id: Value, result: Value) -> String {
-    json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string()
+    json!({"jsonrpc":"2.0", "id":id, "result":result}).to_string()
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": { "code": code, "message": message },
-    })
-    .to_string()
+    json!({"jsonrpc":"2.0", "id":id, "error":{"code":code, "message":message}}).to_string()
 }
 
-/// Names of the tools this server advertises.
-///
-/// Exposed so `verify` can check its expectations against what is actually
-/// advertised (issue #57). A rename on either side would otherwise show up
-/// as an agent quietly choosing no tool at all.
 pub fn advertised_tool_names() -> Vec<String> {
-    tool_descriptors()
+    tool_specs()
         .iter()
-        .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+        .map(|(name, _, _)| (*name).to_owned())
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn request(line: &str) -> Value {
-        let response = handle_line(line).expect("a request with an id gets a response");
-        serde_json::from_str(&response).expect("responses are JSON")
-    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
-    fn initialize_reports_the_protocol_version_and_tool_capability() {
-        let response = request(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
-
-        assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
-        assert!(response["result"]["capabilities"]["tools"].is_object());
-        assert_eq!(response["result"]["serverInfo"]["name"], "agent-odometer");
-    }
-
-    /// #47: "MCP descriptions warn about sensitive session metadata and
-    /// default to aggregate/read-only results." Stated at initialize, so an
-    /// agent knows before it calls anything.
-    #[test]
-    fn initialize_warns_that_results_are_sensitive_aggregates() {
-        let response = request(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
-        let instructions = response["result"]["instructions"]
-            .as_str()
-            .expect("instructions");
-
-        assert!(instructions.contains("sensitive"), "{instructions}");
-        assert!(instructions.contains("never writes"), "{instructions}");
-        assert!(
-            instructions.contains("not prompts"),
-            "an agent must know message text is not returned: {instructions}"
-        );
-    }
-
-    #[test]
-    fn every_advertised_tool_is_read_only_and_documented() {
-        let response = request(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
-        let tools = response["result"]["tools"].as_array().expect("tools");
-
-        assert!(!tools.is_empty());
-        for tool in tools {
-            let name = tool["name"].as_str().expect("name");
-            let description = tool["description"].as_str().expect("description");
-            assert!(
-                !description.is_empty(),
-                "{name} needs a description an agent can act on"
-            );
-            assert!(tool["inputSchema"].is_object(), "{name} needs a schema");
-            // No mutating verb is reachable: these are simply not exposed,
-            // rather than gated behind a flag that could be flipped.
-            for forbidden in ["set_", "write", "rebuild", "delete", "apply", "merge"] {
-                assert!(
-                    !name.contains(forbidden),
-                    "{name} looks like a mutation and must not be exposed"
+    fn availability_tools_report_unavailable_without_preparing_the_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let rates = RateCard::load_bundled().unwrap();
+        let config = Config::default();
+        let now = "2026-09-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for state in ["missing", "old", "dirty", "corrupt"] {
+            let path = directory.path().join(state).join("history.sqlite3");
+            if state != "missing" {
+                std::fs::create_dir(path.parent().unwrap()).unwrap();
+                if state == "corrupt" {
+                    std::fs::write(&path, b"synthetic invalid database").unwrap();
+                } else {
+                    let writer = HistoryStore::open(&path).unwrap();
+                    if state == "dirty" {
+                        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures/sample-session.jsonl");
+                        let session = crate::parser::parse_file(&source, false).unwrap().unwrap();
+                        writer
+                            .observe(std::path::Path::new("synthetic.jsonl"), &session, 1)
+                            .unwrap();
+                    }
+                    drop(writer);
+                    let connection = rusqlite::Connection::open(&path).unwrap();
+                    connection
+                        .execute_batch(if state == "old" {
+                            "PRAGMA user_version = 9"
+                        } else {
+                            "UPDATE durable_sessions SET ledger_dirty = 1"
+                        })
+                        .unwrap();
+                }
+            }
+            let before = std::fs::read(&path).ok();
+            for name in ["ledger_status", "diagnostics_report", "usage_report"] {
+                let result = execute_at_path(
+                    &path,
+                    prepare_call(&json!({"name":name})).unwrap(),
+                    QueryControl::default(),
+                    &rates,
+                    &config,
+                    now,
                 );
+                if name == "usage_report" {
+                    assert!(matches!(result, Err(ToolError::Failed(_))), "{state}");
+                    assert!(!format!("{result:?}").contains(&path.display().to_string()));
+                    continue;
+                }
+                let value: Value = serde_json::from_str(
+                    &result.unwrap_or_else(|error| panic!("{state}/{name}: {error:?}")),
+                )
+                .unwrap();
+                assert_eq!(value["schema_version"], 1, "{state}/{name}");
+                assert_eq!(value["ledger_available"], false, "{state}/{name}");
+                if name == "ledger_status" {
+                    assert!(value["sessions"].is_null());
+                    assert!(value["ledger_bytes"].is_null());
+                    assert_eq!(value["rate_card_version"], rates.version);
+                    let cli: Value = serde_json::from_str(
+                        &crate::report_cli::render_status(
+                            None,
+                            &rates,
+                            crate::report_cli::Format::Json,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(value, cli);
+                } else {
+                    assert!(value["providers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|provider| {
+                            provider["ledger"].is_null()
+                                && provider["models"].as_array().unwrap().is_empty()
+                        }));
+                }
+                assert!(!value.to_string().contains(&path.display().to_string()));
+            }
+            assert_eq!(std::fs::read(&path).ok(), before, "{state}");
+            if state == "missing" {
+                assert!(!path.parent().unwrap().exists());
             }
         }
     }
 
     #[test]
-    fn an_unknown_method_is_a_protocol_error() {
-        let response = request(r#"{"jsonrpc":"2.0","id":3,"method":"resources/list"}"#);
-
-        assert_eq!(response["error"]["code"], METHOD_NOT_FOUND);
-        assert!(response["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("resources/list")));
-    }
-
-    #[test]
-    fn an_unknown_tool_is_rejected_by_name() {
-        let response = request(
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"rebuild_history"}}"#,
-        );
-
-        assert_eq!(response["error"]["code"], INVALID_PARAMS);
-        assert!(response["error"]["message"]
-            .as_str()
-            .is_some_and(|message| message.contains("rebuild_history")));
-    }
-
-    /// A notification carries no `id` and must get no reply — a spurious
-    /// response makes well-behaved clients complain.
-    #[test]
-    fn a_notification_gets_no_response() {
-        assert!(handle_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
-    }
-
-    /// Unparseable input still gets an answer, against a null id. Staying
-    /// silent would hang a client that is waiting on one.
-    #[test]
-    fn malformed_json_is_answered_rather_than_ignored() {
-        let response = handle_line("{not json").expect("a reply");
-        let parsed: Value = serde_json::from_str(&response).expect("the reply itself is JSON");
-
-        assert_eq!(parsed["id"], Value::Null);
-        assert_eq!(parsed["error"]["code"], INVALID_REQUEST);
-    }
-
-    #[test]
-    fn a_malformed_date_argument_is_rejected_rather_than_widened() {
-        // Silently widening to all time would hand an agent a much larger
-        // number than it asked for, with nothing to signal the difference.
-        let error = window_from(&json!({ "from": "August 2026" })).expect_err("rejected");
-        match error {
-            ToolError::BadArguments(message) => {
-                assert!(message.contains("August 2026"), "{message}");
+    fn unavailable_ledger_does_not_disable_request_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing").join("history.sqlite3");
+        let rates = RateCard::load_bundled().unwrap();
+        let config = Config::default();
+        let now = "2026-09-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for name in ["ledger_status", "diagnostics_report"] {
+            let cancelled = QueryControl::default();
+            cancelled.cancel();
+            for (control, expected) in [
+                (cancelled, "cancelled"),
+                (QueryControl::with_timeout(Duration::ZERO), "deadline"),
+            ] {
+                let error = execute_at_path(
+                    &path,
+                    prepare_call(&json!({"name":name})).unwrap(),
+                    control,
+                    &rates,
+                    &config,
+                    now,
+                )
+                .unwrap_err();
+                assert!(matches!(error, ToolError::Failed(message) if message.contains(expected)));
             }
-            _ => panic!("expected a bad-arguments error"),
+        }
+        let mut bounded = QueryControl::default();
+        bounded.max_rows = 1;
+        let error = execute_at_path(
+            &path,
+            prepare_call(&json!({"name":"diagnostics_report"})).unwrap(),
+            bounded,
+            &rates,
+            &config,
+            now,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Failed(message) if message.contains("row limit")));
+        assert!(!path.parent().unwrap().exists());
+    }
+
+    /// At the first cancellation line, wait until both workers are actually
+    /// running. This proves interruption during execution, not just before it.
+    struct GatedInput {
+        inner: std::io::Cursor<Vec<u8>>,
+        boundary: usize,
+        started: mpsc::Receiver<()>,
+        released: bool,
+    }
+
+    impl std::io::Read for GatedInput {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buffer)
         }
     }
 
-    #[test]
-    fn a_reversed_window_is_rejected() {
-        let error = window_from(&json!({ "from": "2026-08-31", "to": "2026-08-01" }))
-            .expect_err("rejected");
-        assert!(matches!(error, ToolError::BadArguments(_)));
+    impl BufRead for GatedInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if !self.released && self.inner.position() as usize >= self.boundary {
+                for _ in 0..2 {
+                    self.started
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("worker started");
+                }
+                self.released = true;
+            }
+            self.inner.fill_buf()
+        }
+        fn consume(&mut self, amount: usize) {
+            self.inner.consume(amount);
+        }
     }
 
-    #[test]
-    fn a_window_is_inclusive_of_the_named_end_day() {
-        let (from, to) =
-            window_from(&json!({ "from": "2026-08-01", "to": "2026-08-15" })).expect("parsed");
-
-        assert_eq!(from.unwrap().to_rfc3339(), "2026-08-01T00:00:00+00:00");
-        assert_eq!(to.unwrap().to_rfc3339(), "2026-08-15T23:59:59.999+00:00");
-    }
-
-    #[test]
-    fn an_absent_window_is_all_time_rather_than_an_error() {
-        let (from, to) = window_from(&json!({})).expect("parsed");
-        assert!(from.is_none() && to.is_none());
-    }
-
-    #[test]
-    fn serve_answers_each_line_and_stops_at_end_of_input() {
-        let input = concat!(
-            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            "\n",
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-            "\n",
-        );
+    fn transport(input: &str) -> Vec<Value> {
         let mut output = Vec::new();
-
-        serve(std::io::BufReader::new(input.as_bytes()), &mut output);
-
-        let lines: Vec<&str> = std::str::from_utf8(&output)
-            .expect("utf-8")
+        serve_with_executor(input.as_bytes(), &mut output, |_, _| {
+            panic!("invalid input must not execute")
+        });
+        String::from_utf8(output)
+            .unwrap()
             .lines()
-            .collect();
-        // Two requests, one notification: two responses.
-        assert_eq!(lines.len(), 2, "got {lines:?}");
-        let first: Value = serde_json::from_str(lines[0]).unwrap();
-        let second: Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(first["id"], 1);
-        assert_eq!(second["id"], 2);
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
     }
 
     #[test]
-    fn only_the_mcp_subcommand_is_claimed() {
-        // Anything else must fall through so the desktop app still starts.
-        for command in ["report", "status", "hook", ""] {
-            assert_ne!(command, "mcp");
+    fn initializes_lists_read_only_tools_and_ignores_notifications() {
+        let replies = transport(concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"
+        ));
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["result"]["protocolVersion"], PROTOCOL_VERSION);
+        let instructions = replies[0]["result"]["instructions"].as_str().unwrap();
+        for warning in [
+            "sensitive",
+            "never changes application records",
+            "not prompts",
+        ] {
+            assert!(instructions.contains(warning));
+        }
+        for tool in replies[1]["result"]["tools"].as_array().unwrap() {
+            assert_eq!(tool["annotations"]["readOnlyHint"], true);
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert!(!tool["description"].as_str().unwrap().is_empty());
+        }
+        for old in [
+            "usage_report",
+            "project_report",
+            "workflow_metrics",
+            "quota_status",
+        ] {
+            assert!(advertised_tool_names().iter().any(|name| name == old));
+        }
+    }
+
+    #[test]
+    fn malformed_protocol_and_arguments_never_dispatch() {
+        for input in [
+            "{bad",
+            "[]",
+            "null",
+            "{\"id\":1,\"method\":\"initialize\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"initialize\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":true,\"method\":\"initialize\"}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":42}",
+        ] {
+            assert!(transport(input)[0]["error"].is_object(), "{input}");
+        }
+        for args in [
+            json!(null),
+            json!([]),
+            json!({"from":false}),
+            json!({"from":null}),
+            json!({"from":"2026-9-01"}),
+            json!({"from":"2026-02-30"}),
+            json!({"from":"2026-09-10", "to":"2026-09-01"}),
+            json!({"include_paths":true}),
+            json!({"limit":10}),
+        ] {
+            let input = json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"usage_report", "arguments":args}}).to_string();
+            assert_eq!(
+                transport(&input)[0]["error"]["code"],
+                INVALID_PARAMS,
+                "{args}"
+            );
+        }
+        for limit in [json!(0), json!(1001), json!(-1), json!(1.5), json!("2")] {
+            assert!(
+                prepare_call(&json!({"name":"session_report", "arguments":{"limit":limit}}))
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            prepare_call(&json!({"name":"delete_history"})),
+            Err(ToolError::UnknownTool(_))
+        ));
+    }
+
+    #[test]
+    fn dates_are_inclusive_and_absent_windows_remain_all_time() {
+        let call = prepare_call(
+            &json!({"name":"usage_report", "arguments":{"from":"2026-08-01", "to":"2026-08-15"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            call.request.from.unwrap().to_rfc3339(),
+            "2026-08-01T00:00:00+00:00"
+        );
+        assert_eq!(
+            call.request.to.unwrap().to_rfc3339(),
+            "2026-08-15T23:59:59.999+00:00"
+        );
+        let call = prepare_call(&json!({"name":"usage_report"})).unwrap();
+        assert!(call.request.from.is_none() && call.request.to.is_none());
+    }
+
+    #[test]
+    fn oversized_input_is_discarded_and_next_request_is_answered() {
+        let input = format!(
+            "{}\n{{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}}\n",
+            "x".repeat(MAX_INPUT_BYTES + 10)
+        );
+        let replies = transport(&input);
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0]["error"]["code"], INVALID_REQUEST);
+        assert_eq!(replies[1]["id"], 7);
+    }
+
+    #[test]
+    fn cancellation_interrupts_work_and_capacity_never_exceeds_two() {
+        // Input holds both worker slots until cancellation notifications have
+        // arrived. A third call is rejected immediately, never queued.
+        let requests = [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"usage_report"}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"usage_report"}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"usage_report"}}),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>();
+        let boundary = requests[..2].iter().map(|line| line.len() + 1).sum();
+        let (started, receiver) = mpsc::channel();
+        let input = GatedInput {
+            inner: std::io::Cursor::new(requests.join("\n").into_bytes()),
+            boundary,
+            started: receiver,
+            released: false,
+        };
+        let active = AtomicUsize::new(0);
+        let maximum = AtomicUsize::new(0);
+        let mut output = Vec::new();
+        serve_with_executor(input, &mut output, |_, control| {
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(count, Ordering::SeqCst);
+            started.send(()).unwrap();
+            loop {
+                if let Err(error) = control.check() {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    return Err(ToolError::failed(error));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let replies: Vec<Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            replies.iter().find(|reply| reply["id"] == 3).unwrap()["error"]["code"],
+            SERVER_BUSY
+        );
+        for id in [1, 2] {
+            let reply = replies.iter().find(|reply| reply["id"] == id).unwrap();
+            assert_eq!(reply["result"]["isError"], true);
+            assert!(reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("cancelled"));
+        }
+    }
+
+    #[test]
+    fn eof_drains_work_and_oversized_results_are_explicit_errors() {
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"usage_report\"}}";
+        for oversized in [false, true] {
+            let mut output = Vec::new();
+            serve_with_executor(input.as_bytes(), &mut output, |_, _| {
+                Ok(if oversized {
+                    "x".repeat(MAX_OUTPUT_BYTES)
+                } else {
+                    "{}".into()
+                })
+            });
+            assert!(output.len() < MAX_OUTPUT_BYTES);
+            let reply: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(reply["result"]["isError"], oversized);
         }
     }
 }

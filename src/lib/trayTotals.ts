@@ -1,8 +1,8 @@
 // Today's tray totals, computed from cached per-session range rollups.
 // Extracted from the App tray effect so the summing logic is unit-testable
-// and can rerun on rate-card changes without refetching range data.
+// using backend pricing refreshed whenever the saved rate card changes.
 
-import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from './credits';
+import { formatCredits } from './currency';
 import type { Harness, RangeTotals, RateCard } from './types';
 
 export interface TrayTotals {
@@ -27,7 +27,7 @@ export interface TraySessionLike {
 export function computeTrayTotals(
   sessions: Iterable<TraySessionLike>,
   ranges: Record<string, RangeTotals>,
-  rateCard: RateCard,
+  _rateCard: RateCard,
   quotaLabel: string | null = null,
 ): TrayTotals {
   let tokens = 0; let codexCredits = 0; let codexApi = 0; let claudeUsd = 0;
@@ -36,25 +36,25 @@ export function computeTrayTotals(
   for (const session of sessions) {
     const range = ranges[session.storage_id]; if (!range) continue;
     tokens += range.tokens.total_tokens;
-    const plan = creditsFromBuckets(range.buckets, rateCard, session.harness);
+    const plan = range.pricing?.plan;
     if (session.harness === 'codex') {
-      if (session.credits_unlimited) unlimited++; else codexCredits += plan.total;
-      missingCredits ||= plan.missingModels.length > 0;
-      unpricedCredits ||= plan.unpricedModels.length > 0;
-      const api = apiCostFromBuckets(range.buckets, rateCard, session.harness);
-      codexApi += api?.total ?? 0; missingApi ||= !api || api.missingModels.length > 0;
-      unpricedApi ||= (api?.unpricedModels.length ?? 0) > 0;
+      if (session.credits_unlimited) unlimited++; else codexCredits += (plan?.total ?? Number.NaN);
+      missingCredits ||= (plan?.missing_models.length ?? 0) > 0;
+      unpricedCredits ||= (plan?.unpriced_models.length ?? 0) > 0;
+      const api = range.pricing?.api;
+      codexApi += api?.total ?? 0; missingApi ||= !api || api.missing_models.length > 0;
+      unpricedApi ||= (api?.unpriced_models.length ?? 0) > 0;
     } else {
-      claudeUsd += plan.total; missingClaude ||= plan.missingModels.length > 0;
-      unpricedClaude ||= plan.unpricedModels.length > 0;
+      claudeUsd += (plan?.total ?? Number.NaN); missingClaude ||= (plan?.missing_models.length ?? 0) > 0;
+      unpricedClaude ||= (plan?.unpriced_models.length ?? 0) > 0;
     }
   }
   const creditText = unlimited > 0 && codexCredits === 0 ? `unlimited (${unlimited})` : `${codexCredits.toFixed(2)}${unlimited ? ` + ${unlimited} unlimited` : ''}${unpricedCredits ? ' · excludes unpriced' : missingCredits ? ' · fallback' : ''}`;
   return {
     tokens: tokens.toLocaleString(),
-    codex_credits: creditText,
+    codex_credits: !Number.isFinite(codexCredits) ? 'unavailable' : creditText,
     codex_api_usd: missingApi ? 'unavailable · missing direct rate' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
-    claude_usd: `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}`,
+    claude_usd: !Number.isFinite(claudeUsd) ? 'unavailable' : `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}`,
     quota: quotaLabel ?? '',
   };
 }
