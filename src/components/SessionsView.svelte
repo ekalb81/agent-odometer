@@ -409,8 +409,7 @@
   /// `projectStore`. Falls back to the session's own auto-computed label
   /// only until that resolve completes.
   function repositoryDisplay(session: TrackedSession): string {
-    if (!session.project_key) return '';
-    return projectStore.info(session.project_key)?.label ?? session.project_label ?? '';
+    return projectStore.forSession(session)?.label ?? session.project_label ?? '';
   }
 
   /// Splits a `repository_root` label at its first `/` so the repository
@@ -539,9 +538,38 @@
   // Drilling into one parent is inherently a flat question ("which of these
   // runs cost the most"), so the scope implies the flattening.
   const flatMode = $derived(sessionGridStore.flattenSubagents || focusedParentId !== null);
+  const projectAnchors = $derived.by(() => {
+    const byId = new Map(filtered.map((session) => [session.storage_id, session]));
+    const anchors = new Map<string, TrackedSession>();
+    for (const session of filtered) {
+      let anchor = session;
+      const seen = new Set<string>();
+      while (!projectStore.hasOverride(anchor.storage_id) && !seen.has(anchor.storage_id)) {
+        seen.add(anchor.storage_id);
+        const parentId = parentStorageId(anchor);
+        const parent = parentId ? byId.get(parentId) : undefined;
+        if (!parent || projectStore.hasOverride(parent.storage_id)) break;
+        anchor = parent;
+      }
+      anchors.set(session.storage_id, anchor);
+    }
+    return anchors;
+  });
+  function projectGroupKey(session: TrackedSession): string {
+    const anchor = projectAnchors.get(session.storage_id) ?? session;
+    return projectStore.forSession(anchor)?.project_key ?? anchor.project_key ?? 'missing:';
+  }
+  function displayParentStorageId(session: TrackedSession): string | null {
+    const parentId = parentStorageId(session);
+    if (!sessionGridStore.groupByRepository || !parentId) return parentId;
+    const parent = projectAnchors.get(parentId);
+    // Project reassignment changes display grouping, never actual lineage.
+    // A collapse in one project must not withhold rows in another project.
+    return parent && projectGroupKey(session) !== projectGroupKey(parent) ? null : parentId;
+  }
   const displayedWithAnchors = $derived(
     orderSessionsForDisplay([...filtered].sort(compareSession), {
-      parentOf: parentStorageId,
+      parentOf: displayParentStorageId,
       collapsed: collapsedParents,
       flat: flatMode,
     }),
@@ -675,18 +703,9 @@
   /// itself, so this can never disagree with the grid's sort/filter/label.
   function groupByRepository(sessions: TrackedSession[]): { label: string; sessions: TrackedSession[] }[] {
     const groups = new Map<string, { label: string; sessions: TrackedSession[] }>();
-    const byStorageId = new Map(sessions.map((session) => [session.storage_id, session]));
     for (const session of sessions) {
-      let anchor = session;
-      const seen = new Set<string>();
-      while (!seen.has(anchor.storage_id)) {
-        seen.add(anchor.storage_id);
-        const parentId = parentStorageId(anchor);
-        const parent = parentId ? byStorageId.get(parentId) : undefined;
-        if (!parent) break;
-        anchor = parent;
-      }
-      const info = anchor.project_key ? projectStore.info(anchor.project_key) : undefined;
+      const anchor = projectAnchors.get(session.storage_id) ?? session;
+      const info = projectStore.forSession(anchor);
       const key = info?.project_key ?? anchor.project_key ?? 'missing:';
       const label = info?.label ?? anchor.project_label ?? 'No working directory recorded';
       const group = groups.get(key);
@@ -2069,11 +2088,11 @@
                   {:else if column.id === 'tools'}
                     <span class="text-right font-mono text-xs text-ink" title={session.tool_metrics ? `${session.tool_metrics.reads} read · ${session.tool_metrics.searches} search · ${session.tool_metrics.mutations} mutation · ${session.tool_metrics.commands} command` : undefined}>{fmt.format(session.tool_metrics?.calls ?? 0)}</span>
                   {:else if column.id === 'repository'}
-                    {@const project = session.project_key ? projectStore.info(session.project_key) : undefined}
+                    {@const project = projectStore.forSession(session)}
                     {@const label = project?.label ?? session.project_label ?? ''}
                     {@const provenance = project?.provenance ?? session.project_provenance}
                     {@const repoSplit = provenance === 'repository_root' ? splitRepositoryLabel(label) : null}
-                    {#if !session.project_key}
+                    {#if !project && !session.project_key}
                       <span class="text-ink-faint text-xs truncate" title="No working directory recorded for this session">—</span>
                     {:else if repoSplit}
                       <span class="flex items-center min-w-0 whitespace-nowrap text-xs" title={`${label}${session.working_directory ? ` · ${session.working_directory}` : ''}`}>

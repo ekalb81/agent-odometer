@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::model::{Harness, RateLimitSnapshotPoint, RateLimitWindow, Session, TurnInfo};
-use crate::provider::{claude_code_provider_id, codex_provider_id};
+use crate::provider::{claude_code_provider_id, codex_provider_id, gemini_cli_provider_id};
 use crate::rates::RateCard;
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
@@ -40,6 +40,7 @@ pub fn try_run_cli() -> bool {
         return false;
     }
     let harness = match args.next().as_deref() {
+        Some("gemini") | Some("gemini_cli") => gemini_cli_provider_id(),
         Some("codex") => codex_provider_id(),
         Some("claude") | Some("claude_code") => claude_code_provider_id(),
         _ => {
@@ -53,9 +54,11 @@ pub fn try_run_cli() -> bool {
         config.turn_receipts_codex
     } else if harness == claude_code_provider_id() {
         config.turn_receipts_claude
+    } else if harness == gemini_cli_provider_id() {
+        config.turn_receipts_gemini
     } else {
         // Fail safe: turn receipts have no configuration toggle for a
-        // provider outside the two builtins, so treat it as disabled.
+        // provider without hook wiring, so treat it as disabled.
         false
     };
     // A stale hook after the feature is disabled must be nearly free: do not
@@ -99,7 +102,7 @@ pub fn try_run_cli() -> bool {
 }
 
 fn print_hook_output(message: Option<String>) {
-    // Both Codex and Claude Code accept this common Stop-hook output shape.
+    // Codex, Claude Code, and Gemini CLI accept this common output shape.
     // Serialization is infallible for this fixed structure; keep stdout JSON-only.
     let value = match message {
         Some(message) => serde_json::json!({
@@ -120,8 +123,27 @@ fn run_hook(harness: Harness, config: &Config) -> anyhow::Result<String> {
     if raw.len() as u64 > MAX_HOOK_INPUT_BYTES {
         return Err(anyhow!("hook input exceeded the safety limit"));
     }
-    let input: HookInput = serde_json::from_slice(&raw).context("hook input was not valid JSON")?;
-    if input.hook_event_name != "Stop" {
+    run_hook_input(
+        harness,
+        config,
+        &raw,
+        &RateCard::load_from_disk().context("the rate card could not be loaded")?,
+    )
+}
+
+fn run_hook_input(
+    harness: Harness,
+    config: &Config,
+    raw: &[u8],
+    rates: &RateCard,
+) -> anyhow::Result<String> {
+    let input: HookInput = serde_json::from_slice(raw).context("hook input was not valid JSON")?;
+    let event = if harness == gemini_cli_provider_id() {
+        "AfterAgent"
+    } else {
+        "Stop"
+    };
+    if input.hook_event_name != event {
         return Err(anyhow!("unexpected hook event"));
     }
     if input.session_id.is_empty() || input.session_id.len() > 256 {
@@ -138,6 +160,8 @@ fn run_hook(harness: Harness, config: &Config) -> anyhow::Result<String> {
         crate::parser::parse_file(&transcript, false)
     } else if harness == claude_code_provider_id() {
         crate::claude_parser::parse_file(&transcript)
+    } else if harness == gemini_cli_provider_id() {
+        crate::gemini_parser::parse_file(&transcript)
     } else {
         // Fail safe: parsing dispatch has no route for an unknown provider.
         Err(anyhow!("unsupported provider for turn receipts"))
@@ -161,8 +185,7 @@ fn run_hook(harness: Harness, config: &Config) -> anyhow::Result<String> {
             .or_else(|| session.turns.last())
             .ok_or_else(|| anyhow!("the completed turn was not found"))?,
     };
-    let rates = RateCard::load_from_disk().context("the rate card could not be loaded")?;
-    Ok(build_receipt(&session, turn, &rates))
+    Ok(build_receipt(&session, turn, rates))
 }
 
 fn expand_home_path(value: &str) -> PathBuf {
@@ -198,6 +221,12 @@ fn validate_transcript_path(path: &Path, harness: &Harness, config: &Config) -> 
             .collect()
     } else if *harness == claude_code_provider_id() {
         config.claude_session_roots.iter().collect()
+    } else if *harness == gemini_cli_provider_id() {
+        config
+            .providers
+            .get(harness)
+            .map(|source| source.live_roots.iter().collect())
+            .unwrap_or_default()
     } else {
         // Fail safe: no roots are trusted for a provider without dedicated
         // hook wiring, so the path check below rejects the transcript.
@@ -247,8 +276,7 @@ pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> St
     } else if session.harness == claude_code_provider_id() {
         first.push_str(&format_optional_amount(turn_plan, "API", true));
     } else {
-        // Neutral fallback: no plan/credits pricing concept exists outside
-        // Codex, so treat an unknown provider the same as Claude Code.
+        // Gemini CLI reports USD estimates through the shared plan surface.
         first.push_str(&format_optional_amount(turn_plan, "API", true));
     }
 
@@ -268,7 +296,7 @@ pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> St
             format_session_amount(&session_plan, "API", true)
         )
     } else {
-        // Neutral fallback: same generic "API"-only shape as Claude Code.
+        // Gemini CLI uses the same USD estimate presentation.
         format!(
             "Session{}",
             format_session_amount(&session_plan, "API", true)
@@ -693,6 +721,80 @@ mod tests {
             ..Default::default()
         };
         (session, rates)
+    }
+
+    #[test]
+    fn gemini_after_agent_receipt_uses_configured_roots_and_shared_prices() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            include_str!("../tests/fixtures/gemini/chats/session-1.jsonl"),
+        )
+        .unwrap();
+        let mut config = Config::default().normalized();
+        config
+            .providers
+            .get_mut(&gemini_cli_provider_id())
+            .unwrap()
+            .live_roots = vec![dir.path().to_owned()];
+        let input = serde_json::json!({"session_id":"77777777-8888-9999-aaaa-bbbbbbbbbbbb", "transcript_path":transcript, "hook_event_name":"AfterAgent"});
+        let rates = RateCard::load_bundled().unwrap();
+        let receipt = run_hook_input(
+            gemini_cli_provider_id(),
+            &config,
+            &serde_json::to_vec(&input).unwrap(),
+            &rates,
+        )
+        .unwrap();
+        let session = crate::gemini_parser::parse_file(&transcript)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt,
+            build_receipt(&session, session.turns.last().unwrap(), &rates)
+        );
+        assert!(receipt.contains("turn 2"));
+        assert!(receipt.contains("≈$"));
+        assert!(!receipt.contains("Quota"));
+        assert!(!receipt.contains("credits"));
+        let mut wrong_event = input.clone();
+        wrong_event["hook_event_name"] = "Stop".into();
+        assert!(run_hook_input(
+            gemini_cli_provider_id(),
+            &config,
+            &serde_json::to_vec(&wrong_event).unwrap(),
+            &rates
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unexpected hook event"));
+        let mut wrong_id = input.clone();
+        wrong_id["session_id"] = "another-session".into();
+        assert!(run_hook_input(
+            gemini_cli_provider_id(),
+            &config,
+            &serde_json::to_vec(&wrong_id).unwrap(),
+            &rates
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("identity did not match"));
+        config
+            .providers
+            .get_mut(&gemini_cli_provider_id())
+            .unwrap()
+            .live_roots
+            .clear();
+        assert!(run_hook_input(
+            gemini_cli_provider_id(),
+            &config,
+            &serde_json::to_vec(&input).unwrap(),
+            &rates
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("outside the watched roots"));
     }
 
     #[test]

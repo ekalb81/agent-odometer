@@ -111,7 +111,11 @@ pub fn price_tokens(
                     resolved_model: resolution.resolved_model,
                 };
             };
-            let amount = token_cost(tokens, rate, service_tier_multiplier(model, service_tier));
+            let amount = token_cost(
+                tokens,
+                rate,
+                service_tier_multiplier(model, service_tier, table),
+            );
             PricedAmount {
                 amount: Some(amount),
                 basis: crate::rates::downgrade_for_cache_creation_fallback(
@@ -148,12 +152,17 @@ pub fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f6
         * multiplier
 }
 
-/// Service-tier price multiplier for a model, where the provider charges one.
-pub fn service_tier_multiplier(model: &str, service_tier: Option<&str>) -> f64 {
+/// Service-tier price multiplier for a model and pricing surface.
+/// Astra fast mode uses 2.5x Codex credits but 2x OpenAI API USD rates.
+pub fn service_tier_multiplier(model: &str, service_tier: Option<&str>, table: RateTable) -> f64 {
     if service_tier != Some("fast") {
         return 1.0;
     }
     match model {
+        "gpt-6-astra" => match table {
+            RateTable::Plan => 2.5,
+            RateTable::Api => 2.0,
+        },
         "gpt-5.5" => 2.5,
         "gpt-5.4" => 2.0,
         _ => 1.0,
@@ -545,7 +554,7 @@ pub(crate) fn price_buckets_detailed_controlled(
         let cost = token_cost(
             &bucket.tokens,
             rate,
-            service_tier_multiplier(&bucket.model, bucket.service_tier.as_deref()),
+            service_tier_multiplier(&bucket.model, bucket.service_tier.as_deref(), table),
         );
         total += cost;
         let basis = crate::rates::downgrade_for_cache_creation_fallback(
@@ -761,6 +770,51 @@ pub fn project_report(
             .collect();
     let session_overrides = store.list_session_project_overrides()?;
     let rows = store.session_project_rows()?;
+    // Resolve presentation from the destination project, including sessions
+    // outside the report window and original residents reassigned elsewhere.
+    // The contributing session's detected label belongs to its source project.
+    let mut detected = BTreeMap::new();
+    let mut members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for row in &rows {
+        store.check_query()?;
+        if let Some(key) = &row.project_key {
+            let metadata = (
+                row.label.clone().unwrap_or_default(),
+                row.provenance
+                    .as_deref()
+                    .unwrap_or("fallback_path_identity")
+                    == "fallback_path_identity",
+            );
+            detected
+                .entry(key.clone())
+                .and_modify(|existing| {
+                    if metadata < *existing {
+                        *existing = metadata.clone();
+                    }
+                })
+                .or_insert(metadata);
+        }
+        if let Some(raw) = session_overrides
+            .get(&row.session_key)
+            .or(row.project_key.as_ref())
+        {
+            let canonical = crate::history_store::resolve_canonical_project_key(&overrides, raw);
+            members.entry(canonical).or_default().insert(raw.clone());
+        }
+    }
+    let metadata_for = |key: &str| {
+        detected.get(key).cloned().unwrap_or_else(|| {
+            (
+                if key.starts_with("manual:") {
+                    "Standalone project"
+                } else {
+                    "Assigned project"
+                }
+                .to_owned(),
+                true,
+            )
+        })
+    };
     let keys: Vec<String> = rows.iter().map(|row| row.session_key.clone()).collect();
     let totals = store
         .range_totals_multi(&keys, &[(from, to)])?
@@ -800,16 +854,21 @@ pub fn project_report(
         let alias = overrides
             .get(&canonical)
             .and_then(|row| row.display_label.clone());
+        let metadata_key =
+            if detected.contains_key(&canonical) || members[&canonical].contains(&canonical) {
+                &canonical
+            } else {
+                members[&canonical].first().expect("project has a member")
+            };
+        let (detected_label, label_is_path) = metadata_for(metadata_key);
         let aliased = alias.is_some();
-        let label = alias
-            .or_else(|| row.label.clone())
-            .unwrap_or_else(|| canonical.clone());
+        let label = alias.unwrap_or(detected_label);
 
         let entry = by_project.entry(canonical).or_insert_with(|| Accumulated {
             label,
             // An explicit local alias replaces the path entirely, so a
             // renamed project is no longer path-identified.
-            label_is_path: !aliased && row.provenance.as_deref() == Some("fallback_path_identity"),
+            label_is_path: !aliased && label_is_path,
             sessions: 0,
             tokens: TokenTotals::default(),
             buckets: BTreeMap::new(),

@@ -15,7 +15,7 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 ## What you can see
 
 - **Every session, across providers** — Codex, Claude Code, Gemini CLI, and an All tab that keeps credits and USD estimates explicitly separated.
-- **Per-project spend** — working directories resolve to a stable project identity (repository root, workspace root, provider project id, or the path itself), so linked worktrees collapse into one project while nested repos and monorepo subfolders stay distinct. Sort, group, and filter by it.
+- **Per-project spend** — working directories resolve to a stable project identity (repository root, workspace root, provider project id, or the path itself), so linked worktrees collapse into one project while nested repos and monorepo subfolders stay distinct. Sort, group, and filter by it. Use **Change project** in session details to move one session, make it standalone, or restore detection; manage project names and merges in Settings.
 - **Quota windows and budgets** — subscription and credit windows with reset timing, pace, and projected run-out, plus soft per-provider and per-project budgets with local alerts. Windows with unlike units are never summed together, and a projection is suppressed rather than guessed when the evidence is too thin.
 - **Where tool overhead goes** — calls attributed by origin (core, MCP, provider), MCP server, allowlisted shell-command family, language, and context source, with exportable totals.
 - **Tokens where they went** — input, cached, output, and reasoning tokens per session, per model, and per turn.
@@ -30,7 +30,7 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Optional instruction inventory** — enable a hideable Instructions tab to find `AGENTS.md` and `CLAUDE.md` files across global, observed-project, and explicitly configured roots; review nested effective chains, deterministic warning signals, sanitized Markdown previews, and linked before/after usage evidence. Discovery is read-only, cancellable, progress-visible, bounded, and off by default.
 - **Provider diagnostics** — one report per provider covering configured roots, files discovered and parsed, parse failures, cache and history health, pricing coverage, and quota-source status. Each provider resolves to `ready`, `degraded`, `unsupported`, or `not_detected` with a reason. The local view shows your exact paths; the exportable bug-report JSON redacts them by default.
 - **Opt-in performance evidence** — default-off local timings cover startup, scans/cache/parsers, analytics, exports, and UI work; logs are size-bounded and exportable as JSONL or CSV.
-- **Opt-in turn receipts** — add a reversible Codex or Claude Code `Stop` hook that shows the completed turn's tokens and estimated cost inside the harness. Codex receipts also preserve provider-reported quota precision and label per-turn changes as account-wide observations.
+- **Opt-in turn receipts** — add a reversible Codex/Claude Code `Stop` or Gemini CLI `AfterAgent` hook that shows the completed turn's tokens and estimated cost inside the harness. Codex receipts also preserve provider-reported quota precision and label per-turn changes as account-wide observations.
 - **Quick glance** — the tray menu mirrors today's tokens, Codex credits/API estimate, and Claude USD with native show, hide, settings, and quit controls.
 - **Light and dark** — follows your OS theme by default; switchable in Settings.
 

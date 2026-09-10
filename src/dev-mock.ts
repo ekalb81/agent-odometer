@@ -11,6 +11,7 @@ import type {
   HistoryRebuildStatus,
   HistoryStatus,
   ProviderDiagnostic,
+  ProjectInfo,
   QuotaAlert,
   QuotaConfigWire,
   QuotaSnapshot,
@@ -22,6 +23,7 @@ import type {
 
 const DAY = 86_400_000;
 let rateOverride: RateCard | null = null;
+const projectAssignments = new Map<string, string>();
 const currentRates = () => rateOverride ?? RATES;
 const now = import.meta.env.VITE_VISUAL_TEST === '1'
   ? Date.parse('2026-07-29T15:30:00.000Z')
@@ -329,6 +331,21 @@ function turnReceiptStatus(): TurnReceiptIntegrationStatus {
       last_receipt: null,
       last_run_detail: null,
     },
+    gemini_cli: {
+      requested: false,
+      configured: false,
+      receipt_observed: false,
+      config_source: 'gemini_settings_json',
+      config_path: '/home/dev/.gemini/settings.json',
+      diagnostic_code: 'hook_not_requested',
+      detail: 'Off. Harness configuration is unchanged.',
+      restart_recommended: false,
+      trust_review_recommended: false,
+      last_run_at: null,
+      last_run_success: null,
+      last_receipt: null,
+      last_run_detail: null,
+    },
   };
 }
 
@@ -463,23 +480,44 @@ mockIPC((cmd, payload) => {
           display_path: '…/Codex/2026-08-04/ser',
         },
       ];
-    case 'resolve_projects':
-      return [
-        {
-          project_key: 'repo:demo-fixture',
-          label: 'demo',
-          provenance: 'repository_root',
-          member_keys: ['repo:demo-fixture'],
-          session_count: visibleFixtures().length,
-        },
-      ];
+    case 'resolve_projects': {
+      const projects = new Map<string, ProjectInfo>();
+      for (const fixture of visibleFixtures()) {
+        const session = summary(fixture);
+        const override = projectAssignments.get(session.storage_id);
+        const key = override ?? session.project_key ?? 'repo:demo-fixture';
+        let project = projects.get(key);
+        if (!project) {
+          project = {
+            project_key: key,
+            label: key === 'repo:demo-fixture' ? 'demo' : 'Standalone project',
+            provenance: key === 'repo:demo-fixture' ? 'repository_root' : 'fallback_path_identity',
+            member_keys: [key],
+            session_count: 0,
+            overridden_session_keys: [],
+          };
+          projects.set(key, project);
+        }
+        project.session_count++;
+        if (override) project.overridden_session_keys!.push(session.storage_id);
+      }
+      return [...projects.values()];
+    }
     case 'set_project_alias':
     case 'merge_projects':
     case 'unmerge_project':
-    case 'clear_session_project_override':
       return null;
-    case 'reassign_session_project':
-      return 'repo:demo-fixture';
+    case 'clear_session_project_override': {
+      const { sessionKey } = payload as { sessionKey: string };
+      projectAssignments.delete(sessionKey);
+      return null;
+    }
+    case 'reassign_session_project': {
+      const { sessionKey, projectKey } = payload as { sessionKey: string; projectKey: string | null };
+      const key = projectKey ?? `manual:${sessionKey}`;
+      projectAssignments.set(sessionKey, key);
+      return key;
+    }
     case 'list_providers': {
       // Kept to the two shipped-and-visually-baselined providers for every
       // other scenario; Gemini CLI is registered but intentionally left out
@@ -593,6 +631,7 @@ mockIPC((cmd, payload) => {
         turn_receipts_enabled: false,
         turn_receipts_codex: true,
         turn_receipts_claude: true,
+        turn_receipts_gemini: false,
       };
     case 'list_instruction_files': {
       if (visualScenario === 'instructions-empty') return emptyInstructionInventory();

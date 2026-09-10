@@ -11,6 +11,7 @@
     summarizeOptimizationFindings,
   } from '../lib/optimization';
   import Sparkline from './Sparkline.svelte';
+  import SessionProjectEditor from './SessionProjectEditor.svelte';
 
   interface Props {
     session: Session | null;
@@ -287,6 +288,9 @@
 
     <!-- Scrollable body -->
     <div class="flex-1 overflow-y-auto min-h-0">
+      {#key session.storage_id}
+        <SessionProjectEditor {session} />
+      {/key}
       <!-- Context bar -->
       {#if ctxPercent !== null}
         <div class="px-5 py-3 border-b border-edge">

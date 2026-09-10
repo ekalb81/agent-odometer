@@ -514,6 +514,7 @@ export interface Config {
   turn_receipts_enabled: boolean;
   turn_receipts_codex: boolean;
   turn_receipts_claude: boolean;
+  turn_receipts_gemini?: boolean;
 }
 
 export interface InstructionRoot {
@@ -633,6 +634,7 @@ export interface TurnReceiptIntegrationStatus {
   executable_path: string;
   codex: HarnessIntegrationStatus;
   claude_code: HarnessIntegrationStatus;
+  gemini_cli?: HarnessIntegrationStatus;
 }
 
 export interface PerformanceStatus {
@@ -979,6 +981,8 @@ export interface ProjectInfo {
   provenance: ProjectProvenance;
   /** Every auto-computed `project_key` folded into this project; more than one only after a merge. */
   member_keys: string[];
+  /** Durable session keys explicitly reassigned into this project; absent in older payloads. */
+  overridden_session_keys?: string[];
   session_count: number;
 }
 

@@ -50,6 +50,7 @@
   async function reload(): Promise<void> {
     loading = true;
     await projectStore.refresh();
+    error = projectStore.error;
     projects = [...projectStore.all()].sort((a, b) =>
       a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }),
     );
