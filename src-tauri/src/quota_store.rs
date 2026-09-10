@@ -35,13 +35,9 @@ pub enum BudgetUnit {
     /// in `commands.rs::validate_quota_config`).
     PercentOfWindow,
     /// Raw token count, summed over the budget's rolling `period_hours`.
-    /// Deliberately not dollar-denominated: pricing/model-resolution is
-    /// owned by the frontend's `credits.ts` (see `docs/ARCHITECTURE.md`'s
-    /// pricing-catalog contract — "the dashboard remains the owner of
-    /// interactive and date-scoped pricing"), so re-deriving it inside this
-    /// Rust service would create a second, driftable pricing
-    /// implementation. A dollar-denominated project budget is deferred;
-    /// see the PR description.
+    /// Monetary project budgets remain deferred. If added, they must use
+    /// the shared Rust query service's pricing and model resolution rather
+    /// than defining a separate calculator here.
     Tokens,
 }
 

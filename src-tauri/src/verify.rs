@@ -17,7 +17,7 @@
 //! default. "Not verified" and "verified working" must never render the
 //! same, which is the failure mode this whole issue exists to prevent.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
@@ -59,6 +59,17 @@ pub struct VerifyReport {
     pub ok: bool,
 }
 
+impl VerifyReport {
+    fn from_checks(checks: Vec<Check>) -> Self {
+        let ok = checks.iter().all(|check| check.status == CheckStatus::Pass);
+        Self {
+            schema_version: VERIFY_SCHEMA_VERSION,
+            checks,
+            ok,
+        }
+    }
+}
+
 pub const VERIFY_SCHEMA_VERSION: u32 = 1;
 
 /// Tools the MCP server is expected to expose. Verified against what the
@@ -66,9 +77,21 @@ pub const VERIFY_SCHEMA_VERSION: u32 = 1;
 /// selection fails here rather than in the agent.
 const EXPECTED_TOOLS: &[&str] = &[
     "usage_report",
+    "model_report",
     "project_report",
     "workflow_metrics",
+    "session_report",
+    "activity_report",
+    "category_report",
+    "tools_report",
+    "context_report",
+    "findings_report",
+    "diagnostics_report",
     "quota_status",
+    "quota_report",
+    "mirrored_sessions",
+    "ledger_status",
+    "statusline",
 ];
 
 /// How stale the ledger may be before its recency is worth flagging.
@@ -90,12 +113,7 @@ pub fn verify(executable: &std::path::Path, now: DateTime<Utc>) -> VerifyReport 
     checks.extend(mcp);
     checks.push(verify_ledger(now));
 
-    let ok = checks.iter().all(|check| check.status == CheckStatus::Pass);
-    VerifyReport {
-        schema_version: VERIFY_SCHEMA_VERSION,
-        checks,
-        ok,
-    }
+    VerifyReport::from_checks(checks)
 }
 
 /// Launches the MCP server and drives a real session against it.
@@ -140,11 +158,26 @@ fn verify_mcp_round_trip(executable: &std::path::Path) -> Vec<Check> {
         detail: format!("launched '{} mcp'", executable.display()),
     });
 
-    let result = drive_session(&mut child);
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = (|| {
+            let mut stdin = stdin.context("no stdin on the server")?;
+            let mut reader = BufReader::new(stdout.context("no stdout on the server")?);
+            drive_session(&mut stdin, &mut reader)
+        })();
+        let _ = send.send(result);
+    });
+    let result = receive
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .context("MCP verification exceeded its 20-second deadline")
+        .and_then(|result| result);
     // Always reaped: a verification command that leaves a stray server
     // process behind has made the system slightly worse for having run.
     let _ = child.kill();
     let _ = child.wait();
+    let _ = worker.join();
 
     match result {
         Ok(session) => checks.extend(session),
@@ -161,10 +194,7 @@ fn verify_mcp_round_trip(executable: &std::path::Path) -> Vec<Check> {
     checks
 }
 
-fn drive_session(child: &mut std::process::Child) -> Result<Vec<Check>> {
-    let mut stdin = child.stdin.take().context("no stdin on the server")?;
-    let stdout = child.stdout.take().context("no stdout on the server")?;
-    let mut reader = BufReader::new(stdout);
+fn drive_session<W: Write, R: BufRead>(mut stdin: W, mut reader: R) -> Result<Vec<Check>> {
     let mut checks = Vec::new();
 
     let initialize = request(
@@ -265,9 +295,14 @@ fn request<W: Write, R: BufRead>(input: &mut W, output: &mut R, line: &str) -> R
     writeln!(input, "{line}").context("could not write to the server")?;
     input.flush().context("could not flush to the server")?;
     let mut response = String::new();
+    const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
     let read = output
+        .take(MAX_RESPONSE_BYTES as u64 + 1)
         .read_line(&mut response)
         .context("could not read from the server")?;
+    if read > MAX_RESPONSE_BYTES {
+        anyhow::bail!("the server response exceeds 8 MiB");
+    }
     if read == 0 {
         anyhow::bail!("the server closed its output before replying");
     }
@@ -286,16 +321,17 @@ fn verify_ledger(now: DateTime<Utc>) -> Check {
             }
         }
     };
-    let store = match HistoryStore::open(&path) {
-        Ok(store) => store,
-        Err(error) => {
-            return Check {
-                id: "ledger",
-                status: CheckStatus::Fail,
-                detail: format!("could not open {}: {error}", path.display()),
+    let store =
+        match HistoryStore::open_read_only(&path, crate::query_control::QueryControl::default()) {
+            Ok(store) => store,
+            Err(error) => {
+                return Check {
+                    id: "ledger",
+                    status: CheckStatus::Fail,
+                    detail: format!("could not open {}: {error}", path.display()),
+                }
             }
-        }
-    };
+        };
     let cutoff = now - Duration::days(RECENT_ACTIVITY_DAYS);
     match store.session_keys_since(cutoff.timestamp_millis()) {
         Ok(keys) if !keys.is_empty() => Check {
@@ -347,6 +383,34 @@ pub fn render(report: &VerifyReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_requires_every_check_to_pass() {
+        for status in [CheckStatus::Pass, CheckStatus::Fail, CheckStatus::Unknown] {
+            let report = VerifyReport::from_checks(vec![
+                Check {
+                    id: "mcp_initialize",
+                    status: CheckStatus::Pass,
+                    detail: "synthetic handshake succeeded".into(),
+                },
+                Check {
+                    id: "ledger",
+                    status,
+                    detail: "synthetic ledger observation".into(),
+                },
+            ]);
+            assert_eq!(report.ok, status == CheckStatus::Pass);
+            assert_eq!(render(&report).contains("NOT verified"), !report.ok);
+        }
+    }
+
+    #[test]
+    fn verification_rejects_oversized_peer_output() {
+        let oversized = vec![b'x'; 8 * 1024 * 1024 + 1];
+        let mut reader = std::io::Cursor::new(oversized);
+        let error = request(&mut Vec::new(), &mut reader, "{}").unwrap_err();
+        assert!(error.to_string().contains("exceeds 8 MiB"));
+    }
 
     #[test]
     fn a_launch_failure_marks_the_dependent_checks_unknown_not_failed() {

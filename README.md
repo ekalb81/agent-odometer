@@ -155,6 +155,8 @@ npm run tauri dev
 | `npm run test:coverage` | Run frontend tests and enforce the source-backed initial coverage slice |
 | `npm run build` | Build the frontend into `dist/` |
 | `npm run tauri build` | Build and bundle the desktop app |
+| `npm run mock:pricing:check` | Verify synthetic browser pricing fixtures against Rust output (requires Cargo) |
+| `npm run mock:pricing:generate` | Regenerate synthetic browser pricing fixtures through Rust (requires Cargo) |
 | `npm run visual:test` | Run deterministic Playwright screenshot comparisons |
 | `npm run visual:update` | Review and intentionally update Playwright baselines (Linux only; use the pinned container elsewhere) |
 | `npm run visual:gallery` | Build an HTML gallery from current Playwright screenshots |
@@ -174,7 +176,11 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
-Frontend tests live beside the modules and components they cover as `*.test.ts`. Parser integration tests and synthetic fixtures live in `src-tauri/tests/`; never commit real session data. Set `RUST_LOG` (e.g. `$env:RUST_LOG = 'odometer_lib=info'`) for native tracing.
+Frontend tests live beside the modules and components they cover as `*.test.ts`. Parser integration tests and synthetic fixtures live in `src-tauri/tests/`; never commit real session data. Rust owns token pricing, with frozen bucket and detail expectations under `tests/conformance/`. The frontend formats and sums returned prices; browser demos use Rust-generated synthetic prices rather than a separate calculator. Ordinary browser development and visual tests use the committed fixture JSON and do not need a Rust runtime; see [the fixture workflow](docs/VISUAL_TESTING.md#local-workflow) when changing synthetic inputs or pricing. Set `RUST_LOG` (e.g. `$env:RUST_LOG = 'odometer_lib=info'`) for native tracing.
+
+### Read-only reports
+
+The executable also provides local reports without starting the desktop: `agent-odometer report --from 2026-09-01 --format json`, `agent-odometer tools`, and `agent-odometer statusline`. Use `agent-odometer export --report models --format markdown` for a versioned export, or `agent-odometer mcp` for the bounded, read-only stdio server. Existing JSON and CSV formats remain compatible by default. See [headless commands, export schemas, and query limits](docs/HEADLESS.md).
 
 ### Repository layout
 
@@ -183,11 +189,19 @@ src/                     Svelte frontend
   components/            Views and reusable UI
   lib/ipc.ts             Typed Tauri command/event boundary
   lib/types.ts           TypeScript mirrors of Rust wire models
-  lib/credits.ts         Credit / API-cost calculations
-  lib/sessionProjection.ts Shared filter, pricing, model-comparison, and export projection
+  lib/currency.ts        Currency labels and amount formatting
+  lib/sessionProjection.ts Shared filter, priced-value, model-comparison, and export projection
 src-tauri/
   src/                   Rust parsers, telemetry, correlation, config events, git outcomes, tray, and commands
     history_store.rs     Durable SQLite history: facts, hour-bucket rollups, migrations
+    query.rs             Shared token and bucket pricing, range enrichment
+    query_desktop.rs     Summary, detail, turn, and dated-scenario pricing
+    query_reports.rs     Category, tool, context, findings, diagnostics, and statusline reports
+    query_control.rs     Shared cancellation, deadlines, and work limits
+    headless.rs          Shared CLI/MCP query dispatch
+    report_cli.rs        Terminal reporting adapter
+    report_output.rs     Versioned JSON, CSV, and Markdown export formatting
+    mcp_server.rs        Bounded, read-only stdio MCP adapter
     provider.rs          Provider registry, adapter contract, capability flags
     project_identity.rs  Working directory to stable project identity
     quota.rs             Quota windows, pace, budgets, alerts

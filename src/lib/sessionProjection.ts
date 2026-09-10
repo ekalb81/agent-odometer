@@ -1,16 +1,14 @@
 import {
-  apiCostFromBuckets,
-  computeSummaryCredits,
-  creditsFromBuckets,
   harnessCurrency,
-} from './credits';
+} from './currency';
 import type {
   Harness,
   PricingBasis,
   RangeTotals,
   RateCard,
   SessionSummary,
-  TierBucket,
+  SummaryPricing,
+  RangePricing,
   ToolMetrics,
   TokenTotals,
 } from './types';
@@ -34,6 +32,7 @@ export interface SessionProjection<T extends SessionSummary = SessionSummary> {
   planCost: number;
   apiCost: number | null;
   displayCost: number;
+  pricingAvailable: boolean;
   currency: string;
   missingModels: string[];
   unpricedModels: string[];
@@ -49,6 +48,7 @@ const projectionCache = new WeakMap<SessionSummary, {
   rates: RateCard | null;
   range: RangeTotals | undefined;
   dateScoped: boolean;
+  pricing: RangePricing | undefined;
   value: SessionProjection;
 }>();
 
@@ -204,19 +204,21 @@ export function projectSession<T extends SessionSummary>(
   rates: RateCard | null,
   range: RangeTotals | undefined,
   dateScoped: boolean,
+  pricing: RangePricing | undefined = dateScoped ? range?.pricing : undefined,
 ): SessionProjection<T> {
   const cached = projectionCache.get(session);
-  if (cached && cached.rates === rates && cached.range === range && cached.dateScoped === dateScoped) {
+  if (cached && cached.rates === rates && cached.range === range && cached.dateScoped === dateScoped && cached.pricing === pricing) {
     return cached.value as SessionProjection<T>;
   }
   const tokens = dateScoped ? (range?.tokens ?? zeroTotals()) : session.tokens_total;
-  if (!rates) {
+  if (!rates || !pricing) {
     const value: SessionProjection<T> = {
       session,
       tokens,
-      planCost: 0,
+      planCost: Number.NaN,
       apiCost: null,
-      displayCost: 0,
+      displayCost: Number.NaN,
+      pricingAvailable: false,
       // Rates have not loaded yet, so `harnessCurrency` (which reads
       // `rates.currencies`) is not available. Codex is the only provider
       // priced in its own plan-credit unit; every other registered provider
@@ -229,17 +231,14 @@ export function projectSession<T extends SessionSummary>(
       rateCardVersion: null,
       rateCardFetchedAt: null,
     };
-    projectionCache.set(session, { rates, range, dateScoped, value });
+    projectionCache.set(session, { rates, range, dateScoped, pricing, value });
     return value;
   }
 
-  const buckets = dateScoped ? (range?.buckets ?? []) : session.buckets;
-  const plan = dateScoped
-    ? creditsFromBuckets(buckets, rates, session.harness)
-    : computeSummaryCredits(session, rates);
-  const api = apiCostFromBuckets(buckets, rates, session.harness);
+  const plan = pricing.plan;
+  const api = pricing.api;
   const useApi = usesApiPricing(session, rates);
-  const directApiCost = api && api.missingModels.length === 0 && api.unpricedModels.length === 0
+  const directApiCost = api && api.missing_models.length === 0 && api.unpriced_models.length === 0
     ? api.total
     : null;
 
@@ -250,10 +249,11 @@ export function projectSession<T extends SessionSummary>(
     // Exports use this field as a direct-rate estimate. Fallback-priced or
     // unavailable models stay explicit instead of becoming a misleading $0.
     apiCost: directApiCost,
-    displayCost: useApi ? (api?.total ?? 0) : plan.total,
+    displayCost: useApi ? (api?.total ?? Number.NaN) : plan.total,
+    pricingAvailable: !useApi || api !== null,
     currency: useApi ? 'USD' : harnessCurrency(rates, session.harness),
-    missingModels: useApi ? (api?.missingModels ?? []) : plan.missingModels,
-    unpricedModels: useApi ? (api?.unpricedModels ?? []) : plan.unpricedModels,
+    missingModels: useApi ? (api?.missing_models ?? []) : plan.missing_models,
+    unpricedModels: useApi ? (api?.unpriced_models ?? []) : plan.unpriced_models,
     timeAwareApiStatus: rates.pricing_catalog.rate_periods.some((period) =>
       period.surface === (session.harness === 'codex' ? 'openai_api_usd' : 'anthropic_api_usd'))
       ? 'unavailable_requires_request_history'
@@ -262,7 +262,7 @@ export function projectSession<T extends SessionSummary>(
     rateCardVersion: rates.version,
     rateCardFetchedAt: rates.fetched_at,
   };
-  projectionCache.set(session, { rates, range, dateScoped, value });
+  projectionCache.set(session, { rates, range, dateScoped, pricing, value });
   return value;
 }
 
@@ -271,32 +271,22 @@ export function projectSessions<T extends SessionSummary>(
   rates: RateCard | null,
   ranges: Record<string, RangeTotals>,
   dateScoped: boolean,
+  summaries: Record<string, SummaryPricing> = {},
+  ready = false,
 ): Map<string, SessionProjection<T>> {
   const result = new Map<string, SessionProjection<T>>();
   for (const session of sessions) {
-    result.set(session.storage_id, projectSession(session, rates, ranges[session.storage_id], dateScoped));
+    result.set(session.storage_id, projectSession(session, rates, ranges[session.storage_id], dateScoped, dateScoped
+      ? (ranges[session.storage_id]?.pricing ?? (ready && !ranges[session.storage_id] ? emptyPricing(session.harness, rates) : undefined))
+      : summaries[session.storage_id]?.pricing));
   }
   return result;
 }
 
-function priceBucket(bucket: TierBucket, harness: Harness, rates: RateCard): {
-  cost: number;
-  currency: string;
-  fallbackUsed: boolean;
-  unpriced: boolean;
-  basis: PricingBasis;
-} {
-  const useApi = harness === 'codex' && Object.keys(rates.api_models ?? {}).length > 0;
-  const priced = useApi
-    ? apiCostFromBuckets([bucket], rates, harness)
-    : creditsFromBuckets([bucket], rates, harness);
-  return {
-    cost: priced?.total ?? 0,
-    currency: useApi ? 'USD' : harnessCurrency(rates, harness),
-    fallbackUsed: (priced?.missingModels.length ?? 0) > 0,
-    unpriced: (priced?.unpricedModels.length ?? 0) > 0,
-    basis: priced?.byModel.find((mc) => mc.model === bucket.model)?.basis ?? 'unavailable',
-  };
+/** A successfully queried window with no record contains no usage. */
+export function emptyPricing(harness: Harness, rates: RateCard | null): RangePricing {
+  const plan = { total: 0, by_model: [], missing_models: [], unpriced_models: [] };
+  return { plan, api: harness === 'codex' && rates && Object.keys(rates.api_models).length ? plan : null };
 }
 
 export function aggregateModelMetrics<T extends SessionSummary>(
@@ -306,13 +296,17 @@ export function aggregateModelMetrics<T extends SessionSummary>(
 ): ModelMetric[] {
   if (!ranges || !rates) return [];
   const grouped = new Map<string, ModelMetric>();
+  const modelBases = new Map<string, PricingBasis>();
+  const confidence: Record<PricingBasis, number> = {
+    direct: 0, free_local: 0, subscription: 0, stale: 3, aliased: 1, floating_alias: 1, estimated: 2, fallback: 3, unavailable: 4,
+  };
 
   for (const session of sessions) {
     const range = ranges[session.storage_id];
     if (!range) continue;
     for (const bucket of range.buckets) {
       const key = `${session.harness}\0${bucket.model}`;
-      const priced = priceBucket(bucket, session.harness, rates);
+
       let metric = grouped.get(key);
       if (!metric) {
         metric = {
@@ -320,19 +314,30 @@ export function aggregateModelMetrics<T extends SessionSummary>(
           model: bucket.model,
           tokens: zeroTotals(),
           cost: 0,
-          currency: priced.currency,
+          currency: displayCurrency(session, rates),
           fallbackUsed: false,
           unpriced: false,
-          basis: priced.basis,
+          basis: 'unavailable',
           tools: zeroToolMetrics(),
         };
         grouped.set(key, metric);
       }
       addTotals(metric.tokens, bucket.tokens);
-      metric.cost += priced.cost;
-      metric.fallbackUsed ||= priced.fallbackUsed;
-      metric.unpriced ||= priced.unpriced;
-      metric.basis = priced.basis;
+
+    }
+    // by_model already combines service tiers; apply each model price once.
+    const surface = usesApiPricing(session, rates) ? range.pricing?.api : range.pricing?.plan;
+    for (const model of new Set(range.buckets.map((bucket) => bucket.model))) {
+      const metric = grouped.get(`${session.harness}\0${model}`)!;
+      const priced = surface?.by_model.find((entry) => entry.model === model);
+      metric.cost += priced?.cost ?? Number.NaN;
+      metric.fallbackUsed ||= priced?.basis === 'fallback';
+      metric.unpriced ||= priced?.unpriced ?? false;
+      const basis = priced?.basis ?? 'unavailable';
+      const key = `${session.harness}\0${model}`;
+      const previous = modelBases.get(key);
+      metric.basis = previous && confidence[previous] >= confidence[basis] ? previous : basis;
+      modelBases.set(key, metric.basis);
     }
     for (const [model, tools] of Object.entries(range.tool_metrics_by_model ?? {})) {
       const key = `${session.harness}\0${model}`;
@@ -347,7 +352,11 @@ export function aggregateModelMetrics<T extends SessionSummary>(
     }
   }
 
-  return [...grouped.values()].sort((a, b) => b.cost - a.cost);
+  return [...grouped.values()].sort((a, b) => {
+    if (!Number.isFinite(a.cost)) return Number.isFinite(b.cost) ? 1 : 0;
+    if (!Number.isFinite(b.cost)) return -1;
+    return b.cost - a.cost;
+  });
 }
 
 function csvCell(value: string | number | boolean | null): string {
@@ -391,7 +400,7 @@ export function exportRows<T extends SessionSummary>(
       output_tokens: tokens.output_tokens,
       reasoning_output_tokens: tokens.reasoning_output_tokens,
       total_tokens: tokens.total_tokens,
-      codex_credits: session.harness === 'codex' ? planCost : null,
+      codex_credits: session.harness === 'codex' && Number.isFinite(planCost) ? planCost : null,
       codex_estimated_api_usd: session.harness === 'codex' ? apiCost : null,
       codex_time_aware_api_usd: null,
       codex_time_aware_api_status: session.harness === 'codex' ? timeAwareApiStatus : null,
@@ -402,7 +411,7 @@ export function exportRows<T extends SessionSummary>(
       cache_write_pricing: session.harness === 'codex' && pricingCatalogAvailable
         ? 'unmodeled_not_observed'
         : null,
-      claude_estimated_usd: session.harness === 'claude_code' ? planCost : null,
+      claude_estimated_usd: session.harness === 'claude_code' && Number.isFinite(planCost) ? planCost : null,
       display_currency: currency,
       fallback_models: missingModels.join(';'),
       unpriced_models: unpricedModels.join(';'),

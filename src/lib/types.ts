@@ -12,7 +12,7 @@ export interface TokenTotals {
   cached_input_tokens: number;
   /** Anthropic cache-creation ("cache write") tokens: a subset of
    * input_tokens distinct from cached_input_tokens (cache reads). Always 0
-   * for Codex. See credits.ts eventCost — never double-price this against
+   * for Codex. See query.rs token_cost — never double-price this against
    * cached_input_tokens or the plain input rate. */
   cache_creation_input_tokens: number;
   output_tokens: number;
@@ -162,6 +162,8 @@ export interface SubscriptionUsageEntry {
 }
 
 export interface Session {
+  /** Attached by get_session_details only, never stored in Rust Session snapshots. */
+  pricing?: SessionPricing;
   id: string;
   /** Durable, harness-namespaced storage identity; provider id remains in `id`. */
   storage_id: string;
@@ -252,8 +254,69 @@ export interface ToolDimensionMetrics {
 /** Issue #44 open-set dimension kind. */
 export type ToolDimensionKind = 'mcp_server' | 'shell_family' | 'language' | 'context_source';
 
+/** Query-time pricing from the shared Rust service; mirrors query.rs. */
+export interface PricedModel {
+  model: string;
+  cost: number;
+  basis: PricingBasis;
+  unpriced: boolean;
+}
+
+export interface PricedSurface {
+  total: number;
+  by_model: PricedModel[];
+  missing_models: string[];
+  unpriced_models: string[];
+}
+
+export interface RangePricing {
+  plan: PricedSurface;
+  api: PricedSurface | null;
+}
+
+/** Response-only cumulative pricing; never derived from an unbounded event window. */
+export interface SummaryPricing {
+  pricing: RangePricing;
+  categories: Record<string, RangePricing>;
+}
+
+export interface TurnPrice {
+  cost: number;
+  fallback_used: boolean;
+  unpriced: boolean;
+  basis: PricingBasis;
+}
+
+export interface PricingRuleSummary {
+  id: string;
+  label: string;
+  from: string;
+  to: string | null;
+  provenance: PricingProvenance;
+}
+
+export interface TimeAwarePricing extends PricedSurface {
+  surface: PricingSurface;
+  applied_rate_periods: string[];
+  applied_modifiers: string[];
+  conditional_evidence_missing: string[];
+  cache_write_pricing_unmodeled: boolean;
+  unobserved_cache_write_input_multipliers: number[];
+  rules: PricingRuleSummary[];
+}
+
+export interface SessionPricing {
+  plan: PricedSurface;
+  flat_api: PricedSurface | null;
+  turn_prices: Record<string, { plan: TurnPrice; api: TurnPrice | null }>;
+  time_aware_api: TimeAwarePricing | null;
+}
+
 /** Date-scoped rollup returned by sessions_in_ranges. */
 export interface RangeTotals {
+  /** Authoritative server estimate for this event window.
+   * Absent in raw aggregates, older payloads, or when provider identity is unknown. */
+  pricing?: RangePricing;
   tokens: TokenTotals;
   buckets: TierBucket[];
   tool_metrics: ToolMetrics;
@@ -530,7 +593,7 @@ export interface ProviderDescriptor {
   archived_sources: boolean;
   session_index: boolean;
   /** Rate-card currency key this provider prices into (see `harnessCurrency`
-   *  in `credits.ts`). Codex uses "credits"; every other current provider
+   *  in `currency.ts`). Codex uses "credits"; every other current provider
    *  prices in "USD". */
   currency: string;
   /** Whether Odometer can open this provider's session via a native deep
@@ -666,8 +729,8 @@ export interface ModelRate {
    * cache-creation tokens must be priced at the ordinary `input` rate
    * (exactly today's pre-#42 accounting) rather than at zero. `0` is a
    * real, deliberate "this is free" claim, distinct from "unknown". Always
-   * resolve through `cacheCreationRate()` in credits.ts rather than reading
-   * this field directly. */
+   * price through Rust's ModelRate::cache_creation_rate; the frontend only
+   * edits this field and displays returned prices. */
   cache_creation_input: number | null;
   output: number;
   reasoning: number;
@@ -850,6 +913,8 @@ export interface ExternalEvent {
 }
 
 export interface CorrelationObservation {
+  /** Derived from each observation's buckets using the query's rate snapshot. */
+  pricing_by_harness?: Partial<Record<Harness, RangePricing>>;
   session_count: number;
   turn_count: number;
   session_duration_ms: number;

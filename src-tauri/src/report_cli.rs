@@ -18,9 +18,12 @@ use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::headless::{QueryKind, Request};
 use crate::history_store::HistoryStore;
 use crate::query::{range_report, RangeReport};
+use crate::query_control::QueryControl;
 use crate::rates::RateCard;
+use crate::report_output;
 
 /// Output shape a subcommand renders in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +68,17 @@ pub fn try_run_cli() -> bool {
             | "sessions"
             | "activity"
             | "verify"
+            | "models"
+            | "categories"
+            | "tools"
+            | "context"
+            | "findings"
+            | "diagnostics"
+            | "statusline"
+            | "export"
+            | "help"
+            | "--help"
+            | "-h"
     ) {
         return false;
     }
@@ -85,10 +99,53 @@ pub fn try_run_cli() -> bool {
 }
 
 fn run(command: &str, args: &[String]) -> Result<String> {
-    let format = parse_format(args)?;
+    if matches!(command, "help" | "--help" | "-h") || args == ["--help"] {
+        return Ok(help().into());
+    }
+    validate_arguments(command, args)?;
+    let report = if command == "export" {
+        flag_value(args, "--report")?.unwrap_or_else(|| "report".into())
+    } else {
+        command.to_owned()
+    };
+    let version = flag_value(args, "--schema-version")?
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(if command == "export" { 2 } else { 1 });
+    if !matches!(version, 1 | 2) {
+        bail!("unsupported --schema-version {version}; expected 1 or 2");
+    }
+    let format = if command == "export" && flag_value(args, "--format")?.is_none() {
+        Format::Json
+    } else {
+        parse_format(args)?
+    };
+    let markdown = flag_value(args, "--format")?.as_deref() == Some("markdown");
+    let output = if version == 2 || markdown {
+        let data: serde_json::Value =
+            serde_json::from_str(&run_native(&report, args, Format::Json)?)?;
+        let value = if version == 2 {
+            report_output::envelope(&report, data)
+        } else {
+            data
+        };
+        if markdown || format == Format::Text {
+            report_output::markdown(&report, &value, version)
+        } else if format == Format::Csv {
+            report_output::csv(&report, &value)
+        } else {
+            serde_json::to_string_pretty(&value)?
+        }
+    } else {
+        run_native(&report, args, format)?
+    };
+    report_output::check_size(output, QueryControl::default().max_output_bytes())
+}
+
+fn run_native(command: &str, args: &[String], format: Format) -> Result<String> {
     match command {
         "status" => run_status(format),
-        "report" => run_report(args, format),
+        "report" | "models" => run_report(args, format),
         "quota" => run_quota(format),
         "projects" => run_projects(args, format),
         "metrics" => run_metrics(args, format),
@@ -96,8 +153,193 @@ fn run(command: &str, args: &[String]) -> Result<String> {
         "sessions" => run_sessions(args, format),
         "activity" => run_activity(args, format),
         "verify" => run_verify(format),
+        "categories" | "tools" | "context" | "findings" | "diagnostics" | "statusline" => {
+            let control = if command == "statusline" {
+                QueryControl::with_timeout(std::time::Duration::from_millis(250))
+            } else {
+                QueryControl::default()
+            };
+            let rates = load_rates();
+            let config = Config::load_read_only()?;
+            let (from, to) = parse_window(args)?;
+            control.check()?;
+            let store = HistoryStore::default_path()
+                .and_then(|path| HistoryStore::open_read_only(&path, control.clone()));
+            let value = if command == "diagnostics" {
+                serde_json::to_value(crate::query::diagnostics_report(
+                    store.as_ref().ok(),
+                    &config,
+                    &rates,
+                    Utc::now(),
+                    args.iter().any(|arg| arg == "--include-paths"),
+                )?)?
+            } else {
+                crate::headless::execute(
+                    QueryKind::parse(command).context("unknown report")?,
+                    &store?,
+                    &rates,
+                    &config,
+                    &Request {
+                        from,
+                        to,
+                        utc_offset: *Local::now().offset(),
+                        ..Default::default()
+                    },
+                    Utc::now(),
+                )?
+            };
+            control.check()?;
+            match format {
+                Format::Json => Ok(serde_json::to_string_pretty(&value)?),
+                Format::Csv => Ok(report_output::csv(command, &value)),
+                Format::Text if command == "statusline" => Ok(statusline_text(&value)),
+                Format::Text => Ok(report_output::markdown(command, &value, 1)),
+            }
+        }
         other => bail!("unknown command '{other}'"),
     }
+}
+
+fn help() -> &'static str {
+    "Odometer read-only reports\n\n\
+Commands: status, report, models, projects, sessions, categories, tools, context,\n\
+          findings, diagnostics, metrics, activity, quota, mirrors, statusline, verify\n\
+Export:   export --report <command> [--format json|csv|markdown|text]\n\n\
+Options:  --from YYYY-MM-DD --to YYYY-MM-DD (inclusive UTC dates)\n\
+          --limit N (sessions only; default 20; 0 means all within query limits)\n\
+          --include-paths (projects/diagnostics only)\n\
+          --schema-version 1|2 (existing reports default 1; export defaults 2)\n\n\
+Version 1 preserves existing JSON/CSV contracts. Version 2 carries a common\n\
+export envelope and lossless typed CSV fields. No command parses transcripts,\n\
+migrates the ledger, or reaches the network. Open the desktop app to update history.\n\
+Queries have a 10-second deadline and 8 MiB output limit; statusline has 250 ms."
+}
+
+/// Reject malformed requests before opening a ledger, rather than silently
+/// widening a report when a date or limit was misspelled.
+fn validate_arguments(command: &str, args: &[String]) -> Result<()> {
+    let report = if command == "export" {
+        flag_value(args, "--report")?.unwrap_or_else(|| "report".into())
+    } else {
+        command.to_owned()
+    };
+    if QueryKind::parse(&report).is_none() && report != "verify" {
+        bail!("unknown report '{report}'");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !seen.insert(flag) {
+            bail!("duplicate option '{flag}'");
+        }
+        let takes_value = match flag {
+            "--format" | "--schema-version" => true,
+            "--report" if command == "export" => true,
+            "--from" | "--to"
+                if matches!(
+                    report.as_str(),
+                    "report"
+                        | "models"
+                        | "projects"
+                        | "sessions"
+                        | "categories"
+                        | "tools"
+                        | "context"
+                        | "findings"
+                        | "metrics"
+                        | "activity"
+                ) =>
+            {
+                true
+            }
+            "--limit" if report == "sessions" => true,
+            "--include-paths" if matches!(report.as_str(), "projects" | "diagnostics") => false,
+            _ => bail!("unknown or unsupported option '{flag}' for {report}"),
+        };
+        if takes_value {
+            let value = args
+                .get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .with_context(|| format!("{flag} needs a value"))?;
+            if flag == "--limit" {
+                let limit = value
+                    .parse::<usize>()
+                    .context("--limit must be a nonnegative integer")?;
+                if limit > 50_000 {
+                    bail!("--limit exceeds the 50000-session query limit");
+                }
+            }
+            index += 1;
+        }
+        index += 1;
+    }
+    parse_window(args)?;
+    Ok(())
+}
+
+fn statusline_text(value: &serde_json::Value) -> String {
+    let tokens = value
+        .pointer("/tokens/total_tokens")
+        .and_then(serde_json::Value::as_i64);
+    let mut output = format!(
+        "Odometer · {} tokens today",
+        tokens
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unavailable".into())
+    );
+    if let Some(totals) = value
+        .get("cost_by_currency")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (currency, amount) in totals {
+            if let Some(amount) = amount.as_f64() {
+                output.push_str(&format!(
+                    " · {amount:.4} {}",
+                    currency.replace(['\r', '\n', '\u{1b}'], " ")
+                ));
+            }
+        }
+    }
+    let providers = value.get("providers").and_then(serde_json::Value::as_array);
+    if value
+        .get("pricing_complete")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+        || providers.is_some_and(|providers| {
+            providers.iter().any(|provider| {
+                provider
+                    .get("pricing")
+                    .is_none_or(serde_json::Value::is_null)
+                    || provider
+                        .pointer("/pricing/plan/unpriced_models")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|models| !models.is_empty())
+                    || provider
+                        .pointer("/pricing/plan/by_model")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|models| {
+                            models.iter().any(|model| {
+                                model.get("basis").and_then(serde_json::Value::as_str)
+                                    == Some("unavailable")
+                            })
+                        })
+            })
+        })
+    {
+        output.push_str(" · incomplete pricing");
+    }
+    if providers.is_some_and(|providers| {
+        providers.iter().any(|provider| {
+            provider
+                .pointer("/pricing/plan/missing_models")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|models| !models.is_empty())
+        })
+    }) {
+        output.push_str(" · estimated");
+    }
+    output
 }
 
 fn parse_format(args: &[String]) -> Result<Format> {
@@ -107,7 +349,8 @@ fn parse_format(args: &[String]) -> Result<Format> {
             "json" => Ok(Format::Json),
             "csv" => Ok(Format::Csv),
             "text" => Ok(Format::Text),
-            other => bail!("unknown --format '{other}'; expected json, csv, or text"),
+            "markdown" => Ok(Format::Json),
+            other => bail!("unknown --format '{other}'; expected json, csv, markdown, or text"),
         },
     }
 }
@@ -135,6 +378,9 @@ fn flag_value(args: &[String], name: &str) -> Result<Option<String>> {
 fn parse_date(value: &str, end_of_day: bool) -> Result<DateTime<Utc>> {
     let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .with_context(|| format!("could not read '{value}' as a YYYY-MM-DD date"))?;
+    if date.format("%Y-%m-%d").to_string() != value {
+        bail!("'{value}' must use YYYY-MM-DD date format");
+    }
     let time = if end_of_day {
         date.and_hms_milli_opt(23, 59, 59, 999)
     } else {
@@ -176,8 +422,8 @@ fn load_rates() -> RateCard {
 fn open_ledger() -> Result<HistoryStore> {
     let path =
         HistoryStore::default_path().context("could not resolve the durable history location")?;
-    HistoryStore::open(&path)
-        .with_context(|| format!("could not open the durable history at {}", path.display()))
+    HistoryStore::open_read_only(&path, QueryControl::default())
+        .context("could not open durable history; open the desktop app to prepare it")
 }
 
 fn run_status(format: Format) -> Result<String> {
@@ -193,8 +439,8 @@ pub fn render_status(
     format: Format,
 ) -> Result<String> {
     let sessions = store
-        .and_then(|store| store.session_keys().ok())
-        .map(|keys| keys.len());
+        .and_then(|store| store.session_count().ok())
+        .and_then(|count| usize::try_from(count).ok());
     let ledger_bytes = store.and_then(|store| store.database_footprint().total_bytes());
 
     let status = StatusReport {
@@ -244,7 +490,7 @@ pub fn render_status(
 fn run_report(args: &[String], format: Format) -> Result<String> {
     let store = open_ledger()?;
     let rates = load_rates();
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_read_only()?;
     report_from(&store, &rates, &config, args, format)
 }
 
@@ -266,21 +512,12 @@ pub fn report_from(
 
 /// Resolves a session key to the provider that owns it.
 ///
-/// Storage ids are `<provider>:<id>`, so the provider is the prefix. A key
-/// that does not carry one falls back to the first configured provider
-/// rather than guessing a specific vendor.
-fn harness_resolver(config: &Config) -> impl Fn(&str) -> String + '_ {
-    move |key: &str| {
-        key.split_once(':')
-            .map(|(provider, _)| provider.to_owned())
-            .unwrap_or_else(|| {
-                config
-                    .providers
-                    .keys()
-                    .next()
-                    .map(|id| id.as_str().to_owned())
-                    .unwrap_or_default()
-            })
+/// Only a registered, validated provider prefix establishes identity.
+fn harness_resolver(_config: &Config) -> impl Fn(&str) -> String + '_ {
+    |key: &str| {
+        crate::query::provider_for_key(key)
+            .map(|provider| provider.as_str().to_owned())
+            .unwrap_or_default()
     }
 }
 
@@ -294,8 +531,8 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
             for usage in &report.by_model {
                 out.push_str(&format!(
                     "{},{},{},{},{},{},{},{},{}\n",
-                    usage.model,
-                    usage.harness,
+                    csv_field(&usage.model),
+                    csv_field(&usage.harness),
                     usage.tokens.total_tokens,
                     usage.tokens.input_tokens,
                     usage.tokens.cached_input_tokens,
@@ -305,7 +542,7 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
                         .cost
                         .map(|cost| format!("{cost:.6}"))
                         .unwrap_or_default(),
-                    usage.currency
+                    csv_field(&usage.currency)
                 ));
             }
             out
@@ -483,7 +720,7 @@ pub fn activity_from(
 fn run_sessions(args: &[String], format: Format) -> Result<String> {
     let store = open_ledger()?;
     let rates = load_rates();
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_read_only()?;
     sessions_from(&store, &rates, &config, args, format)
 }
 
@@ -643,7 +880,7 @@ pub fn render_mirrors(store: &HistoryStore, format: Format) -> Result<String> {
 fn run_metrics(args: &[String], format: Format) -> Result<String> {
     let store = open_ledger()?;
     let rates = load_rates();
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_read_only()?;
     metrics_from(&store, &rates, &config, args, format)
 }
 
@@ -720,7 +957,7 @@ pub fn metrics_from(
 fn run_projects(args: &[String], format: Format) -> Result<String> {
     let store = open_ledger()?;
     let rates = load_rates();
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_read_only()?;
     projects_from(&store, &rates, &config, args, format)
 }
 
@@ -793,6 +1030,9 @@ pub fn projects_from(
                 for (currency, cost) in &project.cost_by_currency {
                     out.push_str(&format!("  {cost:.4} {currency}"));
                 }
+                if !project.pricing_complete {
+                    out.push_str("  [incomplete pricing; subtotal only]");
+                }
                 out.push('\n');
             }
             if report.sessions_without_project > 0 {
@@ -818,11 +1058,7 @@ pub fn projects_from(
 /// Quotes a CSV field that could contain a comma. Project labels are
 /// user-supplied aliases, so this is not hypothetical.
 fn csv_field(value: &str) -> String {
-    if value.contains(',') || value.contains('"') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_owned()
-    }
+    report_output::csv_field(value)
 }
 
 fn run_quota(format: Format) -> Result<String> {
@@ -1131,5 +1367,89 @@ mod tests {
         let resolve = harness_resolver(&config);
         assert_eq!(resolve("codex:abc123"), "codex");
         assert_eq!(resolve("claude_code:xyz"), "claude_code");
+        assert_eq!(resolve("missing-prefix"), "");
+        assert_eq!(resolve("codex:"), "");
+        assert_eq!(resolve("unknown:xyz"), "");
+    }
+
+    #[test]
+    fn bad_options_are_rejected_before_opening_any_history() {
+        for (command, raw) in [
+            ("report", vec!["--form", "json"]),
+            (
+                "report",
+                vec!["--from", "2026-08-01", "--from", "2026-08-02"],
+            ),
+            ("report", vec!["--from"]),
+            ("report", vec!["--from", "2026-8-1"]),
+            ("report", vec!["--from", "2026-08-02", "--to", "2026-08-01"]),
+            ("statusline", vec!["--from", "2026-08-01"]),
+            ("tools", vec!["--include-paths"]),
+            ("sessions", vec!["--limit", "-1"]),
+            ("sessions", vec!["--limit", "50001"]),
+            ("export", vec!["--report", "unknown"]),
+        ] {
+            let args = raw.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert!(
+                validate_arguments(command, &args).is_err(),
+                "{command} {args:?}"
+            );
+        }
+        assert!(validate_arguments("sessions", &["--limit".into(), "0".into()]).is_ok());
+        assert!(validate_arguments(
+            "export",
+            &[
+                "--report".into(),
+                "categories".into(),
+                "--format".into(),
+                "markdown".into()
+            ]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn export_schema_rejects_unknown_versions_without_reading_history() {
+        assert!(run("export", &["--schema-version".into(), "3".into()])
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
+        assert!(run("report", &["--format".into(), "yaml".into()]).is_err());
+        assert!(run("help", &[]).unwrap().contains("--schema-version"));
+    }
+
+    #[test]
+    fn statusline_keeps_currencies_and_incomplete_pricing_visible() {
+        let rendered = statusline_text(&serde_json::json!({
+            "tokens": {"total_tokens": 1200},
+            "cost_by_currency": {"credits": 2.0, "USD": 0.25},
+            "providers": [{"pricing": null}, {"pricing": {"plan": {
+                "unpriced_models": [], "missing_models": ["future-model"], "by_model": []
+            }}}]
+        }));
+        assert!(rendered.contains("1200 tokens today"));
+        assert!(rendered.contains("2.0000 credits"));
+        assert!(rendered.contains("0.2500 USD"));
+        assert!(rendered.contains("incomplete pricing"));
+        assert!(rendered.contains("estimated"));
+        assert_eq!(rendered.lines().count(), 1);
+    }
+
+    #[test]
+    fn export_envelope_preserves_pricing_provenance_without_changing_v1() {
+        let native: serde_json::Value =
+            serde_json::from_str(&render_report(&sample_report(), Format::Json).unwrap()).unwrap();
+        let exported = report_output::envelope("models", native.clone());
+        assert_eq!(exported["schema_version"], 2);
+        assert_eq!(exported["data"], native);
+        assert_eq!(
+            exported["data"]["by_model"][1]["cost"],
+            serde_json::Value::Null
+        );
+        assert_eq!(exported["data"]["by_model"][1]["basis"], "unavailable");
+        let csv = report_output::csv("models", &exported);
+        assert!(csv.contains("/data/by_model/1/cost,null,null"));
+        assert!(csv.contains("/data/by_model/1/basis,string,"));
+        assert!(report_output::markdown("models", &exported, 2).contains("/data/by_model/1/cost"));
     }
 }

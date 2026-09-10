@@ -849,8 +849,8 @@ impl RateCard {
 /// charge is partly a fallback-priced estimate, not a direct price —
 /// downgrade so the UI doesn't render it as one. Other bases (`Fallback`,
 /// `Unavailable`, `FreeLocal`, `Stale`, ...) already carry their own, more
-/// specific provenance and are left untouched. Mirrors
-/// `downgradeForCacheCreationFallback` in credits.ts — keep both in sync.
+/// specific provenance and are left untouched. All pricing consumers use
+/// this shared policy through the Rust query service.
 pub fn downgrade_for_cache_creation_fallback(
     basis: PricingBasis,
     rate: &ModelRate,

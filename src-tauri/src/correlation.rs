@@ -46,6 +46,8 @@ pub struct CorrelationObservation {
     pub session_duration_ms: u64,
     pub tokens: TokenTotals,
     pub buckets_by_harness: BTreeMap<Harness, Vec<TierBucket>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pricing_by_harness: BTreeMap<Harness, crate::query::RangePricing>,
     pub tool_metrics: ToolMetrics,
 }
 

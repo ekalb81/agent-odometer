@@ -18,7 +18,7 @@
 //! of Tauri types so a CLI, a local API, or an MCP server can call it with
 //! nothing but a `HistoryStore` and a `RateCard`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Result;
 use chrono::{DateTime, TimeZone, Timelike, Utc};
@@ -26,7 +26,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::history_store::HistoryStore;
 use crate::model::{RangeTotals, TierBucket, TokenTotals};
-use crate::provider::codex_provider_id;
+use crate::provider::{codex_provider_id, ProviderId, ProviderRegistry};
+pub use crate::query_desktop::*;
+use crate::query_reports::least_confident_basis;
+pub use crate::query_reports::*;
 use crate::rates::{ModelRate, PricingBasis, RateCard};
 
 /// Which rate table a query prices against.
@@ -205,6 +208,56 @@ pub struct RangeReport {
     pub unpriced_models: Vec<String>,
 }
 
+fn report_provider_known(harness: &str) -> bool {
+    ProviderId::new(harness)
+        .ok()
+        .is_some_and(|id| ProviderRegistry::builtin().adapter(&id).is_some())
+}
+
+fn report_price_tokens(
+    rates: &RateCard,
+    harness: &str,
+    bucket: &TierBucket,
+    now: DateTime<Utc>,
+) -> PricedAmount {
+    if !report_provider_known(harness) {
+        return PricedAmount {
+            amount: None,
+            basis: PricingBasis::Unavailable,
+            resolved_model: bucket.model.clone(),
+        };
+    }
+    price_tokens(
+        rates,
+        harness,
+        &bucket.model,
+        bucket.service_tier.as_deref(),
+        &bucket.tokens,
+        RateTable::Plan,
+        now,
+    )
+}
+
+fn report_price_buckets(
+    store: &HistoryStore,
+    rates: &RateCard,
+    harness: &str,
+    buckets: &[TierBucket],
+    now: DateTime<Utc>,
+) -> Result<(Option<f64>, Vec<String>)> {
+    if !report_provider_known(harness) {
+        let mut missing = BTreeSet::new();
+        for bucket in buckets {
+            store.check_query()?;
+            missing.insert(bucket.model.clone());
+        }
+        return Ok((None, missing.into_iter().collect()));
+    }
+    price_buckets_controlled(rates, harness, buckets, RateTable::Plan, now, || {
+        store.check_query()
+    })
+}
+
 /// The schema version of [`RangeReport`]. Bump on any incompatible change;
 /// additive optional fields do not require one.
 pub const RANGE_REPORT_SCHEMA_VERSION: u32 = 1;
@@ -232,10 +285,12 @@ pub fn range_report(
     // Keyed by (harness, model), not model alone: two providers can use the
     // same model name, and folding them together would attribute all of that
     // usage to whichever session was seen first — including its currency.
-    let mut by_model: BTreeMap<(String, String), TokenTotals> = BTreeMap::new();
+    let mut by_model: BTreeMap<(String, String), (TokenTotals, Option<f64>, PricingBasis)> =
+        BTreeMap::new();
     let mut sessions_with_usage = 0usize;
 
     for key in &keys {
+        store.check_query()?;
         let Some(range) = totals.get(key) else {
             continue;
         };
@@ -246,32 +301,33 @@ pub fn range_report(
         accumulate(&mut tokens, &range.tokens);
         let harness = harness_for(key);
         for bucket in &range.buckets {
+            store.check_query()?;
+            // Price before merging tiers: flattening them into model totals
+            // loses the fast-service multiplier and cache-write provenance.
+            let priced = report_price_tokens(rates, &harness, bucket, now);
             let entry = by_model
                 .entry((harness.clone(), bucket.model.clone()))
-                .or_default();
-            accumulate(entry, &bucket.tokens);
+                .or_insert_with(|| (TokenTotals::default(), Some(0.0), priced.basis));
+            accumulate(&mut entry.0, &bucket.tokens);
+            entry.1 = entry
+                .1
+                .zip(priced.amount)
+                .map(|(total, amount)| total + amount);
+            entry.2 = least_confident_basis(entry.2, priced.basis);
         }
     }
 
     let mut cost_by_currency: BTreeMap<String, f64> = BTreeMap::new();
     let mut unpriced: BTreeSet<String> = BTreeSet::new();
     let mut models = Vec::with_capacity(by_model.len());
-    for ((harness, model), model_tokens) in by_model {
+    for ((harness, model), (model_tokens, amount, basis)) in by_model {
+        store.check_query()?;
         let currency = rates
             .currencies
             .get(&harness)
             .cloned()
             .unwrap_or_else(|| rates.currency.clone());
-        let priced = price_tokens(
-            rates,
-            &harness,
-            &model,
-            None,
-            &model_tokens,
-            RateTable::Plan,
-            now,
-        );
-        match priced.amount {
+        match amount {
             Some(amount) => {
                 *cost_by_currency.entry(currency.clone()).or_insert(0.0) += amount;
             }
@@ -283,9 +339,9 @@ pub fn range_report(
             model,
             harness,
             tokens: model_tokens,
-            cost: priced.amount,
+            cost: amount,
             currency,
-            basis: priced.basis,
+            basis,
         });
     }
 
@@ -345,9 +401,9 @@ pub struct PricedModel {
 /// is enough for a CLI line but loses the per-model breakdown, the
 /// per-model basis, and the difference between "no rate published" and
 /// "explicitly unpriceable" — all of which the desktop renders. That gap is
-/// why the two engines could not share an aggregation, so this closes it:
-/// the shape here is the one `credits.ts`'s `bucketsCost` produces, and
-/// `tests/pricing_conformance.rs` asserts they agree case for case.
+/// why desktop, CLI, and MCP share this aggregation. The frozen expectations
+/// in `tests/pricing_conformance.rs` preserve the accepted desktop values
+/// without retaining a second pricing engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PricedSurface {
     pub total: f64,
@@ -359,12 +415,62 @@ pub struct PricedSurface {
     pub unpriced_models: Vec<String>,
 }
 
+/// Derived pricing attached only at the range-query response boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RangePricing {
+    pub plan: PricedSurface,
+    pub api: Option<PricedSurface>,
+}
+
+/// Enrich final range maps without changing their raw accounting data.
+/// Resident summaries are authoritative for identity; nonresident entries
+/// may use a durable key only when its provider prefix is registered.
+pub fn enrich_range_pricing(
+    ranges: &mut [HashMap<String, RangeTotals>],
+    rates: &RateCard,
+    now: DateTime<Utc>,
+    resident_provider: impl Fn(&str) -> Option<ProviderId>,
+) {
+    for range in ranges {
+        for (key, totals) in range {
+            let provider = resident_provider(key).or_else(|| {
+                let (prefix, suffix) = key.split_once(':')?;
+                if suffix.is_empty() {
+                    return None;
+                }
+                let provider = ProviderId::new(prefix).ok()?;
+                ProviderRegistry::builtin().adapter(&provider)?;
+                Some(provider)
+            });
+            totals.pricing = provider.and_then(|provider| {
+                price_buckets_detailed(
+                    rates,
+                    provider.as_str(),
+                    &totals.buckets,
+                    RateTable::Plan,
+                    now,
+                )
+                .map(|plan| RangePricing {
+                    plan,
+                    api: price_buckets_detailed(
+                        rates,
+                        provider.as_str(),
+                        &totals.buckets,
+                        RateTable::Api,
+                        now,
+                    ),
+                })
+            });
+        }
+    }
+}
+
 /// Prices a window's buckets against one rate table, with full provenance.
 ///
 /// `None` means the table does not apply to this harness at all — the API
 /// table for a non-Codex session — which is a different answer from "priced
 /// at zero" and lets a caller hide the column rather than render a nought.
-/// Mirrors `apiCostFromBuckets` returning null.
+/// The serialized API field is null for this unavailable surface.
 pub fn price_buckets_detailed(
     rates: &RateCard,
     harness: &str,
@@ -372,10 +478,24 @@ pub fn price_buckets_detailed(
     table: RateTable,
     now: DateTime<Utc>,
 ) -> Option<PricedSurface> {
+    price_buckets_detailed_controlled(rates, harness, buckets, table, now, || Ok(()))
+        .expect("unrestricted pricing does not cancel")
+}
+
+/// Same aggregation with request checkpoints for headless queries.
+pub(crate) fn price_buckets_detailed_controlled(
+    rates: &RateCard,
+    harness: &str,
+    buckets: &[TierBucket],
+    table: RateTable,
+    now: DateTime<Utc>,
+    check: impl Fn() -> Result<()>,
+) -> Result<Option<PricedSurface>> {
+    check()?;
     if table == RateTable::Api
         && (harness != codex_provider_id().as_str() || rates.api_models.is_empty())
     {
-        return None;
+        return Ok(None);
     }
 
     let rate_table = match table {
@@ -389,6 +509,7 @@ pub fn price_buckets_detailed(
     let mut total = 0.0;
 
     for bucket in buckets {
+        check()?;
         let is_unpriced = rates.unpriced_models.contains(&bucket.model);
         let resolution = rates.resolve_model_pricing(&bucket.model, harness, rate_table, now);
 
@@ -444,7 +565,7 @@ pub fn price_buckets_detailed(
         }
     }
 
-    Some(PricedSurface {
+    Ok(Some(PricedSurface {
         total,
         by_model: by_model
             .into_iter()
@@ -457,7 +578,7 @@ pub fn price_buckets_detailed(
             .collect(),
         missing_models: missing.into_iter().collect(),
         unpriced_models: unpriced.into_iter().collect(),
-    })
+    }))
 }
 
 /// Sums the priceable buckets in `buckets`, returning the total and the
@@ -472,10 +593,24 @@ pub fn price_buckets(
     table: RateTable,
     now: DateTime<Utc>,
 ) -> (Option<f64>, Vec<String>) {
+    price_buckets_controlled(rates, harness, buckets, table, now, || Ok(()))
+        .expect("unrestricted pricing does not cancel")
+}
+
+fn price_buckets_controlled(
+    rates: &RateCard,
+    harness: &str,
+    buckets: &[TierBucket],
+    table: RateTable,
+    now: DateTime<Utc>,
+    check: impl Fn() -> Result<()>,
+) -> Result<(Option<f64>, Vec<String>)> {
+    check()?;
     let mut total = 0.0;
     let mut priced = false;
     let mut omitted: BTreeSet<String> = BTreeSet::new();
     for bucket in buckets {
+        check()?;
         let amount = price_tokens(
             rates,
             harness,
@@ -495,7 +630,7 @@ pub fn price_buckets(
             }
         }
     }
-    (priced.then_some(total), omitted.into_iter().collect())
+    Ok((priced.then_some(total), omitted.into_iter().collect()))
 }
 
 /// How far back a quota query loads sessions.
@@ -555,6 +690,9 @@ pub struct ProjectUsage {
     /// Totals keyed by currency, never summed across them — the same rule
     /// [`RangeReport`] follows and for the same reason.
     pub cost_by_currency: BTreeMap<String, f64>,
+    pub unpriced_models: Vec<String>,
+    /// False when a subtotal omits usage without a model/provider/rate.
+    pub pricing_complete: bool,
 }
 
 /// A per-project usage report (issue #47's `projects` command, over #41's
@@ -635,13 +773,13 @@ pub fn project_report(
         label_is_path: bool,
         sessions: usize,
         tokens: TokenTotals,
-        buckets: Vec<TierBucket>,
-        harness: String,
+        buckets: BTreeMap<String, Vec<TierBucket>>,
     }
     let mut by_project: BTreeMap<String, Accumulated> = BTreeMap::new();
     let mut without_project = 0usize;
 
     for row in &rows {
+        store.check_query()?;
         let Some(range) = totals.get(&row.session_key) else {
             continue;
         };
@@ -674,46 +812,59 @@ pub fn project_report(
             label_is_path: !aliased && row.provenance.as_deref() == Some("fallback_path_identity"),
             sessions: 0,
             tokens: TokenTotals::default(),
-            buckets: Vec::new(),
-            harness: harness_for(&row.session_key),
+            buckets: BTreeMap::new(),
         });
         entry.sessions += 1;
         accumulate(&mut entry.tokens, &range.tokens);
-        entry.buckets.extend(range.buckets.iter().cloned());
+        entry
+            .buckets
+            .entry(harness_for(&row.session_key))
+            .or_default()
+            .extend(range.buckets.iter().cloned());
     }
 
     let projects = by_project
         .into_iter()
         .map(|(project_key, accumulated)| {
+            store.check_query()?;
             // Only the path-identity case carries a path: a repository or
             // workspace root yields a name.
             let label_is_path = accumulated.label_is_path;
             let mut cost_by_currency: BTreeMap<String, f64> = BTreeMap::new();
-            let currency = rates
-                .currencies
-                .get(&accumulated.harness)
-                .cloned()
-                .unwrap_or_else(|| rates.currency.clone());
-            let (cost, _unpriced) = price_buckets(
-                rates,
-                &accumulated.harness,
-                &accumulated.buckets,
-                RateTable::Plan,
-                now,
-            );
-            if let Some(cost) = cost {
-                cost_by_currency.insert(currency, cost);
+            let mut unpriced_models = BTreeSet::new();
+            let mut attributed_tokens = 0;
+            let mut pricing_complete = true;
+            for (harness, buckets) in &accumulated.buckets {
+                store.check_query()?;
+                attributed_tokens += buckets
+                    .iter()
+                    .map(|bucket| bucket.tokens.total_tokens)
+                    .sum::<u64>();
+                let currency = rates
+                    .currencies
+                    .get(harness)
+                    .cloned()
+                    .unwrap_or_else(|| rates.currency.clone());
+                let (cost, unpriced) = report_price_buckets(store, rates, harness, buckets, now)?;
+                pricing_complete &= cost.is_some() && unpriced.is_empty();
+                unpriced_models.extend(unpriced);
+                if let Some(cost) = cost {
+                    *cost_by_currency.entry(currency).or_default() += cost;
+                }
             }
-            ProjectUsage {
+            Ok(ProjectUsage {
                 project_key,
                 label: accumulated.label,
                 label_is_path,
                 sessions: accumulated.sessions,
+                pricing_complete: pricing_complete
+                    && attributed_tokens >= accumulated.tokens.total_tokens,
                 tokens: accumulated.tokens,
                 cost_by_currency,
-            }
+                unpriced_models: unpriced_models.into_iter().collect(),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     Ok(ProjectReport {
         schema_version: PROJECT_REPORT_SCHEMA_VERSION,
@@ -821,6 +972,7 @@ pub fn workflow_metrics(
     let mut total_priceable_tokens = 0f64;
 
     for key in &keys {
+        store.check_query()?;
         let Some(range) = totals.get(key) else {
             continue;
         };
@@ -833,15 +985,8 @@ pub fn workflow_metrics(
 
         let harness = harness_for(key);
         for bucket in &range.buckets {
-            let priced = price_tokens(
-                rates,
-                &harness,
-                &bucket.model,
-                bucket.service_tier.as_deref(),
-                &bucket.tokens,
-                RateTable::Plan,
-                now,
-            );
+            store.check_query()?;
+            let priced = report_price_tokens(rates, &harness, bucket, now);
             let bucket_tokens = bucket.tokens.total_tokens as f64;
             total_priceable_tokens += bucket_tokens;
             // Only a direct or aliased resolution is real coverage. A
@@ -973,6 +1118,7 @@ pub fn session_report(
 
     let mut sessions = Vec::new();
     for key in &keys {
+        store.check_query()?;
         let Some(range) = totals.get(key) else {
             continue;
         };
@@ -981,7 +1127,7 @@ pub fn session_report(
         }
         let harness = harness_for(key);
         let (cost, unpriced_models) =
-            price_buckets(rates, &harness, &range.buckets, RateTable::Plan, now);
+            report_price_buckets(store, rates, &harness, &range.buckets, now)?;
         let currency = rates
             .currencies
             .get(&harness)
@@ -1157,4 +1303,87 @@ pub fn convert_totals(rates: &RateCard, totals: &BTreeMap<String, f64>) -> Vec<C
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod range_pricing_tests {
+    use super::*;
+
+    fn raw_range() -> RangeTotals {
+        serde_json::from_value(serde_json::json!({
+            "tokens": TokenTotals::default(),
+            "buckets": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn older_range_payloads_remain_unpriced_and_omit_pricing() {
+        let range = raw_range();
+        assert!(range.pricing.is_none());
+        assert!(serde_json::to_value(range)
+            .unwrap()
+            .get("pricing")
+            .is_none());
+    }
+
+    #[test]
+    fn enrichment_uses_resident_identity_then_only_registered_key_prefixes() {
+        let mut ranges = vec![HashMap::from([
+            ("legacy-resident-id".to_owned(), raw_range()),
+            ("codex:thread:resident-claude".to_owned(), raw_range()),
+            ("codex:thread:archived".to_owned(), raw_range()),
+            ("claude_code:subagent:parent:child".to_owned(), raw_range()),
+            ("gemini_cli:session:archived".to_owned(), raw_range()),
+            ("unknown:session:archived".to_owned(), raw_range()),
+            ("CODEX:thread:archived".to_owned(), raw_range()),
+            ("codex:".to_owned(), raw_range()),
+            ("unqualified".to_owned(), raw_range()),
+        ])];
+        let mut rates = RateCard::default();
+        rates.api_models.insert(
+            "synthetic".into(),
+            ModelRate {
+                input: 1.0,
+                cached_input: 0.5,
+                cache_creation_input: Some(1.25),
+                output: 2.0,
+                reasoning: 2.0,
+            },
+        );
+        enrich_range_pricing(&mut ranges, &rates, Utc::now(), |key| match key {
+            "legacy-resident-id" => Some(codex_provider_id()),
+            "codex:thread:resident-claude" => Some(crate::provider::claude_code_provider_id()),
+            _ => None,
+        });
+        for key in ["legacy-resident-id", "codex:thread:archived"] {
+            let pricing = ranges[0][key].pricing.as_ref().unwrap();
+            assert_eq!(pricing.plan.total, 0.0);
+            assert_eq!(pricing.api.as_ref().unwrap().total, 0.0);
+        }
+        for key in [
+            "codex:thread:resident-claude",
+            "claude_code:subagent:parent:child",
+            "gemini_cli:session:archived",
+        ] {
+            let pricing = ranges[0][key].pricing.as_ref().unwrap();
+            assert_eq!(pricing.plan.total, 0.0);
+            assert!(pricing.api.is_none());
+        }
+        for key in [
+            "unknown:session:archived",
+            "CODEX:thread:archived",
+            "codex:",
+            "unqualified",
+        ] {
+            assert!(ranges[0][key].pricing.is_none(), "{key}");
+        }
+        // The response remains deserializable, including explicit null API.
+        let wire = serde_json::to_value(&ranges).unwrap();
+        let decoded: Vec<HashMap<String, RangeTotals>> = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            decoded[0]["legacy-resident-id"].pricing,
+            ranges[0]["legacy-resident-id"].pricing
+        );
+    }
 }

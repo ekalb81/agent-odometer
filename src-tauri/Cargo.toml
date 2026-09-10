@@ -36,7 +36,7 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
 gix = { version = "0.86", default-features = false, features = ["sha1"] }
-rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "hooks"] }
 tauri-plugin-opener = "2"
 tempfile = "3"
 

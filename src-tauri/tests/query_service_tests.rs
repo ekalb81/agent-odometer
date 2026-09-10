@@ -2465,11 +2465,11 @@ fn verification_renders_json_and_csv_with_every_check() {
 
 #[test]
 fn a_report_with_a_failed_check_is_not_ok() {
-    let executable = std::path::PathBuf::from(env!("CARGO_BIN_EXE_agent-odometer"));
-    let good = odometer_lib::verify::verify(&executable, Utc::now());
+    // A successful handshake with the real binary is covered above. Its
+    // full verdict also depends on the user's local ledger, which may be
+    // absent, outdated, or busy and must not be created by verification.
     let bad = odometer_lib::verify::verify(std::path::Path::new("cargo"), Utc::now());
 
-    assert!(good.ok, "the real binary verifies");
     assert!(!bad.ok, "a non-server binary does not");
     assert!(
         odometer_lib::verify::render(&bad).contains("NOT verified"),

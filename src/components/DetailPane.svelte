@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { PricingBasis, Session } from '../lib/types';
   import { rates } from '../lib/stores/rates';
-  import { computeSessionApiCostScenarios, computeSessionCredits, fallbackModelName, formatCredits, harnessCurrency, tokensCost } from '../lib/credits';
+  import { formatCredits, harnessCurrency } from '../lib/currency';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
   import { providersStore } from '../lib/stores/providers.svelte';
   import {
@@ -150,31 +150,14 @@
   );
   const ctxBarWidth = $derived(ctxPercent !== null ? Math.min(ctxPercent, 100) : 0);
 
-  const sessionCredits = $derived(
-    session && $rates ? computeSessionCredits(session, $rates) : null,
-  );
+  const sessionCredits = $derived(session?.pricing?.plan ?? null);
 
   // What the same usage would cost à la carte at OpenAI API rates —
   // informational for subscription users; codex sessions only.
-  const apiCostScenarios = $derived(
-    session && $rates
-      ? computeSessionApiCostScenarios(session, $rates)
-      : null,
-  );
-  const flatApiReference = $derived(apiCostScenarios?.flat ?? null);
+  const flatApiReference = $derived(session?.pricing?.flat_api ?? null);
   const sessionApiCost = $derived(session?.harness === 'codex' ? flatApiReference : null);
-  const timeAwareApiScenario = $derived(apiCostScenarios?.timeAware ?? null);
-  const timeAwarePricingRules = $derived((() => {
-    if (!$rates || !timeAwareApiScenario) return [];
-    const ids = new Set([
-      ...timeAwareApiScenario.appliedRatePeriods,
-      ...timeAwareApiScenario.appliedModifiers,
-    ]);
-    return [
-      ...$rates.pricing_catalog.rate_periods,
-      ...$rates.pricing_catalog.conditional_modifiers,
-    ].filter((rule) => ids.has(rule.id));
-  })());
+  const timeAwareApiScenario = $derived(session?.pricing?.time_aware_api ?? null);
+  const timeAwarePricingRules = $derived(timeAwareApiScenario?.rules ?? []);
 
   // The headline money figure: Codex shows the API-rate estimate, Claude the
   // Anthropic-rate cost.
@@ -190,20 +173,21 @@
   // so per-turn amounts reconcile with the displayed total.
   const turnCostById = $derived((() => {
     const m = new Map<string, { cost: number; fallbackUsed: boolean; unpriced: boolean; basis: PricingBasis }>();
-    if (!session || !$rates) return m;
-    const table =
-      session.harness === 'codex' && sessionApiCost
-        ? ($rates.api_models ?? $rates.models)
-        : $rates.models;
+    if (!session?.pricing) return m;
     for (const t of session.turns) {
-      m.set(t.turn_id, tokensCost(t.tokens, t.model, $rates, t.service_tier, session.harness, table));
+      const prices = session.pricing.turn_prices[t.turn_id];
+      const price = session.harness === 'codex' && sessionApiCost ? prices?.api : prices?.plan;
+      if (price) m.set(t.turn_id, { ...price, fallbackUsed: price.fallback_used });
     }
     return m;
   })());
 
   // Mini bar chart series (turn order, oldest → newest).
   const turnCosts = $derived(
-    turnsAsc.map((t) => ({ index: t.index, cost: turnCostById.get(t.turn_id)?.cost ?? 0 })),
+    turnsAsc.flatMap((t) => {
+      const price = turnCostById.get(t.turn_id);
+      return price ? [{ index: t.index, cost: price.cost }] : [];
+    }),
   );
   const maxTurnCost = $derived(turnCosts.reduce((m, t) => Math.max(m, t.cost), 0));
 
@@ -289,7 +273,7 @@
       </div>
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label">{heroCost?.label ?? 'Cost'}</div>
-        <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroCost?.text ?? '—'}</div>
+        <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroCost?.text ?? 'Unavailable'}</div>
       </div>
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label">Turns</div>
@@ -549,7 +533,7 @@
               </thead>
               <tbody>
                 {#each Object.entries(session.tokens_by_model) as [modelName, t]}
-                  {@const modelCredit = sessionCredits?.byModel.find((mc) => mc.model === modelName)}
+                  {@const modelCredit = sessionCredits?.by_model.find((mc) => mc.model === modelName)}
                   <tr class="border-b border-edgerow">
                     <td class="py-1 pr-2 font-mono text-ink-2 max-w-[110px] truncate" title={modelName}>
                       {modelName}
@@ -561,8 +545,8 @@
                         <span class="text-sky-500" title="Priced via a floating provider alias — correct as of the rate card's fetch, but the provider repoints these without renaming, so it expires and falls back to a flagged fallback rate">↝*</span>
                       {:else if modelCredit?.basis === 'estimated'}
                         <span class="text-sky-500" title="Includes cache-write tokens priced at the ordinary input rate — no published cache-write premium for this model">≈</span>
-                      {:else if modelCredit?.fallbackUsed}
-                        <span class="text-amber-500" title="Fallback rate used ({$rates ? fallbackModelName($rates, session.harness) : '—'})">⚠</span>
+                      {:else if modelCredit?.basis === 'fallback'}
+                        <span class="text-amber-500" title="Fallback rate used">⚠</span>
                       {/if}
                     </td>
                     <td class="py-1 px-1 text-right font-mono text-ink-2">{fmt(t.input_tokens)}</td>
@@ -584,9 +568,9 @@
                 Flat {session.harness === 'codex' ? 'OpenAI' : 'Anthropic'} API reference: <span class="text-accent-cost">{formatCredits(flatApiReference.total, 'USD')}</span>
                 at the legacy rate table{#if session.harness === 'codex' && session.plan_type}&nbsp;— informational on the {session.plan_type} plan{/if}
               </p>
-              {#if flatApiReference.unpricedModels.length > 0}
+              {#if flatApiReference.unpriced_models.length > 0}
                 <p class="mt-1 text-[11px] text-amber-500">
-                  Excludes models without a published rate: {flatApiReference.unpricedModels.join(', ')}
+                  Excludes models without a published rate: {flatApiReference.unpriced_models.join(', ')}
                 </p>
               {/if}
             {/if}
@@ -605,23 +589,23 @@
                   {/each}
                 </p>
               {/if}
-              {#if timeAwareApiScenario.conditionalEvidenceMissing.length > 0}
+              {#if timeAwareApiScenario.conditional_evidence_missing.length > 0}
                 <p class="mt-1 text-[11px] text-amber-500">
                   Conditional rule not applied without direct per-request input evidence:
-                  {timeAwareApiScenario.conditionalEvidenceMissing.join(', ')}. The dated base rate remains included.
+                  {timeAwareApiScenario.conditional_evidence_missing.join(', ')}. The dated base rate remains included.
                 </p>
               {/if}
-              {#if timeAwareApiScenario.cacheWritePricingUnmodeled}
+              {#if timeAwareApiScenario.cache_write_pricing_unmodeled}
                 <p class="mt-1 text-[11px] text-ink-faint">
-                  {#if timeAwareApiScenario.unobservedCacheWriteInputMultipliers.length > 0}
-                    Documented {timeAwareApiScenario.unobservedCacheWriteInputMultipliers.map((multiplier) => `${multiplier}×`).join(', ')} cache-write input premium remains unmodeled:
+                  {#if timeAwareApiScenario.unobserved_cache_write_input_multipliers.length > 0}
+                    Documented {timeAwareApiScenario.unobserved_cache_write_input_multipliers.map((multiplier) => `${multiplier}×`).join(', ')} cache-write input premium remains unmodeled:
                   {:else}
                     Cache-write premiums remain unmodeled:
                   {/if}
                   parsed usage does not distinguish cache writes from uncached input.
                 </p>
               {/if}
-            {:else if session.tokens_history.length > 0 && ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0}
+            {:else if session.pricing && session.tokens_history.length > 0 && ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0}
               <p class="mt-1 text-[11px] text-ink-faint">
                 Time-aware API scenario unavailable: this session has a model or time outside the catalog’s dated coverage. The flat reference above is retained.
               </p>

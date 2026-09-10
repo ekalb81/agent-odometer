@@ -80,6 +80,8 @@
   let trayRefreshGeneration = $state(0);
   let trayTimer: ReturnType<typeof setTimeout> | null = null;
   let trayJobGeneration = 0;
+  let trayEpoch = 0;
+  let lastTrayRates: RateCard | null = null;
   let trayQueue: Promise<void> = Promise.resolve();
   const trayCache = new RangeDataCache();
   const trayMutations = new MutationAccumulator();
@@ -87,7 +89,7 @@
   // The queue serializes refresh jobs so a drain/plan never runs against a
   // cache that an in-flight fetch hasn't updated yet. A superseded job skips
   // before draining, leaving its pending mutations to the newer job.
-  async function runTrayRefresh(generation: number, rateCard: RateCard): Promise<void> {
+  async function runTrayRefresh(generation: number, epoch: number, rateCard: RateCard): Promise<void> {
     if (generation !== trayJobGeneration) return;
     const start = new Date(); start.setHours(0, 0, 0, 0);
     const end = new Date(start); end.setDate(end.getDate() + 1); end.setMilliseconds(-1);
@@ -110,6 +112,7 @@
           () => sessionsInRanges(trayRange),
           { sessions: ids.length, fetched: ids.length, mode: 'full' },
         );
+        if (epoch !== trayEpoch) return;
         results = trayCache.applyFull(rangesKey, ids, fetched);
       } else if (plan.mode === 'delta') {
         const fetched = plan.fetchIds.length > 0
@@ -119,6 +122,7 @@
               { sessions: ids.length, fetched: plan.fetchIds.length, mode: 'delta' },
             )
           : null;
+        if (epoch !== trayEpoch) return;
         results = trayCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
       }
       if (!results) return;
@@ -130,10 +134,13 @@
       try {
         quotaLabel = quotaTrayLabel(await getQuotaSnapshots());
       } catch (error) {
+        if (epoch !== trayEpoch) return;
         console.error('quota tray label refresh failed:', error);
       }
+      if (epoch !== trayEpoch) return;
       await setTrayTotals(computeTrayTotals(sessionsStore.map.values(), results[0], rateCard, quotaLabel));
     } catch (error) {
+      if (epoch !== trayEpoch) return;
       trayCache.invalidate();
       console.error('tray totals refresh failed:', error);
     }
@@ -143,15 +150,29 @@
     trayMutations.observe(sessionsStore.mutationLog);
     const rateCard = $rates;
     void trayRefreshGeneration;
+    const ratesChanged = rateCard !== lastTrayRates;
+    lastTrayRates = rateCard;
+    if (ratesChanged) {
+      const previous = trayCache.current();
+      trayCache.invalidate();
+      trayEpoch += 1;
+      if (previous && rateCard) {
+        const raw = Object.fromEntries(Object.entries(previous[0]).map(([id, totals]) => [id, { ...totals, pricing: undefined }]));
+        const epoch = trayEpoch;
+        void setTrayTotals(computeTrayTotals(sessionsStore.map.values(), raw, rateCard))
+          .catch((error) => { if (epoch === trayEpoch) console.error('tray pricing invalidation failed:', error); });
+      }
+      trayJobGeneration += 1;
+    }
     if (!rateCard) return;
     if (trayTimer !== null) clearTimeout(trayTimer);
     trayTimer = setTimeout(() => {
       trayTimer = null;
       const generation = ++trayJobGeneration;
       trayQueue = trayQueue
-        .then(() => runTrayRefresh(generation, rateCard))
+        .then(() => runTrayRefresh(generation, trayEpoch, rateCard))
         .catch(() => {});
-    }, 250);
+    }, ratesChanged ? 0 : 250);
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);
     const boundary = setTimeout(() => { trayRefreshGeneration += 1; }, next.getTime() - now.getTime());
     return () => { clearTimeout(boundary); if (trayTimer !== null) clearTimeout(trayTimer); };

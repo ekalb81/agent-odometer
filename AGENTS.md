@@ -4,7 +4,7 @@ These instructions apply to the entire repository.
 
 ## Project purpose
 
-Odometer is a local Tauri companion to agent CLI harnesses: the ChatGPT desktop app's Codex experience and Claude Code. It reads each harness's session JSONL files and presents searchable task, turn, token, subagent, and estimated cost data in per-harness tabs. Rust owns filesystem access, parsing, persistence, and Tauri IPC; Svelte owns filtering, presentation, and credit calculations.
+Odometer is a local Tauri companion to agent CLI harnesses: the ChatGPT desktop app's Codex experience and Claude Code. It reads each harness's session JSONL files and presents searchable task, turn, token, subagent, and estimated cost data in per-harness tabs. Rust owns filesystem access, parsing, persistence, pricing, and Tauri IPC; Svelte owns filtering, presentation, and aggregation of already-priced values.
 
 Start with [README.md](README.md) for commands and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the data flow, contracts, invariants, and known limitations.
 
@@ -18,6 +18,8 @@ Start with [README.md](README.md) for commands and [docs/ARCHITECTURE.md](docs/A
 ## Architecture boundaries
 
 - Keep filesystem access and JSONL parsing in Rust. The frontend should receive typed data through Tauri commands/events, not read session files directly.
+- Keep pricing in the shared Rust query service (`query.rs` and `query_desktop.rs`). Frontend code may sum returned costs and use `src/lib/currency.ts` for presentation, but must not resolve rates or calculate token prices. Preserve the frozen bucket and detail pricing oracles; do not restore a duplicate TypeScript calculator in tests or browser mocks.
+- Saved rate-card replacements invalidate priced responses by object identity, even when `RateCard.version` is unchanged. Preserve raw totals, mark obsolete costs unavailable, and refetch batched prices; reject superseded successes and failures before updating caches or tray output.
 - Put Rust commands in `src-tauri/src/commands.rs`, register them in `src-tauri/src/lib.rs`, and expose typed frontend wrappers in `src/lib/ipc.ts`.
 - Keep Rust serialized structs and `src/lib/types.ts` synchronized. Add backward-compatible Serde defaults when persisted or historical data may omit a new field.
 - Event names are contracts: `session-updated` (payload: `SessionSummary`), `session-removed`, `scan-progress` (payload: `ScanStatus`), `history-progress` (payload: `HistoryStatus`), `config-updated`, and `rates-updated`. Update every producer and listener together. Full sessions travel only through `get_session_details`; keep `SessionSummary` free of `turns`/`tokens_history` — the split exists because full sessions measured ~200 MB across a real corpus.
@@ -92,7 +94,7 @@ CI additionally runs Playwright visual regression against committed baselines, a
 
 The visual suite runs in a pinned container and baselines are platform-specific: `npm run visual:update` refuses to run unless `ODOMETER_VISUAL_BASELINE_ENV=playwright-v1.62.0-jammy` is set (see `scripts/assert-visual-baseline-platform.mjs` for the exact check and the `Visual regression` job in `.github/workflows/ci.yml` for the pinned image digest and invocation). Workflow: run `npm run visual:test` against the committed baselines first, inspect the diff images for every failure, confirm each changed pixel is intended, and only then regenerate with `npm run visual:update` inside the matching container. Never hand-edit baseline PNGs, and never weaken the comparison threshold to make a diff pass.
 
-Important limitation: visual regression only covers frontend-computed values. The suite renders `src/dev-mock.ts` fixtures in a browser with no Rust backend, so `scripts/visual-impact.mjs` correctly treats `src-tauri/src/**` as non-impacting and skips the job for Rust-only changes. It is not a safety net for Rust-side accounting — pricing and parser changes need their own equivalence tests.
+Important limitation: visual regression covers presentation of fixture responses. The suite renders `src/dev-mock.ts` in a browser with no live Rust backend; its synthetic pricing fixtures are generated through the Rust query service. `scripts/visual-impact.mjs` treats ordinary Rust source changes as non-impacting, so a passing or skipped visual job does not prove Rust accounting. Pricing and parser changes need focused Rust and frozen-oracle tests, including `npm run mock:pricing:check` to verify generated browser fixtures remain current. Regenerate only intentional fixture changes with `npm run mock:pricing:generate`; both fixture commands require Cargo, while ordinary browser and visual runs use committed JSON.
 
 For runtime or UI changes, also exercise the affected flow with `npm run tauri dev`. If a failure predates your work, report it precisely and do not silently reformat or repair unrelated files.
 

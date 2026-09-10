@@ -1,0 +1,1938 @@
+{
+  "_note": "Synthetic legacy desktop detail pricing oracle. Existing range expectations are unchanged. Expected blocks are captured once from credits.ts before backend migration.",
+  "now": "2026-08-01T00:00:00Z",
+  "rate_card": {
+    "version": 1,
+    "currency": "credits",
+    "unit": "per_1m_tokens",
+    "source_url": "https://example.test/rates",
+    "fetched_at": "2026-08-01",
+    "fallback_model": "fallback-model",
+    "fallback_models": {
+      "codex": "fallback-model",
+      "claude_code": "fallback-model"
+    },
+    "models": {
+      "base-model": {
+        "input": 10,
+        "cached_input": 1,
+        "cache_creation_input": 12.5,
+        "output": 30,
+        "reasoning": 30
+      },
+      "no-premium-model": {
+        "input": 10,
+        "cached_input": 1,
+        "output": 30,
+        "reasoning": 30
+      },
+      "alias-target": {
+        "input": 20,
+        "cached_input": 2,
+        "output": 60,
+        "reasoning": 60
+      },
+      "fallback-model": {
+        "input": 99,
+        "cached_input": 9.9,
+        "output": 99,
+        "reasoning": 99
+      },
+      "gpt-5.5": {
+        "input": 10,
+        "cached_input": 1,
+        "output": 30,
+        "reasoning": 30
+      },
+      "gpt-5.4": {
+        "input": 10,
+        "cached_input": 1,
+        "output": 30,
+        "reasoning": 30
+      }
+    },
+    "api_models": {
+      "base-model": {
+        "input": 5,
+        "cached_input": 0.5,
+        "cache_creation_input": 6.25,
+        "output": 15,
+        "reasoning": 15
+      },
+      "fallback-model": {
+        "input": 50,
+        "cached_input": 5,
+        "output": 50,
+        "reasoning": 50
+      }
+    },
+    "model_aliases": {
+      "aliased-model": "alias-target"
+    },
+    "floating_model_aliases": {
+      "floating-model": {
+        "target": "base-model",
+        "expires_at": "2099-12-31",
+        "source_url": "https://example.test/floating"
+      },
+      "floating-expired": {
+        "target": "base-model",
+        "expires_at": "2020-01-01",
+        "source_url": "https://example.test/floating"
+      }
+    },
+    "unpriced_models": [
+      "unpriced-model"
+    ],
+    "free_local_models": [
+      "local-model"
+    ],
+    "pricing_catalog": {
+      "rate_periods": [
+        {
+          "id": "before",
+          "model": "base-model",
+          "from": "2026-01-01T00:00:00Z",
+          "to": "2026-08-01T01:00:00Z",
+          "surface": "openai_api_usd",
+          "rate": {
+            "input": 10,
+            "cached_input": 1,
+            "cache_creation_input": 12.5,
+            "output": 30,
+            "reasoning": 30
+          },
+          "label": "before",
+          "provenance": {
+            "evidence": "synthetic",
+            "source_url": "https://example.test/rule",
+            "verified_at": "2026-08-01T00:00:00Z",
+            "note": null
+          }
+        },
+        {
+          "id": "after",
+          "model": "base-model",
+          "from": "2026-08-01T01:00:00Z",
+          "to": null,
+          "surface": "openai_api_usd",
+          "rate": {
+            "input": 20,
+            "cached_input": 1,
+            "cache_creation_input": 12.5,
+            "output": 30,
+            "reasoning": 30
+          },
+          "label": "after",
+          "provenance": {
+            "evidence": "synthetic",
+            "source_url": "https://example.test/rule",
+            "verified_at": "2026-08-01T00:00:00Z",
+            "note": null
+          }
+        },
+        {
+          "id": "estimated",
+          "model": "no-premium-model",
+          "from": "2026-01-01T00:00:00Z",
+          "to": null,
+          "surface": "openai_api_usd",
+          "rate": {
+            "input": 10,
+            "cached_input": 1,
+            "output": 30,
+            "reasoning": 30
+          },
+          "label": "estimated",
+          "provenance": {
+            "evidence": "synthetic",
+            "source_url": "https://example.test/rule",
+            "verified_at": "2026-08-01T00:00:00Z",
+            "note": null
+          },
+          "cache_write_input_multiplier": 1.25
+        },
+        {
+          "id": "fast",
+          "model": "gpt-5.5",
+          "from": "2026-01-01T00:00:00Z",
+          "to": null,
+          "surface": "openai_api_usd",
+          "rate": {
+            "input": 10,
+            "cached_input": 1,
+            "cache_creation_input": 12.5,
+            "output": 30,
+            "reasoning": 30
+          },
+          "label": "fast",
+          "provenance": {
+            "evidence": "synthetic",
+            "source_url": "https://example.test/rule",
+            "verified_at": "2026-08-01T00:00:00Z",
+            "note": null
+          }
+        },
+        {
+          "id": "anthropic",
+          "model": "base-model",
+          "from": "2026-01-01T00:00:00Z",
+          "to": null,
+          "surface": "anthropic_api_usd",
+          "rate": {
+            "input": 10,
+            "cached_input": 1,
+            "cache_creation_input": 12.5,
+            "output": 30,
+            "reasoning": 30
+          },
+          "label": "anthropic",
+          "provenance": {
+            "evidence": "synthetic",
+            "source_url": "https://example.test/rule",
+            "verified_at": "2026-08-01T00:00:00Z",
+            "note": null
+          }
+        }
+      ],
+      "conditional_modifiers": [
+        {
+          "id": "large",
+          "model": "base-model",
+          "surface": "openai_api_usd",
+          "from": "2026-01-01T00:00:00Z",
+          "to": null,
+          "condition": {
+            "kind": "request_input_token_threshold",
+            "greater_than": 100
+          },
+          "multipliers": {
+            "input": 2,
+            "output": 3
+          },
+          "provenance": {
+            "evidence": "synthetic",
+            "source_url": "https://example.test/rule",
+            "verified_at": "2026-08-01T00:00:00Z",
+            "note": null
+          },
+          "label": "large"
+        }
+      ],
+      "notes": []
+    }
+  },
+  "base_session": {
+    "id": "synthetic-detail",
+    "storage_id": "codex:thread:synthetic-detail",
+    "harness": "codex",
+    "file_path": "",
+    "archived": false,
+    "started_at": "2026-08-01T00:00:00Z",
+    "last_event_at": "2026-08-01T02:00:00Z",
+    "total_turns": 0,
+    "tokens_total": {
+      "input_tokens": 1000000,
+      "cached_input_tokens": 200000,
+      "cache_creation_input_tokens": 100000,
+      "output_tokens": 100000,
+      "reasoning_output_tokens": 20000,
+      "total_tokens": 1100000
+    },
+    "tokens_by_model": {
+      "base-model": {
+        "input_tokens": 1000000,
+        "cached_input_tokens": 200000,
+        "cache_creation_input_tokens": 100000,
+        "output_tokens": 100000,
+        "reasoning_output_tokens": 20000,
+        "total_tokens": 1100000
+      }
+    },
+    "tokens_history": [],
+    "turns": [],
+    "tool_observations": [],
+    "tool_metrics": {
+      "calls": 0,
+      "reads": 0,
+      "searches": 0,
+      "mutations": 0,
+      "commands": 0,
+      "other": 0,
+      "successes": 0,
+      "failures": 0,
+      "unknown": 0,
+      "mutation_targets": 0,
+      "one_shot_mutations": 0,
+      "retry_count": 0,
+      "duration_ms": 0,
+      "output_bytes": 0,
+      "core_origin_calls": 0,
+      "mcp_origin_calls": 0,
+      "provider_origin_calls": 0,
+      "unknown_origin_calls": 0
+    },
+    "tool_metrics_by_model": {},
+    "category_totals": {},
+    "optimization_findings": [],
+    "rate_limits_history": []
+  },
+  "cases": [
+    {
+      "name": "no history retains plan model totals and empty flat API",
+      "session": {},
+      "expected": {
+        "plan": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 0,
+          "by_model": [],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": null
+      }
+    },
+    {
+      "name": "no history unavailable model retains zero breakdown",
+      "session": {
+        "tokens_by_model": {
+          "unknown": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 200000,
+            "cache_creation_input_tokens": 100000,
+            "output_tokens": 100000,
+            "reasoning_output_tokens": 20000,
+            "total_tokens": 1100000
+          }
+        }
+      },
+      "rate_overrides": {
+        "fallback_model": "absent",
+        "fallback_models": {},
+        "models": {},
+        "api_models": {}
+      },
+      "expected": {
+        "plan": {
+          "total": 0,
+          "by_model": [
+            {
+              "model": "unknown",
+              "cost": 0,
+              "basis": "unavailable",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [
+            "unknown"
+          ],
+          "unpriced_models": []
+        },
+        "flat_api": null,
+        "turn_prices": {},
+        "time_aware_api": null
+      }
+    },
+    {
+      "name": "no history explicit unpriced model",
+      "session": {
+        "tokens_by_model": {
+          "unpriced-model": {
+            "input_tokens": 1000000,
+            "cached_input_tokens": 200000,
+            "cache_creation_input_tokens": 100000,
+            "output_tokens": 100000,
+            "reasoning_output_tokens": 20000,
+            "total_tokens": 1100000
+          }
+        }
+      },
+      "expected": {
+        "plan": {
+          "total": 0,
+          "by_model": [
+            {
+              "model": "unpriced-model",
+              "cost": 0,
+              "basis": "unavailable",
+              "unpriced": true
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [
+            "unpriced-model"
+          ]
+        },
+        "flat_api": {
+          "total": 0,
+          "by_model": [],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": null
+      }
+    },
+    {
+      "name": "period boundary and strict threshold",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T00:59:59Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 100,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          },
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 22.9,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 22.9,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": {
+          "total": 51.35,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 51.35,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "after",
+            "before"
+          ],
+          "applied_modifiers": [
+            "large"
+          ],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "after",
+              "label": "after",
+              "from": "2026-08-01T01:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            },
+            {
+              "id": "before",
+              "label": "before",
+              "from": "2026-01-01T00:00:00Z",
+              "to": "2026-08-01T01:00:00Z",
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            },
+            {
+              "id": "large",
+              "label": "large",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "missing request evidence does not speculate modifier",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": null,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 5.725,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 5.725,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": {
+          "total": 18.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 18.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "after"
+          ],
+          "applied_modifiers": [],
+          "conditional_evidence_missing": [
+            "large"
+          ],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "after",
+              "label": "after",
+              "from": "2026-08-01T01:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "missing period makes dated scenario unavailable",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          },
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "unknown",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 102.53,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            },
+            {
+              "model": "unknown",
+              "cost": 91.08,
+              "basis": "fallback",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [
+            "unknown"
+          ],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 51.725,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 5.725,
+              "basis": "direct",
+              "unpriced": false
+            },
+            {
+              "model": "unknown",
+              "cost": 46,
+              "basis": "fallback",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [
+            "unknown"
+          ],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": null
+      }
+    },
+    {
+      "name": "positive null model makes dated scenario unavailable",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": null,
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 0,
+          "by_model": [],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 0,
+          "by_model": [],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": null
+      }
+    },
+    {
+      "name": "zero null model does not poison dated scenario",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": null,
+            "service_tier": null,
+            "request_input_tokens": null,
+            "total_tokens": 0,
+            "delta": {
+              "input_tokens": 0,
+              "cached_input_tokens": 0,
+              "cache_creation_input_tokens": 0,
+              "output_tokens": 0,
+              "reasoning_output_tokens": 0,
+              "total_tokens": 0
+            }
+          },
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 5.725,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 5.725,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": {
+          "total": 39.9,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 39.9,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "after"
+          ],
+          "applied_modifiers": [
+            "large"
+          ],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "after",
+              "label": "after",
+              "from": "2026-08-01T01:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            },
+            {
+              "id": "large",
+              "label": "large",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "explicit unpriced event makes dated scenario unavailable",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "unpriced-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 0,
+          "by_model": [
+            {
+              "model": "unpriced-model",
+              "cost": 0,
+              "basis": "unavailable",
+              "unpriced": true
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [
+            "unpriced-model"
+          ]
+        },
+        "flat_api": {
+          "total": 0,
+          "by_model": [
+            {
+              "model": "unpriced-model",
+              "cost": 0,
+              "basis": "unavailable",
+              "unpriced": true
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [
+            "unpriced-model"
+          ]
+        },
+        "turn_prices": {},
+        "time_aware_api": null
+      }
+    },
+    {
+      "name": "estimated provenance sticks after clean event",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "no-premium-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          },
+          {
+            "timestamp": "2026-08-01T02:00:00Z",
+            "model": "no-premium-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 0,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 22.4,
+          "by_model": [
+            {
+              "model": "no-premium-model",
+              "cost": 22.4,
+              "basis": "estimated",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 92,
+          "by_model": [
+            {
+              "model": "no-premium-model",
+              "cost": 92,
+              "basis": "fallback",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [
+            "no-premium-model"
+          ],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": {
+          "total": 22.4,
+          "by_model": [
+            {
+              "model": "no-premium-model",
+              "cost": 22.4,
+              "basis": "estimated",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "estimated"
+          ],
+          "applied_modifiers": [],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [
+            1.25
+          ],
+          "rules": [
+            {
+              "id": "estimated",
+              "label": "estimated",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unobserved documented cache writes remain metadata",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "no-premium-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 0,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 11.2,
+          "by_model": [
+            {
+              "model": "no-premium-model",
+              "cost": 11.2,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 46,
+          "by_model": [
+            {
+              "model": "no-premium-model",
+              "cost": 46,
+              "basis": "fallback",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [
+            "no-premium-model"
+          ],
+          "unpriced_models": []
+        },
+        "turn_prices": {},
+        "time_aware_api": {
+          "total": 11.2,
+          "by_model": [
+            {
+              "model": "no-premium-model",
+              "cost": 11.2,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "estimated"
+          ],
+          "applied_modifiers": [],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": true,
+          "unobserved_cache_write_input_multipliers": [
+            1.25
+          ],
+          "rules": [
+            {
+              "id": "estimated",
+              "label": "estimated",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "fast session and turn costs preserve tier multiplier",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "gpt-5.5",
+            "service_tier": "fast",
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ],
+        "turns": [
+          {
+            "turn_id": "fast",
+            "index": 0,
+            "model": "gpt-5.5",
+            "service_tier": "fast",
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 28,
+          "by_model": [
+            {
+              "model": "gpt-5.5",
+              "cost": 28,
+              "basis": "estimated",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 115,
+          "by_model": [
+            {
+              "model": "gpt-5.5",
+              "cost": 115,
+              "basis": "fallback",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [
+            "gpt-5.5"
+          ],
+          "unpriced_models": []
+        },
+        "turn_prices": {
+          "fast": {
+            "plan": {
+              "cost": 28,
+              "fallback_used": false,
+              "unpriced": false,
+              "basis": "direct"
+            },
+            "api": {
+              "cost": 115,
+              "fallback_used": true,
+              "unpriced": false,
+              "basis": "fallback"
+            }
+          }
+        },
+        "time_aware_api": {
+          "total": 28.625,
+          "by_model": [
+            {
+              "model": "gpt-5.5",
+              "cost": 28.625,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "fast"
+          ],
+          "applied_modifiers": [],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "fast",
+              "label": "fast",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "turn null fallback unpriced and creation provenance",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ],
+        "turns": [
+          {
+            "turn_id": "null",
+            "index": 0,
+            "model": null,
+            "service_tier": null,
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          },
+          {
+            "turn_id": "fallback",
+            "index": 0,
+            "model": "unknown",
+            "service_tier": null,
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          },
+          {
+            "turn_id": "unpriced",
+            "index": 0,
+            "model": "unpriced-model",
+            "service_tier": null,
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          },
+          {
+            "turn_id": "creation",
+            "index": 0,
+            "model": "no-premium-model",
+            "service_tier": null,
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 5.725,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 5.725,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {
+          "null": {
+            "plan": {
+              "cost": 0,
+              "fallback_used": false,
+              "unpriced": false,
+              "basis": "unavailable"
+            },
+            "api": {
+              "cost": 0,
+              "fallback_used": false,
+              "unpriced": false,
+              "basis": "unavailable"
+            }
+          },
+          "fallback": {
+            "plan": {
+              "cost": 91.08,
+              "fallback_used": true,
+              "unpriced": false,
+              "basis": "fallback"
+            },
+            "api": {
+              "cost": 46,
+              "fallback_used": true,
+              "unpriced": false,
+              "basis": "fallback"
+            }
+          },
+          "unpriced": {
+            "plan": {
+              "cost": 0,
+              "fallback_used": false,
+              "unpriced": true,
+              "basis": "unavailable"
+            },
+            "api": {
+              "cost": 0,
+              "fallback_used": false,
+              "unpriced": true,
+              "basis": "unavailable"
+            }
+          },
+          "creation": {
+            "plan": {
+              "cost": 11.2,
+              "fallback_used": false,
+              "unpriced": false,
+              "basis": "direct"
+            },
+            "api": {
+              "cost": 46,
+              "fallback_used": true,
+              "unpriced": false,
+              "basis": "fallback"
+            }
+          }
+        },
+        "time_aware_api": {
+          "total": 39.9,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 39.9,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "after"
+          ],
+          "applied_modifiers": [
+            "large"
+          ],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "after",
+              "label": "after",
+              "from": "2026-08-01T01:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            },
+            {
+              "id": "large",
+              "label": "large",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Claude flat and dated API scenario uses Anthropic surface",
+      "session": {
+        "harness": "claude_code",
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ],
+        "turns": [
+          {
+            "turn_id": "claude",
+            "index": 0,
+            "model": "base-model",
+            "service_tier": null,
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {
+          "claude": {
+            "plan": {
+              "cost": 11.45,
+              "fallback_used": false,
+              "unpriced": false,
+              "basis": "direct"
+            },
+            "api": null
+          }
+        },
+        "time_aware_api": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "anthropic_api_usd",
+          "applied_rate_periods": [
+            "anthropic"
+          ],
+          "applied_modifiers": [],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "anthropic",
+              "label": "anthropic",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "Gemini retains legacy Anthropic scenario mapping",
+      "session": {
+        "harness": "gemini_cli",
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ],
+        "turns": [
+          {
+            "turn_id": "gemini",
+            "index": 0,
+            "model": "base-model",
+            "service_tier": null,
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          }
+        ]
+      },
+      "expected": {
+        "plan": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "turn_prices": {
+          "gemini": {
+            "plan": {
+              "cost": 11.45,
+              "fallback_used": false,
+              "unpriced": false,
+              "basis": "direct"
+            },
+            "api": null
+          }
+        },
+        "time_aware_api": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "anthropic_api_usd",
+          "applied_rate_periods": [
+            "anthropic"
+          ],
+          "applied_modifiers": [],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "anthropic",
+              "label": "anthropic",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "absent API table does not fabricate flat API",
+      "session": {
+        "tokens_history": [
+          {
+            "timestamp": "2026-08-01T01:00:00Z",
+            "model": "base-model",
+            "service_tier": null,
+            "request_input_tokens": 101,
+            "total_tokens": 1100000,
+            "delta": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            }
+          }
+        ],
+        "turns": [
+          {
+            "turn_id": "no-api",
+            "index": 0,
+            "model": "base-model",
+            "service_tier": null,
+            "status": "completed",
+            "tokens": {
+              "input_tokens": 1000000,
+              "cached_input_tokens": 200000,
+              "cache_creation_input_tokens": 100000,
+              "output_tokens": 100000,
+              "reasoning_output_tokens": 20000,
+              "total_tokens": 1100000
+            },
+            "tool_metrics": {
+              "calls": 0,
+              "reads": 0,
+              "searches": 0,
+              "mutations": 0,
+              "commands": 0,
+              "other": 0,
+              "successes": 0,
+              "failures": 0,
+              "unknown": 0,
+              "mutation_targets": 0,
+              "one_shot_mutations": 0,
+              "retry_count": 0,
+              "duration_ms": 0,
+              "output_bytes": 0,
+              "core_origin_calls": 0,
+              "mcp_origin_calls": 0,
+              "provider_origin_calls": 0,
+              "unknown_origin_calls": 0
+            }
+          }
+        ]
+      },
+      "rate_overrides": {
+        "api_models": {}
+      },
+      "expected": {
+        "plan": {
+          "total": 11.45,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 11.45,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": []
+        },
+        "flat_api": null,
+        "turn_prices": {
+          "no-api": {
+            "plan": {
+              "cost": 11.45,
+              "fallback_used": false,
+              "unpriced": false,
+              "basis": "direct"
+            },
+            "api": null
+          }
+        },
+        "time_aware_api": {
+          "total": 39.9,
+          "by_model": [
+            {
+              "model": "base-model",
+              "cost": 39.9,
+              "basis": "direct",
+              "unpriced": false
+            }
+          ],
+          "missing_models": [],
+          "unpriced_models": [],
+          "surface": "openai_api_usd",
+          "applied_rate_periods": [
+            "after"
+          ],
+          "applied_modifiers": [
+            "large"
+          ],
+          "conditional_evidence_missing": [],
+          "cache_write_pricing_unmodeled": false,
+          "unobserved_cache_write_input_multipliers": [],
+          "rules": [
+            {
+              "id": "after",
+              "label": "after",
+              "from": "2026-08-01T01:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            },
+            {
+              "id": "large",
+              "label": "large",
+              "from": "2026-01-01T00:00:00Z",
+              "to": null,
+              "provenance": {
+                "evidence": "synthetic",
+                "source_url": "https://example.test/rule",
+                "verified_at": "2026-08-01T00:00:00Z",
+                "note": null
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

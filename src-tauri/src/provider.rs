@@ -106,7 +106,7 @@ pub struct ProviderCapabilities {
     pub session_index: bool,
     /// The rate-card currency key this provider's usage prices into (see
     /// `RateCard::currencies` in `rates.rs` / `harnessCurrency` in
-    /// `credits.ts`). Codex uses its own plan-credit unit ("credits");
+    /// `currency.ts`). Codex uses its own plan-credit unit ("credits");
     /// every other current provider prices directly in "USD". This is a
     /// capability rather than a fixed enum so a future provider with its own
     /// native unit does not require another closed match arm.

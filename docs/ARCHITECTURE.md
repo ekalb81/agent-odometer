@@ -5,7 +5,7 @@
 Odometer is a local companion to agent CLI harnesses — the ChatGPT desktop app's Codex experience and Claude Code — with two halves:
 
 - `src-tauri/`: Rust/Tauri backend for discovery, incremental JSONL parsing, filesystem watching, persistence, and native commands.
-- `src/`: Svelte 5/TypeScript frontend for reactive state, scoped tabs (`all` plus each harness), filtering, projection/export, tables, details, settings, and credit calculations.
+- `src/`: Svelte 5/TypeScript frontend for reactive state, scoped tabs (`all` plus each harness), filtering, projection/export, tables, details, settings, and presentation of backend-priced costs.
 
 Every session carries a `harness` tag (`codex` | `claude_code`). All three scopes share one session store, `SessionsView`, detail pane, filter predicates, pricing projection, and model aggregate. The All scope never adds plan credits to USD.
 
@@ -110,10 +110,10 @@ is stable. It reports the delta in percentage points as **observed**, `no measur
 provider value is unchanged, or `unavailable/window changed` rather than inventing precision. These
 snapshots are account-wide and can include concurrent activity or rolling-window expiry.
 
-The hook process cannot execute frontend TypeScript, so `turn_receipts.rs` contains a deliberately
-narrow mirror of the existing subset-aware token formula and documented Fast-tier multipliers. Its
-focused Rust tests are a parity gate; the dashboard remains the owner of interactive and date-scoped
-pricing.
+The headless hook and desktop commands use the same pricing service in `query.rs`. Receipts price
+the selected turn and cumulative session buckets through that service; `turn_receipts.rs` owns
+receipt selection and formatting, not a separate token formula. Frozen pricing expectations and
+focused receipt tests protect subset accounting, model resolution, and Fast-tier behavior.
 
 ## Backend modules
 
@@ -132,6 +132,13 @@ pricing.
 | `src-tauri/src/commands.rs` | Tauri command boundary |
 | `src-tauri/src/config.rs` | Session-root configuration and persistence |
 | `src-tauri/src/rates.rs` | Bundled rate card and user override persistence |
+| `src-tauri/src/query.rs` | Shared model, token, and bucket pricing; final range enrichment |
+| `src-tauri/src/query_desktop.rs` | Cumulative summary/category, detail/turn, and dated-scenario pricing |
+| `src-tauri/src/query_reports.rs` | Shared headless reports over ledger facts and lightweight category projections |
+| `src-tauri/src/query_control.rs` | Request cancellation, deadlines, and materialization limits |
+| `src-tauri/src/headless.rs` | Query selection and validation shared by CLI/MCP adapters |
+| `src-tauri/src/report_cli.rs` / `report_output.rs` | Command-line adapter and versioned export formatting |
+| `src-tauri/src/mcp_server.rs` | Bounded concurrent read-only stdio requests and cancellation |
 | `src-tauri/src/store.rs` | Concurrent in-memory session state and watcher handle |
 | `src-tauri/src/telemetry.rs` | Cross-harness normalized tool metrics, classifier, and deterministic optimization findings |
 | `src-tauri/src/tool_impact.rs` | Provider/tool target discovery, observed-use cohorts, and matched observational baselines |
@@ -160,7 +167,7 @@ Token accounting uses two views:
 - Latest cumulative `total_token_usage` drives session totals.
 - Per-call `last_token_usage` is attributed to the active model and appended to event history. Buckets are reconciled against the cumulative total so resumed sessions and early unassigned usage converge.
 
-Cached input and reasoning output are included within input and output respectively. Credit calculation in `src/lib/credits.ts` subtracts the subsets before applying the ordinary input/output rates, then prices the subsets at their own rates.
+Cached input and cache-creation input are disjoint subsets of input; reasoning output is included within output. The shared Rust pricing service subtracts the subsets before applying the ordinary input/output rates, then prices each subset at its own rate.
 
 Credit history also records `service_tier`. Current documented Fast mode multipliers are applied event-by-event for GPT-5.5 and GPT-5.4; models without a documented Fast rate remain at the standard multiplier.
 
@@ -181,7 +188,7 @@ Anthropic usage reports `input_tokens` excluding cache traffic, while the viewer
 
 The rate card has two intentionally separate pricing layers:
 
-- The legacy `models` map prices Codex plan credits and Claude API USD, with `currencies` and `fallback_models` keeping harness units and unknown-model fallbacks separate. `api_models` supplies the Codex tab's flat informational API-USD comparison. These maps remain authoritative for list summaries, range buckets, existing views, and editable user overrides. Every `ModelRate` carries `cache_creation_input` alongside `input`/`cached_input`/`output`/`reasoning` — a normalized dimension distinct from both, so cache-creation (write) tokens are priced at their own rate instead of the plain input rate. `cached_input_tokens` and `cache_creation_input_tokens` are disjoint subsets of `input_tokens`: `eventCost` (`src/lib/credits.ts`) and `token_cost` (`src-tauri/src/turn_receipts.rs`) both subtract both subsets before pricing the remainder at the ordinary input rate, so neither subset is ever priced twice.
+- The legacy `models` map prices Codex plan credits and Claude API USD, with `currencies` and `fallback_models` keeping harness units and unknown-model fallbacks separate. `api_models` supplies the Codex tab's flat informational API-USD comparison. These maps remain authoritative for list summaries, range buckets, existing views, and editable user overrides. Every `ModelRate` carries `cache_creation_input` alongside `input`/`cached_input`/`output`/`reasoning` — a normalized dimension distinct from both, so cache-creation (write) tokens are priced at their own rate instead of the plain input rate. `cached_input_tokens` and `cache_creation_input_tokens` are disjoint subsets of `input_tokens`: `token_cost` in `src-tauri/src/query.rs` subtracts both subsets before pricing the remainder at the ordinary input rate, so neither subset is ever priced twice.
 - `pricing_catalog` supplies opt-in, event-level scenarios. Every base period and conditional modifier has a stable ID, billing `surface`, exact model, half-open UTC interval `[from, to)`, label, and provenance (`evidence`, source URL, verification timestamp, and optional note). A rule never crosses from OpenAI API USD, Anthropic API USD, or Codex plan credits to another surface.
 
 Catalog validation is fail-closed. Rule IDs, models, labels, evidence, and source URLs must be non-empty; IDs must be globally unique; interval ends must follow starts; cache-write and conditional multipliers must be positive; base periods for one `(surface, model)` cannot overlap; and modifiers with the same `(surface, model, condition)` cannot overlap. Adjacent periods are valid. A malformed or invalid on-disk override logs a warning and falls back to the bundled card.
@@ -189,12 +196,12 @@ Catalog validation is fail-closed. Rule IDs, models, labels, evidence, and sourc
 Time-aware pricing follows these rules:
 
 - A full session is evaluated event by event at the event timestamp. Every priced event must identify a model and have a direct catalog period for its model and billing surface. Missing coverage, a known-unpriced model, or an unattributed nonzero event makes the time-aware scenario unavailable (`null`); it never substitutes a fallback model, the latest rate, or the flat reference retroactively.
-- Conditional rules operate on one provider request. The current threshold condition applies only when observed `request_input_tokens` is strictly greater than the configured threshold. Missing request-level evidence never triggers a modifier speculatively; the result names the applicable rule under `conditionalEvidenceMissing`.
+- Conditional rules operate on one provider request. The current threshold condition applies only when observed `request_input_tokens` is strictly greater than the configured threshold. Missing request-level evidence never triggers a modifier speculatively; the result names the applicable rule under `conditional_evidence_missing`.
 - Applicable input multipliers compose multiplicatively and cover ordinary, cached, and cache-creation input. Output multipliers likewise cover ordinary and reasoning output. The existing service-tier multiplier is then applied to the event.
-- A period's declared cache-write multiplier (`cache_write_input_multiplier`) is provenance metadata; the dollar amount for cache-creation tokens comes from the period's own `rate.cache_creation_input`. `cacheWritePricingUnmodeled` is only `true` when a period declares a multiplier but no event in the session ever reported nonzero `cache_creation_input_tokens` under it — once cache-creation tokens are observed, the premium is priced directly rather than left as unobserved metadata.
+- A period's declared cache-write multiplier (`cache_write_input_multiplier`) is provenance metadata; the dollar amount for cache-creation tokens comes from the period's own `rate.cache_creation_input`. `cache_write_pricing_unmodeled` is only `true` when a period declares a multiplier but no event in the session ever reported nonzero `cache_creation_input_tokens` under it — once cache-creation tokens are observed, the premium is priced directly rather than left as unobserved metadata.
 - The scenario result carries the IDs of every applied period and modifier. The flat reference remains visible beside it so a dated or conditional scenario cannot silently redefine existing totals.
 
-`unpriced_models` identifies known models without a published rate; flat calculations exclude and label their usage rather than applying a fallback. `free_local_models` identifies models that are explicitly zero-cost (free tier, local/self-hosted) — a distinct, deliberate declaration from `unpriced_models` (no published price) or an ordinary unresolved rate. Other unknown model IDs first resolve through `model_aliases` (raw provider id -> canonical rate-table key); alias chains may hop multiple entries, and a cycle is detected and terminated deterministically rather than looping. Unresolved model IDs then use the configured per-harness fallback only in the legacy flat calculation and remain named in the UI. `RateCard::resolve_model_pricing` (mirrored by `resolveModelPricing` in `credits.ts` — keep both in sync) is the one place every surface resolves a raw model id and records why: `direct`, `aliased`, `fallback`, `estimated`, `free_local`, `subscription`, `stale`, or `unavailable` (`PricingBasis`). The dashboard renders this provenance as visually distinct badges (an amber ⚠ for fallback, an amber ◇ for unpriced, a blue ↝ for aliased) in the session detail pane and model-comparison table rather than collapsing every non-exact price into one indicator.
+`unpriced_models` identifies known models without a published rate; flat calculations exclude and label their usage rather than applying a fallback. `free_local_models` identifies models that are explicitly zero-cost (free tier, local/self-hosted) — a distinct, deliberate declaration from `unpriced_models` (no published price) or an ordinary unresolved rate. Other unknown model IDs first resolve through `model_aliases` (raw provider id -> canonical rate-table key); alias chains may hop multiple entries, and a cycle is detected and terminated deterministically rather than looping. Unresolved model IDs then use the configured per-harness fallback only in the legacy flat calculation and remain named in the UI. Rust's `RateCard::resolve_model_pricing` is the shared model resolver used by query pricing; it records why a rate was selected: `direct`, `aliased`, `fallback`, `estimated`, `free_local`, `subscription`, `stale`, or `unavailable` (`PricingBasis`). The dashboard renders returned provenance as visually distinct badges (an amber ⚠ for fallback, an amber ◇ for unpriced, a blue ↝ for aliased) in the session detail pane and model-comparison table rather than resolving model rates itself or collapsing every non-exact price into one indicator.
 
 When an older user rate card is upgraded, user-edited legacy rates, currencies, units, and fallback choices are preserved; new bundled legacy entries, aliases, free/local declarations, and subscription plans are added only where the user has no existing entry for that key; bundled catalog rules replace or append by stable ID; separately identified custom rules remain; and bundled notes are unioned. A model a user already customized before `cache_creation_input` existed has that one field backfilled from the bundled card (its `input`/`cached_input`/`output`/`reasoning` edits are untouched) so upgrading a pre-#42 override doesn't silently zero-price cache-creation tokens forever. Saving validates the catalog before writing an adjacent temporary file and renaming it into place.
 
@@ -216,7 +223,7 @@ This catalog is a bounded advance on issue #42, not the complete pricing authori
 | `session-removed` | session ID | Remove a session after its rollout disappears |
 | `scan-progress` | `ScanStatus` | Bulk-scan progress for the startup indicator (throttled; final event has `complete: true`) |
 | `config-updated` | `Config` | Refresh settings and replace the scanned session set |
-| `rates-updated` | `RateCard` | Recompute displayed credit estimates |
+| `rates-updated` | `RateCard` | Replace the rate card and refetch backend prices |
 | `config-event` | `ExternalEvent` | Append a redacted local configuration-change marker |
 | `open-settings` | none | Open Settings from the native tray menu |
 
@@ -224,7 +231,15 @@ The frontend batches incoming `session-updated` events into ~150ms flushes befor
 
 Sessions cross the wire in two shapes. `SessionSummary` (list rows, live updates) carries metadata, cumulative totals, and per-(model, service_tier) `TierBucket`s — credit math is linear per (model, tier), so buckets price usage exactly without the event history. The full `Session` (turns + `tokens_history`) is fetched per-id via `get_session_details` when a session is selected. This matters at scale: a real 704-session corpus serializes to ~195 MB as full sessions but ~1 MB as summaries, and an active session's live update drops from ~2 MB to ~1 KB per emit.
 
-Date-scoped numbers come from the batched `sessions_in_ranges` command. The frontend passes the filtered session IDs, and chronological histories use binary partitioning to visit only each window's relevant slice. It returns per-session `RangeTotals` (tokens, tier buckets, and compact tool metrics). The table, analytics, model comparison, export, tray, and generic correlation engine reuse those maps rather than starting per-row scans.
+Date-scoped numbers come from the batched `sessions_in_ranges` command. The frontend passes the filtered session IDs; the backend reads ledger rollups and exact partial-hour edges, with full-history fallback for unavailable or stale ledger entries. It returns per-session `RangeTotals` (tokens, tier buckets, and compact tool metrics). The table, analytics, model comparison, export, tray, and generic correlation engine reuse those maps rather than starting per-row scans.
+
+`RangeTotals.pricing` is optional: `{ plan: PricedSurface, api: PricedSurface | null }`. Each surface contains `total`, `by_model` (model, cost, basis, unpriced), `missing_models`, and `unpriced_models`. The shared Rust query service attaches this only after final range aggregation, using one loaded rate card and one timestamp per batch. Raw aggregates remain unpriced; this derived field is not persisted in the ledger or scan cache. Unknown provider identity leaves pricing absent, and an unsupported API surface is null rather than zero. Older payloads without the field remain valid.
+
+These server estimates are authoritative for rendered costs, exports, and tray figures. All-time session and category prices come from the batched `get_session_pricing` command, which prices resident summary buckets and preserves their no-history fallback; an unbounded event window is not substituted for cumulative usage. `get_session_details` returns a response-only flattened session with plan, flat API, per-turn, and dated-scenario pricing, including the rule metadata from the same rate snapshot. Detail totals retain historical per-event subset clamping before costs are combined, even when corrected usage counters temporarily make an event's subset exceed its parent. Correlation responses carry before/after pricing per harness. None of these derived prices are persisted in session snapshots.
+
+Table, analytics, tray, selected details, and correlation requests refresh when a saved rate-card object changes, including edits that retain the same card version. A rate-only refresh retains raw session data but marks outdated costs unavailable until replacement prices arrive. Request epochs prevent superseded successes or failures from updating replacement caches or tray output; ordinary session updates still fetch only changed IDs. Exports await matching backend prices and reject an incomplete response or changes to exported sessions or rates during that request. Model analytics sum server model costs once per session/model, independently of the number of service-tier token buckets.
+
+The frontend formats money through `src/lib/currency.ts` and combines already-priced values; it contains no token-pricing engine. Frozen synthetic oracles under `tests/conformance/` preserve bucket and detailed pricing expectations, including no-history, turn, and dated-scenario behavior. Rust tests exercise the production service against those fixed expectations. Browser-only mocks consume Rust-generated synthetic prices; fixture-only range interpolation supports deterministic UI scenarios and is not a production pricing implementation.
 
 `list_tool_impact_targets` discovers provider and individual-tool choices from the same filtered sessions and time window. `compare_tool_impact` then builds turn-level observed and not-observed cohorts for the selected target. When at least three comparisons are available, the UI uses nearest-in-time pairs with the same harness, model, and deterministic task category. This is observational: transcripts prove use, but cannot prove whether an unused target was installed or available, and whole overlapping turns are included because token events do not carry turn IDs.
 
@@ -240,7 +255,7 @@ Optimization findings are timestamped at the observation that triggered them. `R
 
 `src/lib/types.ts` manually mirrors Rust's serialized structs. Rust field or serialization changes therefore require an explicit TypeScript update.
 
-`sessionsStore` is the canonical reactive session collection. `sessionProjection.ts` owns the pure selection, date-scoped pricing, model aggregation, and export rows used by every scope. `SessionsView.svelte` derives ordering, day groups, analytics, comparison, export, event correlation, and selection from that projection; its fixed-height virtual list keeps DOM size bounded for large corpora. `DetailPane.svelte` fetches full details only on demand, including normalized observations, categories, and findings.
+`sessionsStore` is the canonical reactive session collection. `sessionProjection.ts` owns the pure selection, projection of backend prices, model aggregation, and export rows used by every scope. `SessionsView.svelte` derives ordering, day groups, analytics, comparison, export, event correlation, and selection from that projection; its fixed-height virtual list keeps DOM size bounded for large corpora. `DetailPane.svelte` fetches full details only on demand, including normalized observations, categories, findings, and prices.
 
 ## Performance measurements
 

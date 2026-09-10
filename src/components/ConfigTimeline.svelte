@@ -1,6 +1,6 @@
 <script lang="ts">
   import { correlateEvents } from '../lib/ipc';
-  import { apiCostFromBuckets, creditsFromBuckets, formatCredits } from '../lib/credits';
+  import { formatCredits, harnessCurrency } from '../lib/currency';
   import {
     comparisonReady,
     nextCorrelationBoundaryDelay,
@@ -19,6 +19,7 @@
   let requestGeneration = 0;
   let error = $state<string | null>(null);
   let boundaryRefresh = $state(0);
+  let lastPricingRates: typeof $rates = null;
   let displayEvents = $derived(events.slice(-50).reverse());
   let revertLabels = $derived.by(() => rapidRevertLabels(events.slice(-50)));
 
@@ -29,6 +30,11 @@
     // list. Store mutations replace this Map, providing a bounded refresh key.
     void sessionsStore.map;
     void boundaryRefresh;
+    // Server pricing belongs to the saved card, even when token observations
+    // and the event list have not changed. Discard stale prices while loading.
+    const rateCard = $rates;
+    if (rateCard !== lastPricingRates) correlations = [];
+    lastPricingRates = rateCard;
     if (!active) {
       loading = false;
       return;
@@ -60,18 +66,16 @@
   });
 
   function costs(item: EventCorrelation): string {
-    if (!$rates) return '';
-    const price = (observation: EventCorrelation['before']) => {
-      const codex = observation.buckets_by_harness.codex ?? [];
-      const claude = observation.buckets_by_harness.claude_code ?? [];
-      return {
-        credits: creditsFromBuckets(codex, $rates!, 'codex').total,
-        codexUsd: apiCostFromBuckets(codex, $rates!, 'codex')?.total ?? 0,
-        claudeUsd: creditsFromBuckets(claude, $rates!, 'claude_code').total,
-      };
+    const before = item.before.pricing_by_harness;
+    const after = item.after.pricing_by_harness;
+    const delta = (left: number | undefined, right: number | undefined, currency: string, signed = false) => {
+      if (left === undefined || right === undefined) return 'unavailable';
+      const difference = right - left;
+      return `${signed && difference >= 0 ? '+' : ''}${signed && currency === 'credits' ? difference.toFixed(2) : formatCredits(difference, currency)}`;
     };
-    const before = price(item.before); const after = price(item.after);
-    return `credits ${after.credits - before.credits >= 0 ? '+' : ''}${(after.credits - before.credits).toFixed(2)} · Codex flat API ${formatCredits(after.codexUsd - before.codexUsd, 'USD')} · Claude ${formatCredits(after.claudeUsd - before.claudeUsd, 'USD')}`;
+    const codexCurrency = $rates ? harnessCurrency($rates, 'codex') : 'credits';
+    const claudeCurrency = $rates ? harnessCurrency($rates, 'claude_code') : 'USD';
+    return `${codexCurrency} ${delta(before?.codex?.plan.total, after?.codex?.plan.total, codexCurrency, true)} · Codex flat API ${delta(before?.codex?.api?.total, after?.codex?.api?.total, 'USD')} · Claude ${delta(before?.claude_code?.plan.total, after?.claude_code?.plan.total, claudeCurrency)}`;
   }
 
   function countContext(item: EventCorrelation): string {

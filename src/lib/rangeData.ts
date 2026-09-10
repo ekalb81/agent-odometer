@@ -7,13 +7,16 @@
 // only the sessions whose rollups can have changed and merge them into its
 // cached results.
 //
-// Correctness rests on one invariant: a session's rollup for any window can
+// Raw rollups obey this invariant: a session's rollup for any window can
 // only change when that session is upserted (every transcript change parses
 // into an upsert). Cached rollups for unchanged sessions therefore stay valid
 // even while an open-ended window's "to" bound advances with the clock. The
 // one drift this admits — a session carrying an event timestamped in the
 // future relative to an earlier fetch — self-corrects on that session's next
 // upsert or on the next full refetch (range-key change, snapshot replace).
+// Derived backend pricing additionally depends on the rate-card identity.
+// Consumers must invalidate and supersede in-flight requests when it changes,
+// even if the card version and all session data remain unchanged.
 
 import type { RangeTotals } from './types';
 
