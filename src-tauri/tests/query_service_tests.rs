@@ -1078,6 +1078,127 @@ fn a_project_report_groups_usage_and_counts_sessions() {
     assert_eq!(two_session.tokens.input_tokens, 2_000);
 }
 
+#[test]
+fn project_report_uses_destination_metadata_after_reassignment() {
+    for reverse in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+        let source = directory.path().join("source-project");
+        let target = directory.path().join("target-project");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        let mut sessions = vec![
+            session_in_project(
+                "source",
+                when.timestamp_millis(),
+                "ignored",
+                &source.to_string_lossy(),
+                "fallback_path_identity",
+            ),
+            session_in_project(
+                "target",
+                when.timestamp_millis() - 86_400_000,
+                "ignored",
+                &target.to_string_lossy(),
+                "fallback_path_identity",
+            ),
+        ];
+        if reverse {
+            sessions.reverse();
+        }
+        let store = ledger(directory.path(), &sessions);
+        let rows = store.session_project_rows().unwrap();
+        let source_row = rows
+            .iter()
+            .find(|row| {
+                row.label
+                    .as_deref()
+                    .is_some_and(|label| label.ends_with("source-project"))
+            })
+            .unwrap();
+        let target_row = rows
+            .iter()
+            .find(|row| {
+                row.label
+                    .as_deref()
+                    .is_some_and(|label| label.ends_with("target-project"))
+            })
+            .unwrap();
+        let target_key = target_row.project_key.as_deref().unwrap();
+        store
+            .reassign_session_project(&source_row.session_key, Some(target_key))
+            .unwrap();
+        // The destination's original session is now elsewhere and outside the window.
+        store
+            .reassign_session_project(&target_row.session_key, None)
+            .unwrap();
+        let report = || {
+            odometer_lib::query::project_report(
+                &store,
+                &card(),
+                |_| "codex".into(),
+                Some(when),
+                None,
+                when,
+            )
+            .unwrap()
+        };
+        let project = &report().projects[0];
+        assert_eq!(project.project_key, target_key);
+        assert_eq!(project.label, target_row.label.as_deref().unwrap());
+        assert!(project.label_is_path);
+        assert_eq!(project.tokens.input_tokens, 1_000);
+        store
+            .set_project_alias(target_key, Some("Destination alias"))
+            .unwrap();
+        let project = &report().projects[0];
+        assert_eq!(project.label, "Destination alias");
+        assert!(!project.label_is_path);
+    }
+}
+
+#[test]
+fn project_report_missing_destinations_do_not_inherit_source_labels() {
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let source = directory.path().join("private-source");
+    std::fs::create_dir_all(&source).unwrap();
+    let store = ledger(
+        directory.path(),
+        &[session_in_project(
+            "source",
+            when.timestamp_millis(),
+            "ignored",
+            &source.to_string_lossy(),
+            "fallback_path_identity",
+        )],
+    );
+    let key = store.session_project_rows().unwrap()[0].session_key.clone();
+    let report = || {
+        odometer_lib::query::project_report(&store, &card(), |_| "codex".into(), None, None, when)
+            .unwrap()
+    };
+    for (destination, label) in [
+        ("manual:test", "Standalone project"),
+        ("repo:missing", "Assigned project"),
+    ] {
+        store
+            .reassign_session_project(&key, Some(destination))
+            .unwrap();
+        assert_eq!(report().projects[0].label, label);
+    }
+    store
+        .merge_project("repo:missing", "repo:canonical")
+        .unwrap();
+    assert_eq!(report().projects[0].label, "Assigned project");
+    store
+        .set_project_alias("repo:canonical", Some("Merged destination"))
+        .unwrap();
+    let project = &report().projects[0];
+    assert_eq!(project.label, "Merged destination");
+    assert!(!project.label_is_path);
+}
+
 /// #41's redaction contract, applied where data leaves the desktop. A
 /// `fallback_path_identity` label *is* an absolute local path, and CLI
 /// output gets piped into files and pasted into issues.

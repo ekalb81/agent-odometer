@@ -3432,6 +3432,62 @@ mod tests {
     }
 
     #[test]
+    fn project_budget_scope_follows_assignment_restore_and_canonical_merges() {
+        let sessions = [
+            project_fixture_session("moved", Some("repo:a"), Some("A")),
+            project_fixture_session("stays", Some("repo:a"), Some("A")),
+            project_fixture_session("target", Some("repo:b"), Some("B")),
+            project_fixture_session("missing", None, None),
+        ];
+        let mut scope = super::ProjectBudgetScope {
+            sessions: HashMap::new(),
+            projects: HashMap::new(),
+        };
+        let matching = |scope: &super::ProjectBudgetScope, key| {
+            sessions
+                .iter()
+                .filter(|session| scope.includes(session, key))
+                .map(|session| session.storage_id.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            matching(&scope, "repo:a"),
+            ["codex:thread:moved", "codex:thread:stays"]
+        );
+        scope
+            .sessions
+            .insert("codex:thread:moved".into(), "repo:b".into());
+        scope
+            .sessions
+            .insert("codex:thread:missing".into(), "repo:b".into());
+        assert_eq!(matching(&scope, "repo:a"), ["codex:thread:stays"]);
+        assert_eq!(
+            matching(&scope, "repo:b"),
+            [
+                "codex:thread:moved",
+                "codex:thread:target",
+                "codex:thread:missing"
+            ]
+        );
+        scope.sessions.remove("codex:thread:moved");
+        assert_eq!(
+            matching(&scope, "repo:a"),
+            ["codex:thread:moved", "codex:thread:stays"]
+        );
+        scope.projects.insert(
+            "repo:a".into(),
+            crate::history_store::ProjectOverrideRow {
+                project_key: "repo:a".into(),
+                display_label: None,
+                canonical_project_key: Some("repo:b".into()),
+            },
+        );
+        assert_eq!(matching(&scope, "repo:b").len(), 4);
+        assert_eq!(matching(&scope, "repo:a"), matching(&scope, "repo:b"));
+        assert!(matching(&scope, "manual:unrelated").is_empty());
+    }
+
+    #[test]
     fn resolve_projects_maps_missing_directory_assignments_through_merged_destinations() {
         let sessions = [
             project_fixture_session("z", None, None),
@@ -3965,6 +4021,26 @@ pub fn set_quota_config(
     Ok(wire)
 }
 
+/// Durable project assignments shared across one alert-evaluation batch.
+struct ProjectBudgetScope {
+    sessions: HashMap<String, String>,
+    projects: HashMap<String, crate::history_store::ProjectOverrideRow>,
+}
+
+impl ProjectBudgetScope {
+    fn includes(&self, session: &SessionSummary, project_key: &str) -> bool {
+        let effective = self
+            .sessions
+            .get(&session.storage_id)
+            .map(String::as_str)
+            .or(session.project_key.as_deref());
+        effective.is_some_and(|key| {
+            crate::history_store::resolve_canonical_project_key(&self.projects, key)
+                == crate::history_store::resolve_canonical_project_key(&self.projects, project_key)
+        })
+    }
+}
+
 /// Token usage for one budget's provider/project scope over its rolling
 /// period, from the in-memory session projection. Only ever called for
 /// `Tokens`-unit budgets; `PercentOfWindow` budgets read their current
@@ -3978,7 +4054,12 @@ fn token_budget_current_value(
     state: &AppState,
     budget: &crate::quota_store::QuotaBudget,
     now: DateTime<Utc>,
+    project_scope: Option<&ProjectBudgetScope>,
 ) -> Option<f64> {
+    // Missing durable overrides makes the project scope unavailable, not empty.
+    if budget.project_key.is_some() && project_scope.is_none() {
+        return None;
+    }
     let period_hours = budget.period_hours.unwrap_or(24).max(1) as i64;
     let since = now - chrono::Duration::hours(period_hours);
     let ids: Vec<String> = state
@@ -3986,8 +4067,9 @@ fn token_budget_current_value(
         .iter()
         .filter(|entry| entry.value().summary.harness == budget.provider)
         .filter(|entry| {
-            budget.project_key.is_none()
-                || entry.value().summary.project_key.as_deref() == budget.project_key.as_deref()
+            budget.project_key.as_deref().is_none_or(|key| {
+                project_scope.is_some_and(|scope| scope.includes(&entry.value().summary, key))
+            })
         })
         .map(|entry| entry.key().clone())
         .collect();
@@ -4068,6 +4150,25 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
         .map(|snapshot| (snapshot.provider.as_str(), snapshot))
         .collect();
 
+    // One durable assignment read per batch, shared by every project budget.
+    let project_scope = if store.budgets.iter().any(|budget| {
+        budget.project_key.is_some() && budget.unit == crate::quota_store::BudgetUnit::Tokens
+    }) {
+        state.history_ready().and_then(|history| {
+            let sessions = history.list_session_project_overrides().ok()?;
+            let projects = history.list_project_overrides().ok()?;
+            Some(ProjectBudgetScope {
+                sessions,
+                projects: projects
+                    .into_iter()
+                    .map(|row| (row.project_key.clone(), row))
+                    .collect(),
+            })
+        })
+    } else {
+        None
+    };
+
     let evaluations: Vec<crate::quota::BudgetEvaluation> = store
         .budgets
         .iter()
@@ -4083,7 +4184,7 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
                     })
                     .and_then(|window| window.used),
                 crate::quota_store::BudgetUnit::Tokens => {
-                    token_budget_current_value(state, budget, now)
+                    token_budget_current_value(state, budget, now, project_scope.as_ref())
                 }
             };
             crate::quota::BudgetEvaluation {

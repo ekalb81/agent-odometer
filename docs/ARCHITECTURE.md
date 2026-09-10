@@ -281,6 +281,11 @@ only the selected session, including when it belongs to a parent/subagent family
 Scan completion refreshes the shared mapping once so an early partial lookup cannot hide
 saved assignments. Opening the editor refreshes destination choices and shares any active
 lookup; transcript appends do not cause per-session project requests.
+Headless project reports resolve labels and path provenance from the destination project,
+including destinations whose original sessions are outside the report window or moved
+elsewhere. Project token budgets join the same durable session assignments and canonical
+merges; an unreadable override store makes the scoped value unavailable rather than
+attributing usage to its detected project.
 
 ## Performance measurements
 
