@@ -2174,6 +2174,132 @@ mod tests {
     }
 
     #[test]
+    fn malformed_gemini_controls_abort_all_setup_before_any_write() {
+        let root = tempdir().unwrap();
+        let codex = root.path().join("codex");
+        let claude = root.path().join("claude");
+        let gemini = root.path().join("gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let path = gemini.join("settings.json");
+        let config = Config {
+            turn_receipts_enabled: true,
+            turn_receipts_codex: true,
+            turn_receipts_claude: true,
+            turn_receipts_gemini: true,
+            ..Config::default()
+        };
+        for (controls, expected) in [
+            (json!([]), "hooksConfig must be an object"),
+            (
+                json!({"enabled": "false"}),
+                "hooksConfig.enabled must be a boolean",
+            ),
+            (
+                json!({"disabled": false}),
+                "hooksConfig.disabled must be an array",
+            ),
+            (
+                json!({"disabled": [7]}),
+                "hooksConfig.disabled entries must be strings",
+            ),
+        ] {
+            let original =
+                serde_json::to_vec(&json!({"theme":"preserve", "hooksConfig": controls})).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let error = sync_at(&config, Path::new("odometer"), &codex, &claude, &gemini)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(!codex.join("hooks.json").exists());
+            assert!(!claude.join("settings.json").exists());
+        }
+    }
+
+    #[test]
+    fn gemini_setup_transaction_rolls_back_then_commits_and_removes_only_owned_handler() {
+        let root = tempdir().unwrap();
+        let codex = root.path().join("codex");
+        let claude = root.path().join("claude");
+        let gemini = root.path().join("gemini");
+        std::fs::create_dir_all(&gemini).unwrap();
+        let path = gemini.join("settings.json");
+        let original = br#"{"theme":"mine","hooksConfig":{"enabled":true,"disabled":["other-hook"]},"hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"keep-me"}]}]}}"#;
+        std::fs::write(&path, original).unwrap();
+        let mut config = Config {
+            turn_receipts_enabled: true,
+            turn_receipts_codex: false,
+            turn_receipts_claude: false,
+            turn_receipts_gemini: true,
+            ..Config::default()
+        };
+        let executable = Path::new("/synthetic/Odometer App/odometer");
+        let spec = JsonHookSpec::gemini(executable);
+        let transaction = sync_at(&config, executable, &codex, &claude, &gemini).unwrap();
+        let installed: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(inspect_json_value(&path, &installed, &spec)
+            .unwrap()
+            .current());
+        assert!(!gemini_hooks_disabled(&installed).unwrap());
+        transaction.abort().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        sync_at(&config, executable, &codex, &claude, &gemini)
+            .unwrap()
+            .commit()
+            .unwrap();
+        let committed = std::fs::read(&path).unwrap();
+        sync_at(&config, executable, &codex, &claude, &gemini)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            committed,
+            "repeated setup must not rewrite a current handler"
+        );
+        let status = json_status(
+            gemini_cli_provider_id(),
+            true,
+            ConfigSource::GeminiSettingsJson,
+            &path,
+            &spec,
+        );
+        assert!(status.configured);
+        assert_eq!(status.config_source, "gemini_settings_json");
+        config.turn_receipts_gemini = false;
+        sync_at(&config, executable, &codex, &claude, &gemini)
+            .unwrap()
+            .commit()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            serde_json::from_slice::<Value>(original).unwrap()
+        );
+        assert!(!codex.join("hooks.json").exists());
+        assert!(!claude.join("settings.json").exists());
+    }
+
+    #[test]
+    fn malformed_gemini_event_shapes_report_the_actual_event_without_rewriting() {
+        let path = Path::new("settings.json");
+        let spec = JsonHookSpec::gemini(Path::new("odometer"));
+        for (hooks, expected) in [
+            (
+                json!({"AfterAgent": {}}),
+                "hooks.AfterAgent must be an array",
+            ),
+            (
+                json!({"AfterAgent": [{"hooks": {}}]}),
+                "hooks.AfterAgent[].hooks must be an array",
+            ),
+        ] {
+            let original = serde_json::to_vec(&json!({"hooks": hooks})).unwrap();
+            let error = plan_json_hook_bytes(path, Some(original), &spec, true).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn gemini_disabled_controls_are_preserved_and_reported() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("settings.json");
