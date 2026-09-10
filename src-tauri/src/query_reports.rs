@@ -487,6 +487,31 @@ pub fn diagnostics_report(
     now: DateTime<Utc>,
     include_paths: bool,
 ) -> Result<HeadlessDiagnosticsReport> {
+    diagnostics_report_controlled(store, config, rates, now, include_paths, None)
+}
+
+pub fn diagnostics_report_controlled(
+    store: Option<&HistoryStore>,
+    config: &Config,
+    rates: &RateCard,
+    now: DateTime<Utc>,
+    include_paths: bool,
+    control: Option<&crate::query_control::QueryControl>,
+) -> Result<HeadlessDiagnosticsReport> {
+    let mut rows = 0;
+    let mut check_row = || -> Result<()> {
+        rows += 1;
+        if let Some(control) = control {
+            control.check()?;
+            if rows > control.max_rows {
+                bail!("query row limit exceeded");
+            }
+        }
+        if let Some(store) = store {
+            store.check_query_rows(rows)?;
+        }
+        Ok(())
+    };
     let config = config.clone().normalized();
     let stats = store
         .map(HistoryStore::provider_stats)
@@ -504,9 +529,7 @@ pub fn diagnostics_report(
     ids.extend(stats.keys().cloned());
     let mut providers = Vec::new();
     for name in ids {
-        if let Some(store) = store {
-            store.check_query()?;
-        }
+        check_row()?;
         let provider = registered_provider(&name);
         let mut roots = Vec::new();
         if let Some(source) = config.providers.get(name.as_str()) {
@@ -514,13 +537,17 @@ pub fn diagnostics_report(
                 ("live", &source.live_roots),
                 ("archive", &source.archive_roots),
             ] {
-                roots.extend(paths.iter().map(|path| DiagnosticSource {
-                    kind,
-                    path: include_paths.then(|| path.to_string_lossy().into_owned()),
-                    exists: path.exists(),
-                }));
+                for path in paths {
+                    check_row()?;
+                    roots.push(DiagnosticSource {
+                        kind,
+                        path: include_paths.then(|| path.to_string_lossy().into_owned()),
+                        exists: path.exists(),
+                    });
+                }
             }
             if let Some(path) = &source.session_index_path {
+                check_row()?;
                 roots.push(DiagnosticSource {
                     kind: "session_index",
                     path: include_paths.then(|| path.to_string_lossy().into_owned()),
@@ -535,6 +562,7 @@ pub fn diagnostics_report(
                 row.models
                     .iter()
                     .map(|model| {
+                        check_row()?;
                         let priced = provider.as_ref().map(|provider| {
                             price_tokens(
                                 rates,
@@ -546,16 +574,17 @@ pub fn diagnostics_report(
                                 now,
                             )
                         });
-                        DiagnosticModel {
+                        Ok(DiagnosticModel {
                             model: model.clone(),
                             basis: priced
                                 .as_ref()
                                 .map_or(PricingBasis::Unavailable, |value| value.basis),
                             resolved_model: priced.map(|value| value.resolved_model),
-                        }
+                        })
                     })
-                    .collect()
+                    .collect::<Result<Vec<_>>>()
             })
+            .transpose()?
             .unwrap_or_default();
         let ledger = store.map(|_| DiagnosticLedger {
             durable_sessions: row.as_ref().map_or(0, |row| row.durable_sessions),
@@ -570,14 +599,6 @@ pub fn diagnostics_report(
             models,
             quota_status: "not_queried_use_quota_report",
         });
-        if let Some(store) = store {
-            store.check_query_rows(
-                providers
-                    .iter()
-                    .map(|row| 1 + row.models.len() + row.roots.len())
-                    .sum(),
-            )?;
-        }
     }
     Ok(HeadlessDiagnosticsReport {
         schema_version: HEADLESS_REPORT_SCHEMA_VERSION,

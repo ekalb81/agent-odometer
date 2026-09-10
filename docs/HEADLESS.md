@@ -138,6 +138,8 @@ Windowed tools accept optional string arguments `from` and `to`, with the same s
 
 Tool results contain a JSON report encoded in the MCP text-content item. A client can parse that text as JSON after checking `isError`. For example:
 
+`ledger_status` and `diagnostics_report` return `ledger_available: false` when the ledger is missing, outdated, dirty, or unreadable. Unavailable ledger counts remain null; usage reports still return an explicit error. Availability reports retain cancellation, deadline, and row limits and do not create or repair the ledger.
+
 ```json
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"local-report-client","version":"1"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}

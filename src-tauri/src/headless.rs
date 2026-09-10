@@ -7,6 +7,9 @@ use serde_json::{json, Value};
 
 use crate::{config::Config, history_store::HistoryStore, query, rates::RateCard};
 
+pub const LEDGER_UNAVAILABLE: &str =
+    "durable history is unavailable; open the desktop app to prepare it, or retry when it is ready";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
     Status,
@@ -129,28 +132,54 @@ pub fn execute(
     request: &Request,
     now: DateTime<Utc>,
 ) -> Result<Value> {
+    execute_optional(kind, Some(store), rates, config, request, now, None)
+}
+
+/// Availability reports remain useful before a ledger is ready. Every other
+/// report requires a ready ledger; unavailable usage never becomes an empty result.
+pub fn execute_optional(
+    kind: QueryKind,
+    store: Option<&HistoryStore>,
+    rates: &RateCard,
+    config: &Config,
+    request: &Request,
+    now: DateTime<Utc>,
+    control: Option<&crate::query_control::QueryControl>,
+) -> Result<Value> {
     request.validate_for(kind)?;
-    store.check_query()?;
+    if let Some(control) = control {
+        control.check()?;
+    }
+    if let Some(store) = store {
+        store.check_query()?;
+    }
     let Request { from, to, .. } = *request;
     let provider = |key: &str| {
         query::provider_for_key(key)
             .map(|id| id.to_string())
             .unwrap_or_default()
     };
+    let required_store = || store.ok_or_else(|| anyhow::anyhow!(LEDGER_UNAVAILABLE));
     let result = match kind {
         QueryKind::Status => json!({
             "schema_version": 1,
-            "ledger_available": true,
-            "sessions": store.session_count()?,
-            "ledger_bytes": store.database_footprint().total_bytes(),
+            "ledger_available": store.is_some(),
+            "sessions": store.map(HistoryStore::session_count).transpose()?,
+            "ledger_bytes": store.and_then(|store| store.database_footprint().total_bytes()),
             "rate_card_version": rates.version,
             "rate_card_fetched_at": rates.fetched_at,
         }),
-        QueryKind::Report | QueryKind::Models => {
-            serde_json::to_value(query::range_report(store, rates, provider, from, to, now)?)?
-        }
+        QueryKind::Report | QueryKind::Models => serde_json::to_value(query::range_report(
+            required_store()?,
+            rates,
+            provider,
+            from,
+            to,
+            now,
+        )?)?,
         QueryKind::Projects => {
-            let mut report = query::project_report(store, rates, provider, from, to, now)?;
+            let mut report =
+                query::project_report(required_store()?, rates, provider, from, to, now)?;
             if !request.include_paths {
                 for project in &mut report.projects {
                     project.label = project.redacted_label().to_owned();
@@ -159,10 +188,15 @@ pub fn execute(
             serde_json::to_value(report)?
         }
         QueryKind::Metrics => serde_json::to_value(query::workflow_metrics(
-            store, rates, provider, from, to, now,
+            required_store()?,
+            rates,
+            provider,
+            from,
+            to,
+            now,
         )?)?,
         QueryKind::Sessions => serde_json::to_value(query::session_report(
-            store,
+            required_store()?,
             rates,
             provider,
             from,
@@ -171,27 +205,39 @@ pub fn execute(
             now,
         )?)?,
         QueryKind::Activity => serde_json::to_value(query::activity_heatmap(
-            store,
+            required_store()?,
             request.utc_offset,
             from,
             to,
         )?)?,
-        QueryKind::Categories => {
-            serde_json::to_value(query::category_report(store, rates, from, to, now)?)?
+        QueryKind::Categories => serde_json::to_value(query::category_report(
+            required_store()?,
+            rates,
+            from,
+            to,
+            now,
+        )?)?,
+        QueryKind::Tools => {
+            serde_json::to_value(query::tools_report(required_store()?, from, to)?)?
         }
-        QueryKind::Tools => serde_json::to_value(query::tools_report(store, from, to)?)?,
-        QueryKind::Context => serde_json::to_value(query::context_report(store, from, to)?)?,
-        QueryKind::Findings => serde_json::to_value(query::findings_report(store, from, to)?)?,
-        QueryKind::Diagnostics => serde_json::to_value(query::diagnostics_report(
-            Some(store),
+        QueryKind::Context => {
+            serde_json::to_value(query::context_report(required_store()?, from, to)?)?
+        }
+        QueryKind::Findings => {
+            serde_json::to_value(query::findings_report(required_store()?, from, to)?)?
+        }
+        QueryKind::Diagnostics => serde_json::to_value(query::diagnostics_report_controlled(
+            store,
             config,
             rates,
             now,
             request.include_paths,
+            control,
         )?)?,
         // Preserve the original unwrapped array contracts for existing CLI
         // scripts and quota_status clients. New adapters wrap explicitly.
         QueryKind::Quota => {
+            let store = required_store()?;
             let policy = crate::quota_store::QuotaStoreFile::load();
             serde_json::to_value(query::quota_snapshots(
                 store,
@@ -199,14 +245,19 @@ pub fn execute(
                 chrono::Duration::seconds(policy.max_cache_age_secs),
             )?)?
         }
-        QueryKind::Mirrors => serde_json::to_value(store.mirrored_session_groups()?)?,
+        QueryKind::Mirrors => serde_json::to_value(required_store()?.mirrored_session_groups()?)?,
         QueryKind::Statusline => serde_json::to_value(query::statusline_report(
-            store,
+            required_store()?,
             rates,
             now,
             request.utc_offset,
         )?)?,
     };
-    store.check_query()?;
+    if let Some(store) = store {
+        store.check_query()?;
+    }
+    if let Some(control) = control {
+        control.check()?;
+    }
     Ok(result)
 }

@@ -398,24 +398,43 @@ fn execute_local(call: PreparedCall, control: QueryControl) -> Result<String, To
     // touch a user's ledger, config, or rate card.
     control.check().map_err(ToolError::failed)?;
     let path = HistoryStore::default_path().map_err(ToolError::failed)?;
-    let store = HistoryStore::open_read_only(&path, control).map_err(|_| ToolError::Failed("durable history is unavailable; open the desktop app to prepare it, or retry when it is ready".into()))?;
     let rates = RateCard::load_from_disk()
         .or_else(|_| RateCard::load_bundled())
         .unwrap_or_default();
     let config = Config::load_read_only()
         .map_err(|_| ToolError::Failed("local configuration is unreadable or malformed".into()))?;
-    execute_with(&store, &rates, &config, call, Utc::now())
+    execute_at_path(&path, call, control, &rates, &config, Utc::now())
+}
+
+fn execute_at_path(
+    path: &std::path::Path,
+    call: PreparedCall,
+    control: QueryControl,
+    rates: &RateCard,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> Result<String, ToolError> {
+    control.check().map_err(ToolError::failed)?;
+    let store = HistoryStore::open_read_only(path, control.clone()).ok();
+    // Opening can fail because the request expired or was cancelled. Preserve
+    // those failures instead of turning them into a successful availability report.
+    control.check().map_err(ToolError::failed)?;
+    let result = execute_with(store.as_ref(), rates, config, call, now, Some(&control))?;
+    control.check().map_err(ToolError::failed)?;
+    Ok(result)
 }
 
 fn execute_with(
-    store: &HistoryStore,
+    store: Option<&HistoryStore>,
     rates: &RateCard,
     config: &Config,
     call: PreparedCall,
     now: DateTime<Utc>,
+    control: Option<&QueryControl>,
 ) -> Result<String, ToolError> {
-    let result = headless::execute(call.kind, store, rates, config, &call.request, now)
-        .map_err(ToolError::failed)?;
+    let result =
+        headless::execute_optional(call.kind, store, rates, config, &call.request, now, control)
+            .map_err(ToolError::failed)?;
     let result = if let Some(key) = call.envelope_key {
         json!({"schema_version":1, key:result})
     } else {
@@ -442,7 +461,7 @@ pub fn call_tool_with_config(
     params: &Value,
     now: DateTime<Utc>,
 ) -> Result<String, ToolError> {
-    execute_with(store, rates, config, prepare_call(params)?, now)
+    execute_with(Some(store), rates, config, prepare_call(params)?, now, None)
 }
 
 fn tool_response(id: Value, result: Result<String, ToolError>) -> String {
@@ -483,6 +502,134 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn availability_tools_report_unavailable_without_preparing_the_ledger() {
+        let directory = tempfile::tempdir().unwrap();
+        let rates = RateCard::load_bundled().unwrap();
+        let config = Config::default();
+        let now = "2026-09-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for state in ["missing", "old", "dirty", "corrupt"] {
+            let path = directory.path().join(state).join("history.sqlite3");
+            if state != "missing" {
+                std::fs::create_dir(path.parent().unwrap()).unwrap();
+                if state == "corrupt" {
+                    std::fs::write(&path, b"synthetic invalid database").unwrap();
+                } else {
+                    let writer = HistoryStore::open(&path).unwrap();
+                    if state == "dirty" {
+                        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("tests/fixtures/sample-session.jsonl");
+                        let session = crate::parser::parse_file(&source, false).unwrap().unwrap();
+                        writer
+                            .observe(std::path::Path::new("synthetic.jsonl"), &session, 1)
+                            .unwrap();
+                    }
+                    drop(writer);
+                    let connection = rusqlite::Connection::open(&path).unwrap();
+                    connection
+                        .execute_batch(if state == "old" {
+                            "PRAGMA user_version = 9"
+                        } else {
+                            "UPDATE durable_sessions SET ledger_dirty = 1"
+                        })
+                        .unwrap();
+                }
+            }
+            let before = std::fs::read(&path).ok();
+            for name in ["ledger_status", "diagnostics_report", "usage_report"] {
+                let result = execute_at_path(
+                    &path,
+                    prepare_call(&json!({"name":name})).unwrap(),
+                    QueryControl::default(),
+                    &rates,
+                    &config,
+                    now,
+                );
+                if name == "usage_report" {
+                    assert!(matches!(result, Err(ToolError::Failed(_))), "{state}");
+                    assert!(!format!("{result:?}").contains(&path.display().to_string()));
+                    continue;
+                }
+                let value: Value = serde_json::from_str(
+                    &result.unwrap_or_else(|error| panic!("{state}/{name}: {error:?}")),
+                )
+                .unwrap();
+                assert_eq!(value["schema_version"], 1, "{state}/{name}");
+                assert_eq!(value["ledger_available"], false, "{state}/{name}");
+                if name == "ledger_status" {
+                    assert!(value["sessions"].is_null());
+                    assert!(value["ledger_bytes"].is_null());
+                    assert_eq!(value["rate_card_version"], rates.version);
+                    let cli: Value = serde_json::from_str(
+                        &crate::report_cli::render_status(
+                            None,
+                            &rates,
+                            crate::report_cli::Format::Json,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(value, cli);
+                } else {
+                    assert!(value["providers"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|provider| {
+                            provider["ledger"].is_null()
+                                && provider["models"].as_array().unwrap().is_empty()
+                        }));
+                }
+                assert!(!value.to_string().contains(&path.display().to_string()));
+            }
+            assert_eq!(std::fs::read(&path).ok(), before, "{state}");
+            if state == "missing" {
+                assert!(!path.parent().unwrap().exists());
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_ledger_does_not_disable_request_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing").join("history.sqlite3");
+        let rates = RateCard::load_bundled().unwrap();
+        let config = Config::default();
+        let now = "2026-09-01T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        for name in ["ledger_status", "diagnostics_report"] {
+            let cancelled = QueryControl::default();
+            cancelled.cancel();
+            for (control, expected) in [
+                (cancelled, "cancelled"),
+                (QueryControl::with_timeout(Duration::ZERO), "deadline"),
+            ] {
+                let error = execute_at_path(
+                    &path,
+                    prepare_call(&json!({"name":name})).unwrap(),
+                    control,
+                    &rates,
+                    &config,
+                    now,
+                )
+                .unwrap_err();
+                assert!(matches!(error, ToolError::Failed(message) if message.contains(expected)));
+            }
+        }
+        let mut bounded = QueryControl::default();
+        bounded.max_rows = 1;
+        let error = execute_at_path(
+            &path,
+            prepare_call(&json!({"name":"diagnostics_report"})).unwrap(),
+            bounded,
+            &rates,
+            &config,
+            now,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ToolError::Failed(message) if message.contains("row limit")));
+        assert!(!path.parent().unwrap().exists());
+    }
 
     /// At the first cancellation line, wait until both workers are actually
     /// running. This proves interruption during execution, not just before it.
