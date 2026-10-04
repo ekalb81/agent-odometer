@@ -195,6 +195,7 @@ pub(super) fn write_exclusions(
     if identities.is_empty() {
         return Ok(());
     }
+    read_exclusions(path, |_| Ok(()))?;
     use std::io::{Read, Seek, SeekFrom, Write};
     let mut file = std::fs::OpenOptions::new()
         .read(true)
@@ -209,14 +210,20 @@ pub(super) fn write_exclusions(
     // A crash before the prior record was complete cannot have committed its
     // SQL purge. Remove only that incomplete tail before appending a new intent.
     let mut complete = length;
+    let mut tail = vec![0; 32 * 1024];
     while complete > 0 {
-        file.seek(SeekFrom::Start(complete - 1))?;
-        let mut byte = [0];
-        file.read_exact(&mut byte)?;
-        if byte[0] == b'\n' {
+        let begin = complete.saturating_sub(tail.len() as u64);
+        let chunk = &mut tail[..usize::try_from(complete - begin)?];
+        file.seek(SeekFrom::Start(begin))?;
+        file.read_exact(chunk)?;
+        if let Some(index) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            complete = begin + index as u64 + 1;
             break;
         }
-        complete -= 1;
+        complete = begin;
+        if length - complete > 32 * 1024 * 1024 {
+            bail!("incomplete purge exclusion tail exceeds its safe size limit");
+        }
     }
     file.set_len(complete)?;
     file.seek(SeekFrom::End(0))?;
@@ -226,8 +233,11 @@ pub(super) fn write_exclusions(
         identities: identities.to_vec(),
     };
     let raw = serde_json::to_vec(&record)?;
-    if raw.len() > 32 * 1024 * 1024 {
+    if raw.len() >= 32 * 1024 * 1024 {
         bail!("purge exclusion batch exceeds its safe size limit");
+    }
+    if complete + raw.len() as u64 + 1 > 256 * 1024 * 1024 {
+        bail!("purge exclusion journal would exceed its safe size limit");
     }
     file.write_all(&raw)?;
     file.write_all(b"\n")?;
@@ -235,7 +245,10 @@ pub(super) fn write_exclusions(
     Ok(())
 }
 
-pub(super) fn restore_exclusions(connection: &mut Connection, path: &Path) -> Result<()> {
+fn read_exclusions(
+    path: &Path,
+    mut apply: impl FnMut(ExclusionRecord) -> Result<()>,
+) -> Result<()> {
     use std::io::BufRead;
     let file = match std::fs::File::open(exclusion_path(path)) {
         Ok(file) => file,
@@ -245,9 +258,9 @@ pub(super) fn restore_exclusions(connection: &mut Connection, path: &Path) -> Re
     if file.metadata()?.len() > 256 * 1024 * 1024 {
         bail!("purge exclusion journal exceeds its safe size limit");
     }
-    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut reader = std::io::BufReader::new(file);
     let mut raw = Vec::new();
+    let mut identities = 0usize;
     loop {
         raw.clear();
         // Limit the allocation before reading an untrusted/corrupt record.
@@ -268,15 +281,107 @@ pub(super) fn restore_exclusions(connection: &mut Connection, path: &Path) -> Re
         if record.version != 1 {
             bail!("unsupported purge exclusion version; update Odometer before recovery");
         }
+        identities += record.identities.len();
+        if identities > 500_000 {
+            bail!("purge exclusion identity limit exceeded");
+        }
+        apply(record)?;
+    }
+    Ok(())
+}
+
+pub(super) fn restore_exclusions(connection: &mut Connection, path: &Path) -> Result<()> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    read_exclusions(path, |record| {
         for (key, identity, fingerprint) in record.identities {
             // If SQL rolled back, the existing row is still retained. On an
             // empty recovery replacement every confirmed identity is excluded.
             transaction.execute("INSERT OR IGNORE INTO purged_sessions(session_key,identity_key,first_event_fingerprint,purged_at_ms)
               SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM durable_sessions WHERE session_key=?1)",params![key,identity,fingerprint,record.purged_at_ms])?;
         }
-    }
+        Ok(())
+    })?;
     transaction.commit()?;
     Ok(())
+}
+
+/// Bounded minimal-identity cache, kept even when the main ledger cannot open.
+/// Invalid or unexpectedly removed journals cannot be treated as empty.
+#[derive(Default)]
+pub struct ExclusionCache {
+    path: Option<PathBuf>,
+    stamp: Option<(u64, std::time::SystemTime)>,
+    initialized: bool,
+    invalid: bool,
+    identities: std::collections::HashSet<(String, String)>,
+}
+
+impl ExclusionCache {
+    pub fn unavailable() -> Self {
+        Self {
+            invalid: true,
+            ..Self::default()
+        }
+    }
+    pub fn at(path: PathBuf) -> Self {
+        Self {
+            path: Some(path),
+            ..Self::default()
+        }
+    }
+    pub fn bind(&mut self, path: PathBuf) {
+        if self.path.as_ref() != Some(&path) {
+            *self = Self::at(path);
+        }
+    }
+    pub fn is_excluded(&mut self, session: &Session) -> Result<bool> {
+        let Some(path) = &self.path else {
+            if self.invalid {
+                bail!("independent purge exclusions are unavailable");
+            }
+            return Ok(false);
+        };
+        let stamp = match std::fs::metadata(exclusion_path(path)) {
+            Ok(metadata) => Some((metadata.len(), metadata.modified()?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if !self.initialized || stamp != self.stamp {
+            if self.initialized && self.stamp.is_some() && stamp.is_none() {
+                self.invalid = true;
+            } else {
+                let mut loaded = std::collections::HashSet::new();
+                let result = read_exclusions(path, |record| {
+                    for (key, identity, fingerprint) in record.identities {
+                        loaded.insert((key, fingerprint.clone()));
+                        loaded.insert((identity, fingerprint));
+                    }
+                    Ok(())
+                });
+                self.invalid = result.is_err();
+                if result.is_ok() {
+                    let additional = loaded
+                        .iter()
+                        .filter(|identity| !self.identities.contains(*identity))
+                        .count();
+                    if self.identities.len() + additional > 1_000_000 {
+                        self.invalid = true;
+                    } else {
+                        self.identities.extend(loaded);
+                    }
+                }
+            }
+            self.initialized = true;
+            self.stamp = stamp;
+        }
+        if self.invalid {
+            bail!("independent purge exclusions could not be verified; source history cannot be republished");
+        }
+        Ok(self.identities.contains(&(
+            provider_identity(session)?,
+            first_event_fingerprint(session),
+        )))
+    }
 }
 
 // A fingerprint group is indivisible: leaving one present/young sibling behind
@@ -337,6 +442,37 @@ fn purge_candidates(
 }
 
 impl HistoryStore {
+    pub fn exclusion_path_identity(&self) -> PathBuf {
+        self.path.clone()
+    }
+    pub fn session_lifecycles(
+        &self,
+    ) -> Result<HashMap<String, (SessionLifecycle, SourceAvailability)>> {
+        let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
+        let mut statement=connection.prepare("SELECT d.session_key,d.lifecycle,EXISTS(SELECT 1 FROM source_locations l WHERE l.session_key=d.session_key AND l.present=1) FROM durable_sessions d ORDER BY d.session_key")?;
+        let mut rows = statement.query([])?;
+        let mut result = HashMap::new();
+        while let Some(row) = rows.next()? {
+            self.check_query()?;
+            if let Some(control) = &self.query_control {
+                control.consume_row()?;
+            }
+            result.insert(
+                row.get(0)?,
+                (
+                    decode_lifecycle(&row.get::<_, String>(1)?)?,
+                    if row.get::<_, bool>(2)? {
+                        SourceAvailability::Present
+                    } else {
+                        SourceAvailability::Missing
+                    },
+                ),
+            );
+        }
+        Ok(result)
+    }
+
     pub fn has_session_key(&self, key: &str) -> Result<bool> {
         Ok(self.open_reader()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM durable_sessions WHERE session_key=?1)",

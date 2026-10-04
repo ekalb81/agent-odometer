@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 #[path = "history_lifecycle.rs"]
 mod lifecycle;
-pub use lifecycle::{PurgePreview, PurgeResult, PurgedSource, RetentionPolicy, RetentionStatus};
+pub use lifecycle::{
+    ExclusionCache, PurgePreview, PurgeResult, PurgedSource, RetentionPolicy, RetentionStatus,
+};
 #[path = "history_recovery.rs"]
 mod recovery;
 pub use recovery::{HistoryFailure, HistoryFailureKind, RecoveryReceipt};
@@ -6678,6 +6680,128 @@ mod tests {
             })
             .unwrap();
         assert!(preserved.path().join("history.sqlite3").is_file());
+    }
+
+    #[test]
+    fn retention_exclusion_cache_survives_unavailable_ledger_and_rejects_invalid_journal() {
+        let (directory, store) = store();
+        let original = session("purged-unavailable", 100);
+        let database = store.path.clone();
+        let intent = vec![(
+            "codex:thread:purged-unavailable".into(),
+            provider_identity(&original).unwrap(),
+            first_event_fingerprint(&original),
+        )];
+        lifecycle::write_exclusions(&database, &intent, now_ms()).unwrap();
+        drop(store);
+        std::fs::write(&database, b"synthetic corruption").unwrap();
+        assert!(HistoryStore::open(&database).is_err());
+        let mut cache = ExclusionCache::at(database.clone());
+        let mut copy = original.clone();
+        copy.file_path = directory
+            .path()
+            .join("resumed-copy.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        copy.tokens_total.input_tokens += 100;
+        assert!(cache.is_excluded(&copy).unwrap());
+        let fresh = session("never-purged", 10);
+        assert!(!cache.is_excluded(&fresh).unwrap());
+        let journal = database.with_file_name("history.sqlite3.exclusions.jsonl");
+        std::fs::write(&journal, b"invalid completed record\n").unwrap();
+        assert!(cache.is_excluded(&fresh).is_err());
+        std::fs::remove_file(&journal).unwrap();
+        assert!(cache.is_excluded(&copy).is_err());
+    }
+
+    #[test]
+    fn retention_journal_repairs_chunked_partial_tail_and_preserves_completed_records() {
+        use std::io::Write;
+        let (directory, store) = store();
+        let original = session("prior-erasure", 100);
+        let next = session("next-erasure", 200);
+        let identities = |session: &Session| {
+            vec![(
+                session.effective_storage_id(),
+                provider_identity(session).unwrap(),
+                first_event_fingerprint(session),
+            )]
+        };
+        lifecycle::write_exclusions(&store.path, &identities(&original), now_ms()).unwrap();
+        let journal = directory.path().join("history.sqlite3.exclusions.jsonl");
+        let prior = std::fs::read(&journal).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&vec![b'x'; 96 * 1024 + 7])
+            .unwrap();
+        lifecycle::write_exclusions(&store.path, &identities(&next), now_ms()).unwrap();
+        assert!(std::fs::read(&journal).unwrap().starts_with(&prior));
+        let mut cache = ExclusionCache::at(store.path.clone());
+        assert!(cache.is_excluded(&original).unwrap());
+        assert!(cache.is_excluded(&next).unwrap());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&vec![b'x'; 32 * 1024 * 1024 + 1])
+            .unwrap();
+        assert!(lifecycle::write_exclusions(&store.path, &identities(&next), now_ms()).is_err());
+    }
+
+    #[test]
+    fn retention_oversized_recovery_marker_fails_without_allocating_or_overwriting_history() {
+        let (_directory, store) = store();
+        let database = store.path.clone();
+        let marker = database.with_file_name("history.sqlite3.recovery.json");
+        std::fs::write(marker, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(store
+            .recovery_receipt()
+            .unwrap_err()
+            .to_string()
+            .contains("safe size limit"));
+        drop(store);
+        assert!(HistoryStore::open(&database)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("safe size limit"));
+        assert!(database.is_file());
+    }
+
+    #[test]
+    fn retention_large_summary_listing_is_bounded_and_independent_of_full_snapshot_payloads() {
+        let (directory, store) = store();
+        for index in 0..256 {
+            let mut original = session(&format!("bounded-{index}"), 100);
+            original.thread_name = Some("λ".repeat(4096));
+            original.first_user_message = Some("λ".repeat(8192));
+            let path = directory.path().join(format!("source-{index}.jsonl"));
+            store.observe(&path, &original, 1).unwrap();
+            store.mark_path_missing(&path).unwrap();
+        }
+        // A summary read must not deserialize full stored sessions, even when
+        // a full payload would fail. The source of its preview is materialized.
+        store
+            .connection()
+            .unwrap()
+            .execute("UPDATE session_snapshots SET session_json=x'FF'", [])
+            .unwrap();
+        let summaries = store.session_summaries().unwrap();
+        assert_eq!(summaries.len(), 256);
+        for summary in &summaries {
+            assert_eq!(summary.lifecycle, SessionLifecycle::Retained);
+            assert_eq!(summary.thread_name.as_ref().unwrap().chars().count(), 512);
+            assert_eq!(
+                summary.first_user_message.as_ref().unwrap().chars().count(),
+                1024
+            );
+        }
+        let bytes = serde_json::to_vec(&summaries).unwrap();
+        assert!(bytes.len() < 2 * 1024 * 1024);
+        assert!(!String::from_utf8(bytes).unwrap().contains("tokens_history"));
+        assert!(store.load_one(&summaries[0].storage_id).is_err());
     }
 
     fn tool(

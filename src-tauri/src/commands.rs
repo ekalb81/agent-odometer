@@ -1845,45 +1845,53 @@ pub async fn get_speed_report(
 /// cost look like an open/migration cost. `startup.history_open` is kept as
 /// the open/migrate phase alone so it means what its name says; the new
 /// `startup.history_hydrate` names the rest.
+fn report_history_migration(
+    app: &AppHandle,
+    state: &AppState,
+    event: crate::history_store::MigrationStepEvent,
+) {
+    let snapshot = HistoryStepSnapshot {
+        step: event.step.to_string(),
+        step_index: event.step_index,
+        step_total: event.step_total,
+        items_done: event.items_done,
+        items_total: event.items_total,
+        elapsed_ms: event.elapsed_ms,
+    };
+    state.record_history_step(snapshot.clone());
+    if let Some(elapsed_ms) = event.elapsed_ms {
+        state.performance.record_backend_duration_ms(
+            format!("history.migration.{}", event.step),
+            elapsed_ms as f64,
+            true,
+            BTreeMap::from([
+                ("from_version".into(), event.from_version.to_string()),
+                ("to_version".into(), event.to_version.to_string()),
+            ]),
+        );
+    }
+    let _ = app.emit(
+        "history-progress",
+        &HistoryStatus {
+            status: HistoryReadinessStatus::Pending,
+            step: Some(snapshot.step),
+            step_index: Some(snapshot.step_index),
+            step_total: Some(snapshot.step_total),
+            items_done: snapshot.items_done,
+            items_total: snapshot.items_total,
+            elapsed_ms: snapshot.elapsed_ms,
+            coverage_complete: None,
+            failure: None,
+        },
+    );
+}
+
 pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
     std::thread::spawn(move || {
         crate::memory::record_phase_sample(&state.performance, "history_open", "before");
         let open_started = Instant::now();
-        let progress_app = app.clone();
-        let progress_state = state.clone();
-        let result = crate::history_store::HistoryStore::open_default_with_progress(move |event| {
-            let snapshot = HistoryStepSnapshot {
-                step: event.step.to_string(),
-                step_index: event.step_index,
-                step_total: event.step_total,
-                items_done: event.items_done,
-                items_total: event.items_total,
-                elapsed_ms: event.elapsed_ms,
-            };
-            progress_state.record_history_step(snapshot.clone());
-            if let Some(elapsed_ms) = event.elapsed_ms {
-                progress_state.performance.record_backend_duration_ms(
-                    format!("history.migration.{}", event.step),
-                    elapsed_ms as f64,
-                    true,
-                    BTreeMap::from([
-                        ("from_version".into(), event.from_version.to_string()),
-                        ("to_version".into(), event.to_version.to_string()),
-                    ]),
-                );
-            }
-            let _ = progress_app.emit(
-                "history-progress",
-                &HistoryStatus {
-                    status: HistoryReadinessStatus::Pending,
-                    step: Some(snapshot.step),
-                    step_index: Some(snapshot.step_index),
-                    step_total: Some(snapshot.step_total),
-                    items_done: snapshot.items_done,
-                    items_total: snapshot.items_total,
-                    elapsed_ms: snapshot.elapsed_ms,
-                },
-            );
+        let result = crate::history_store::HistoryStore::open_default_with_progress(|event| {
+            report_history_migration(&app, &state, event);
         });
         let success = result.is_ok();
         // Phase 1 ends here: `Connection::open`, pragmas, and `migrate()`
@@ -1937,6 +1945,8 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
             }
             Err(error) => {
                 tracing::warn!("durable history unavailable: {}", error);
+                *state.history_failure.lock().unwrap() =
+                    Some(crate::history_store::HistoryFailure::from_error(&error));
                 state.set_history_ready(None)
             }
         };
@@ -1973,6 +1983,10 @@ pub fn spawn_history_open(app: AppHandle, state: Arc<AppState>) {
                 items_done: None,
                 items_total: None,
                 elapsed_ms: Some(total_elapsed_ms),
+                coverage_complete: state
+                    .history_ready()
+                    .and_then(|history| history.has_complete_coverage().ok()),
+                failure: state.history_failure.lock().unwrap().clone(),
             },
         );
     });
@@ -2007,6 +2021,8 @@ pub struct HistoryStatus {
     pub items_done: Option<usize>,
     pub items_total: Option<usize>,
     pub elapsed_ms: Option<u64>,
+    pub coverage_complete: Option<bool>,
+    pub failure: Option<crate::history_store::HistoryFailure>,
 }
 
 /// Returns the current durable-history open/migration status. The frontend
@@ -2014,11 +2030,31 @@ pub struct HistoryStatus {
 /// listeners attached) and then follows "history-progress" events.
 #[tauri::command]
 pub fn get_history_status(state: State<'_, Arc<AppState>>) -> HistoryStatus {
-    let status = match state.history_readiness() {
+    history_status_snapshot(&state)
+}
+
+fn history_status_snapshot(state: &AppState) -> HistoryStatus {
+    let mut status = match state.history_readiness() {
         HistoryReadinessKind::Pending => HistoryReadinessStatus::Pending,
         HistoryReadinessKind::Ready => HistoryReadinessStatus::Ready,
         HistoryReadinessKind::Unavailable => HistoryReadinessStatus::Unavailable,
     };
+    let mut failure = state.history_failure.lock().unwrap().clone();
+    let coverage_complete =
+        state
+            .history_ready()
+            .and_then(|history| match history.has_complete_coverage() {
+                Ok(complete) => Some(complete),
+                Err(error) => {
+                    status = HistoryReadinessStatus::Unavailable;
+                    let mut failed = crate::history_store::HistoryFailure::from_error(&error);
+                    failed.message.push_str(
+                        " Restart Odometer to close this archive before attempting preservation.",
+                    );
+                    failure = Some(failed);
+                    None
+                }
+            });
     let last_step = state.last_history_step();
     HistoryStatus {
         status,
@@ -2028,6 +2064,8 @@ pub fn get_history_status(state: State<'_, Arc<AppState>>) -> HistoryStatus {
         items_done: last_step.as_ref().and_then(|s| s.items_done),
         items_total: last_step.as_ref().and_then(|s| s.items_total),
         elapsed_ms: last_step.as_ref().and_then(|s| s.elapsed_ms),
+        coverage_complete,
+        failure,
     }
 }
 
@@ -2158,6 +2196,131 @@ pub(crate) fn emit_session_summary(
     state
         .with_current_summary(summary, || app.emit("session-updated", summary))
         .unwrap_or(Ok(()))
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HistoryRecoveryStatus {
+    pub status: HistoryReadinessStatus,
+    pub failure: Option<crate::history_store::HistoryFailure>,
+    pub coverage_complete: Option<bool>,
+    pub backup_directory: Option<std::path::PathBuf>,
+    pub can_recover: bool,
+    pub can_retry: bool,
+}
+
+#[tauri::command]
+pub async fn get_history_recovery_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<HistoryRecoveryStatus, String> {
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = crate::history_store::HistoryStore::default_path()
+            .map_err(|error| error.to_string())?;
+        let receipt = crate::history_store::HistoryStore::recovery_receipt_at(&path);
+        let readiness = app_state.history_readiness();
+        let snapshot = history_status_snapshot(&app_state);
+        let mut status = snapshot.status;
+        let mut failure = snapshot.failure;
+        let mut coverage_complete = snapshot.coverage_complete;
+        let backup_directory = match receipt {
+            Ok(receipt) => receipt.map(|receipt| receipt.backup_directory),
+            Err(error) => {
+                status = HistoryReadinessStatus::Unavailable;
+                failure = Some(crate::history_store::HistoryFailure::from_error(&error));
+                coverage_complete = None;
+                None
+            }
+        };
+        Ok(HistoryRecoveryStatus {
+            status,
+            failure,
+            coverage_complete,
+            backup_directory,
+            can_retry: readiness == HistoryReadinessKind::Unavailable,
+            can_recover: readiness == HistoryReadinessKind::Unavailable
+                && crate::history_store::HistoryStore::can_preserve_for_recovery(&path),
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Reopening and confirmed preservation share the existing writer exclusion,
+/// migration progress, hydration, and source-scan paths.
+fn reopen_history(
+    app: AppHandle,
+    state: Arc<AppState>,
+    preserve: bool,
+) -> Result<Option<crate::history_store::RecoveryReceipt>, String> {
+    let reservation = state.try_begin_rebuild()?;
+    let transition = state.config_transition.lock().unwrap();
+    if state.history_readiness() != HistoryReadinessKind::Unavailable {
+        return Err("history is already available or still preparing; restart if its open connection failed".into());
+    }
+    let config = Config::load().map_err(|error| error.to_string())?;
+    let sources = config
+        .provider_sources()
+        .map_err(|error| error.to_string())?;
+    let path =
+        crate::history_store::HistoryStore::default_path().map_err(|error| error.to_string())?;
+    state.prepare_history_open();
+    let _ = app.emit("history-progress", history_status_snapshot(&state));
+    let opened = if preserve {
+        crate::history_store::HistoryStore::recover_unavailable(&path)
+            .map(|(store, receipt)| (store, Some(receipt)))
+    } else {
+        crate::history_store::HistoryStore::open_with_progress(&path, |event| {
+            report_history_migration(&app, &state, event)
+        })
+        .map(|store| (store, None))
+    };
+    let (store, receipt) = match opened {
+        Ok(value) => value,
+        Err(error) => {
+            *state.history_failure.lock().unwrap() =
+                Some(crate::history_store::HistoryFailure::from_error(&error));
+            state.set_history_ready(None);
+            let _ = app.emit("history-progress", history_status_snapshot(&state));
+            return Err(error.to_string());
+        }
+    };
+    state.attach_reopened_history(Arc::new(store));
+    *state.history_failure.lock().unwrap() = None;
+    state.advance_scan_generation();
+    let _ = app.emit("history-progress", history_status_snapshot(&state));
+    // Dispatch while configuration is still serialized, just like set_config.
+    // The scan waits for this writer reservation to be released.
+    spawn_scan(app, state.clone(), config, sources, true);
+    drop(transition);
+    drop(reservation);
+    Ok(receipt)
+}
+
+#[tauri::command]
+pub async fn recover_history(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    confirmation: String,
+) -> Result<crate::history_store::RecoveryReceipt, String> {
+    if confirmation != "REBUILD READABLE HISTORY" {
+        return Err("confirm the reviewed recovery before rebuilding".into());
+    }
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || reopen_history(app, state, true))
+        .await
+        .map_err(|error| error.to_string())??
+        .ok_or("recovery receipt was not created".into())
+}
+
+#[tauri::command]
+pub async fn retry_history_open(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || reopen_history(app, state, false).map(|_| ()))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Returns the current history-rebuild status. The frontend calls this once

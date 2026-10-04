@@ -15,6 +15,7 @@ pub struct RecoveryReceipt {
 pub enum HistoryFailureKind {
     Corrupt,
     NewerSchema,
+    ExclusionsUnverified,
     Unavailable,
 }
 
@@ -28,7 +29,17 @@ impl HistoryFailure {
     pub fn from_error(error: &anyhow::Error) -> Self {
         let corrupt = error.chain().any(|cause| cause.downcast_ref::<rusqlite::Error>().is_some_and(|error| matches!(error,
             rusqlite::Error::SqliteFailure(code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase))));
-        if corrupt {
+        if error
+            .chain()
+            .any(|cause| cause.to_string().contains("history recovery marker"))
+        {
+            Self { kind: HistoryFailureKind::Unavailable, message: "Recovery evidence could not be verified. Preserve the recovery marker and existing backup while restoring or repairing the marker; historical coverage cannot be assumed complete.".into() }
+        } else if error
+            .chain()
+            .any(|cause| cause.to_string().contains("purge exclusion"))
+        {
+            Self {kind:HistoryFailureKind::ExclusionsUnverified,message:"Purge exclusions could not be verified. Source import is paused to prevent erased history from returning; preserve the exclusion journal while restoring or repairing it.".into()}
+        } else if corrupt {
             Self { kind: HistoryFailureKind::Corrupt, message: "The history database could not be read. Live source transcripts remain accessible.".into() }
         } else if error.to_string().contains("newer than") {
             Self { kind: HistoryFailureKind::NewerSchema, message: "This history was written by a newer Odometer. Update Odometer to read it, or preserve it and rebuild readable sources separately.".into() }
@@ -44,15 +55,27 @@ fn marker_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-pub(super) fn apply_marker(connection: &mut Connection, path: &Path) -> Result<()> {
-    let marker = marker_path(path);
-    let raw = match std::fs::read(marker) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+fn read_marker(path: &Path) -> Result<Option<RecoveryReceipt>> {
+    use std::io::Read;
+    let file = match std::fs::File::open(marker_path(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let receipt: RecoveryReceipt =
-        serde_json::from_slice(&raw).context("invalid history recovery marker")?;
+    let mut raw = Vec::new();
+    file.take(64 * 1024 + 1).read_to_end(&mut raw)?;
+    if raw.len() > 64 * 1024 {
+        bail!("history recovery marker exceeds its safe size limit");
+    }
+    Ok(Some(
+        serde_json::from_slice(&raw).context("invalid history recovery marker")?,
+    ))
+}
+
+pub(super) fn apply_marker(connection: &mut Connection, path: &Path) -> Result<()> {
+    let Some(receipt) = read_marker(path)? else {
+        return Ok(());
+    };
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute("INSERT INTO history_meta(key,value) VALUES('coverage_complete','0') ON CONFLICT(key) DO UPDATE SET value='0'", [])?;
     for (key, value) in [
@@ -144,11 +167,12 @@ impl HistoryStore {
     }
 
     pub fn recovery_receipt(&self) -> Result<Option<RecoveryReceipt>> {
-        let raw = match std::fs::read(marker_path(&self.path)) {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        Ok(Some(serde_json::from_slice(&raw)?))
+        read_marker(&self.path)
+    }
+    pub fn recovery_receipt_at(path: &Path) -> Result<Option<RecoveryReceipt>> {
+        read_marker(path)
+    }
+    pub fn can_preserve_for_recovery(path: &Path) -> bool {
+        path.is_file() && !marker_path(path).exists()
     }
 }

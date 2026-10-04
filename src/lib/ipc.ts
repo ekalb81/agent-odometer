@@ -92,6 +92,16 @@ export function getHistoryStatus(): Promise<HistoryStatus> {
   return invoke<HistoryStatus>('get_history_status');
 }
 
+export function getHistoryRecoveryStatus(): Promise<import('./types').HistoryRecoveryStatus> {
+  return invoke('get_history_recovery_status');
+}
+export function recoverHistory(confirmation: string): Promise<import('./types').RecoveryReceipt> {
+  return invoke('recover_history', { confirmation });
+}
+export function retryHistoryOpen(): Promise<void> {
+  return invoke('retry_history_open');
+}
+
 export function getRetentionStatus(): Promise<import('./types').RetentionStatus> {
   return invoke('get_retention_status');
 }

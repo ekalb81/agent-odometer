@@ -614,7 +614,15 @@ mockIPC((cmd, payload) => {
     case 'get_scan_status':
       return scanStatus();
     case 'get_history_status':
-      return historyStatus();
+      return { ...historyStatus(), coverage_complete: true, failure: null };
+    case 'get_history_recovery_status':
+      return { status: 'ready', coverage_complete: true, failure: null, backup_directory: null, can_recover: false, can_retry: false };
+    case 'get_retention_status':
+      return { policy: { retained_days: null }, present_sessions: FIXTURES.length, retained_sessions: 0, superseded_sessions: 0, purged_sessions: 0, coverage_complete: true, recovered_at: null };
+    case 'set_retention_policy':
+      return { policy: (payload as { policy: { retained_days: number | null } }).policy, present_sessions: FIXTURES.length, retained_sessions: 0, superseded_sessions: 0, purged_sessions: 0, coverage_complete: true, recovered_at: null };
+    case 'preview_history_purge':
+      return { cutoff_utc_day: '2026-09-04', sessions: 0, identity_groups: 0, snapshot_bytes: 0, tokens: { input_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 0 }, revision: 'browser-preview' };
     case 'get_history_rebuild_status':
       return historyRebuildStatus();
     case 'get_performance_status':

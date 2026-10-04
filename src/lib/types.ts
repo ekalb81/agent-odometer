@@ -494,6 +494,19 @@ export interface HistoryStatus {
   items_done: number | null;
   items_total: number | null;
   elapsed_ms: number | null;
+  coverage_complete?: boolean | null;
+  failure?: HistoryFailure | null;
+}
+
+export interface HistoryFailure { kind: 'corrupt' | 'newer_schema' | 'exclusions_unverified' | 'unavailable'; message: string; }
+export interface RecoveryReceipt { backup_directory: string; recovered_at_ms: number; }
+export interface HistoryRecoveryStatus {
+  status: HistoryReadinessStatus;
+  failure: HistoryFailure | null;
+  coverage_complete: boolean | null;
+  backup_directory: string | null;
+  can_recover: boolean;
+  can_retry: boolean;
 }
 
 export interface RetentionPolicy { retained_days: number | null; }

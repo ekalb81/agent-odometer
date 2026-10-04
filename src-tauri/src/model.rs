@@ -717,7 +717,7 @@ pub type RangeWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// Date-scoped rollup of one session's usage, returned by the
 /// `sessions_in_ranges` command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RangeTotals {
     /// Response-only derived pricing; raw aggregates and older payloads omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

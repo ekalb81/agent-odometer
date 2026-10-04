@@ -657,3 +657,118 @@ fn historical_category_totals_without_buckets_are_not_reported_as_free() {
     assert_eq!(report.categories[0].unattributed_tokens.total_tokens, 200);
     assert!(!report.categories[0].pricing_complete);
 }
+
+#[test]
+fn retention_lifecycle_reconciles_copies_replacement_purge_and_hour_edges_across_restart() {
+    use odometer_lib::history_store::RetentionPolicy;
+    use odometer_lib::model::{SessionLifecycle, SourceAvailability};
+    let root = tempfile::tempdir().unwrap();
+    let database = root.path().join("history.sqlite3");
+    let store = HistoryStore::open(&database).unwrap();
+    let mut original = session("retention-golden");
+    let bucket = TierBucket {
+        model: "gpt-5.4".into(),
+        service_tier: None,
+        tokens: TokenTotals {
+            input_tokens: 100,
+            cached_input_tokens: 20,
+            cache_creation_input_tokens: 7,
+            output_tokens: 40,
+            reasoning_output_tokens: 9,
+            total_tokens: 140,
+        },
+    };
+    for minute in [0, 30, 75, 150, 210] {
+        add_bucket(&mut original, &bucket, minute);
+    }
+    let source = root.path().join("source.jsonl");
+    let copy = root.path().join("copy.jsonl");
+    let old_key = store.observe(&source, &original, 1).unwrap().key;
+    assert_eq!(store.observe(&copy, &original, 1).unwrap().key, old_key);
+    store.mark_path_missing(&copy).unwrap();
+    let bounds = [
+        (None, None),
+        (
+            Some(instant() + Duration::minutes(15)),
+            Some(instant() + Duration::minutes(200)),
+        ),
+    ];
+    let verify = |store: &HistoryStore, key: &String| {
+        let totals = store
+            .range_totals_multi(std::slice::from_ref(key), &bounds)
+            .unwrap();
+        assert_eq!(totals[0][key].tokens, original.tokens_total);
+        let mut expected = TokenTotals::default();
+        for point in original.tokens_history.iter().filter(|point| {
+            point.timestamp >= bounds[1].0.unwrap() && point.timestamp <= bounds[1].1.unwrap()
+        }) {
+            expected += &point.delta;
+        }
+        assert_eq!(totals[1][key].tokens, expected);
+        assert_eq!(totals[1][key].tokens.cache_creation_input_tokens, 21);
+    };
+    verify(&store, &old_key);
+    let mut replacement = original.clone();
+    replacement.started_at += Duration::days(1);
+    replacement.last_event_at += Duration::days(1);
+    for point in &mut replacement.tokens_history {
+        point.timestamp += Duration::days(1);
+    }
+    let new_key = store.observe(&source, &replacement, 2).unwrap().key;
+    assert_ne!(new_key, old_key);
+    let old = store
+        .session_summaries()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.storage_id == old_key)
+        .unwrap();
+    assert_eq!(old.lifecycle, SessionLifecycle::Superseded);
+    assert_eq!(old.source_availability, SourceAvailability::Missing);
+    verify(&store, &old_key);
+    store.mark_path_missing(&source).unwrap();
+    let empty = session("retained-zero");
+    let zero_path = root.path().join("zero.jsonl");
+    let zero_key = store.observe(&zero_path, &empty, 2).unwrap().key;
+    store.mark_path_missing(&zero_path).unwrap();
+    let report = session_report(
+        &store,
+        &oracle().rate_card,
+        |key| provider_for_key(key).unwrap().to_string(),
+        None,
+        None,
+        None,
+        instant(),
+    )
+    .unwrap();
+    assert!(report.sessions.iter().any(|row| row.session_key == zero_key
+        && row.tokens == TokenTotals::default()
+        && row.lifecycle == SessionLifecycle::Retained));
+    let wire = serde_json::to_string(&report).unwrap();
+    assert!(!wire.contains("first_user_message"));
+    assert!(!wire.contains("file_path"));
+    store
+        .set_retention_policy(&RetentionPolicy {
+            retained_days: Some(30),
+        })
+        .unwrap();
+    drop(store);
+    let store = HistoryStore::open(&database).unwrap();
+    verify(&store, &old_key);
+    let now = Utc.with_ymd_and_hms(2026, 10, 4, 12, 0, 0).unwrap();
+    let preview = store.preview_purge(now).unwrap();
+    assert_eq!(preview.sessions, 3);
+    let erased = store.purge_retained(&preview, now).unwrap();
+    assert_eq!(erased.removed_keys.len(), 3);
+    assert!(store.session_summaries().unwrap().is_empty());
+    assert!(store
+        .range_totals_multi(&[old_key, new_key, zero_key], &bounds)
+        .unwrap()
+        .iter()
+        .all(|range| range.is_empty()));
+    drop(store);
+    let store = HistoryStore::open(&database).unwrap();
+    assert!(store.is_session_excluded(&original).unwrap());
+    assert!(store.is_session_excluded(&replacement).unwrap());
+    assert_eq!(store.retention_status().unwrap().purged_sessions, 3);
+    assert!(store.has_complete_coverage().unwrap());
+}

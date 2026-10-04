@@ -37,8 +37,9 @@ copies and are not removed by purge.
 
 Explicit unavailable-database recovery preserves the database, WAL, and SHM in
 a new sibling backup directory before preparing a replacement. A durable
-recovery marker precedes those moves, so interruption cannot make a replacement
-claim complete coverage. The replacement restores verified exclusions and
+recovery marker precedes those moves, so a process interruption cannot make a replacement
+claim complete coverage. This does not claim power-loss durability of directory
+entries. The replacement restores verified exclusions and
 rebuilds only readable configured sources. Its persistent coverage remains
 incomplete: missing-source history preserved in the damaged backup is not
 claimed as recovered. Token and money budgets must consult
