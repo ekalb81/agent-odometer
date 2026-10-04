@@ -2606,6 +2606,7 @@ fn card_with_conversion(target: &str, rate: f64) -> RateCard {
     let mut rates = card();
     rates.currency = "USD".into();
     rates.display_currency = Some(odometer_lib::rates::CurrencyConversion {
+        from_currency: None,
         target_currency: target.to_string(),
         rate,
         as_of: Utc.with_ymd_and_hms(2026, 8, 1, 0, 0, 0).unwrap(),
@@ -2653,6 +2654,106 @@ fn plan_credits_are_never_converted() {
             .all(|entry| entry.from_currency != "credits"),
         "credits must never be restated as money"
     );
+}
+
+#[test]
+fn legacy_conversion_cannot_turn_a_credit_card_into_money() {
+    let mut rates = card_with_conversion("EUR", 0.9);
+    rates.currency = "credits".into();
+    let totals = std::collections::BTreeMap::from([("credits".into(), 100.0), ("USD".into(), 5.0)]);
+    assert!(odometer_lib::query::convert_totals(&rates, &totals).is_empty());
+    rates.display_currency.as_mut().unwrap().from_currency = Some("USD".into());
+    let converted = odometer_lib::query::convert_totals(&rates, &totals);
+    assert_eq!(converted.len(), 1);
+    assert_eq!(converted[0].from_currency, "USD");
+    assert_eq!(converted[0].amount, 4.5);
+    assert_eq!(totals["credits"], 100.0);
+    assert_eq!(totals["USD"], 5.0);
+}
+
+#[test]
+fn converted_pricing_is_an_additive_backend_money_surface() {
+    let mut rates = card_with_conversion("EUR", 0.9);
+    rates.api_models = rates.models.clone();
+    rates.currency = "credits".into();
+    rates.display_currency.as_mut().unwrap().from_currency = Some("USD".into());
+    let bucket = odometer_lib::model::TierBucket {
+        model: "real-model".into(),
+        service_tier: None,
+        tokens: odometer_lib::model::TokenTotals {
+            input_tokens: 1_000_000,
+            total_tokens: 1_000_000,
+            ..Default::default()
+        },
+    };
+    let now = Utc.with_ymd_and_hms(2026, 8, 10, 0, 0, 0).unwrap();
+    let priced = odometer_lib::query::price_surfaces(&[bucket], "codex", &rates, now);
+    assert!(priced.plan.converted.is_none());
+    let api = priced.api.unwrap();
+    let converted = api.converted.unwrap();
+    assert_eq!(converted.from_currency, "USD");
+    assert!((converted.amount - api.total * 0.9).abs() < 1e-12);
+    assert_eq!(converted.as_of, rates.display_currency.unwrap().as_of);
+}
+
+#[test]
+fn overflow_and_non_money_sources_are_never_display_restated() {
+    let mut rates = card_with_conversion("EUR", 2.0);
+    let huge = std::collections::BTreeMap::from([("USD".into(), f64::MAX)]);
+    assert!(odometer_lib::query::convert_totals(&rates, &huge).is_empty());
+    rates.display_currency.as_mut().unwrap().from_currency = Some("credits".into());
+    assert!(rates.display_currency.as_ref().unwrap().validate().is_err());
+    rates.display_currency.as_mut().unwrap().from_currency = Some("USD".into());
+    rates.display_currency.as_mut().unwrap().target_currency = "credits".into();
+    assert!(rates.display_currency.as_ref().unwrap().validate().is_err());
+}
+
+#[test]
+fn dated_legacy_credits_never_inherit_the_api_fx_currency() {
+    use odometer_lib::rates::{CurrencyConversion, PricingSurface};
+    let mut rates = RateCard::load_bundled().unwrap();
+    let now = Utc.with_ymd_and_hms(2026, 10, 4, 0, 0, 0).unwrap();
+    rates.display_currency = Some(CurrencyConversion {
+        from_currency: Some("USD".into()),
+        target_currency: "EUR".into(),
+        rate: 0.9,
+        as_of: now,
+        source: "Synthetic offline quote".into(),
+    });
+    let session = session_at(
+        "synthetic-fx",
+        "gpt-6-sol",
+        now.timestamp_millis(),
+        1_000_000,
+        0,
+    );
+    let legacy =
+        odometer_lib::query::time_aware_surface(&session, &rates, PricingSurface::CodexPlanCredits)
+            .unwrap();
+    assert_eq!(legacy.pricing.total, 50.0);
+    assert!(legacy.pricing.converted.is_none());
+    let api =
+        odometer_lib::query::time_aware_surface(&session, &rates, PricingSurface::OpenaiApiUsd)
+            .unwrap();
+    assert!(api.pricing.total > 0.0);
+    let converted = api.pricing.converted.unwrap();
+    assert_eq!(converted.from_currency, "USD");
+    assert!((converted.amount - api.pricing.total * 0.9).abs() < 1e-12);
+}
+
+#[test]
+fn all_unpriced_usage_has_no_fabricated_zero_fx_estimate() {
+    let mut rates = card_with_conversion("EUR", 0.9);
+    rates.display_currency.as_mut().unwrap().from_currency = Some("USD".into());
+    rates.unpriced_models.push("real-model".into());
+    let bucket = TierBucket {
+        model: "real-model".into(),
+        service_tier: None,
+        tokens: tokens(1_000_000, 0),
+    };
+    let priced = odometer_lib::query::price_surfaces(&[bucket], "codex", &rates, Utc::now());
+    assert_eq!(priced.plan.unpriced_models, ["real-model"]);
+    assert!(priced.plan.converted.is_none());
 }
 
 /// The card carries one rate, defined as multiplying an amount already in

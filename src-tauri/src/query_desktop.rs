@@ -126,6 +126,7 @@ pub fn current_pricing(
         api_estimate: price_buckets_detailed(rates, harness, buckets, RateTable::ApiEstimate, now)
             .unwrap_or(PricedSurface {
                 total: 0.0,
+                converted: None,
                 by_model: Vec::new(),
                 missing_models: buckets.iter().map(|b| b.model.clone()).collect(),
                 unpriced_models: buckets.iter().map(|b| b.model.clone()).collect(),
@@ -407,6 +408,7 @@ pub fn time_aware_surface(
     let mut result = TimeAwarePricing {
         pricing: PricedSurface {
             total: 0.0,
+            converted: None,
             by_model: Vec::new(),
             missing_models: Vec::new(),
             unpriced_models: Vec::new(),
@@ -581,6 +583,22 @@ pub fn time_aware_surface(
                 }),
         )
         .collect();
+    if result.pricing.unpriced_models.is_empty()
+        || result.pricing.by_model.iter().any(|model| !model.unpriced)
+    {
+        result.pricing.converted = crate::query::convert_total(
+            rates,
+            match surface {
+                PricingSurface::CodexPlanCredits
+                | PricingSurface::CodexPurchasedCredits
+                | PricingSurface::CodexIncludedAllowance => "credits",
+                PricingSurface::OpenaiApiUsd
+                | PricingSurface::AnthropicApiUsd
+                | PricingSurface::GeminiApiUsd => "USD",
+            },
+            result.pricing.total,
+        );
+    }
     Some(result)
 }
 
