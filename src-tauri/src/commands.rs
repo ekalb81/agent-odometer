@@ -775,72 +775,8 @@ pub async fn sessions_in_ranges(
         return Err("durable history is still preparing; retry shortly".into());
     }
     let blocking_state = app_state.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
-        // The ledger is authoritative when available; sessions whose latest
-        // persist failed (plus everything, when the store never opened) fall
-        // back to walking in-memory history, keeping answers complete.
-        let (ledger_keys, memory_keys): (Vec<String>, Vec<String>) =
-            match blocking_state.history_ready() {
-                Some(_) => keys
-                    .into_iter()
-                    .partition(|key| !blocking_state.ledger_is_stale(key)),
-                None => (Vec::new(), keys),
-            };
-        let mut source = "memory";
-        let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); bounds.len()];
-        let mut memory_keys = memory_keys;
-        if let Some(history) = blocking_state.history_ready() {
-            match history.range_totals_multi(&ledger_keys, &bounds) {
-                Ok(maps) => {
-                    source = if memory_keys.is_empty() {
-                        "ledger"
-                    } else {
-                        "mixed"
-                    };
-                    out = maps;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "ledger range aggregation failed; recomputing in memory: {}",
-                        error
-                    );
-                    // Distinct from store-absent "memory" so recordings can
-                    // spot ledger regressions rather than configuration.
-                    source = "fallback";
-                    memory_keys.extend(ledger_keys);
-                }
-            }
-        }
-        if !memory_keys.is_empty() {
-            // Issue #139: `state.sessions` no longer carries full
-            // `tokens_history`, so the in-memory fallback for exactly these
-            // (expected-rare) sessions resolves full content on demand —
-            // from the resident full-content fallback for a genuinely
-            // ledger-stale session, or a ledger read for a session whose
-            // facts are correct but rollups lag. A failure here is a hard
-            // error for the whole call rather than a silent partial: a
-            // window with no entry for one of these sessions reads as zero
-            // to the frontend, which would be exactly #116's silent
-            // undercount if the miss were swallowed instead.
-            let sessions = blocking_state.full_sessions(&memory_keys)?;
-            for session in sessions {
-                let key = session.effective_storage_id();
-                for (i, rt) in session.range_totals_multi(&bounds).into_iter().enumerate() {
-                    if range_has_data(&rt) {
-                        out[i].insert(key.clone(), rt);
-                    }
-                }
-            }
-        }
-        let rates = get_rates();
-        let now = Utc::now();
-        crate::query::enrich_range_pricing(&mut out, &rates, now, |key| {
-            blocking_state
-                .sessions
-                .get(key)
-                .map(|entry| entry.summary.harness.clone())
-        });
-        Ok((out, source))
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        range_totals_for_sessions(&blocking_state, keys, &bounds, &get_rates(), Utc::now())
     })
     .await
     .map_err(|e| e.to_string())
@@ -860,6 +796,84 @@ pub async fn sessions_in_ranges(
         ]),
     );
     result.map(|(out, _)| out)
+}
+
+type PricedRangeMaps = Vec<HashMap<String, RangeTotals>>;
+
+/// Shared ledger-first assembly for desktop ranges and rolling soft budgets.
+/// A failed or pending read must not become a plausible partial total.
+pub(crate) fn range_totals_for_sessions(
+    state: &AppState,
+    keys: Vec<String>,
+    bounds: &[crate::model::RangeWindow],
+    rates: &RateCard,
+    now: DateTime<Utc>,
+) -> Result<(PricedRangeMaps, &'static str), String> {
+    if matches!(state.history_readiness(), HistoryReadinessKind::Pending) {
+        return Err("durable history is still preparing; retry shortly".into());
+    }
+    // The ledger is authoritative when available; sessions whose latest
+    // persist failed (plus everything, when the store never opened) fall
+    // back to walking in-memory history, keeping answers complete.
+    let (ledger_keys, memory_keys): (Vec<String>, Vec<String>) = match state.history_ready() {
+        Some(_) => keys
+            .into_iter()
+            .partition(|key| !state.ledger_is_stale(key)),
+        None => (Vec::new(), keys),
+    };
+    let mut source = "memory";
+    let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); bounds.len()];
+    let mut memory_keys = memory_keys;
+    if let Some(history) = state.history_ready() {
+        match history.range_totals_multi(&ledger_keys, bounds) {
+            Ok(maps) => {
+                source = if memory_keys.is_empty() {
+                    "ledger"
+                } else {
+                    "mixed"
+                };
+                out = maps;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "ledger range aggregation failed; recomputing in memory: {}",
+                    error
+                );
+                // Distinct from store-absent "memory" so recordings can
+                // spot ledger regressions rather than configuration.
+                source = "fallback";
+                memory_keys.extend(ledger_keys);
+            }
+        }
+    }
+    if !memory_keys.is_empty() {
+        // Issue #139: `state.sessions` no longer carries full
+        // `tokens_history`, so the in-memory fallback for exactly these
+        // (expected-rare) sessions resolves full content on demand —
+        // from the resident full-content fallback for a genuinely
+        // ledger-stale session, or a ledger read for a session whose
+        // facts are correct but rollups lag. A failure here is a hard
+        // error for the whole call rather than a silent partial: a
+        // window with no entry for one of these sessions reads as zero
+        // to the frontend, which would be exactly #116's silent
+        // undercount if the miss were swallowed instead.
+        let sessions = state.full_sessions(&memory_keys)?;
+        for session in sessions {
+            let key = session.effective_storage_id();
+            for (i, rt) in session.range_totals_multi(bounds).into_iter().enumerate() {
+                if range_has_data(&rt) {
+                    out[i].insert(key.clone(), rt);
+                }
+            }
+        }
+    }
+    crate::query::enrich_range_pricing(&mut out, rates, now, |key| {
+        state
+            .sessions
+            .get(key)
+            .map(|entry| entry.summary.harness.clone())
+    });
+    Ok((out, source))
 }
 
 #[derive(Debug, serde::Deserialize)]
