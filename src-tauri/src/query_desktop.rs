@@ -253,8 +253,7 @@ pub fn price_session_details(
     )
     .expect("plan table always applies");
     if session.tokens_history.is_empty() {
-        // Legacy detail fallback displays unknown model rows even without a
-        // usable rate; bucket summaries intentionally omit those rows.
+        // Keep legacy model rows visible without presenting absent rates as zero.
         for model in session.tokens_by_model.keys() {
             if !plan.by_model.iter().any(|entry| &entry.model == model) {
                 let resolution = rates.resolve_model_pricing(model, harness, &rates.models, now);
@@ -262,7 +261,7 @@ pub fn price_session_details(
                     model: model.clone(),
                     cost: 0.0,
                     basis: resolution.basis,
-                    unpriced: false,
+                    unpriced: resolution.basis == PricingBasis::Unavailable,
                 });
             }
         }

@@ -163,10 +163,12 @@
 
   // The headline money figure: Codex shows the API-rate estimate, Claude the
   // Anthropic-rate cost.
-  function surfaceMoney(surface: PricedSurface, api = false): string {
+  function surfaceMoney(surface: PricedSurface, api = false, unit?: string): string {
     if (costIsUnmeasured(surface.unpriced_models, surface.total)) return 'Unavailable';
-    const amount = api ? formatCredits(surface.total, 'USD') : fmtCredit(surface.total);
-    return amount + (surface.unpriced_models.length > 0 ? ' · excludes unpriced' : '');
+    const amount = unit ? formatCredits(surface.total, unit) : api ? formatCredits(surface.total, 'USD') : fmtCredit(surface.total);
+    return amount
+      + (surface.unpriced_models.length > 0 ? ` · excludes unpriced: ${surface.unpriced_models.join(', ')}` : '')
+      + (surface.missing_models.length > 0 ? ` · fallback rate used: ${surface.missing_models.join(', ')}` : '');
   }
   const heroCost = $derived(
     session?.harness === 'codex'
@@ -584,7 +586,7 @@
                     { label: 'Included allowance', value: current.included_allowance, unit: 'Standard-credit equivalents' },
                     { label: 'API base estimate', value: current.api_estimate, unit: 'USD' },
                   ] as scenario}
-                    <p>{scenario.label}: <span class="font-mono">{scenario.value.unpriced_models.length > 0 || scenario.value.missing_models.length > 0 ? 'Unavailable' : formatCredits(scenario.value.total, scenario.unit)}</span></p>
+                    <p>{scenario.label}: <span class="font-mono">{surfaceMoney(scenario.value, scenario.unit === 'USD', scenario.unit)}</span></p>
                   {/each}
                 {:else}
                   <p>Current purchased-credit and included-allowance estimates: Unavailable</p>
@@ -593,7 +595,7 @@
                   { label: 'Dated purchased credits', value: session.pricing?.dated_purchased_credits, unit: 'purchased credits' },
                   { label: 'Dated included allowance', value: session.pricing?.dated_included_allowance, unit: 'Standard-credit equivalents' },
                 ] as scenario}
-                  <p>{scenario.label}: <span class="font-mono">{scenario.value ? formatCredits(scenario.value.total, scenario.unit) : 'Unavailable'}</span></p>
+                  <p>{scenario.label}: <span class="font-mono">{scenario.value ? surfaceMoney(scenario.value, false, scenario.unit) : 'Unavailable'}</span></p>
                 {/each}
                 <p class="text-ink-faint">Included allowance uses Standard-credit equivalents, not a quota percentage or inferred plan size. Dated estimates require covered event dates. API request-size premiums never apply to Codex allowances.</p>
               </div>

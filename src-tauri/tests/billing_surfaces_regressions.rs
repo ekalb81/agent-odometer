@@ -426,4 +426,15 @@ fn stale_fallback_never_proves_speed_or_borrows_dated_model_evidence() {
     .unwrap();
     assert_eq!(expired.missing_models, ["unknown"]);
     assert_eq!(expired.unpriced_models, ["unknown"]);
+    let mut legacy = session("unknown", None, Some(100));
+    legacy.tokens_history.clear();
+    legacy.tokens_by_model.insert("unknown".into(), usage());
+    let legacy = price_session_details(legacy, &rates, now).pricing.plan;
+    let row = legacy
+        .by_model
+        .iter()
+        .find(|row| row.model == "unknown")
+        .unwrap();
+    assert!(row.unpriced);
+    assert_eq!(row.basis, PricingBasis::Unavailable);
 }
