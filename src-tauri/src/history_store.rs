@@ -6624,6 +6624,13 @@ mod tests {
             .path()
             .join("history.sqlite3.exclusions.jsonl")
             .exists());
+        preview.cutoff_utc_day = "2026-9-01".into();
+        assert!(store
+            .purge_retained(&preview, now)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid purge cutoff"));
+        assert_eq!(store.retention_status().unwrap().retained_sessions, 1);
         store
             .purge_retained(&store.preview_purge(now).unwrap(), now)
             .unwrap();

@@ -557,6 +557,9 @@ impl HistoryStore {
         let reviewed_cutoff =
             chrono::NaiveDate::parse_from_str(&preview.cutoff_utc_day, "%Y-%m-%d")
                 .map_err(|_| anyhow!("invalid purge cutoff; review a fresh preview"))?;
+        if reviewed_cutoff.to_string() != preview.cutoff_utc_day {
+            bail!("invalid purge cutoff format; review a fresh preview");
+        }
         if reviewed_cutoff > allowed_cutoff {
             bail!("purge cutoff exceeds the current retention policy; review a fresh preview");
         }
