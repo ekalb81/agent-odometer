@@ -9,6 +9,7 @@ export function savedSummarySearch(
 ): SavedSearchDefinition {
   return {
     name, query: filters.search, scope, content_scope: 'summary',
+    content_classes: { conversation: true, tool_calls: false, tool_results: false },
     session_key: null, fingerprint: null,
     from: filters.dateFrom ? toUtcIso(filters.dateFrom) : null,
     to: filters.dateTo ? toUtcIso(filters.dateTo) : null,

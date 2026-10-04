@@ -11,6 +11,7 @@ export const organizationStore = {
   get busy() { return busy; },
   get error() { return error; },
   update(summary: OrganizationSummary) {
+    generation++; busy = false;
     summaries = { ...summaries, [summary.identity.session_key]: summary };
   },
   async load(keys: string[]) {

@@ -1388,6 +1388,7 @@ export interface AnnotationEdit {
 export interface SavedSearchDefinition {
   name: string; query: string; scope: string;
   content_scope: 'summary' | 'session_content';
+  content_classes: TranscriptContentScope;
   session_key: string | null; fingerprint: string | null;
   from: string | null; to: string | null; model: string;
   show_active: boolean; show_archived: boolean; show_subagents: boolean;

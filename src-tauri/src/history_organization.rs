@@ -66,6 +66,8 @@ pub struct SavedSearchDefinition {
     /// `summary` searches the current summary fields. `session_content` requires
     /// the explicit bounded transcript search service; never silently downgraded.
     pub content_scope: String,
+    #[serde(default)]
+    pub content_classes: crate::transcript_search::ContentScope,
     pub session_key: Option<String>,
     pub fingerprint: Option<String>,
     pub from: Option<String>,
@@ -432,6 +434,7 @@ mod tests {
             query: "summary phrase".into(),
             scope: "all".into(),
             content_scope: "summary".into(),
+            content_classes: Default::default(),
             session_key: None,
             fingerprint: None,
             from: Some("2026-01-01T00:00:00Z".into()),
