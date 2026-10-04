@@ -149,6 +149,9 @@ focused receipt tests protect subset accounting, model resolution, and Fast-tier
 | `src-tauri/src/headless.rs` | Query selection and validation shared by CLI/MCP adapters |
 | `src-tauri/src/report_cli.rs` / `report_output.rs` | Command-line adapter and versioned export formatting |
 | `src-tauri/src/mcp_server.rs` | Bounded concurrent read-only stdio requests and cancellation |
+| `src-tauri/src/integration_status.rs` | Shared status and bounded diagnostic vocabulary; headless scan readiness stays unknown |
+| `src-tauri/src/mcp_integration.rs` | Explicit scoped MCP entry previews, race-safe apply, private backups and manual recovery |
+| `src-tauri/src/integration_activity.rs` | Bounded allowlisted local call metadata, excluding all request/result bodies |
 | `src-tauri/src/store.rs` | Concurrent in-memory session state and watcher handle |
 | `src-tauri/src/telemetry.rs` | Cross-harness normalized tool metrics, classifier, and deterministic optimization findings |
 | `src-tauri/src/tool_impact.rs` | Provider/tool target discovery, observed-use cohorts, and matched observational baselines |

@@ -1,10 +1,11 @@
-//! End-to-end integration verification (issue #57).
+//! Bounded direct-server verification shared by CLI and Integration Center.
 //!
 //! #57 is a P0 release gate for the MCP delivery in #47, and it states the
 //! bar plainly: *"A configuration file or running process alone must never
 //! be presented as proof that the integration works."*
 //!
-//! So nothing here inspects configuration. Every check performs the real
+//! This proves the server round trip, not fresh-task use by a supported client.
+//! Every check performs the real
 //! operation and reports what came back:
 //!
 //! - the server binary launches as a child process,
@@ -76,6 +77,7 @@ pub const VERIFY_SCHEMA_VERSION: u32 = 1;
 /// server actually advertises, so a rename that breaks an agent's tool
 /// selection fails here rather than in the agent.
 const EXPECTED_TOOLS: &[&str] = &[
+    "odometer_status",
     "usage_report",
     "model_report",
     "project_report",
@@ -107,9 +109,17 @@ const RECENT_ACTIVITY_DAYS: i64 = 14;
 /// `executable` is the binary to launch for the MCP round trip — the
 /// running executable in production, and a test can point it elsewhere.
 pub fn verify(executable: &std::path::Path, now: DateTime<Utc>) -> VerifyReport {
+    verify_in_directory(executable, None, now)
+}
+
+pub fn verify_in_directory(
+    executable: &std::path::Path,
+    directory: Option<&std::path::Path>,
+    now: DateTime<Utc>,
+) -> VerifyReport {
     let mut checks = Vec::new();
 
-    let mcp = verify_mcp_round_trip(executable);
+    let mcp = verify_mcp_round_trip_in_directory(executable, directory);
     checks.extend(mcp);
     checks.push(verify_ledger(now));
 
@@ -118,29 +128,46 @@ pub fn verify(executable: &std::path::Path, now: DateTime<Utc>) -> VerifyReport 
 
 /// Launches the MCP server and drives a real session against it.
 ///
-/// This is the check #57 is really about. Reading a client config file
-/// would prove a file exists; spawning the server and getting a real answer
-/// back proves the integration works.
+/// This proves the direct server path. The UI separately reports client
+/// configuration and real client activity; those claims cannot be inferred here.
+#[cfg(test)]
 fn verify_mcp_round_trip(executable: &std::path::Path) -> Vec<Check> {
+    verify_mcp_round_trip_in_directory(executable, None)
+}
+fn verify_mcp_round_trip_in_directory(
+    executable: &std::path::Path,
+    directory: Option<&std::path::Path>,
+) -> Vec<Check> {
     let mut checks = Vec::new();
 
-    let child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("mcp")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let child = command.spawn();
 
     let mut child = match child {
         Ok(child) => child,
-        Err(error) => {
+        Err(_) => {
             // Every later check depended on this one, and none of them ran.
             // Reporting them as `Unknown` rather than omitting them keeps
             // the list a stable shape for anything reading it.
             checks.push(Check {
                 id: "mcp_launch",
                 status: CheckStatus::Fail,
-                detail: format!("could not launch '{} mcp': {error}", executable.display()),
+                detail: diagnostic_detail(
+                    crate::integration_status::DiagnosticCode::ServerLaunchFailed,
+                ),
             });
             for id in ["mcp_initialize", "mcp_tools", "mcp_query"] {
                 checks.push(Check {
@@ -200,16 +227,18 @@ fn drive_session<W: Write, R: BufRead>(mut stdin: W, mut reader: R) -> Result<Ve
     let initialize = request(
         &mut stdin,
         &mut reader,
-        r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"odometer-verifier","version":"1"}}}"#,
     )?;
     let protocol = initialize["result"]["protocolVersion"]
         .as_str()
         .unwrap_or_default();
-    checks.push(if protocol.is_empty() {
+    checks.push(if protocol != crate::mcp_server::PROTOCOL_VERSION {
         Check {
             id: "mcp_initialize",
             status: CheckStatus::Fail,
-            detail: "the server did not report a protocol version".into(),
+            detail: diagnostic_detail(
+                crate::integration_status::DiagnosticCode::ProtocolVersionMismatch,
+            ),
         }
     } else {
         Check {
@@ -233,55 +262,72 @@ fn drive_session<W: Write, R: BufRead>(mut stdin: W, mut reader: R) -> Result<Ve
                 .collect()
         })
         .unwrap_or_default();
-    let missing: Vec<&str> = EXPECTED_TOOLS
-        .iter()
-        .copied()
-        .filter(|expected| !advertised.contains(expected))
-        .collect();
-    checks.push(if missing.is_empty() {
-        Check {
-            id: "mcp_tools",
-            status: CheckStatus::Pass,
-            detail: format!("all {} expected tools advertised", EXPECTED_TOOLS.len()),
-        }
-    } else {
-        Check {
-            id: "mcp_tools",
-            status: CheckStatus::Fail,
-            detail: format!("missing tools: {}", missing.join(", ")),
-        }
+    let schemas_match = listed["result"]["tools"].as_array().is_some_and(|tools| {
+        let expected = crate::mcp_server::tool_descriptors();
+        tools.len() == expected.len()
+            && expected.iter().all(|required| {
+                tools
+                    .iter()
+                    .filter(|tool| {
+                        tool["name"] == required["name"]
+                            && tool["inputSchema"] == required["inputSchema"]
+                    })
+                    .count()
+                    == 1
+            })
     });
+    checks.push(
+        if schemas_match && advertised.len() == EXPECTED_TOOLS.len() {
+            Check {
+                id: "mcp_tools",
+                status: CheckStatus::Pass,
+                detail: format!(
+                    "all {} expected tools and input schemas advertised",
+                    EXPECTED_TOOLS.len()
+                ),
+            }
+        } else {
+            Check {
+                id: "mcp_tools",
+                status: CheckStatus::Fail,
+                detail: diagnostic_detail(
+                    crate::integration_status::DiagnosticCode::ToolCatalogMismatch,
+                ),
+            }
+        },
+    );
 
     // A real query, not a ping: this is what proves the server can reach the
     // ledger and produce an answer, which is the whole claim being verified.
     let called = request(
         &mut stdin,
         &mut reader,
-        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"workflow_metrics","arguments":{}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"odometer_status","arguments":{}}}"#,
     )?;
     let is_error = called["result"]["isError"].as_bool().unwrap_or(true);
     let text = called["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
-    checks.push(if is_error || text.is_empty() {
+    let status = serde_json::from_str::<Value>(text).ok();
+    let usable = status.as_ref().is_some_and(|status| {
+        status["schema_version"].as_u64()
+            == Some(u64::from(crate::integration_status::SCHEMA_VERSION))
+            && status["ledger_available"] == true
+            && status["sessions"].as_u64().is_some()
+    });
+    checks.push(if is_error || !usable {
         Check {
             id: "mcp_query",
             status: CheckStatus::Fail,
-            detail: if text.is_empty() {
-                "the tool returned no content".into()
-            } else {
-                format!("the tool reported an error: {text}")
-            },
+            detail: diagnostic_detail(crate::integration_status::DiagnosticCode::LedgerNotReady),
         }
     } else {
-        let sessions = serde_json::from_str::<Value>(text)
-            .ok()
-            .and_then(|value| value["sessions"].as_u64());
+        let sessions = status.and_then(|value| value["sessions"].as_u64());
         Check {
             id: "mcp_query",
             status: CheckStatus::Pass,
             detail: match sessions {
-                Some(count) => format!("a live query returned metrics over {count} session(s)"),
+                Some(count) => format!("odometer_status returned a usable schema and readable ledger over {count} session(s); scan freshness remains unknown"),
                 None => "a live query returned a result".into(),
             },
         }
@@ -306,7 +352,26 @@ fn request<W: Write, R: BufRead>(input: &mut W, output: &mut R, line: &str) -> R
     if read == 0 {
         anyhow::bail!("the server closed its output before replying");
     }
-    serde_json::from_str(&response).context("the server's reply was not JSON")
+    let response: Value =
+        serde_json::from_str(&response).context("the server's reply was not JSON")?;
+    let request: Value = serde_json::from_str(line)?;
+    if response["jsonrpc"] != "2.0" || response["id"] != request["id"] {
+        anyhow::bail!("the server response did not match the request");
+    }
+    Ok(response)
+}
+
+fn diagnostic_detail(code: crate::integration_status::DiagnosticCode) -> String {
+    let diagnostic = code.diagnostic();
+    format!(
+        "{}: {} {}",
+        serde_json::to_value(code)
+            .expect("static diagnostic code serializes")
+            .as_str()
+            .expect("diagnostic is a string"),
+        diagnostic.evidence,
+        diagnostic.next_action
+    )
 }
 
 /// Confirms the ledger opens and reports how current its data is.
@@ -371,7 +436,7 @@ pub fn render(report: &VerifyReport) -> String {
         out.push_str(&format!("{marker} {:<16} {}\n", check.id, check.detail));
     }
     out.push_str(if report.ok {
-        "\nintegration verified end to end\n"
+        "\ndirect server round trip verified; fresh client task use is not proven\n"
     } else {
         // Never "mostly working": a partially verified integration is one an
         // agent will fail against in a way nobody expects.
@@ -383,6 +448,79 @@ pub fn render(report: &VerifyReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer_responses(
+        protocol: &str,
+        tools: Value,
+        status: Value,
+        is_error: bool,
+    ) -> std::io::Cursor<Vec<u8>> {
+        let responses = [
+            serde_json::json!({"jsonrpc":"2.0", "id":1, "result":{"protocolVersion":protocol}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":2, "result":{"tools":tools}}),
+            serde_json::json!({"jsonrpc":"2.0", "id":3, "result":{"isError":is_error,"content":[{"type":"text", "text":status.to_string()}]}}),
+        ];
+        std::io::Cursor::new(
+            responses
+                .iter()
+                .map(|value| format!("{value}\n"))
+                .collect::<String>()
+                .into_bytes(),
+        )
+    }
+
+    #[test]
+    fn verifier_rejects_stale_protocol_schema_and_fabricated_canary() {
+        let catalog = serde_json::to_value(crate::mcp_server::tool_descriptors()).unwrap();
+        let status = serde_json::json!({"schema_version":1,"ledger_available":true,"sessions":0});
+        let mut reader = peer_responses("2025-06-18", catalog.clone(), status.clone(), false);
+        assert!(drive_session(Vec::new(), &mut reader)
+            .unwrap()
+            .iter()
+            .all(|check| check.status == CheckStatus::Pass));
+        let mut reader = peer_responses("unsupported", catalog.clone(), status.clone(), false);
+        assert_eq!(
+            drive_session(Vec::new(), &mut reader).unwrap()[0].status,
+            CheckStatus::Fail
+        );
+        let mut stale = catalog.clone();
+        stale[0]["inputSchema"]["additionalProperties"] = Value::Bool(true);
+        let mut reader = peer_responses("2025-06-18", stale, status.clone(), false);
+        assert_eq!(
+            drive_session(Vec::new(), &mut reader).unwrap()[1].status,
+            CheckStatus::Fail
+        );
+        for invalid in [
+            serde_json::json!({"sessions":0}),
+            serde_json::json!({"schema_version":1,"ledger_available":false,"sessions":null}),
+            serde_json::json!({"schema_version":99,"ledger_available":true,"sessions":3}),
+        ] {
+            let mut reader = peer_responses("2025-06-18", catalog.clone(), invalid, false);
+            assert_eq!(
+                drive_session(Vec::new(), &mut reader).unwrap()[2].status,
+                CheckStatus::Fail
+            );
+        }
+        let secret = serde_json::json!({"private_prompt":"synthetic secret response text"});
+        let mut reader = peer_responses("2025-06-18", catalog, secret, true);
+        let checks = drive_session(Vec::new(), &mut reader).unwrap();
+        assert!(!serde_json::to_string(&checks)
+            .unwrap()
+            .contains("synthetic secret"));
+    }
+
+    #[test]
+    fn verifier_rejects_a_response_for_another_request() {
+        let mut reader = std::io::Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{}}\n");
+        assert!(request(
+            &mut Vec::new(),
+            &mut reader,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("did not match"));
+    }
 
     #[test]
     fn verification_requires_every_check_to_pass() {
@@ -475,7 +613,14 @@ mod tests {
         // A green tick with no evidence is exactly what #57 says must not
         // count as proof.
         assert!(rendered.contains("2025-06-18"), "{rendered}");
-        assert!(rendered.contains("verified end to end"), "{rendered}");
+        assert!(
+            rendered.contains("direct server round trip verified"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("fresh client task use is not proven"),
+            "{rendered}"
+        );
     }
 
     #[test]

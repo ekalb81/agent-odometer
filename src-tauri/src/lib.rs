@@ -17,6 +17,9 @@ pub mod harness_integration;
 pub mod headless;
 pub mod history_store;
 pub mod instructions;
+pub mod integration_activity;
+pub mod integration_status;
+pub mod mcp_integration;
 pub mod mcp_server;
 pub mod memory;
 pub mod model;
@@ -51,20 +54,22 @@ pub mod verify;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, approve_quota_account, cancel_history_rebuild,
-    cancel_instruction_scan, change_quota_account, check_quota_alerts, check_quota_budgets,
-    clear_session_project_override, compare_tool_impact, correlate_events, export_performance_data,
-    get_bundled_rates, get_config, get_history_rebuild_status, get_history_status,
-    get_live_quota_status, get_performance_live_status, get_performance_status,
-    get_provider_diagnostics, get_quota_config, get_quota_snapshots, get_rates, get_scan_status,
-    get_session_details, get_session_pricing, get_speed_report, get_subscription_usage,
-    get_transcript_page, get_turn_receipt_status, identify_quota_account, list_external_events,
-    list_instruction_files, list_providers, list_sessions, list_tool_impact_targets,
-    merge_projects, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
-    reassign_session_project, rebuild_history, record_frontend_performance,
+    add_defender_exclusions, apply_integration_change, approve_quota_account,
+    cancel_history_rebuild, cancel_instruction_scan, change_quota_account, check_quota_alerts,
+    check_quota_budgets, clear_session_project_override, compare_tool_impact, correlate_events,
+    export_performance_data, get_bundled_rates, get_config, get_history_rebuild_status,
+    get_history_status, get_integration_status, get_live_quota_status, get_performance_live_status,
+    get_performance_status, get_provider_diagnostics, get_quota_config, get_quota_snapshots,
+    get_rates, get_scan_status, get_session_details, get_session_pricing, get_speed_report,
+    get_subscription_usage, get_transcript_page, get_turn_receipt_status, identify_quota_account,
+    list_external_events, list_instruction_files, list_providers, list_sessions,
+    list_tool_impact_targets, merge_projects, open_instruction_file,
+    open_integration_configuration, open_task_in_chatgpt, preview_integration_change,
+    read_instruction_file, reassign_session_project, rebuild_history, record_frontend_performance,
     repair_turn_receipt_integrations, resolve_projects, resolve_working_directories,
     reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges, set_config, set_project_alias,
-    set_quota_config, set_rates, set_tray_totals, unmerge_project, write_export,
+    set_quota_config, set_rates, set_tray_totals, test_integration_client, unmerge_project,
+    write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -127,6 +132,11 @@ pub fn run() {
             clear_session_project_override,
             set_config,
             get_turn_receipt_status,
+            get_integration_status,
+            preview_integration_change,
+            apply_integration_change,
+            test_integration_client,
+            open_integration_configuration,
             repair_turn_receipt_integrations,
             get_rates,
             get_bundled_rates,

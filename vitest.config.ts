@@ -14,6 +14,7 @@ export default defineConfig({
       reportsDirectory: './coverage/frontend',
       include: [
         'src/components/DiagnosticsPanel.svelte',
+        'src/components/IntegrationCenter.svelte',
         'src/components/SessionContextMenu.svelte',
         'src/components/SessionGridControls.svelte',
         'src/components/SessionProjectEditor.svelte',
