@@ -35,6 +35,7 @@
     windowLabel,
   } from '../lib/subscriptionUsage';
   import { providersStore } from '../lib/stores/providers.svelte';
+  import { formatCompactTokens } from '../lib/format';
 
   interface Props {
     /** Gate on `active && analyticsOpen`: `<details>` keeps collapsed
@@ -220,13 +221,6 @@
     return () => clearInterval(interval);
   });
 
-  function fmtCompact(n: number): string {
-    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
-    if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
-    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
-    return String(n);
-  }
-
   function harnessLabel(harness: string): string {
     return providersStore.displayName(harness);
   }
@@ -278,7 +272,7 @@
     <span class="text-xs font-semibold text-ink">Subscription usage</span>
     {#if trailingTokens}
       <span class="text-[11px] text-ink-muted font-mono">
-        {#each TRAILING_WINDOWS as w, i (w.label)}{i > 0 ? ' · ' : ''}{w.label} {fmtCompact(trailingTokens[i])}{/each}
+        {#each TRAILING_WINDOWS as w, i (w.label)}{i > 0 ? ' · ' : ''}{w.label} {formatCompactTokens(trailingTokens[i])}{/each}
         &nbsp;tokens
       </span>
     {/if}

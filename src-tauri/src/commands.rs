@@ -1780,6 +1780,18 @@ pub fn get_scan_status(state: State<'_, Arc<AppState>>) -> ScanStatus {
     }
 }
 
+/// Returns bounded Codex turn or response throughput from local recorded data.
+#[tauri::command]
+pub async fn get_speed_report(
+    state: State<'_, Arc<AppState>>,
+    query: crate::speed::SpeedQuery,
+) -> Result<crate::speed::SpeedReport, String> {
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::speed::report(query, &app_state))
+        .await
+        .map_err(|_| "The speed report could not be generated.".to_owned())
+}
+
 /// Opens (and migrates, if needed) the durable history archive on a
 /// background thread so Tauri can create a window before a chained schema
 /// migration on an existing install completes (#116). `AppState` starts in

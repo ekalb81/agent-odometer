@@ -44,12 +44,7 @@ pub fn classify_tool(name: &str) -> ToolKind {
 fn stable_hash(value: &str) -> String {
     // FNV-1a is intentionally simple and stable across processes. This is an
     // identity key, not a security primitive; raw arguments are never stored.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{:016x}", hash)
+    format!("{:016x}", crate::stable_hash::fnv1a64(value.as_bytes()))
 }
 
 fn resource_candidate(arguments: &Value) -> Option<&str> {

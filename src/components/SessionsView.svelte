@@ -7,6 +7,7 @@
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { formatCredits, harnessCurrency } from '../lib/currency';
+  import { formatCompactTokens } from '../lib/format';
   import { getSessionPricing, getSessionDetails, listExternalEvents, onConfigEvent, sessionsInRanges, writeExport } from '../lib/ipc';
   import type { ExternalEvent, Harness, RangeTotals, RateCard, SummaryPricing, Session } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
@@ -33,6 +34,7 @@
   import ConfigTimeline from './ConfigTimeline.svelte';
   import GitOutcomes from './GitOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
+  import SpeedMonitor from './SpeedMonitor.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
   import { clearRenderedSessionRows, publishRenderedSessionRows } from '../lib/paintContext';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
@@ -92,13 +94,6 @@
   );
 
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-  function fmtCompact(n: number): string {
-    if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
-    if (n >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
-    if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
-    return String(n);
-  }
 
   function truncate(str: string, max: number): string {
     return str.length > max ? str.slice(0, max) + '…' : str;
@@ -1457,6 +1452,7 @@
   let exportError = $state<string | null>(null);
   let includeWorkingDirectory = $state(false);
   let analyticsOpen = $state(false);
+  let speedOpen = $state(false);
 
   async function pricedExportProjection(exportSessions: TrackedSession[]) {
     const rateCard = $rates;
@@ -1789,7 +1785,7 @@
       <div>
         <div class="text-[11px] text-ink-muted font-medium">Tokens · {windowLabel}</div>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-          {fmtCompact(windowTotals.tokens)}
+          {formatCompactTokens(windowTotals.tokens)}
           {#if tokensDelta !== null}
             <span class="text-[11px] font-medium {tokensDelta >= 0 ? 'text-pos' : 'text-ink-faint'}">
               {tokensDelta >= 0 ? '▲' : '▼'} {Math.abs(tokensDelta)}%
@@ -1897,6 +1893,13 @@
         {dimensionTotals}
         {dimensionAvailability}
       />
+
+      {#if harness === 'codex'}
+        <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={speedOpen} data-testid="speed-panel">
+          <summary class="cursor-pointer text-xs font-semibold text-ink">Codex speed</summary>
+          <SpeedMonitor active={active && analyticsOpen && speedOpen} />
+        </details>
+      {/if}
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
         <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view</summary>

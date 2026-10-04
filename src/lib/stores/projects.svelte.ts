@@ -8,9 +8,9 @@ import type { ProjectInfo, SessionSummary } from '../types';
  *
  * The backend owns the label: a session's `project_label` field is only the
  * default before any override, so the grid and grouping join
- * through this map rather than reading `project_label` directly. Mirrors
- * `workingDirectoryStore`'s fetch-once-until-refreshed shape — overrides
- * change rarely, and this re-renders on every live session update.
+ * through this map rather than reading `project_label` directly. Fetch once
+ * until refreshed — overrides change rarely, and this re-renders on every
+ * live session update.
  */
 export function createProjectStore() {
   let byKey = $state<ReadonlyMap<string, ProjectInfo>>(new Map());

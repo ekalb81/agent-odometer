@@ -17,6 +17,7 @@
   import DiagnosticsPanel from './DiagnosticsPanel.svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { isTauri } from '@tauri-apps/api/core';
+  import { formatBytes } from '../lib/format';
   import { openUrl } from '@tauri-apps/plugin-opener';
   import { onMount } from 'svelte';
   import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, HarnessIntegrationStatus, TurnReceiptIntegrationStatus, PricingCatalog, HistoryRebuildStatus } from '../lib/types';
@@ -498,12 +499,6 @@
     } finally {
       performanceExporting = false;
     }
-  }
-
-  function formatBytes(value: number): string {
-    if (value < 1024) return `${value} B`;
-    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
-    return `${(value / (1024 * 1024)).toFixed(1)} MiB`;
   }
 
   // ---------------------------------------------------------------------------
