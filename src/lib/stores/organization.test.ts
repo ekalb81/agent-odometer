@@ -27,7 +27,7 @@ describe('private organization metadata requests', () => {
     mocks.getOrganizationSummaries.mockReturnValue(new Promise(resolve => { finish = resolve; }));
     const pending = organizationStore.load([row.identity.session_key]);
     const edited = { ...row, revision:2,pinned:true,has_note:true,tags:['Review'] };
-    organizationStore.update(edited);
+    organizationStore.update(edited, organizationStore.epoch);
     finish([row]); await pending;
     expect(organizationStore.summaries[row.identity.session_key]).toEqual(edited);
     expect(organizationStore.tagLabels).toContain('Review');
@@ -40,5 +40,17 @@ describe('private organization metadata requests', () => {
     await organizationStore.load([row.identity.session_key]);
     expect(organizationStore.summaries).toEqual({});
     expect(organizationStore.error).toContain('Ledger unavailable');
+  });
+  it('does not preserve an edit for an old fingerprint over a pending replacement read', async () => {
+    mocks.getOrganizationSummaries.mockResolvedValue([row]);
+    await organizationStore.load([row.identity.session_key]);
+    let finish!: (rows: OrganizationSummary[]) => void;
+    mocks.getOrganizationSummaries.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const pending = organizationStore.load([row.identity.session_key]);
+    organizationStore.update({ ...row, revision: 2, pinned: true, tags: ['Old'] }, organizationStore.epoch);
+    const replacement = { ...row, identity: { ...row.identity, fingerprint: 'replacement' } };
+    finish([replacement]); await pending;
+    expect(organizationStore.summaries[row.identity.session_key]).toEqual(replacement);
+    expect(organizationStore.tagLabels).not.toContain('Old');
   });
 });

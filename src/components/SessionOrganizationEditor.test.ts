@@ -4,19 +4,39 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import SessionOrganizationEditor from './SessionOrganizationEditor.svelte';
 import { organizationStore } from '../lib/stores/organization.svelte';
 import type { SessionAnnotation } from '../lib/types';
-const mocks = vi.hoisted(() => ({ getOrganizationSummaries:vi.fn(),getSessionAnnotation:vi.fn(),editSessionAnnotation:vi.fn(),listOrganizationTags:vi.fn() }));
+const mocks = vi.hoisted(() => ({ getOrganizationSummaries:vi.fn(),getSessionAnnotation:vi.fn(),editSessionAnnotation:vi.fn(),listOrganizationTags:vi.fn(),getOrganizationRecoveryState:vi.fn() }));
 vi.mock('../lib/ipc', () => mocks);
 const annotation: SessionAnnotation = {summary:{identity:{session_key:'codex:thread:synthetic',fingerprint:'lineage',anchor:''},revision:2,pinned:false,has_note:false,tags:[]},note:''};
 beforeEach(() => {
   vi.resetAllMocks(); organizationStore.invalidate('reset');
   mocks.getOrganizationSummaries.mockResolvedValue([annotation.summary]);
   mocks.getSessionAnnotation.mockResolvedValue(annotation);
+  mocks.listOrganizationTags.mockResolvedValue([]);
+  mocks.getOrganizationRecoveryState.mockResolvedValue(false);
 });
 async function open() {
   const view=render(SessionOrganizationEditor,{sessionKey:annotation.summary.identity.session_key});
   await userEvent.click(await screen.findByRole('button',{name:'Edit organization'}));return view;
 }
 describe('private session editing', () => {
+  it.each(['invalidate', 'replace', 'destroy'] as const)('does not publish a delayed successful save after %s', async action => {
+    const view = await open();
+    let finish!: (value: SessionAnnotation) => void;
+    mocks.editSessionAnnotation.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    await userEvent.click(screen.getByLabelText('Pin this session'));
+    await userEvent.click(screen.getByRole('button', { name: 'Save organization' }));
+    if (action === 'invalidate') organizationStore.invalidate('History purged');
+    if (action === 'replace') {
+      mocks.getOrganizationSummaries.mockResolvedValue([{ ...annotation.summary, identity: { ...annotation.summary.identity, fingerprint: 'replacement' } }]);
+      await organizationStore.load([annotation.summary.identity.session_key]);
+    }
+    if (action === 'destroy') view.unmount();
+    finish({ ...annotation, summary: { ...annotation.summary, revision: 3, pinned: true, tags: ['Old'] } });
+    if (action !== 'destroy') await screen.findByRole('alert');
+    else await waitFor(() => expect(organizationStore.summaries[annotation.summary.identity.session_key]?.pinned).toBe(false));
+    expect(Object.values(organizationStore.summaries).every(row => !row.pinned && !row.tags.includes('Old'))).toBe(true);
+    if (action === 'replace') expect(organizationStore.summaries[annotation.summary.identity.session_key].identity.fingerprint).toBe('replacement');
+  });
   it('discloses that a recovered empty note did not restore private backup data', async () => {
     mocks.getSessionAnnotation.mockResolvedValue({ ...annotation, recovery_backup_unrestored:true });
     await open();

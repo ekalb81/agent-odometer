@@ -17,14 +17,16 @@
   onMount(() => { void load(); });
 
   async function load() {
+    const epoch = organizationStore.epoch;
     busy = true; error = null;
     try {
       const rows = await getOrganizationSummaries([sessionKey]);
       if (!rows[0]) throw new Error('Organization unavailable for this session');
       const value = await getSessionAnnotation(rows[0].identity);
       if (alive) {
+        if (!organizationStore.update(value.summary, epoch)) throw new Error('Organization changed; reload before editing');
         annotation = value; note = value.note; tags = value.summary.tags.join(', ');
-        pinned = value.summary.pinned; organizationStore.update(value.summary);
+        pinned = value.summary.pinned;
       }
     } catch (cause) { if (alive) error = String(cause); }
     finally { if (alive) busy = false; }
@@ -32,14 +34,17 @@
 
   async function save() {
     if (!annotation || busy) return;
+    const epoch = organizationStore.epoch;
     busy = true; error = null;
     try {
       const value = await editSessionAnnotation({
         identity: annotation.summary.identity, revision: annotation.summary.revision,
         pinned, note, tags: [...new Set(tags.split(',').map(tag => tag.trim()).filter(Boolean))],
       });
-      organizationStore.update(value.summary);
-      if (alive) { annotation = value; editing = false; }
+      if (alive) {
+        if (!organizationStore.update(value.summary, epoch)) throw new Error('Organization changed; reload before saving');
+        annotation = value; editing = false;
+      }
     } catch (cause) { if (alive) error = String(cause); }
     finally { if (alive) busy = false; }
   }
