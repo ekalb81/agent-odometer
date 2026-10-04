@@ -3,7 +3,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/ConvertedCost.svelte',
   'src/components/DiagnosticsPanel.svelte',
+  'src/components/FxSettings.svelte',
   'src/components/IntegrationCenter.svelte',
   'src/components/SessionContextMenu.svelte',
   'src/components/SessionGridControls.svelte',

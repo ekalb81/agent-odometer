@@ -275,8 +275,8 @@ export function getBundledRates(): Promise<RateCard> {
   return invoke<RateCard>('get_bundled_rates');
 }
 
-export function setRates(rates: RateCard): Promise<void> {
-  return invoke<void>('set_rates', { rates });
+export function setRates(rates: RateCard): Promise<RateCard> {
+  return invoke<RateCard>('set_rates', { rates });
 }
 
 export function revealInFileManager(path: string): Promise<void> {

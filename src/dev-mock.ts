@@ -749,8 +749,8 @@ mockIPC((cmd, payload) => {
       }
       const updatedRates = (payload as { rates: RateCard }).rates;
       assertFixtureRates(updatedRates, RATES);
-      rateOverride = updatedRates;
-      return true;
+      rateOverride = { ...updatedRates, delivery: { source: 'saved_override', app_version: '0.0.0-fixture', card_version: updatedRates.version, last_failure_reason: null } };
+      return rateOverride;
     }
     case 'set_config':
       if (visualScenario === 'settings-save-error') {

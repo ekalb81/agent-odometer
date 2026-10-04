@@ -1,0 +1,1773 @@
+{
+  "version": 13,
+  "currency": "credits",
+  "unit": "per_1m_tokens",
+  "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+  "fetched_at": "2026-10-04",
+  "_refresh_note": "Verified current Standard rows on 2026-10-04 independently from provider credit/API pages. Existing historical rows retain their prior evidence dates. Gemini 3.8 Flash paid text doubles on 2027-01-01: dated scenarios encode both periods; the promotional flat reference becomes unavailable at that UTC boundary until reviewed/reset. Opaque codex-auto-review historical rates are retained but excluded from current estimates because the current model cannot be established from that identifier.",
+  "_note": "Flat rows are current Standard paid-text reference estimates, not historical invoices. New October rows have independent credit/API provider evidence in rate_provenance; historical rows retain earlier dates and are not reverified. Claude cache reads and five-minute writes are disjoint input subsets; reasoning is included in output. Other service tiers, long context, modalities, cache storage and tools require separate evidence and remain estimated/unavailable (issue #248). Gemini 2.5 Pro and 3.1 Pro Preview are deliberately not given flat rows because prompt-size tiers cannot be represented here. Gemini 3.8 Flash doubles on January 1, 2027: the dated catalog encodes the change and the temporary flat reference expires. Daybreak mappings are bounded assumptions from the credit card; API aliases can depend on approved access and change, so they must be reviewed and expire. The opaque historical codex-auto-review id is excluded from current pricing rather than rewritten to the model currently used for auto review. Version-11 defaults are recognized only by equality with the archived bundle; indistinguishable identical user entries follow the default policy, differing values are preserved for review. Earlier unknown bundles retain existing values and dates. Reset replaces the full card after explicit confirmation. No provider fetch is performed.",
+  "rate_provenance": {
+    "models/gpt-6-astra": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.6-cyber": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.6-sol": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.6-terra": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.6-luna": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.5-cyber": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.5": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.4": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.4-mini": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.3-codex": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-5.2": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/codex-auto-review": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-opus-5": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-fable-5": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-opus-4-8": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-opus-4-7": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-opus-4-6": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-fable-5-1": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-mythos-5-1": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-mythos-5": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-opus-4-5-20251101": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-sonnet-4-5-20250929": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-sonnet-5": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-sonnet-4-6": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-haiku-4-5": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/claude-haiku-4-5-20251001": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gemini-2.5-flash": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-6-astra": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.6-cyber": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.6-sol": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.6-terra": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.6-luna": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.5-cyber": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.5": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.4": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.4-mini": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.3-codex": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/gpt-5.2": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "api_models/codex-auto-review": {
+      "evidence": "Retained legacy estimate; not reverified in this update",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-09-10T00:00:00Z",
+      "note": "Historical bundled row. See the version-11 verification notes; this date does not establish an exact historical effective start."
+    },
+    "models/gpt-6.1-sol": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/gpt-6-sol": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/gpt-6-luna": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/claude-opus-5-5": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/claude-sonnet-5-5": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/gemini-3.8-flash": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/gemini-3.5-flash": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/gemini-3.5-flash-lite": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "models/gemini-3.1-flash-lite": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard paid text reference; excludes modality, storage, tools and other billing scenarios. Current flat rates are reference estimates, not historical bills."
+    },
+    "api_models/gpt-6.1-sol": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard short-context text reference; other service tiers and long context require separate scenarios."
+    },
+    "api_models/gpt-6-sol": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard short-context text reference; other service tiers and long context require separate scenarios."
+    },
+    "api_models/gpt-6-luna": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://developers.openai.com/api/docs/pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "Standard short-context text reference; other service tiers and long context require separate scenarios."
+    },
+    "floating_model_aliases/gpt-daybreak-red-latest": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "The credit card names Daybreak Blue as GPT-5.6 Sol; the API guide warns alias resolution depends on access and can change. This mapping is a bounded reference assumption, not an API entitlement."
+    },
+    "floating_model_aliases/gpt-daybreak-blue-latest": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "The credit card names Daybreak Blue as GPT-5.6 Sol; the API guide warns alias resolution depends on access and can change. This mapping is a bounded reference assumption, not an API entitlement."
+    },
+    "floating_model_aliases/daybreak-blue-latest": {
+      "evidence": "Published Standard pricing",
+      "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+      "verified_at": "2026-10-04T00:00:00Z",
+      "note": "The credit card names Daybreak Blue as GPT-5.6 Sol; the API guide warns alias resolution depends on access and can change. This mapping is a bounded reference assumption, not an API entitlement."
+    }
+  },
+  "upgrade_review": [],
+  "flat_rate_expires_at": {
+    "gemini-3.8-flash": "2027-01-01"
+  },
+  "currencies": {
+    "codex": "credits",
+    "claude_code": "USD",
+    "gemini_cli": "USD"
+  },
+  "fallback_models": {
+    "codex": "gpt-5.6-sol",
+    "claude_code": "claude-opus-4-8",
+    "gemini_cli": "gemini-2.5-flash"
+  },
+  "unpriced_models": [
+    "gpt-5.3-codex-spark",
+    "codex-auto-review"
+  ],
+  "model_aliases": {
+    "claude-opus-4-5": "claude-opus-4-5-20251101",
+    "claude-sonnet-4-5": "claude-sonnet-4-5-20250929"
+  },
+  "floating_model_aliases": {
+    "gpt-daybreak-red-latest": {
+      "target": "gpt-5.6-cyber",
+      "expires_at": "2027-01-02",
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    "gpt-daybreak-blue-latest": {
+      "target": "gpt-5.6-sol",
+      "expires_at": "2027-01-02",
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    },
+    "daybreak-blue-latest": {
+      "target": "gpt-5.6-sol",
+      "expires_at": "2027-01-02",
+      "source_url": "https://developers.openai.com/api/docs/pricing"
+    }
+  },
+  "free_local_models": [],
+  "subscription_plans": {},
+  "pricing_catalog": {
+    "notes": [
+      "Conditional modifiers are scenario estimates, not a claim about Codex subscription billing.",
+      "ModelRate prices distinct cache-read and cache-write subsets. The older catalog notes about absent cache-write fields are historical and superseded. Gemini paid-text scenarios exclude storage, tool, modality and other service-tier charges.",
+      "Purchased credits, included allowance Standard-credit equivalents, and API estimates are separate scenarios, never observed billing allocation. Current scenarios apply as-of query time; dated scenarios apply event timestamps.",
+      "Codex has no observed cache-write tokens; credit scenarios charge no cache writes. Claude cache_creation_input represents five-minute writes, not one-hour storage.",
+      "2026-10-04 bounded harness evidence:50 of170 recent settings/context rows stored priority; one default. Fast and ultrafast were not observed in that sample. Codex protocol883af106 maps Fast to priority."
+    ],
+    "rate_periods": [
+      {
+        "id": "gpt-6.1-sol/codex_plan_credits/standard-2026-10-04",
+        "surface": "codex_plan_credits",
+        "model": "gpt-6.1-sol",
+        "to": null,
+        "rate": {
+          "input": 50,
+          "cached_input": 2.5,
+          "output": 250,
+          "reasoning": 250
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6.1-sol Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-sol/codex_plan_credits/standard-2026-10-04",
+        "surface": "codex_plan_credits",
+        "model": "gpt-6-sol",
+        "to": null,
+        "rate": {
+          "input": 50,
+          "cached_input": 5,
+          "output": 250,
+          "reasoning": 250
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-sol Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-luna/codex_plan_credits/standard-2026-10-04",
+        "surface": "codex_plan_credits",
+        "model": "gpt-6-luna",
+        "to": null,
+        "rate": {
+          "input": 2.5,
+          "cached_input": 0.25,
+          "output": 12.5,
+          "reasoning": 12.5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-luna Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "claude-opus-5-5/anthropic_api_usd/standard-2026-10-04",
+        "surface": "anthropic_api_usd",
+        "model": "claude-opus-5-5",
+        "to": null,
+        "rate": {
+          "input": 4,
+          "cached_input": 0.2,
+          "output": 20,
+          "reasoning": 20,
+          "cache_creation_input": 5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "claude-opus-5-5 Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "claude-sonnet-5-5/anthropic_api_usd/standard-2026-10-04",
+        "surface": "anthropic_api_usd",
+        "model": "claude-sonnet-5-5",
+        "to": null,
+        "rate": {
+          "input": 2,
+          "cached_input": 0.2,
+          "output": 10,
+          "reasoning": 10,
+          "cache_creation_input": 2.5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "claude-sonnet-5-5 Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gemini-3.8-flash/gemini_api_usd/standard-2026-10-04",
+        "surface": "gemini_api_usd",
+        "model": "gemini-3.8-flash",
+        "to": "2027-01-01T00:00:00Z",
+        "rate": {
+          "input": 0.75,
+          "cached_input": 0.075,
+          "output": 3.75,
+          "reasoning": 3.75
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gemini-3.8-flash Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gemini-3.5-flash/gemini_api_usd/standard-2026-10-04",
+        "surface": "gemini_api_usd",
+        "model": "gemini-3.5-flash",
+        "to": null,
+        "rate": {
+          "input": 1.5,
+          "cached_input": 0.15,
+          "output": 9,
+          "reasoning": 9
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gemini-3.5-flash Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gemini-3.5-flash-lite/gemini_api_usd/standard-2026-10-04",
+        "surface": "gemini_api_usd",
+        "model": "gemini-3.5-flash-lite",
+        "to": null,
+        "rate": {
+          "input": 0.3,
+          "cached_input": 0.03,
+          "output": 2.5,
+          "reasoning": 2.5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gemini-3.5-flash-lite Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gemini-3.1-flash-lite/gemini_api_usd/standard-2026-10-04",
+        "surface": "gemini_api_usd",
+        "model": "gemini-3.1-flash-lite",
+        "to": null,
+        "rate": {
+          "input": 0.25,
+          "cached_input": 0.025,
+          "output": 1.5,
+          "reasoning": 1.5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gemini-3.1-flash-lite Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6.1-sol/openai_api_usd/standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6.1-sol",
+        "to": null,
+        "rate": {
+          "input": 2,
+          "cached_input": 0.1,
+          "output": 10,
+          "reasoning": 10,
+          "cache_creation_input": 2.5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6.1-sol Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-sol/openai_api_usd/standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-sol",
+        "to": null,
+        "rate": {
+          "input": 2,
+          "cached_input": 0.2,
+          "output": 10,
+          "reasoning": 10,
+          "cache_creation_input": 2.5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-sol Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-luna/openai_api_usd/standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-luna",
+        "to": null,
+        "rate": {
+          "input": 0.1,
+          "cached_input": 0.01,
+          "output": 0.5,
+          "reasoning": 0.5,
+          "cache_creation_input": 0.125
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-luna Standard paid text",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gemini-3.8-flash/gemini_api_usd/standard-2027-01-01",
+        "surface": "gemini_api_usd",
+        "model": "gemini-3.8-flash",
+        "to": null,
+        "rate": {
+          "input": 1.5,
+          "cached_input": 0.15,
+          "output": 7.5,
+          "reasoning": 7.5
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gemini-3.8-flash Standard paid text",
+        "from": "2027-01-01T00:00:00Z"
+      },
+      {
+        "id": "openai/gpt-5.6-sol/api/verified-2026-09-10",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.6-sol",
+        "from": "2026-09-10T00:00:00Z",
+        "to": null,
+        "rate": { "input": 4.0, "cached_input": 0.4, "output": 20.0, "reasoning": 20.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published current API pricing",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-09-10T00:00:00Z",
+          "note": "Verification-time boundary, not a claimed historical effective start. Promotional pricing is available at least through November 21, 2026; no future increase is assumed."
+        },
+        "label": "GPT-5.6 Sol current API pricing"
+      },
+      {
+        "id": "openai/gpt-5.6-sol/api/base",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.6-sol",
+        "from": "2026-01-01T00:00:00Z",
+        "to": "2026-09-10T00:00:00Z",
+        "rate": { "input": 5.0, "cached_input": 0.5, "output": 30.0, "reasoning": 30.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published API model pricing",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          "verified_at": "2026-07-27T00:00:00Z",
+          "note": "Effective-start instant is a catalog lower bound; the published page does not state a historical start instant."
+        },
+        "label": "GPT-5.6 Sol API base pricing"
+      },
+      {
+        "id": "anthropic/claude-sonnet-5/api/introductory-2026",
+        "surface": "anthropic_api_usd",
+        "model": "claude-sonnet-5",
+        "from": "2026-01-01T00:00:00Z",
+        "to": "2026-09-01T00:00:00Z",
+        "rate": { "input": 2.0, "cached_input": 0.2, "output": 10.0, "reasoning": 10.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published introductory API pricing through 2026-08-31",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "verified_at": "2026-07-28T00:00:00Z",
+          "note": "The provider publishes an end date but not a precise first-effective instant; this lower bound keeps historical scenario selection deterministic. The catalog records the 1.25x five-minute cache-write premium, but cache writes are not represented by ModelRate."
+        },
+        "label": "Claude Sonnet 5 introductory API pricing"
+      },
+      {
+        "id": "anthropic/claude-sonnet-5/api/standard-2026-09-01",
+        "surface": "anthropic_api_usd",
+        "model": "claude-sonnet-5",
+        "from": "2026-09-01T00:00:00Z",
+        "to": null,
+        "rate": { "input": 2.0, "cached_input": 0.2, "output": 10.0, "reasoning": 10.0 },
+        "cache_write_input_multiplier": 1.25,
+        "provenance": {
+          "evidence": "Published cancellation of the September increase; introductory pricing is permanent",
+          "source_url": "https://platform.claude.com/docs/en/about-claude/pricing",
+          "verified_at": "2026-09-10T00:00:00Z",
+          "note": "The catalog records the 1.25x five-minute cache-write premium, but cache writes are not represented by ModelRate."
+        },
+        "label": "Claude Sonnet 5 standard API pricing"
+      },
+      {
+        "id": "gpt-6.1-sol/codex_purchased_credits/standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6.1-sol",
+        "to": null,
+        "rate": {
+          "input": 50,
+          "cached_input": 2.5,
+          "output": 250,
+          "reasoning": 250,
+          "cache_creation_input": 0
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6.1-sol purchased credits",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6.1-sol/codex_included_allowance/standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6.1-sol",
+        "to": null,
+        "rate": {
+          "input": 50,
+          "cached_input": 2.5,
+          "output": 250,
+          "reasoning": 250,
+          "cache_creation_input": 0
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6.1-sol included allowance Standard-credit equivalent",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-sol/codex_purchased_credits/standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-sol",
+        "to": null,
+        "rate": {
+          "input": 50,
+          "cached_input": 5,
+          "output": 250,
+          "reasoning": 250,
+          "cache_creation_input": 0
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-sol purchased credits",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-sol/codex_included_allowance/standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-sol",
+        "to": null,
+        "rate": {
+          "input": 50,
+          "cached_input": 5,
+          "output": 250,
+          "reasoning": 250,
+          "cache_creation_input": 0
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-sol included allowance Standard-credit equivalent",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-luna/codex_purchased_credits/standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-luna",
+        "to": null,
+        "rate": {
+          "input": 2.5,
+          "cached_input": 0.25,
+          "output": 12.5,
+          "reasoning": 12.5,
+          "cache_creation_input": 0
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-luna purchased credits",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "id": "gpt-6-luna/codex_included_allowance/standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-luna",
+        "to": null,
+        "rate": {
+          "input": 2.5,
+          "cached_input": 0.25,
+          "output": 12.5,
+          "reasoning": 12.5,
+          "cache_creation_input": 0
+        },
+        "cache_write_input_multiplier": null,
+        "provenance": {
+          "evidence": "Published Standard pricing",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification-time lower bound, not a claimed launch date. Standard paid text reference; other billing dimensions remain unmodeled."
+        },
+        "label": "gpt-6-luna included allowance Standard-credit equivalent",
+        "from": "2026-10-04T00:00:00Z"
+      },
+      {
+        "rate": {
+          "input": 250.0,
+          "cached_input": 25.0,
+          "output": 1250.0,
+          "reasoning": 1250.0,
+          "cache_creation_input": 0
+        },
+        "provenance": {
+          "evidence": "Published Standard credit token rates",
+          "source_url": "https://learn.chatgpt.com/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound, not a claimed effective launch date."
+        },
+        "id": "gpt-6-astra/codex_purchased_credits/standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "label": "gpt-6-astra purchased credits",
+        "cache_write_input_multiplier": null
+      },
+      {
+        "rate": {
+          "input": 250.0,
+          "cached_input": 25.0,
+          "output": 1250.0,
+          "reasoning": 1250.0,
+          "cache_creation_input": 0
+        },
+        "provenance": {
+          "evidence": "Published Standard credit token rates",
+          "source_url": "https://learn.chatgpt.com/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound, not a claimed effective launch date."
+        },
+        "id": "gpt-6-astra/codex_included_allowance/standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "label": "gpt-6-astra included allowance Standard-credit equivalent",
+        "cache_write_input_multiplier": null
+      },
+      {
+        "id": "gpt-6-astra/openai_api_usd/standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "rate": {
+          "input": 10.0,
+          "cached_input": 1.0,
+          "output": 50.0,
+          "reasoning": 50.0
+        },
+        "provenance": {
+          "evidence": "Published Standard API pricing",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound. Cache writes are not observed in Codex rollouts."
+        },
+        "label": "gpt-6-astra Standard API"
+      }
+    ],
+    "conditional_modifiers": [
+      {
+        "id": "openai/gpt-5.6-sol/api/high-context-over-272k",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.6-sol",
+        "from": "2026-01-01T00:00:00Z",
+        "to": null,
+        "condition": { "kind": "request_input_token_threshold", "greater_than": 272000 },
+        "multipliers": { "input": 2.0, "output": 1.5 },
+        "provenance": {
+          "evidence": "Published API high-context pricing",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          "verified_at": "2026-07-27T00:00:00Z",
+          "note": "This rule is explicitly limited to the OpenAI API USD surface; Codex plan billing evidence is conflicting and is not inferred from this API rule. Cache-write pricing is unmodeled."
+        },
+        "label": "GPT-5.6 Sol API requests exceeding 272K input tokens"
+      },
+      {
+        "id": "gpt-6.1-sol/codex_purchased_credits/tier-standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6.1-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6.1-sol standard codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6.1-sol/codex_purchased_credits/tier-fast-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6.1-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6.1-sol fast codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6.1-sol/codex_included_allowance/tier-standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6.1-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6.1-sol standard codex_included_allowance"
+      },
+      {
+        "id": "gpt-6.1-sol/codex_included_allowance/tier-fast-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6.1-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2.5,
+          "output": 2.5
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6.1-sol fast codex_included_allowance"
+      },
+      {
+        "id": "gpt-6.1-sol/openai_api_usd/tier-standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6.1-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6.1-sol standard openai_api_usd"
+      },
+      {
+        "id": "gpt-6.1-sol/openai_api_usd/tier-fast-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6.1-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6.1-sol fast openai_api_usd"
+      },
+      {
+        "id": "gpt-6.1-sol/openai_api_usd/high-context-over-272k-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6.1-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "request_input_token_threshold",
+          "greater_than": 272000
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 1.5
+        },
+        "provenance": {
+          "evidence": "Published full-request rates above272K input",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Only explicit full-request input evidence. Never applies to Codex credits or included allowances."
+        },
+        "label": "gpt-6.1-sol API full request above272K"
+      },
+      {
+        "id": "gpt-6-sol/codex_purchased_credits/tier-standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-sol standard codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6-sol/codex_purchased_credits/tier-fast-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-sol fast codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6-sol/codex_included_allowance/tier-standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-sol standard codex_included_allowance"
+      },
+      {
+        "id": "gpt-6-sol/codex_included_allowance/tier-fast-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2.5,
+          "output": 2.5
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-sol fast codex_included_allowance"
+      },
+      {
+        "id": "gpt-6-sol/openai_api_usd/tier-standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-sol standard openai_api_usd"
+      },
+      {
+        "id": "gpt-6-sol/openai_api_usd/tier-fast-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-sol fast openai_api_usd"
+      },
+      {
+        "id": "gpt-6-sol/openai_api_usd/high-context-over-272k-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-sol",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "request_input_token_threshold",
+          "greater_than": 272000
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 1.5
+        },
+        "provenance": {
+          "evidence": "Published full-request rates above272K input",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Only explicit full-request input evidence. Never applies to Codex credits or included allowances."
+        },
+        "label": "gpt-6-sol API full request above272K"
+      },
+      {
+        "id": "gpt-6-luna/codex_purchased_credits/tier-standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-luna",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-luna standard codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6-luna/codex_purchased_credits/tier-fast-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-luna",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-luna fast codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6-luna/codex_included_allowance/tier-standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-luna",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-luna standard codex_included_allowance"
+      },
+      {
+        "id": "gpt-6-luna/codex_included_allowance/tier-fast-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-luna",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2.5,
+          "output": 2.5
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-luna fast codex_included_allowance"
+      },
+      {
+        "id": "gpt-6-luna/openai_api_usd/tier-standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-luna",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-luna standard openai_api_usd"
+      },
+      {
+        "id": "gpt-6-luna/openai_api_usd/tier-fast-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-luna",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-luna fast openai_api_usd"
+      },
+      {
+        "id": "gpt-6-luna/openai_api_usd/high-context-over-272k-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-luna",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "request_input_token_threshold",
+          "greater_than": 272000
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 1.5
+        },
+        "provenance": {
+          "evidence": "Published full-request rates above272K input",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Only explicit full-request input evidence. Never applies to Codex credits or included allowances."
+        },
+        "label": "gpt-6-luna API full request above272K"
+      },
+      {
+        "id": "gpt-6-astra/codex_purchased_credits/tier-standard-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra standard codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6-astra/codex_purchased_credits/tier-fast-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra fast codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6-astra/codex_purchased_credits/tier-ultrafast-2026-10-04",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "ultrafast"
+        },
+        "multipliers": {
+          "input": 6,
+          "output": 6
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra ultrafast codex_purchased_credits"
+      },
+      {
+        "id": "gpt-6-astra/codex_included_allowance/tier-standard-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra standard codex_included_allowance"
+      },
+      {
+        "id": "gpt-6-astra/codex_included_allowance/tier-fast-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2.5,
+          "output": 2.5
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra fast codex_included_allowance"
+      },
+      {
+        "id": "gpt-6-astra/codex_included_allowance/tier-ultrafast-2026-10-04",
+        "surface": "codex_included_allowance",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "ultrafast"
+        },
+        "multipliers": {
+          "input": 8,
+          "output": 8
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://learn.chatgpt.com/docs/agent-configuration/speed",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra ultrafast codex_included_allowance"
+      },
+      {
+        "id": "gpt-6-astra/openai_api_usd/tier-standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra standard openai_api_usd"
+      },
+      {
+        "id": "gpt-6-astra/openai_api_usd/tier-fast-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra fast openai_api_usd"
+      },
+      {
+        "id": "gpt-6-astra/openai_api_usd/tier-ultrafast-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "ultrafast"
+        },
+        "multipliers": {
+          "input": 6,
+          "output": 6
+        },
+        "provenance": {
+          "evidence": "Published surface-specific speed billing multiplier",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; priority is a verified Codex Fast spelling. Ultrafast is a documented scenario, not an observed rollout value."
+        },
+        "label": "gpt-6-astra ultrafast openai_api_usd"
+      },
+      {
+        "id": "gpt-6-astra/openai_api_usd/high-context-over-272k-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-6-astra",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "request_input_token_threshold",
+          "greater_than": 272000
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 1.5
+        },
+        "provenance": {
+          "evidence": "Published full-request rates above272K input",
+          "source_url": "https://developers.openai.com/api/docs/models/gpt-6-astra",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Only explicit full-request input evidence. Never applies to Codex credits or included allowances."
+        },
+        "label": "gpt-6-astra API full request above272K"
+      },
+      {
+        "id": "gpt-5.5/openai_api_usd/tier-standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.5",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published API Fast and Standard rates",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; does not establish prior effective dates."
+        },
+        "label": "gpt-5.5 standard API"
+      },
+      {
+        "id": "gpt-5.5/openai_api_usd/tier-fast-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.5",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2.5,
+          "output": 2.5
+        },
+        "provenance": {
+          "evidence": "Published API Fast and Standard rates",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; does not establish prior effective dates."
+        },
+        "label": "gpt-5.5 fast API"
+      },
+      {
+        "id": "gpt-5.4/openai_api_usd/tier-standard-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.4",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "standard"
+        },
+        "multipliers": {
+          "input": 1,
+          "output": 1
+        },
+        "provenance": {
+          "evidence": "Published API Fast and Standard rates",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; does not establish prior effective dates."
+        },
+        "label": "gpt-5.4 standard API"
+      },
+      {
+        "id": "gpt-5.4/openai_api_usd/tier-fast-2026-10-04",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.4",
+        "from": "2026-10-04T00:00:00Z",
+        "to": null,
+        "condition": {
+          "kind": "service_tier",
+          "tier": "fast"
+        },
+        "multipliers": {
+          "input": 2,
+          "output": 2
+        },
+        "provenance": {
+          "evidence": "Published API Fast and Standard rates",
+          "source_url": "https://developers.openai.com/api/docs/pricing",
+          "verified_at": "2026-10-04T00:00:00Z",
+          "note": "Verification lower bound; does not establish prior effective dates."
+        },
+        "label": "gpt-5.4 fast API"
+      }
+    ]
+  },
+  "models": {
+    "gpt-6.1-sol": {"input": 50, "cached_input": 2.5, "output": 250, "reasoning": 250},
+    "gpt-6-sol": {"input": 50, "cached_input": 5, "output": 250, "reasoning": 250},
+    "gpt-6-luna": {"input": 2.5, "cached_input": 0.25, "output": 12.5, "reasoning": 12.5},
+    "claude-opus-5-5": {"input": 4, "cached_input": 0.2, "output": 20, "reasoning": 20, "cache_creation_input": 5},
+    "claude-sonnet-5-5": {"input": 2, "cached_input": 0.2, "output": 10, "reasoning": 10, "cache_creation_input": 2.5},
+    "gemini-3.8-flash": {"input": 0.75, "cached_input": 0.075, "output": 3.75, "reasoning": 3.75},
+    "gemini-3.5-flash": {"input": 1.5, "cached_input": 0.15, "output": 9, "reasoning": 9},
+    "gemini-3.5-flash-lite": {"input": 0.3, "cached_input": 0.03, "output": 2.5, "reasoning": 2.5},
+    "gemini-3.1-flash-lite": {"input": 0.25, "cached_input": 0.025, "output": 1.5, "reasoning": 1.5},
+
+    "gpt-6-astra":    { "input": 250.0, "cached_input": 25.0, "output": 1250.0, "reasoning": 1250.0 },
+    "gpt-5.6-cyber":  { "input": 312.5, "cached_input": 31.25, "output": 1875.0, "reasoning": 1875.0 },
+    "gpt-5.6-sol":    { "input": 100.0, "cached_input": 10.0, "output": 500.0, "reasoning": 500.0 },
+    "gpt-5.6-terra":  { "input": 50.0, "cached_input": 5.0, "output": 300.0, "reasoning": 300.0 },
+    "gpt-5.6-luna":   { "input": 5.0, "cached_input": 0.5, "output": 30.0, "reasoning": 30.0 },
+    "gpt-5.5-cyber":  { "input": 500.0,  "cached_input": 50.000, "output": 3000.0, "reasoning": 3000.0 },
+    "gpt-5.5":        { "input": 125.0,  "cached_input": 12.500, "output": 750.0, "reasoning": 750.0 },
+    "gpt-5.4":        { "input":  62.50, "cached_input":  6.250, "output": 375.0, "reasoning": 375.0 },
+    "gpt-5.4-mini":   { "input":  18.75, "cached_input":  1.875, "output": 113.0, "reasoning": 113.0 },
+    "gpt-5.3-codex":  { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
+    "gpt-5.2":        { "input":  43.75, "cached_input":  4.375, "output": 350.0, "reasoning": 350.0 },
+    "codex-auto-review": { "input": 43.75, "cached_input": 4.375, "output": 350.0, "reasoning": 350.0 },
+
+    "claude-opus-5":     { "input":  5.0, "cached_input": 0.50, "cache_creation_input":  6.25, "output": 25.0, "reasoning": 25.0 },
+    "claude-fable-5":    { "input": 10.0, "cached_input": 1.00, "cache_creation_input": 12.50, "output": 50.0, "reasoning": 50.0 },
+    "claude-opus-4-8":   { "input":  5.0, "cached_input": 0.50, "cache_creation_input":  6.25, "output": 25.0, "reasoning": 25.0 },
+    "claude-opus-4-7":   { "input":  5.0, "cached_input": 0.50, "cache_creation_input":  6.25, "output": 25.0, "reasoning": 25.0 },
+    "claude-opus-4-6":   { "input":  5.0, "cached_input": 0.50, "cache_creation_input":  6.25, "output": 25.0, "reasoning": 25.0 },
+    "claude-fable-5-1":  { "input": 10.0, "cached_input": 0.25, "cache_creation_input": 12.50, "output": 50.0, "reasoning": 50.0 },
+    "claude-mythos-5-1": { "input": 10.0, "cached_input": 0.25, "cache_creation_input": 12.50, "output": 50.0, "reasoning": 50.0 },
+    "claude-mythos-5":   { "input": 10.0, "cached_input": 1.00, "cache_creation_input": 12.50, "output": 50.0, "reasoning": 50.0 },
+    "claude-opus-4-5-20251101": { "input": 5.0, "cached_input": 0.50, "cache_creation_input": 6.25, "output": 25.0, "reasoning": 25.0 },
+    "claude-sonnet-4-5-20250929": { "input": 3.0, "cached_input": 0.30, "cache_creation_input": 3.75, "output": 15.0, "reasoning": 15.0 },
+    "claude-sonnet-5":   { "input":  2.0, "cached_input": 0.20, "cache_creation_input":  2.50, "output": 10.0, "reasoning": 10.0 },
+    "claude-sonnet-4-6": { "input":  3.0, "cached_input": 0.30, "cache_creation_input":  3.75, "output": 15.0, "reasoning": 15.0 },
+    "claude-haiku-4-5":          { "input":  1.0, "cached_input": 0.10, "cache_creation_input": 1.25, "output":  5.0, "reasoning":  5.0 },
+    "claude-haiku-4-5-20251001": { "input":  1.0, "cached_input": 0.10, "cache_creation_input": 1.25, "output":  5.0, "reasoning":  5.0 },
+
+    "gemini-2.5-flash":  { "input": 0.30, "cached_input": 0.03, "output": 2.50, "reasoning": 2.50 }
+  },
+  "api_models": {
+    "gpt-6.1-sol": {"input": 2, "cached_input": 0.1, "output": 10, "reasoning": 10, "cache_creation_input": 2.5},
+    "gpt-6-sol": {"input": 2, "cached_input": 0.2, "output": 10, "reasoning": 10, "cache_creation_input": 2.5},
+    "gpt-6-luna": {"input": 0.1, "cached_input": 0.01, "output": 0.5, "reasoning": 0.5, "cache_creation_input": 0.125},
+
+    "gpt-6-astra":    { "input": 10.0, "cached_input": 1.0, "output": 50.0, "reasoning": 50.0 },
+    "gpt-5.6-cyber":  { "input": 12.5, "cached_input": 1.25, "output": 75.0, "reasoning": 75.0 },
+    "gpt-5.6-sol":    { "input": 4.0, "cached_input": 0.4, "output": 20.0, "reasoning": 20.0 },
+    "gpt-5.6-terra":  { "input": 2.0, "cached_input": 0.2, "output": 12.0, "reasoning": 12.0 },
+    "gpt-5.6-luna":   { "input": 0.2, "cached_input": 0.02, "output": 1.2, "reasoning": 1.2 },
+    "gpt-5.5-cyber":  { "input": 20.00, "cached_input": 2.000, "output": 120.0, "reasoning": 120.0 },
+    "gpt-5.5":        { "input": 5.00, "cached_input": 0.500, "output": 30.0, "reasoning": 30.0 },
+    "gpt-5.4":        { "input": 2.50, "cached_input": 0.250, "output": 15.0, "reasoning": 15.0 },
+    "gpt-5.4-mini":   { "input": 0.75, "cached_input": 0.075, "output":  4.5, "reasoning":  4.5 },
+    "gpt-5.3-codex":  { "input": 1.75, "cached_input": 0.175, "output": 14.0, "reasoning": 14.0 },
+    "gpt-5.2":        { "input": 1.75, "cached_input": 0.175, "output": 14.0, "reasoning": 14.0 },
+    "codex-auto-review": { "input": 1.75, "cached_input": 0.175, "output": 14.0, "reasoning": 14.0 }
+  },
+  "fallback_model": "gpt-5.6-sol"
+}
