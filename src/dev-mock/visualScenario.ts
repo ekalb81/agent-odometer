@@ -18,6 +18,7 @@ export const VISUAL_SCENARIOS = [
   'settings-save-error',
   'history-purge',
   'history-recovery',
+  'organization-recovered',
   'defender-slow',
   'defender-error',
   'updater-available',

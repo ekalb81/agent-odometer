@@ -619,7 +619,7 @@
   {/if}
 
   <!-- Toolbar -->
-  <header class="flex items-center gap-5 px-4 h-12 bg-chrome border-b border-edge shrink-0">
+  <header class="flex items-center gap-5 px-4 h-12 bg-chrome border-b border-edge shrink-0 max-[1100px]:flex-wrap max-[1100px]:h-auto max-[1100px]:py-2 max-[1100px]:gap-y-2">
     <!-- Gauge-O wordmark. The ring/hub follow the text color; the needle is
          always brand orange (#e8935a). -->
     <span class="font-bold text-[15px] tracking-[-0.015em] leading-none text-ink whitespace-nowrap">
@@ -633,7 +633,7 @@
       {/if}
     </span>
 
-    <nav class="flex bg-app rounded-lg p-[2px] gap-[2px] border border-edge" aria-label="Views">
+    <nav class="flex shrink-0 max-w-full overflow-x-auto bg-app rounded-lg p-[2px] gap-[2px] border border-edge" aria-label="Views">
       {#each appViews(providersStore.descriptors) as view (view.id)}
         {#if view.id !== 'instructions' || ($config.instructions_enabled && $config.instructions_tab_visible)}
           <button class={tabClass(activeView === view.id, providerAccent(providerIdForTab(view.id)).tabFill)} onclick={() => (activeView = view.id)}>
@@ -644,7 +644,7 @@
     </nav>
 
     {#if activeScope}
-      <div class="ml-auto flex items-center gap-1">
+      <div class="ml-auto flex items-center gap-1 max-[1100px]:basis-full max-[1100px]:justify-end">
         {#key activeScope}
           <OrganizationToolbar scope={activeScope} filters={filtersByScope[activeScope] ?? defaultFilters()}
             pinnedOnly={organizationFilters[activeScope]?.pinned ?? false}

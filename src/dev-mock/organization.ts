@@ -10,12 +10,12 @@ export function organizationIdentity(key: string): AnnotationIdentity {
 export function organizationSummary(key: string): OrganizationSummary {
   return annotations.get(key)?.summary ?? { identity: organizationIdentity(key), revision: 0, pinned: false, has_note: false, tags: [] };
 }
-export function mockOrganization(command: string, payload: Record<string, unknown>): unknown {
+export function mockOrganization(command: string, payload: Record<string, unknown>, recoveryUnrestored = false): unknown {
   switch (command) {
     case 'get_organization_summaries': return (payload.keys as string[]).map(organizationSummary);
     case 'get_session_annotation': {
       const identity = payload.identity as AnnotationIdentity;
-      return annotations.get(identity.session_key) ?? { summary: organizationSummary(identity.session_key), note: '' };
+      return { ...(annotations.get(identity.session_key) ?? { summary: organizationSummary(identity.session_key), note: '' }), recovery_backup_unrestored: recoveryUnrestored };
     }
     case 'edit_session_annotation': {
       const edit = payload.edit as AnnotationEdit;
