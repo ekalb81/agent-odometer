@@ -756,6 +756,36 @@ test('content search lands on a source record and Escape returns to the search w
   await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
 });
 
+visualTest('human-outcomes-summary', 'explicit human outcomes show coverage and user-reported effort', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByLabel('Task outcome', { exact: true }).selectOption('accepted');
+  await editor.getByLabel('User-reported repair minutes (optional)').fill('12');
+  await editor.getByLabel('Accepted on first pass (explicit report)').selectOption('false');
+  await editor.getByRole('button', { name: 'Save organization' }).click();
+  await expect(editor.getByText(/Human: accepted/)).toBeVisible();
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const outcomes = page.getByLabel('Human task outcomes', { exact: true });
+  await outcomes.locator('summary').click();
+  await expect(outcomes).toContainText('0 / 1 explicitly reported');
+  await expect(outcomes).toContainText('12 minutes');
+  await outcomes.scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
+visualTest('human-outcomes-recovery', 'unrestored human ratings remain unavailable', async (page) => {
+  await page.setViewportSize({ width: 800, height: 900 });
+  await visit(page, { scenario: 'organization-recovered', view: 'codex' });
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const outcomes = page.getByLabel('Human task outcomes', { exact: true });
+  await outcomes.locator('summary').click();
+  await expect(outcomes).toContainText('Unrestored ratings are unavailable, not unrated');
+  await outcomes.scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {

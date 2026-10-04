@@ -500,6 +500,8 @@ Saved UTC bounds remain authoritative across timezone changes and repeated DST h
 
 Ordinary source rebuild/refresh preserves identity-bound organization. Corrupt-database recovery preserves private data only in the original backup; it cannot reconstruct notes, pins, tags, or saved searches from source transcripts. Private editors and search management disclose this limitation, and dependent pin/tag result sets remain unavailable rather than presenting absent annotations as a complete empty result. New private edits apply to the rebuilt database. Backup restoration is a separate future operation.
 
+Schema 14 follows the schema-13 workflow lifecycle migration and adds three nullable structured human-outcome columns to `session_annotations`. Explicit desktop annotation edits validate labels, whole user-reported repair minutes, and optional first-pass evidence under the existing identity/revision transaction. An omitted outcome preserves earlier labels. A null label distinguishes absent human edits from an explicit Not rated edit, so a post-recovery pin/note change cannot make an unrestored rating look known. Root-task reports and explicit structured outcome exports disclose coverage and exclude separately labelled subagents; ordinary accounting, exports, diagnostics, logs, MCP, and source/cache snapshots remain unchanged. Repair notes reuse the private note body. See [human outcome measurement](HUMAN_OUTCOMES.md).
+
 
 ### Account-scoped live quota and soft budgets (#43)
 

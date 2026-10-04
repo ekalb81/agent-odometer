@@ -303,7 +303,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            13
+            14
         );
         assert_eq!(record(&connection, 1000, 3, FindingState::New).revision, 1);
         drop(connection);

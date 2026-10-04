@@ -1,5 +1,7 @@
 {
   "snapshots": [
+    "human-outcomes-summary",
+    "human-outcomes-recovery",
     "organization-saved-search",
     "organization-editor-narrow",
     "organization-recovery-unavailable",

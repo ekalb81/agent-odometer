@@ -14,7 +14,11 @@ pub struct HumanOutcome {
 }
 impl Default for HumanOutcome {
     fn default() -> Self {
-        Self { label: "not_rated".into(), repair_minutes: None, first_pass_accepted: None }
+        Self {
+            label: "not_rated".into(),
+            repair_minutes: None,
+            first_pass_accepted: None,
+        }
     }
 }
 impl HumanOutcome {
@@ -22,7 +26,8 @@ impl HumanOutcome {
         if !["not_rated", "accepted", "rejected", "unresolved"].contains(&self.label.as_str())
             || self.repair_minutes.is_some_and(|minutes| minutes > 525_600)
             || (self.first_pass_accepted == Some(true) && self.label != "accepted")
-            || (self.first_pass_accepted.is_some() && self.label == "not_rated") {
+            || (self.first_pass_accepted.is_some() && self.label == "not_rated")
+        {
             bail!("Use an explicit outcome, whole repair minutes up to 525600, and a first-pass report only for a rated task");
         }
         Ok(())
@@ -48,7 +53,9 @@ fn read_outcome(conn: &Connection, identity: &AnnotationIdentity) -> Result<Opti
             let first_pass_accepted = r.get(2)?;
             Ok(label.map(|label| HumanOutcome { label, repair_minutes, first_pass_accepted }))
         }).optional()?.flatten();
-    if let Some(outcome) = &outcome { outcome.validate()?; }
+    if let Some(outcome) = &outcome {
+        outcome.validate()?;
+    }
     Ok(outcome)
 }
 
@@ -647,7 +654,11 @@ mod tests {
             .unwrap()
             .remove(0);
         let mut rated = edit(&initial);
-        rated.outcome = Some(HumanOutcome { label: "accepted".into(), repair_minutes: Some(0), first_pass_accepted: Some(true) });
+        rated.outcome = Some(HumanOutcome {
+            label: "accepted".into(),
+            repair_minutes: Some(0),
+            first_pass_accepted: Some(true),
+        });
         let saved = store.edit_annotation(&rated).unwrap();
         assert!(store.edit_annotation(&edit(&initial)).is_err());
         // First real usage promotes the provisional fingerprint in-place.
@@ -676,8 +687,21 @@ mod tests {
         // Renaming/relinking the source and changing its displayed title do not
         // turn the human assertion into a label for a different task.
         session.thread_name = Some("Renamed synthetic task".into());
-        assert_eq!(store.observe(&root.path().join("renamed-source.jsonl"), &session, 3).unwrap().key, key);
-        assert_eq!(store.get_annotation(&promoted.identity).unwrap().summary.outcome, promoted.outcome);
+        assert_eq!(
+            store
+                .observe(&root.path().join("renamed-source.jsonl"), &session, 3)
+                .unwrap()
+                .key,
+            key
+        );
+        assert_eq!(
+            store
+                .get_annotation(&promoted.identity)
+                .unwrap()
+                .summary
+                .outcome,
+            promoted.outcome
+        );
         assert_eq!(
             store.get_annotation(&promoted.identity).unwrap().note,
             "PRIVATE_SENTINEL_252"
@@ -691,7 +715,14 @@ mod tests {
             .contains("PRIVATE_SENTINEL_252"));
         drop(store);
         let store = HistoryStore::open(&db).unwrap();
-        assert_eq!(store.get_annotation(&promoted.identity).unwrap().summary.outcome, rated.outcome);
+        assert_eq!(
+            store
+                .get_annotation(&promoted.identity)
+                .unwrap()
+                .summary
+                .outcome,
+            rated.outcome
+        );
         assert_eq!(
             store.get_annotation(&promoted.identity).unwrap().note,
             "PRIVATE_SENTINEL_252"
@@ -714,7 +745,10 @@ mod tests {
         );
         // Older annotation editors omit the field and must not erase a rating.
         assert_eq!(cleared.summary.outcome.as_ref().unwrap().label, "accepted");
-        assert_eq!(cleared.summary.outcome.as_ref().unwrap().repair_minutes, Some(0));
+        assert_eq!(
+            cleared.summary.outcome.as_ref().unwrap().repair_minutes,
+            Some(0)
+        );
     }
 
     #[test]
@@ -729,7 +763,11 @@ mod tests {
             .unwrap()
             .remove(0);
         let mut rated = edit(&initial);
-        rated.outcome = Some(HumanOutcome { label: "rejected".into(), repair_minutes: Some(15), first_pass_accepted: Some(false) });
+        rated.outcome = Some(HumanOutcome {
+            label: "rejected".into(),
+            repair_minutes: Some(15),
+            first_pass_accepted: Some(false),
+        });
         store.edit_annotation(&rated).unwrap();
         store
             .edit_record_bookmark(&RecordBookmark {
@@ -788,14 +826,38 @@ mod tests {
     fn outcomes_are_explicit_bounded_atomic_and_never_guessed_from_other_annotations() {
         let root = tempfile::tempdir().unwrap();
         let store = HistoryStore::open(&root.path().join("history.sqlite")).unwrap();
-        let key = store.observe(&root.path().join("source.jsonl"), &fixture("human-outcome"), 1).unwrap().key;
-        let initial = store.organization_summaries(std::slice::from_ref(&key)).unwrap().remove(0);
+        let key = store
+            .observe(
+                &root.path().join("source.jsonl"),
+                &fixture("human-outcome"),
+                1,
+            )
+            .unwrap()
+            .key;
+        let initial = store
+            .organization_summaries(std::slice::from_ref(&key))
+            .unwrap()
+            .remove(0);
         assert!(initial.outcome.is_none());
         for outcome in [
-            HumanOutcome { label: "git_retained".into(), ..Default::default() },
-            HumanOutcome { label: "accepted".into(), repair_minutes: Some(525_601), first_pass_accepted: None },
-            HumanOutcome { label: "rejected".into(), first_pass_accepted: Some(true), ..Default::default() },
-            HumanOutcome { first_pass_accepted: Some(false), ..Default::default() },
+            HumanOutcome {
+                label: "git_retained".into(),
+                ..Default::default()
+            },
+            HumanOutcome {
+                label: "accepted".into(),
+                repair_minutes: Some(525_601),
+                first_pass_accepted: None,
+            },
+            HumanOutcome {
+                label: "rejected".into(),
+                first_pass_accepted: Some(true),
+                ..Default::default()
+            },
+            HumanOutcome {
+                first_pass_accepted: Some(false),
+                ..Default::default()
+            },
         ] {
             let mut invalid = edit(&initial);
             invalid.outcome = Some(outcome);
@@ -805,7 +867,11 @@ mod tests {
             assert!(!unchanged.summary.pinned && unchanged.note.is_empty());
         }
         let mut unresolved = edit(&initial);
-        unresolved.outcome = Some(HumanOutcome { label: "unresolved".into(), repair_minutes: Some(5), first_pass_accepted: None });
+        unresolved.outcome = Some(HumanOutcome {
+            label: "unresolved".into(),
+            repair_minutes: Some(5),
+            first_pass_accepted: None,
+        });
         let saved = store.edit_annotation(&unresolved).unwrap();
         assert!(store.edit_annotation(&unresolved).is_err());
         let mut clear = edit(&saved.summary);
@@ -814,11 +880,98 @@ mod tests {
         assert_eq!(cleared.summary.outcome, Some(HumanOutcome::default()));
         assert!(cleared.summary.pinned && cleared.summary.has_note);
         let mut payload = serde_json::to_value(&clear).unwrap();
-        payload["outcome"] = serde_json::json!({"label":"accepted","repair_minutes":-1,"first_pass_accepted":null});
+        payload["outcome"] =
+            serde_json::json!({"label":"accepted","repair_minutes":-1,"first_pass_accepted":null});
         assert!(serde_json::from_value::<AnnotationEdit>(payload).is_err());
         let mut old_payload = serde_json::to_value(&clear).unwrap();
         old_payload.as_object_mut().unwrap().remove("outcome");
-        assert!(serde_json::from_value::<AnnotationEdit>(old_payload).unwrap().outcome.is_none());
+        assert!(serde_json::from_value::<AnnotationEdit>(old_payload)
+            .unwrap()
+            .outcome
+            .is_none());
+    }
+
+    #[test]
+    fn schema_thirteen_upgrade_preserves_private_rows_and_measurements_without_guessing_ratings() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("history.sqlite");
+        let store = HistoryStore::open(&db).unwrap();
+        let key = store
+            .observe(
+                &root.path().join("source.jsonl"),
+                &fixture("upgrade-human"),
+                1,
+            )
+            .unwrap()
+            .key;
+        let initial = store
+            .organization_summaries(std::slice::from_ref(&key))
+            .unwrap()
+            .remove(0);
+        store.edit_annotation(&edit(&initial)).unwrap();
+        let bookmark = RecordBookmark {
+            identity: AnnotationIdentity {
+                anchor: "opaque-source:0:hash".into(),
+                ..initial.identity.clone()
+            },
+            revision: 0,
+            bookmarked: true,
+        };
+        store.edit_record_bookmark(&bookmark).unwrap();
+        let measurements = serde_json::to_value(store.session_summaries().unwrap()).unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch(
+                "ALTER TABLE session_annotations DROP COLUMN outcome_label;
+            ALTER TABLE session_annotations DROP COLUMN repair_minutes;
+            ALTER TABLE session_annotations DROP COLUMN first_pass_accepted;
+            UPDATE history_meta SET value='13' WHERE key='schema_version'; PRAGMA user_version=13;",
+            )
+            .unwrap();
+        drop(store);
+        let mut steps = Vec::new();
+        let store = HistoryStore::open_with_progress(&db, |event| {
+            if event.elapsed_ms.is_some() {
+                steps.push(event.step);
+            }
+        })
+        .unwrap();
+        assert_eq!(steps, ["v13_to_v14_human_outcomes"]);
+        let restored = store.get_annotation(&initial.identity).unwrap();
+        assert!(
+            restored.summary.pinned
+                && restored.summary.has_note
+                && restored.summary.outcome.is_none()
+        );
+        assert_eq!(restored.summary.tags, ["Review"]);
+        assert_eq!(restored.note, "PRIVATE_SENTINEL_252");
+        assert!(store.record_bookmarks(&key).unwrap().bookmarks[0].bookmarked);
+        assert_eq!(
+            serde_json::to_value(store.session_summaries().unwrap()).unwrap(),
+            measurements
+        );
+        assert_eq!(
+            store
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name='workflow_finding_lifecycle'",
+                    [],
+                    |r| r.get::<_, u32>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(store);
+        let mut reopened_steps = Vec::new();
+        HistoryStore::open_with_progress(&db, |event| {
+            if event.elapsed_ms.is_some() {
+                reopened_steps.push(event.step);
+            }
+        })
+        .unwrap();
+        assert!(reopened_steps.is_empty());
     }
 
     #[test]

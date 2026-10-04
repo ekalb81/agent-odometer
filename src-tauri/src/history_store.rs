@@ -45,11 +45,11 @@ mod workflow;
 #[path = "history_organization.rs"]
 mod organization;
 pub use organization::{
-    AnnotationEdit, AnnotationIdentity, HumanOutcome, OrganizationSummary, RecordBookmark, RecordBookmarkList,
-    SavedSearch, SavedSearchDefinition, SessionAnnotation,
+    AnnotationEdit, AnnotationIdentity, HumanOutcome, OrganizationSummary, RecordBookmark,
+    RecordBookmarkList, SavedSearch, SavedSearchDefinition, SessionAnnotation,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -2943,6 +2943,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 12 {
         steps += 1;
+        version = 13;
+    }
+    if version == 13 {
+        steps += 1;
     }
     steps
 }
@@ -3074,6 +3078,7 @@ fn migrate(
         lifecycle::install_schema(&transaction)?;
         organization::install_schema(&transaction)?;
         crate::workflow::lifecycle::install_schema(&transaction)?;
+        organization::install_outcome_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -3840,6 +3845,30 @@ fn migrate(
             step_total,
             12,
             13,
+            started.elapsed(),
+        ));
+    }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 13 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v13_to_v14_human_outcomes",
+            step_index,
+            step_total,
+            13,
+            14,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        organization::install_outcome_schema(&transaction)?;
+        transaction.execute_batch("INSERT INTO history_meta(key,value) VALUES('schema_version','14') ON CONFLICT(key) DO UPDATE SET value=excluded.value; PRAGMA user_version=14;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v13_to_v14_human_outcomes",
+            step_index,
+            step_total,
+            13,
+            14,
             started.elapsed(),
         ));
     }
@@ -10444,6 +10473,7 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                14 => "ALTER TABLE session_annotations DROP COLUMN outcome_label; ALTER TABLE session_annotations DROP COLUMN repair_minutes; ALTER TABLE session_annotations DROP COLUMN first_pass_accepted;",
                 13 => "DROP TABLE workflow_finding_lifecycle;",
                 12 => "DROP TABLE annotation_tags; DROP TABLE session_annotations; DROP TABLE organization_tags; DROP TABLE saved_searches; DROP INDEX durable_sessions_organization_identity_idx;",
                 11 => "DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; DELETE FROM history_meta WHERE key IN ('coverage_complete','retention_policy');",
@@ -10679,6 +10709,7 @@ mod tests {
                 "v10_to_v11_retention",
                 "v11_to_v12_organization",
                 "v12_to_v13_workflow",
+                "v13_to_v14_human_outcomes",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );
