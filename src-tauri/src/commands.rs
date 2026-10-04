@@ -4926,3 +4926,148 @@ pub fn change_quota_account(
     let _ = app.emit("live-quota-updated", ());
     result
 }
+
+// Private desktop organization: never exposed by headless/MCP projections.
+#[tauri::command]
+pub async fn get_organization_recovery_state(
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .organization_recovery_pending()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn get_organization_summaries(
+    state: State<'_, Arc<AppState>>,
+    keys: Vec<String>,
+) -> Result<Vec<crate::history_store::OrganizationSummary>, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .organization_summaries(&keys)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn get_session_annotation(
+    state: State<'_, Arc<AppState>>,
+    identity: crate::history_store::AnnotationIdentity,
+) -> Result<crate::history_store::SessionAnnotation, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .get_annotation(&identity)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn edit_session_annotation(
+    state: State<'_, Arc<AppState>>,
+    edit: crate::history_store::AnnotationEdit,
+) -> Result<crate::history_store::SessionAnnotation, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .edit_annotation(&edit)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn list_organization_tags(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<String>, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .organization_tags()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn change_organization_tag(
+    state: State<'_, Arc<AppState>>,
+    label: String,
+    replacement: Option<String>,
+) -> Result<(), String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .change_organization_tag(&label, replacement.as_deref())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn list_saved_searches(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::history_store::SavedSearch>, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history.saved_searches().map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn save_search(
+    state: State<'_, Arc<AppState>>,
+    id: Option<i64>,
+    revision: i64,
+    definition: crate::history_store::SavedSearchDefinition,
+) -> Result<crate::history_store::SavedSearch, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .save_search(id, revision, &definition)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
+pub async fn delete_saved_search(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    revision: i64,
+) -> Result<(), String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .delete_saved_search(id, revision)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}

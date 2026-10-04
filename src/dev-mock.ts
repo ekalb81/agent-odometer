@@ -4,6 +4,7 @@
 
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
+import { mockOrganization } from './dev-mock/organization';
 import { contentSearchFixture, retainedLandingFixture } from './dev-mock/contentSearch';
 import type { TranscriptSearchRequest, TranscriptSearchTarget } from './lib/types';
 import type { TranscriptRequest } from './lib/types';
@@ -284,7 +285,7 @@ function historyStatus(): HistoryStatus & { coverage_complete: boolean | null } 
   // normal warm start.
   return {
     status: visualScenario === 'history-unavailable' ? 'unavailable' : 'ready',
-    coverage_complete: visualScenario === 'history-unavailable' ? null : visualScenario !== 'history-partial',
+    coverage_complete: visualScenario === 'history-unavailable' ? null : !['history-partial', 'organization-recovered'].includes(visualScenario),
     step: null,
     step_index: null,
     step_total: null,
@@ -458,6 +459,16 @@ function emitUpdateProgress(channelId: number) {
 
 mockIPC((cmd, payload) => {
   switch (cmd) {
+    case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
+    case 'get_organization_summaries':
+    case 'get_session_annotation':
+    case 'edit_session_annotation':
+    case 'list_organization_tags':
+    case 'change_organization_tag':
+    case 'list_saved_searches':
+    case 'save_search':
+    case 'delete_saved_search':
+      return mockOrganization(cmd, (payload ?? {}) as Record<string, unknown>, visualScenario === 'organization-recovered');
     case 'list_sessions':
       return visibleFixtures().map(summary);
     case 'get_speed_report': {
