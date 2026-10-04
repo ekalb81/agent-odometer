@@ -14,6 +14,7 @@
   } from '../lib/optimization';
   import Sparkline from './Sparkline.svelte';
   import TranscriptInspector from './TranscriptInspector.svelte';
+  import TranscriptExport from './TranscriptExport.svelte';
   import SessionProjectEditor from './SessionProjectEditor.svelte';
 
   interface Props {
@@ -27,6 +28,7 @@
 
   let { session, childCount = 0, onclose, transcriptAnchor = null }: Props = $props();
   let inspectorOpen = $state(false);
+  let exportOpen = $state(false);
 
 
   const numFmt = new Intl.NumberFormat();
@@ -123,6 +125,7 @@
       lastSessionId = id;
       expandedTurn = null;
       inspectorOpen = !!transcriptAnchor;
+      exportOpen = false;
     }
   });
 
@@ -283,7 +286,10 @@
       </div>
     </div>
 
-    <div class="px-5 py-2 border-b border-edge shrink-0"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { inspectorOpen = true; }}>Inspect transcript</button></div>
+    <div class="px-5 py-2 border-b border-edge shrink-0 flex flex-wrap gap-x-4 gap-y-1 min-h-10"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { inspectorOpen = true; }}>Inspect transcript</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { exportOpen = true; }}>Export transcript</button></div>
+    {#if exportOpen}
+      <TranscriptExport sessionId={session.storage_id} onclose={() => { exportOpen = false; }} />
+    {/if}
     {#if inspectorOpen}
       <TranscriptInspector sessionId={session.storage_id} recordId={transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
     {/if}
