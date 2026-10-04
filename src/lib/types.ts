@@ -1250,3 +1250,36 @@ export interface SpeedQuery {
   to: string;
   measurement: 'turn' | 'response';
 }
+/** Source inspection only; these bodies never belong in summaries or aggregates. */
+export interface TranscriptCursor {
+  session_id: string;
+  source_id: string;
+  generation: string;
+  offset: number;
+  record_start: number;
+  partial: boolean;
+}
+export interface TranscriptRequest {
+  session_id: string;
+  cursor?: TranscriptCursor | null;
+  max_records?: number;
+  max_bytes?: number;
+  record_id?: string | null;
+}
+export interface TranscriptRecord {
+  id: string;
+  byte_offset: number;
+  byte_length: number;
+  raw_json: string | null;
+  kind: string | null;
+  message_id: string | null;
+  issue: string | null;
+}
+export interface TranscriptPage {
+  provider: string | null;
+  availability: 'available' | 'partial' | 'missing' | 'unreadable' | 'unsupported' | 'unknown_session' | 'cursor_invalid';
+  issues: string[];
+  records: TranscriptRecord[];
+  next_cursor: TranscriptCursor | null;
+  source_complete: boolean;
+}

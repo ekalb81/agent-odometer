@@ -1011,6 +1011,7 @@ impl HistoryStore {
                 } else {
                     ProviderSourceKind::Live
                 };
+                let observed_before = crate::transcript::source_generation(&item.path);
                 match adapter.parse_file(&item.path, kind) {
                     Ok(Some(session)) => {
                         // Issue #174: fold this pass's own re-parse straight
@@ -1023,6 +1024,7 @@ impl HistoryStore {
                                 cache,
                                 &item.path,
                                 &session,
+                                observed_before.as_deref(),
                                 &mut scan_cache_touched,
                             );
                         }
@@ -1985,6 +1987,45 @@ impl HistoryStore {
             }
         }
         Ok(out)
+    }
+
+    /// Source metadata only; never deserializes retained message snapshots.
+    pub(crate) fn transcript_sources(
+        &self,
+        session_key: &str,
+    ) -> Result<Option<crate::transcript::TranscriptSources>> {
+        let connection = self.connection()?;
+        let known: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM durable_sessions WHERE session_key = ?1)",
+            [session_key],
+            |row| row.get(0),
+        )?;
+        if !known {
+            return Ok(None);
+        }
+        let ambiguous: bool = connection.query_row(
+            "SELECT collision FROM durable_sessions WHERE session_key = ?1",
+            [session_key],
+            |row| row.get(0),
+        )?;
+        let mut statement = connection.prepare(
+            "SELECT l.path, l.artifact_key, a.identity_key FROM source_locations l JOIN source_artifacts a USING(artifact_key) WHERE l.session_key = ?1 ORDER BY l.present DESC, l.path LIMIT 9",
+        )?;
+        let sources = statement
+            .query_map([session_key], |row| {
+                Ok(crate::transcript::TranscriptSource {
+                    path: row.get(0)?,
+                    source_id: row.get(1)?,
+                    identity: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let limited = sources.len() > 8;
+        Ok(Some(crate::transcript::TranscriptSources {
+            locations: sources.into_iter().take(8).collect(),
+            limited,
+            ambiguous,
+        }))
     }
 
     /// Sessions whose ledger facts cannot be trusted (an overlay advanced
@@ -4146,15 +4187,24 @@ fn record_scan_cache_refresh(
     cache: &ScanCache,
     path: &Path,
     session: &Session,
+    observed_before: Option<&str>,
     touched: &mut HashMap<String, Option<String>>,
 ) {
     let normalized = source_path_key(path);
-    match resolve_scan_cache_key_and_stamp(path) {
-        Some((key, size, mtime_ms)) => {
-            cache.store(&key, size, mtime_ms, session);
+    match (resolve_scan_cache_key_and_stamp(path), observed_before) {
+        (Some((key, size, mtime_ms)), Some(before))
+            if crate::transcript::source_generation(path).as_deref() == Some(before) =>
+        {
+            cache.store_observed(
+                &key,
+                size,
+                mtime_ms,
+                session,
+                Some(crate::transcript::generation_identity(before)),
+            );
             touched.insert(normalized, Some(key));
         }
-        None => {
+        _ => {
             touched.insert(normalized, None);
         }
     }
@@ -12337,5 +12387,62 @@ mod tests {
              (issue #162's own estimate: ~21s)",
             ms_per_file * 4_530.0 / 1_000.0
         );
+    }
+}
+#[cfg(test)]
+mod transcript_source_tests {
+    use super::HistoryStore;
+    use std::io::Write;
+
+    fn synthetic(id: &str) -> crate::model::Session {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}}}").unwrap();
+        crate::parser::parse_file(file.path(), false)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn source_lookup_is_bounded_and_displaced_paths_are_not_owned_by_retained_session() {
+        let root = tempfile::tempdir().unwrap();
+        let history = HistoryStore::open(&root.path().join("history.sqlite")).unwrap();
+        assert!(history
+            .transcript_sources("codex:thread:unknown")
+            .unwrap()
+            .is_none());
+        let old = synthetic("old");
+        let path = root.path().join("source.jsonl");
+        let first = history.observe(&path, &old, 1).unwrap();
+        let before = history.transcript_sources(&first.key).unwrap().unwrap();
+        assert_eq!(before.locations.len(), 1);
+        assert_eq!(before.locations[0].identity, "codex:thread:old");
+        let new = history.observe(&path, &synthetic("new"), 1).unwrap();
+        assert!(history
+            .transcript_sources(&first.key)
+            .unwrap()
+            .unwrap()
+            .locations
+            .is_empty());
+        assert_eq!(
+            history
+                .transcript_sources(&new.key)
+                .unwrap()
+                .unwrap()
+                .locations
+                .len(),
+            1
+        );
+        for index in 0..12 {
+            history
+                .observe(
+                    &root.path().join(format!("duplicate-{index}.jsonl")),
+                    &old,
+                    1,
+                )
+                .unwrap();
+        }
+        let limited = history.transcript_sources(&first.key).unwrap().unwrap();
+        assert_eq!(limited.locations.len(), 8);
+        assert!(limited.limited);
     }
 }

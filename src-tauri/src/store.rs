@@ -455,6 +455,7 @@ pub struct AppState {
     pub config_watcher: Mutex<Option<ConfigWatcherHandle>>,
     instruction_paths: Mutex<HashSet<String>>,
     session_paths: DashMap<String, PathSessionState>,
+    transcript_observations: DashMap<String, (u64, String)>,
     /// Storage ids whose most recent history-store persist failed: their
     /// ledger rows may be stale or absent, so ledger-backed aggregation must
     /// compute exactly these sessions from in-memory history instead.
@@ -530,6 +531,7 @@ impl AppState {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            transcript_observations: DashMap::new(),
             ledger_stale: DashMap::new(),
             rollup_deferred_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(
@@ -740,6 +742,38 @@ impl AppState {
 
     pub fn clear_sessions(&self) {
         self.session_paths.clear();
+        self.transcript_observations.clear();
+    }
+
+    pub(crate) fn record_transcript_observation(
+        &self,
+        generation: u64,
+        path: &Path,
+        stamp: Option<String>,
+    ) {
+        if generation != self.current_scan_generation() {
+            return;
+        }
+        let key = path_key(path);
+        if let Some(stamp) = stamp {
+            self.transcript_observations
+                .insert(key, (generation, stamp));
+        } else {
+            self.transcript_observations.remove(&key);
+        }
+    }
+
+    pub(crate) fn transcript_observation(&self, session_id: &str, path: &Path) -> Option<String> {
+        let key = path_key(path);
+        let owner = self.session_paths.get(&key)?;
+        if owner.storage_id != session_id
+            || owner.removed
+            || owner.generation != self.current_scan_generation()
+        {
+            return None;
+        }
+        let observation = self.transcript_observations.get(&key)?;
+        (observation.0 == owner.generation).then(|| observation.1.clone())
     }
 
     /// Starts a durable location-observation generation for a bulk scan.
@@ -806,6 +840,38 @@ impl AppState {
             self.full_session_fallback.remove(&storage_id);
         }
         Arc::new(ResidentSession::of(session))
+    }
+
+    /// Only a path still owned by this exact storage identity can be read.
+    pub(crate) fn registered_transcript_source(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::transcript::TranscriptSource> {
+        let resident = self.sessions.get(session_id)?;
+        let path = &resident.summary.file_path;
+        let ownership = self.session_paths.get(&path_key(Path::new(path)))?;
+        (ownership.storage_id == session_id
+            && !ownership.removed
+            && ownership.generation == self.current_scan_generation())
+        .then(|| {
+            let summary = &resident.summary;
+            let identity = if summary.source.as_deref() == Some("subagent") {
+                summary
+                    .parent_thread_id
+                    .as_ref()
+                    .map(|parent| crate::model::storage_id_for_claude_subagent(parent, &summary.id))
+                    .unwrap_or_else(|| {
+                        crate::model::storage_id_for_session(&summary.harness, &summary.id)
+                    })
+            } else {
+                crate::model::storage_id_for_session(&summary.harness, &summary.id)
+            };
+            crate::transcript::TranscriptSource {
+                path: path.clone(),
+                source_id: session_id.to_owned(),
+                identity,
+            }
+        })
     }
 
     /// Resolves one session's full content (issue #139): from the resident
@@ -1900,6 +1966,86 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    #[test]
+    fn transcript_ownership_rejects_stale_removed_and_displaced_sources() {
+        let state = state();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("synthetic.jsonl");
+        let mut original = session("original", 0);
+        original.file_path = path.to_string_lossy().into_owned();
+        let id = original.effective_storage_id();
+        state.publish_watched_session(&path, original.clone());
+        assert_eq!(
+            state.registered_transcript_source(&id).unwrap().identity,
+            id
+        );
+        let generation = state.current_scan_generation();
+        state.record_transcript_observation(generation + 1, &path, Some("untrusted".into()));
+        assert!(state.transcript_observation(&id, &path).is_none());
+        state.record_transcript_observation(generation, &path, Some("observed".into()));
+        assert_eq!(
+            state.transcript_observation(&id, &path).as_deref(),
+            Some("observed")
+        );
+        state.advance_scan_generation();
+        assert!(state.registered_transcript_source(&id).is_none());
+        assert!(state.transcript_observation(&id, &path).is_none());
+        state.publish_watched_session(&path, original);
+        assert!(state.transcript_observation(&id, &path).is_none());
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            Some("fresh".into()),
+        );
+        state.mark_source_missing(&path);
+        assert!(state.sessions.contains_key(&id));
+        assert!(state.registered_transcript_source(&id).is_none());
+        assert!(state.transcript_observation(&id, &path).is_none());
+        let mut replacement = session("replacement", 0);
+        replacement.file_path = path.to_string_lossy().into_owned();
+        let replacement_id = replacement.effective_storage_id();
+        state.publish_watched_session(&path, replacement);
+        assert!(state.registered_transcript_source(&id).is_none());
+        assert!(state.transcript_observation(&id, &path).is_none());
+        assert!(state
+            .registered_transcript_source(&replacement_id)
+            .is_some());
+        state.clear_sessions();
+        assert!(state
+            .registered_transcript_source(&replacement_id)
+            .is_none());
+        assert!(state
+            .transcript_observation(&replacement_id, &path)
+            .is_none());
+    }
+
+    #[test]
+    fn registered_claude_subagents_keep_parent_namespaced_identity() {
+        let state = state();
+        let root = tempfile::tempdir().unwrap();
+        for parent in [Some("parent"), None] {
+            let path = root.path().join(if parent.is_some() {
+                "agent-one.jsonl"
+            } else {
+                "agent-two.jsonl"
+            });
+            let mut agent = session("agent", 0);
+            agent.harness = crate::provider::claude_code_provider_id();
+            agent.source = Some("subagent".into());
+            agent.parent_thread_id = parent.map(str::to_owned);
+            agent.storage_id = parent
+                .map(|parent| crate::model::storage_id_for_claude_subagent(parent, &agent.id))
+                .unwrap_or_else(|| crate::model::storage_id_for_session(&agent.harness, &agent.id));
+            agent.file_path = path.to_string_lossy().into_owned();
+            let id = agent.effective_storage_id();
+            state.publish_watched_session(&path, agent);
+            assert_eq!(
+                state.registered_transcript_source(&id).unwrap().identity,
+                id
+            );
+        }
+    }
+
     fn state() -> AppState {
         AppState {
             sessions: DashMap::new(),
@@ -1925,6 +2071,7 @@ mod tests {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            transcript_observations: DashMap::new(),
             ledger_stale: DashMap::new(),
             rollup_deferred_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(Vec::new())),
