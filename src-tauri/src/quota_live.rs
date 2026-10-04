@@ -22,11 +22,21 @@ static PIPE_READERS: AtomicUsize = AtomicUsize::new(0);
 struct ReaderPermit<'a>(&'a AtomicUsize);
 impl<'a> ReaderPermit<'a> {
     fn acquire(counter: &'a AtomicUsize) -> Result<Self, LiveQuotaError> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_PIPE_READERS).then_some(active + 1)
-            })
-            .map_err(|_| LiveQuotaError::LaunchFailed)?;
+        let mut active = counter.load(Ordering::Acquire);
+        loop {
+            if active >= MAX_PIPE_READERS {
+                return Err(LiveQuotaError::LaunchFailed);
+            }
+            match counter.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
         Ok(Self(counter))
     }
 }
@@ -722,7 +732,7 @@ struct RawCredits {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -921,7 +931,11 @@ mod tests {
         );
     }
     #[cfg(unix)]
-    fn fake_app_server(directory: &Path, account: &str, rates: &str) -> std::path::PathBuf {
+    pub(crate) fn fake_app_server(
+        directory: &Path,
+        account: &str,
+        rates: &str,
+    ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = directory.join("synthetic-codex");
         // Fixtures contain only test-owned JSON. The trace records method names,
