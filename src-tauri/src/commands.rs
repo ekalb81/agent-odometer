@@ -4929,6 +4929,34 @@ pub fn change_quota_account(
 
 // Private desktop organization: never exposed by headless/MCP projections.
 #[tauri::command]
+pub async fn get_record_bookmarks(
+    state: State<'_, Arc<AppState>>,
+    session_key: String,
+) -> Result<crate::history_store::RecordBookmarkList, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private bookmarks require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .record_bookmarks(&session_key)
+            .map_err(|_| "Bookmark list unavailable; reload history".to_owned())
+    })
+    .await
+    .map_err(|_| "Bookmark list unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn edit_record_bookmark(
+    state: State<'_, Arc<AppState>>,
+    edit: crate::history_store::RecordBookmark,
+) -> Result<crate::history_store::RecordBookmark, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::transcript::edit_record_bookmark(&state, edit)
+    })
+    .await
+    .map_err(|_| "Bookmark operation unavailable".to_owned())?
+}
+#[tauri::command]
 pub async fn get_organization_recovery_state(
     state: State<'_, Arc<AppState>>,
 ) -> Result<bool, String> {

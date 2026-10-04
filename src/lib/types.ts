@@ -1466,6 +1466,8 @@ export interface TranscriptPage {
 }
 /** Private desktop organization; never part of SessionSummary or exports. */
 export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
+export interface RecordBookmark { identity: AnnotationIdentity; revision: number; bookmarked: boolean }
+export interface RecordBookmarkList { identity: AnnotationIdentity; bookmarks: RecordBookmark[]; recovery_backup_unrestored: boolean }
 export interface OrganizationSummary {
   identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
 }

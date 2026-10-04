@@ -576,6 +576,26 @@ visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigat
   await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
 });
 
+visualTest('transcript-bookmarks-narrow', 'private record bookmarks preserve exact keyboard navigation at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await inspector.getByRole('button', { name: 'Bookmark record', exact: true }).first().click();
+  await expect(inspector.getByText('Record bookmarks (1)', { exact: true })).toBeVisible();
+  await inspector.getByText('Record bookmarks (1)', { exact: true }).click();
+  await inspector.getByRole('button', { name: 'Next page', exact: true }).click();
+  const bookmark = inspector.getByRole('button', { name: 'Open bookmarked record 1', exact: true });
+  await bookmark.focus();
+  await page.keyboard.press('Enter');
+  await expect(inspector.locator('[id="transcript-synthetic:0"]')).toBeFocused();
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  const bounds = await inspector.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
 visualTest('organization-saved-search', 'organization saved search and tag management', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
