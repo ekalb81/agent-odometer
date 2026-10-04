@@ -502,6 +502,8 @@ pub struct AppState {
     /// Cached `get_quota_snapshots` output; see [`crate::quota::QuotaSnapshotCache`]
     /// (issue #128).
     quota_snapshot_cache: crate::quota::QuotaSnapshotCache,
+    pub live_quota: Arc<crate::quota_accounts::LiveQuotaService>,
+    pub(crate) quota_evaluation: Mutex<()>,
     /// Incrementally maintained per-provider rate-limit points/credit
     /// observations feeding [`Self::quota_snapshots`]'s recompute path
     /// (issue #131); see [`crate::quota::QuotaPointsIndex`]. Every
@@ -558,6 +560,8 @@ impl AppState {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
+            quota_evaluation: Mutex::new(()),
             quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
     }
@@ -2117,6 +2121,42 @@ impl AppState {
         self.quota_snapshot_cache.invalidate();
     }
 
+    /// Serialize config and alert-log writes; never replace unreadable or
+    /// newer stored settings with a default loaded for startup resilience.
+    pub fn save_quota_config(
+        &self,
+        config: crate::quota_store::QuotaConfigWire,
+    ) -> Result<crate::quota_store::QuotaConfigWire, String> {
+        crate::quota_store::validate_quota_config(&config)?;
+        let mut cache = self.quota_store_cache.lock().unwrap();
+        let mut store = crate::quota_store::QuotaStoreFile::load_checked()?;
+        store.check_revision(config.revision.as_deref())?;
+        store.notification_log.retain(|entry| {
+            store
+                .budgets
+                .iter()
+                .find(|budget| budget.id == entry.dedup_key)
+                == config
+                    .budgets
+                    .iter()
+                    .find(|budget| budget.id == entry.dedup_key)
+                && config
+                    .budgets
+                    .iter()
+                    .any(|budget| budget.id == entry.dedup_key)
+        });
+        store.budgets = config.budgets;
+        store.notifications = config.notifications;
+        store.max_cache_age_secs = config.max_cache_age_secs;
+        store
+            .save()
+            .map_err(|_| "quota configuration could not be saved".to_string())?;
+        let wire = crate::quota_store::QuotaConfigWire::from(&store);
+        *cache = Some(Arc::new(store));
+        self.quota_snapshot_cache.invalidate();
+        Ok(wire)
+    }
+
     /// Prunes and persists an updated notification dedup log, keeping the
     /// cached quota-config file in sync — deliberately *not* through
     /// [`Self::set_quota_store`], because that also invalidates the quota
@@ -2138,12 +2178,14 @@ impl AppState {
         &self,
         notification_log: Vec<crate::quota_store::NotificationLogEntry>,
         now: DateTime<Utc>,
+        expected_revision: &str,
     ) -> anyhow::Result<()> {
         let mut cache = self.quota_store_cache.lock().unwrap();
-        let mut store = match cache.as_ref() {
-            Some(existing) => (**existing).clone(),
-            None => crate::quota_store::QuotaStoreFile::load(),
-        };
+        let mut store =
+            crate::quota_store::QuotaStoreFile::load_checked().map_err(anyhow::Error::msg)?;
+        store
+            .check_revision(Some(expected_revision))
+            .map_err(anyhow::Error::msg)?;
         store.notification_log = notification_log;
         store.prune_log(now, chrono::Duration::days(30));
         store.save()?;
@@ -2312,6 +2354,8 @@ mod tests {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
+            quota_evaluation: Mutex::new(()),
             quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
     }
@@ -3099,8 +3143,35 @@ mod tests {
     // -- check_quota_alerts no longer re-walks the corpus (issue #131,
     //    round two) ------------------------------------------------------
 
+    fn isolated_quota_test(name: &str) -> bool {
+        if std::env::var("ODOMETER_QUOTA_TEST_CHILD").as_deref() == Ok(name) {
+            return true;
+        }
+        let config = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env("ODOMETER_QUOTA_TEST_CHILD", name)
+            .env("XDG_CONFIG_HOME", config.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        false
+    }
+
     #[test]
     fn token_budget_alerts_require_verified_complete_history() {
+        // Disk revision verification must use a private config, without
+        // process-wide environment mutation during parallel tests.
+        if !isolated_quota_test(
+            "store::tests::token_budget_alerts_require_verified_complete_history",
+        ) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("history.sqlite3");
         let history = Arc::new(HistoryStore::open(&database).unwrap());
@@ -3153,6 +3224,7 @@ mod tests {
             enabled: true,
         });
         budgets.notifications.enabled = true;
+        budgets.save().unwrap();
         state.set_quota_store(budgets.clone());
         assert_eq!(crate::commands::check_quota_alerts_impl(&state).len(), 1);
         state.set_quota_store(budgets.clone());
@@ -3239,5 +3311,260 @@ mod tests {
              landed in state.sessions, i.e. it walked the corpus directly again instead of \
              reading the points index"
         );
+    }
+    #[test]
+    fn budget_finalization_rejects_purge_or_replacement_after_queries() {
+        if !isolated_quota_test(
+            "store::tests::budget_finalization_rejects_purge_or_replacement_after_queries",
+        ) {
+            return;
+        }
+        use crate::quota_store::{BudgetUnit, QuotaBudget};
+        let state = Arc::new(state());
+        let directory = tempfile::tempdir().unwrap();
+        let history =
+            Arc::new(HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap());
+        let now = Utc::now();
+        let mut observed = session("finalize-budget", 1);
+        observed.started_at = now - chrono::Duration::days(10);
+        observed.last_event_at = observed.started_at;
+        observed.tokens_total = TokenTotals {
+            input_tokens: 1_000_000,
+            total_tokens: 1_000_000,
+            ..Default::default()
+        };
+        observed
+            .tokens_history
+            .push(crate::model::TokenHistoryPoint {
+                timestamp: observed.started_at,
+                model: Some("gpt-5.4".into()),
+                service_tier: None,
+                request_input_tokens: Some(1_000_000),
+                total_tokens: 1_000_000,
+                delta: observed.tokens_total.clone(),
+            });
+        let source = directory.path().join("synthetic.jsonl");
+        history.observe(&source, &observed, 1).unwrap();
+        history.mark_path_missing(&source).unwrap();
+        state.set_history_ready(Some(history.clone()));
+        let mut budgets = vec![QuotaBudget {
+            id: "tokens".into(),
+            provider: codex_provider_id(),
+            project_key: None,
+            unit: BudgetUnit::Tokens,
+            window_kind: None,
+            period_hours: Some(8760),
+            threshold: 1.0,
+            enabled: true,
+        }];
+        budgets.push(QuotaBudget {
+            id: "usd".into(),
+            unit: BudgetUnit::Usd,
+            ..budgets[0].clone()
+        });
+        let mut statuses = crate::commands::quota_budget_statuses(
+            &state,
+            &budgets,
+            now,
+            chrono::Duration::hours(1),
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|status| status.current_value.is_some_and(|value| value > 1.0)),
+            "{statuses:?}"
+        );
+        budgets.push(QuotaBudget {
+            id: "provider-window".into(),
+            unit: BudgetUnit::PercentOfWindow,
+            window_kind: Some("weekly".into()),
+            period_hours: None,
+            threshold: 50.0,
+            ..budgets[0].clone()
+        });
+        statuses.push(crate::quota::QuotaBudgetStatus {
+            budget_id: "provider-window".into(),
+            current_value: Some(25.0),
+            unavailable: None,
+        });
+        budgets.push(QuotaBudget {
+            id: "disabled".into(),
+            enabled: false,
+            ..budgets[0].clone()
+        });
+        statuses.push(crate::quota::QuotaBudgetStatus {
+            budget_id: "disabled".into(),
+            current_value: None,
+            unavailable: Some("disabled"),
+        });
+        let original = statuses.clone();
+        let replacement =
+            Arc::new(HistoryStore::open(&directory.path().join("replacement.sqlite3")).unwrap());
+        assert!(replacement.has_complete_coverage().unwrap());
+        state.set_history_ready(Some(replacement));
+        crate::commands::finalize_quota_budget_statuses(
+            &state,
+            Some(&history),
+            &budgets,
+            &mut statuses,
+        );
+        assert!(statuses[..2]
+            .iter()
+            .all(|status| status.current_value.is_none()
+                && status.unavailable == Some("history_unavailable")));
+        state.set_history_ready(Some(history.clone()));
+        history
+            .set_retention_policy(&crate::history_store::RetentionPolicy {
+                retained_days: Some(1),
+            })
+            .unwrap();
+        let preview = history.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        state.purge_retained_history(&preview, |_| {}).unwrap();
+        statuses = original.clone();
+        crate::commands::finalize_quota_budget_statuses(
+            &state,
+            Some(&history),
+            &budgets,
+            &mut statuses,
+        );
+        assert!(statuses[..2]
+            .iter()
+            .all(|status| status.current_value.is_none()
+                && status.unavailable == Some("history_unavailable")));
+        assert_eq!(&statuses[2..], &original[2..]);
+        let evaluations: Vec<_> = budgets
+            .iter()
+            .zip(&statuses)
+            .map(|(budget, status)| crate::quota::BudgetEvaluation {
+                budget,
+                current_value: status.current_value,
+            })
+            .collect();
+        let log = vec![crate::quota_store::NotificationLogEntry {
+            dedup_key: "tokens".into(),
+            fired_at: now,
+        }];
+        let (alerts, next_log) = crate::quota::evaluate_alerts(
+            &evaluations,
+            &crate::quota_store::NotificationSettings {
+                enabled: true,
+                quiet_hours: None,
+            },
+            &log,
+            now,
+            12,
+        );
+        assert!(alerts.is_empty());
+        assert_eq!(
+            next_log, log,
+            "unavailable history must not consume or rearm a crossing"
+        );
+    }
+
+    #[test]
+    fn quota_token_budget_counts_retained_ledger_edges_and_respects_project_changes() {
+        let state = state();
+        let dir = tempfile::tempdir().unwrap();
+        let history = Arc::new(HistoryStore::open(&dir.path().join("history.sqlite3")).unwrap());
+        let mut fixture = session("budget-retained", 1);
+        fixture.project_key = Some("repo:a".into());
+        fixture.started_at = "2026-01-01T00:44:00Z".parse().unwrap();
+        fixture.last_event_at = "2026-01-01T02:46:00Z".parse().unwrap();
+        let mut cumulative = 0;
+        for (timestamp, tokens) in [
+            ("00:44", 11),
+            ("00:45", 13),
+            ("01:30", 17),
+            ("02:45", 19),
+            ("02:46", 23),
+        ] {
+            cumulative += tokens;
+            fixture
+                .tokens_history
+                .push(crate::model::TokenHistoryPoint {
+                    timestamp: format!("2026-01-01T{timestamp}:00Z").parse().unwrap(),
+                    model: Some("gpt-5.4".into()),
+                    service_tier: None,
+                    request_input_tokens: Some(tokens),
+                    total_tokens: cumulative,
+                    delta: TokenTotals {
+                        input_tokens: tokens,
+                        total_tokens: tokens,
+                        ..Default::default()
+                    },
+                });
+        }
+        fixture.tokens_total = TokenTotals {
+            input_tokens: cumulative,
+            total_tokens: cumulative,
+            ..Default::default()
+        };
+        let path = dir.path().join("synthetic.jsonl");
+        let key = history.observe(&path, &fixture, 1).unwrap().key;
+        history
+            .reassign_session_project(&key, Some("repo:a"))
+            .unwrap();
+        history.mark_path_missing(&path).unwrap();
+        state.set_history_ready(Some(history.clone()));
+        state.sessions.clear(); // Deliberately prove no resident hydration is required.
+        history.merge_project("repo:a", "repo:canonical").unwrap();
+        let now = "2026-01-01T02:45:00Z".parse().unwrap();
+        let mut budget = crate::quota_store::QuotaBudget {
+            id: "retained".into(),
+            provider: codex_provider_id(),
+            project_key: Some("repo:canonical".into()),
+            unit: crate::quota_store::BudgetUnit::Tokens,
+            window_kind: None,
+            period_hours: Some(2),
+            threshold: 100.0,
+            enabled: true,
+        };
+        let evaluate = |budget: &crate::quota_store::QuotaBudget| {
+            crate::commands::quota_budget_statuses(
+                &state,
+                std::slice::from_ref(budget),
+                now,
+                chrono::Duration::hours(1),
+            )
+            .remove(0)
+        };
+        assert_eq!(
+            evaluate(&budget).current_value,
+            Some(49.0),
+            "inclusive edges plus a whole rollup hour; excludes future usage"
+        );
+        history
+            .reassign_session_project(&key, Some("repo:elsewhere"))
+            .unwrap();
+        assert_eq!(evaluate(&budget).current_value, Some(0.0));
+        budget.project_key = Some("repo:elsewhere".into());
+        assert_eq!(evaluate(&budget).current_value, Some(49.0));
+        budget.project_key = Some("repo:missing".into());
+        assert_eq!(evaluate(&budget).unavailable, Some("project_unavailable"));
+        // A readable replacement/purged ledger must not make partial usage
+        // appear to be complete budget headroom, for either accounting unit.
+        budget.project_key = Some("repo:elsewhere".into());
+        rusqlite::Connection::open(dir.path().join("history.sqlite3"))
+            .unwrap()
+            .execute(
+                "UPDATE history_meta SET value='0' WHERE key='coverage_complete'",
+                [],
+            )
+            .unwrap();
+        for unit in [
+            crate::quota_store::BudgetUnit::Tokens,
+            crate::quota_store::BudgetUnit::Usd,
+        ] {
+            budget.unit = unit;
+            let status = evaluate(&budget);
+            assert_eq!(
+                status.current_value, None,
+                "partial history cannot produce budget headroom"
+            );
+            assert_eq!(status.unavailable, Some("history_unavailable"));
+        }
+        state.set_history_ready(None);
+        assert_eq!(evaluate(&budget).unavailable, Some("history_unavailable"));
     }
 }
