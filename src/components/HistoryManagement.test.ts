@@ -22,6 +22,19 @@ beforeEach(() => {
 });
 
 describe('history retention confirmation', () => {
+  it('requires saving an edited policy before reviewing its candidates', async () => {
+    mocks.policy.mockResolvedValue({ ...retained, policy: { retained_days: 90 } });
+    render(HistoryManagement);
+    const review = await screen.findByRole('button', { name: 'Review eligible history…' });
+    await userEvent.selectOptions(screen.getByLabelText('Retained-history policy'), '90');
+    expect(review).toBeDisabled();
+    expect(mocks.preview).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Save policy' }));
+    await waitFor(() => expect(mocks.policy).toHaveBeenCalledWith({ retained_days: 90 }));
+    expect(review).toBeEnabled();
+    expect(mocks.purge).not.toHaveBeenCalled();
+  });
+
   it('does not purge while reviewing, with a wrong phrase, or after cancelling', async () => {
     render(HistoryManagement);
     await userEvent.click(await screen.findByRole('button', { name: 'Review eligible history…' }));

@@ -7,6 +7,8 @@
   let health = $state<HistoryRecoveryStatus | null>(null);
   let retention = $state<RetentionStatus | null>(null);
   let days = $state('');
+  let policyDirty = $state(false);
+  let refreshRevision = 0;
   let preview = $state<PurgePreview | null>(null);
   let confirmation = $state('');
   let recoveryReview = $state(false);
@@ -17,20 +19,24 @@
   const count = (n: number) => new Intl.NumberFormat().format(n);
 
   async function refresh() {
+    const revision = ++refreshRevision;
     try {
-      health = await getHistoryRecoveryStatus();
-      if (health.status === 'ready') {
-        retention = await getRetentionStatus();
-        days = retention.policy.retained_days?.toString() ?? '';
-      } else retention = null;
-    } catch (e) { error = String(e); }
+      const nextHealth = await getHistoryRecoveryStatus();
+      const nextRetention = nextHealth.status === 'ready' ? await getRetentionStatus() : null;
+      if (revision !== refreshRevision) return;
+      health = nextHealth;
+      retention = nextRetention;
+      if (!policyDirty && nextRetention) days = nextRetention.policy.retained_days?.toString() ?? '';
+      error = null;
+    } catch (e) { if (revision === refreshRevision) error = String(e); }
   }
 
   onMount(() => {
+    let disposed = false;
     let unlisten: (() => void) | undefined;
     void refresh();
-    void onHistoryProgress(() => { void refresh(); }).then(fn => { unlisten = fn; }).catch(() => {});
-    return () => unlisten?.();
+    void onHistoryProgress(() => { if (!disposed) void refresh(); }).then(fn => { if (disposed) fn(); else unlisten = fn; }).catch(() => {});
+    return () => { disposed = true; refreshRevision += 1; unlisten?.(); };
   });
 
   async function action(run: () => Promise<void>) {
@@ -44,6 +50,7 @@
   function savePolicy() {
     void action(async () => {
       retention = await setRetentionPolicy({ retained_days: days === '' ? null : Number(days) });
+      policyDirty = false;
       preview = null;
       confirmation = '';
       result = 'Retention policy saved. Nothing was deleted.';
@@ -104,7 +111,7 @@
       {/if}
       <div class="flex items-end gap-3 flex-wrap">
         <label class="text-xs text-ink-muted">Retained-history policy
-          <select aria-label="Retained-history policy" class="block mt-1 bg-card border border-edge rounded-sm px-2 py-1.5" bind:value={days} disabled={busy}>
+          <select aria-label="Retained-history policy" class="block mt-1 bg-card border border-edge rounded-sm px-2 py-1.5" bind:value={days} onchange={() => { policyDirty = true; }} disabled={busy}>
             <option value="">Keep all history</option>
             <option value="30">Review activity older than 30 days</option>
             <option value="90">Review activity older than 90 days</option>
@@ -113,14 +120,14 @@
           </select>
         </label>
         <button class="px-3 py-1.5 text-xs border border-edge rounded-sm" disabled={busy} onclick={savePolicy}>Save policy</button>
-        <button class="px-3 py-1.5 text-xs border border-edge rounded-sm" disabled={busy || retention.policy.retained_days === null} onclick={reviewPurge}>Review eligible history…</button>
+        <button class="px-3 py-1.5 text-xs border border-edge rounded-sm" disabled={busy || policyDirty || retention.policy.retained_days === null} onclick={reviewPurge}>Review eligible history…</button>
       </div>
       <p class="text-[11px] text-ink-faint">The policy selects candidates and never deletes automatically. Present sessions and groups with a present or newer sibling are excluded.</p>
     {/if}
 
     {#if preview}
       <div class="border border-amber-500/40 rounded-sm p-3 space-y-2" aria-label="Purge preview">
-        <p class="text-xs text-ink-muted">{count(preview.sessions)} retained sessions in {count(preview.identity_groups)} identity groups have activity before {preview.cutoff_utc_day} UTC. Selected snapshots contain {formatBytes(preview.snapshot_bytes)}.</p>
+        <p class="text-xs text-ink-muted">{count(preview.sessions)} retained {preview.sessions === 1 ? 'session' : 'sessions'} in {count(preview.identity_groups)} identity {preview.identity_groups === 1 ? 'group' : 'groups'} with activity before {preview.cutoff_utc_day} UTC. Selected snapshots contain {formatBytes(preview.snapshot_bytes)}.</p>
         <p class="text-xs text-amber-500">This removes their local snapshots, usage facts, rollups, and session-specific project assignments. Provider files and earlier recovery backups remain. Minimal fingerprint exclusions prevent copied, moved, or resumed erased history from reimporting. New fingerprints can be imported.</p>
         {#if preview.sessions > 0}
           <label class="block text-xs text-ink-muted">Type PURGE {preview.sessions} to confirm
