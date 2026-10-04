@@ -74,6 +74,12 @@ Results go to stdout. Invalid arguments, unavailable required data, cancellation
 
 ## Read-only storage and limits
 
+Object reports expose `coverage_complete`: true for intact history, false after
+readable-source recovery, or null when coverage cannot be verified. `odometer_status`
+also provides explicit incomplete/unverified diagnostics. Session reports distinguish
+present, retained and superseded local history; purged sessions are excluded. These
+metadata do not prove a complete current scan. See [history lifecycle](HISTORY_LIFECYCLE.md).
+
 Headless queries open the existing SQLite ledger with `SQLITE_OPEN_READ_ONLY` inside a read transaction and require the application's current schema. They do not create an application database or configuration, change stored records, migrate a schema, or rebuild rollups. SQLite may create or update its WAL coordination sidecars (`-wal` and `-shm`) while a read-only connection coordinates with other readers and writers. Missing, older, or newer schemas and dirty ledgers with stale rollups are rejected. Run the matching desktop version to initialize, upgrade, or recover the ledger before retrying.
 
 The shared query control bounds work per request:

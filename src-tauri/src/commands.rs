@@ -4536,6 +4536,16 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
         .map(|snapshot| (snapshot.provider.as_str(), snapshot))
         .collect();
 
+    // A readable replacement may contain only part of historical usage. Check
+    // once per batch; provider-reported quota windows remain independent.
+    let token_history_complete = store
+        .budgets
+        .iter()
+        .any(|budget| budget.unit == crate::quota_store::BudgetUnit::Tokens)
+        && state
+            .history_ready()
+            .is_some_and(|history| matches!(history.has_complete_coverage(), Ok(true)));
+
     // One durable assignment read per batch, shared by every project budget.
     let project_scope = if store.budgets.iter().any(|budget| {
         budget.project_key.is_some() && budget.unit == crate::quota_store::BudgetUnit::Tokens
@@ -4569,9 +4579,9 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
                         })
                     })
                     .and_then(|window| window.used),
-                crate::quota_store::BudgetUnit::Tokens => {
-                    token_budget_current_value(state, budget, now, project_scope.as_ref())
-                }
+                crate::quota_store::BudgetUnit::Tokens => token_history_complete
+                    .then(|| token_budget_current_value(state, budget, now, project_scope.as_ref()))
+                    .flatten(),
             };
             crate::quota::BudgetEvaluation {
                 budget,

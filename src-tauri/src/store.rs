@@ -3100,6 +3100,70 @@ mod tests {
     //    round two) ------------------------------------------------------
 
     #[test]
+    fn token_budget_alerts_require_verified_complete_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("history.sqlite3");
+        let history = Arc::new(HistoryStore::open(&database).unwrap());
+        let state = state();
+        let mut observed = session("budget-coverage", 1);
+        let now = Utc::now();
+        observed.started_at = now - chrono::Duration::minutes(2);
+        observed.tokens_total = TokenTotals {
+            input_tokens: 100,
+            total_tokens: 100,
+            ..Default::default()
+        };
+        observed
+            .tokens_history
+            .push(crate::model::TokenHistoryPoint {
+                timestamp: now - chrono::Duration::minutes(1),
+                model: None,
+                service_tier: None,
+                request_input_tokens: Some(100),
+                total_tokens: 100,
+                delta: observed.tokens_total.clone(),
+            });
+        history
+            .observe(&directory.path().join("live.jsonl"), &observed, 1)
+            .unwrap();
+        state.set_history_ready(Some(history));
+        let mut budgets = crate::quota_store::QuotaStoreFile::default();
+        budgets.budgets.push(crate::quota_store::QuotaBudget {
+            id: "history-required".into(),
+            provider: codex_provider_id(),
+            project_key: None,
+            unit: crate::quota_store::BudgetUnit::Tokens,
+            window_kind: None,
+            period_hours: Some(24),
+            threshold: 50.0,
+            enabled: true,
+        });
+        budgets.notifications.enabled = true;
+        state.set_quota_store(budgets.clone());
+        assert_eq!(crate::commands::check_quota_alerts_impl(&state).len(), 1);
+        state.set_quota_store(budgets.clone());
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute(
+                "UPDATE history_meta SET value='0' WHERE key='coverage_complete'",
+                [],
+            )
+            .unwrap();
+        assert!(crate::commands::check_quota_alerts_impl(&state).is_empty());
+        assert!(state.quota_store().notification_log.is_empty());
+        std::fs::write(
+            directory.path().join("history.sqlite3.exclusions.jsonl"),
+            b"unverified journal\n",
+        )
+        .unwrap();
+        assert!(crate::commands::check_quota_alerts_impl(&state).is_empty());
+        state.set_history_ready(None);
+        state.set_quota_store(budgets);
+        assert!(crate::commands::check_quota_alerts_impl(&state).is_empty());
+        assert!(state.quota_store().notification_log.is_empty());
+    }
+
+    #[test]
     fn check_quota_alerts_with_a_configured_budget_reads_the_points_index_not_the_corpus() {
         // `check_quota_alerts` used to build `Vec<QuotaSnapshot>` by walking
         // every session directly and independently of
