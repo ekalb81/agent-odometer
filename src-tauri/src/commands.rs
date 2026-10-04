@@ -2264,6 +2264,7 @@ pub async fn purge_retained_history(
                 let _ = app.emit("session-removed", key);
             })
             .map_err(|error| error.to_string())?;
+        let _ = app.emit("history-progress", history_status_snapshot(&app_state));
         Ok(result)
     })
     .await

@@ -60,6 +60,12 @@ declare whether they reference a session or own independent data. Any
 session-owned derived records must join the same purge transaction, and any
 independent copies need an explicit retention policy and confirmation scope.
 Those features do not exist in this delivery; purge does not imply otherwise.
+
+Any nonempty confirmed purge marks historical coverage incomplete in the same
+transaction. An empty purge leaves completeness unchanged. Token and money budgets
+remain conservatively unavailable once usage has been purged or lost in recovery,
+including future periods. Range-aware eligibility based on preserved deleted time
+bounds is not implemented; smaller recorded totals must not imply extra headroom.
 # Policy and coverage boundaries
 
 Purge previews bind the saved policy revision. Confirmation rechecks that revision,
@@ -69,6 +75,6 @@ remains conservative across a UTC midnight; review again to include newly eligib
 history. Changing and restoring the policy still invalidates the prior preview.
 
 Integration Center and headless `odometer_status` expose `coverage_complete` and
-diagnostics for recovered partial history or unverified coverage. These are recorded
+diagnostics for purged or recovered partial history or unverified coverage. These are recorded
 totals; a readable ledger, completed scan, or successful MCP call does not establish
 that missing historical sources were recovered.

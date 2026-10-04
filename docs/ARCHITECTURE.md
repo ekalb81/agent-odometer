@@ -430,7 +430,7 @@ Session files can contain full prompts, responses, system/developer instructions
 Durable enumeration, lifecycle states, confirmed local-history purge and preserved
 corrupt-database recovery are specified in [History lifecycle](HISTORY_LIFECYCLE.md).
 `HistoryStatus` and Integration Center status carry `coverage_complete`: true for
-an intact archive, false after readable-source recovery, and null when unverified.
+an intact archive, false after nonempty purge or readable-source recovery, and null when unverified.
 A ready/readable archive alone does not establish complete historical coverage.
 
 - A configured root that does not exist when the watcher starts is skipped; creating it later requires saving settings or restarting the app to establish the watch.

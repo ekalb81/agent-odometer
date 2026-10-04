@@ -3104,7 +3104,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("history.sqlite3");
         let history = Arc::new(HistoryStore::open(&database).unwrap());
-        let state = state();
+        let state = Arc::new(state());
         let mut observed = session("budget-coverage", 1);
         let now = Utc::now();
         observed.started_at = now - chrono::Duration::minutes(2);
@@ -3126,7 +3126,21 @@ mod tests {
         history
             .observe(&directory.path().join("live.jsonl"), &observed, 1)
             .unwrap();
-        state.set_history_ready(Some(history));
+        let mut retained = observed.clone();
+        retained.id = "purged-budget-usage".into();
+        retained.storage_id = "codex:thread:purged-budget-usage".into();
+        retained.started_at = "2026-01-01T12:00:00Z".parse().unwrap();
+        retained.last_event_at = retained.started_at;
+        retained.tokens_history[0].timestamp = retained.started_at;
+        let retained_path = directory.path().join("missing.jsonl");
+        history.observe(&retained_path, &retained, 1).unwrap();
+        history.mark_path_missing(&retained_path).unwrap();
+        history
+            .set_retention_policy(&crate::history_store::RetentionPolicy {
+                retained_days: Some(1),
+            })
+            .unwrap();
+        state.set_history_ready(Some(history.clone()));
         let mut budgets = crate::quota_store::QuotaStoreFile::default();
         budgets.budgets.push(crate::quota_store::QuotaBudget {
             id: "history-required".into(),
@@ -3134,7 +3148,7 @@ mod tests {
             project_key: None,
             unit: crate::quota_store::BudgetUnit::Tokens,
             window_kind: None,
-            period_hours: Some(24),
+            period_hours: Some(8760),
             threshold: 50.0,
             enabled: true,
         });
@@ -3142,13 +3156,11 @@ mod tests {
         state.set_quota_store(budgets.clone());
         assert_eq!(crate::commands::check_quota_alerts_impl(&state).len(), 1);
         state.set_quota_store(budgets.clone());
-        rusqlite::Connection::open(&database)
-            .unwrap()
-            .execute(
-                "UPDATE history_meta SET value='0' WHERE key='coverage_complete'",
-                [],
-            )
+        state
+            .purge_retained_history(&history.preview_purge(now).unwrap(), |_| {})
             .unwrap();
+        assert!(!history.has_complete_coverage().unwrap());
+        assert_eq!(state.sessions.len(), 1); // Usage above the threshold still exists.
         assert!(crate::commands::check_quota_alerts_impl(&state).is_empty());
         assert!(state.quota_store().notification_log.is_empty());
         std::fs::write(

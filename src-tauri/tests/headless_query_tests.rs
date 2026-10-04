@@ -770,5 +770,5 @@ fn retention_lifecycle_reconciles_copies_replacement_purge_and_hour_edges_across
     assert!(store.is_session_excluded(&original).unwrap());
     assert!(store.is_session_excluded(&replacement).unwrap());
     assert_eq!(store.retention_status().unwrap().purged_sessions, 3);
-    assert!(store.has_complete_coverage().unwrap());
+    assert!(!store.has_complete_coverage().unwrap());
 }

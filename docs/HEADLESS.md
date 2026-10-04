@@ -75,7 +75,7 @@ Results go to stdout. Invalid arguments, unavailable required data, cancellation
 ## Read-only storage and limits
 
 Object reports expose `coverage_complete`: true for intact history, false after
-readable-source recovery, or null when coverage cannot be verified. `odometer_status`
+nonempty purge or readable-source recovery, or null when coverage cannot be verified. `odometer_status`
 also provides explicit incomplete/unverified diagnostics. Session reports distinguish
 present, retained and superseded local history; purged sessions are excluded. These
 metadata do not prove a complete current scan. See [history lifecycle](HISTORY_LIFECYCLE.md).

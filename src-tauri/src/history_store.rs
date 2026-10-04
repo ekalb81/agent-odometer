@@ -6547,11 +6547,16 @@ mod tests {
             .unwrap();
         let now = timestamp("2026-10-04T12:00:00Z");
         assert_eq!(store.preview_purge(now).unwrap().sessions, 0);
+        store
+            .purge_retained(&store.preview_purge(now).unwrap(), now)
+            .unwrap();
+        assert!(store.has_complete_coverage().unwrap());
         store.mark_path_missing(&path).unwrap();
         let preview = store.preview_purge(now).unwrap();
         assert_eq!(preview.sessions, 1);
         let purged = store.purge_retained(&preview, now).unwrap();
         assert_eq!(purged.removed_keys, vec![observed.key.clone()]);
+        assert!(!store.has_complete_coverage().unwrap());
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"synthetic source left intact"
@@ -6569,6 +6574,7 @@ mod tests {
         drop(store);
         let reopened = HistoryStore::open(&database).unwrap();
         assert!(reopened.is_session_excluded(&original).unwrap());
+        assert!(!reopened.has_complete_coverage().unwrap());
         let mut different = original;
         different.started_at += chrono::Duration::days(1);
         assert!(reopened.observe(&path, &different, 3).is_ok());

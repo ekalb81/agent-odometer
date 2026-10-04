@@ -673,7 +673,7 @@
       </span>
     {:else if historyStore.status.status === 'unavailable' || historyStore.status.coverage_complete === false}
       <button class="text-amber-500 hover:underline" onclick={() => (activeView = 'settings')}>
-        {historyStore.status.status === 'unavailable' ? 'History unavailable — recovery settings' : 'Historical coverage incomplete — recovery settings'}
+        {historyStore.status.status === 'unavailable' ? 'History unavailable — recovery settings' : 'Historical coverage incomplete — history settings'}
       </button>
     {:else if !scanStore.status.complete}
       <span class="flex items-center gap-1.5" role="status">

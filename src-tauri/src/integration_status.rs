@@ -43,7 +43,7 @@ impl DiagnosticCode {
             Self::ProtocolVersionMismatch => ("The server handshake does not match the supported protocol.", "Update the client/server and start a fresh task."),
             Self::ToolCatalogMismatch => ("The advertised tool names or input schemas differ from this version.", "Restart the client after updating Odometer, then test again."),
             Self::LedgerNotReady => ("A readable durable ledger is unavailable.", "Open Odometer and wait for history preparation; do not treat missing usage as zero."),
-            Self::HistoryIncomplete => ("Readable history was recovered, but missing historical sources were not recovered.", "Treat usage as recorded partial totals, not complete spend or allowance usage."),
+            Self::HistoryIncomplete => ("Some historical usage was intentionally purged or could not be recovered.", "Treat usage as recorded partial totals, not complete spend or allowance usage."),
             Self::HistoryCoverageUnavailable => ("Historical coverage could not be verified.", "Inspect retention and recovery settings; do not treat recorded totals as complete."),
             Self::ScanInProgress => ("The desktop has not completed its current source scan.", "Wait for the scan to finish before drawing completeness conclusions."),
             Self::SessionNotFound => ("The requested session is not in the current query snapshot.", "Use session_report to discover a current session key first."),

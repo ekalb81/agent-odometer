@@ -76,6 +76,15 @@ describe('history retention confirmation', () => {
     expect(screen.getByText(/Preserved history: \/synthetic\/preserved/)).toBeInTheDocument();
   });
 
+  it('shows purged partial coverage without inventing a recovery backup', async () => {
+    mocks.health.mockResolvedValue({ ...healthy, coverage_complete: false });
+    mocks.status.mockResolvedValue({ ...retained, purged_sessions: 2, coverage_complete: false });
+    render(HistoryManagement);
+    expect(await screen.findByText(/History was intentionally purged or historical sources were not recovered/)).toBeInTheDocument();
+    expect(screen.queryByText(/Preserved history:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/incomplete after recovery/)).not.toBeInTheDocument();
+  });
+
   it('offers no file replacement or retry while a failed open connection still needs restart', async () => {
     mocks.health.mockResolvedValue({ ...healthy, status: 'unavailable', failure: { kind: 'corrupt', message: 'Restart to close this archive.' } });
     render(HistoryManagement);

@@ -569,6 +569,12 @@ impl HistoryStore {
             bail!("history changed after the purge preview; review a fresh preview");
         }
         write_exclusions(&self.path, &candidates, now.timestamp_millis())?;
+        if !candidates.is_empty() {
+            transaction.execute(
+                "UPDATE history_meta SET value='0' WHERE key='coverage_complete'",
+                [],
+            )?;
+        }
         for (key, identity, fingerprint) in &candidates {
             transaction.execute("INSERT INTO purged_sessions(session_key,identity_key,first_event_fingerprint,purged_at_ms) VALUES(?1,?2,?3,?4)",params![key,identity,fingerprint,now.timestamp_millis()])?;
             // New session-owned derived features must extend this deletion list
@@ -603,7 +609,7 @@ impl HistoryStore {
         })
     }
 
-    /// Recovery of readable sources cannot claim that missing historical sources were recovered.
+    /// Purged or unrecovered history cannot be treated as complete recorded usage.
     pub fn has_complete_coverage(&self) -> Result<bool> {
         self.exclusion_cache.lock().unwrap().verify()?;
         // A read-only query may arrive after a replacement schema was created
