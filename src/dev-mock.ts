@@ -616,7 +616,9 @@ mockIPC((cmd, payload) => {
     case 'get_scan_status':
       return scanStatus();
     case 'get_history_status':
-      return { ...historyStatus(), status: visualScenario === 'history-recovery' ? 'unavailable' : 'ready', coverage_complete: visualScenario === 'history-recovery' ? null : true, failure: null };
+      return visualScenario === 'history-recovery'
+        ? { ...historyStatus(), status: 'unavailable', coverage_complete: null, failure: null }
+        : { ...historyStatus(), failure: null };
     case 'get_history_recovery_status':
       return visualScenario === 'history-recovery' ? { status: 'unavailable', coverage_complete: null, failure: { kind: 'corrupt', message: 'The history database could not be read. Live source transcripts remain accessible.' }, backup_directory: null, can_recover: true, can_retry: true } : { status: 'ready', coverage_complete: true, failure: null, backup_directory: null, can_recover: false, can_retry: false };
     case 'get_retention_status':
