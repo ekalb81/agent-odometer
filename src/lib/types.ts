@@ -1446,6 +1446,15 @@ export interface TranscriptPresentation {
   blocks: TranscriptBlock[];
 }
 export interface TranscriptRecord {
+  context_evidence?: {
+    contributors: string[];
+    compaction: boolean;
+    pre_compaction_tokens: number | null;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    context_window: number | null;
+    unsupported: boolean;
+  } | null;
   id: string;
   byte_offset: number;
   byte_length: number;

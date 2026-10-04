@@ -23,6 +23,7 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Turn-by-turn detail** — click any session for its full story: prompts, replies, per-turn tokens and cost, context-window fill, and a tokens-over-time sparkline.
 - **Source inspection** — select a session and choose **Inspect transcript** for bounded source-order pages, explicit tool links, and recorded edits. See [Transcript inspector](docs/TRANSCRIPT_INSPECTOR.md).
 - **Conversation search** — choose **Search content** in a selected session for bounded message search, explicit tool-body scopes, exact source anchors, and separately labeled retained-message fallback. See [Session content search](docs/TRANSCRIPT_SEARCH.md).
+- **Context evidence** — choose **Explain context** for recorded contributor categories, compaction boundaries, per-call observations, exact source anchors, and explicit coverage limits. See [Context explanation](docs/CONTEXT_EXPLANATION.md).
 - **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
 - **Live** — sessions update in the list while your agents are still running.
 - **Retained history** — missing or replaced transcripts keep local usage and clearly marked session summaries. Settings offers a reviewed, typed purge and preservation-first corrupt-history recovery; partial recovery remains labeled incomplete. See [history lifecycle](docs/HISTORY_LIFECYCLE.md).
