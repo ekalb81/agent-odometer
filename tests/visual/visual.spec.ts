@@ -353,6 +353,29 @@ visualTest('settings-instructions', 'settings instruction inventory', async (pag
   await scrollHeadingToTop(page, 'Instruction inventory');
 });
 
+visualTest('integration-dark', 'integration evidence states in dark theme', async (page) => {
+  await visit(page, { view: 'settings', theme: 'dark' });
+  await expect(page.getByRole('article', { name: 'Codex integration' })).toContainText('Not configured');
+  await scrollHeadingToTop(page, 'Integration Center');
+});
+
+visualTest('integration-narrow-preview', 'integration review remains usable in a narrow window', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'settings' });
+  const card = page.getByRole('article', { name: 'Codex integration' });
+  await card.getByRole('button', { name: 'Preview setup', exact: true }).click();
+  await scrollHeadingToTop(page, 'Review install for Codex');
+  // Existing top-level navigation is wider than this viewport; keep the
+  // component evidence at the left edge instead of inheriting scrollIntoView's
+  // horizontal navigation adjustment.
+  await page.evaluate(() => { document.querySelectorAll('*').forEach((element) => { element.scrollLeft = 0; }); });
+  await expect(page.getByRole('button', { name: 'Apply reviewed change' })).toBeVisible();
+  const integration = page.locator('section[aria-labelledby="integration-heading"]');
+  expect(await integration.evaluate((element) => element.scrollWidth)).toBeLessThanOrEqual(500);
+  expect((await integration.boundingBox())!.x + (await integration.boundingBox())!.width).toBeLessThanOrEqual(500);
+  expect((await integration.boundingBox())!.x).toBeGreaterThanOrEqual(0);
+});
+
 visualTest('settings-rates', 'settings rates frame', async (page) => {
   await visit(page, { view: 'settings' });
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();

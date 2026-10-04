@@ -21,6 +21,88 @@ use std::time::Instant;
 use tauri::{AppHandle, Emitter, State};
 use tauri_plugin_dialog::DialogExt;
 
+/// Read-only Integration Center projection; no config repair occurs on discovery.
+#[tauri::command]
+pub async fn get_integration_status(
+    state: State<'_, Arc<AppState>>,
+    scope: crate::mcp_integration::Scope,
+    project: Option<String>,
+) -> Result<crate::mcp_integration::CenterReport, String> {
+    let complete = state.scanned.load(Ordering::Acquire);
+    let ready = state.history_readiness() == HistoryReadinessKind::Ready;
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::mcp_integration::center(scope, project.as_deref().map(Path::new), complete, ready)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "integration_status_unavailable".to_owned())?
+}
+
+#[tauri::command]
+pub async fn preview_integration_change(
+    client: crate::mcp_integration::Client,
+    scope: crate::mcp_integration::Scope,
+    action: crate::mcp_integration::Change,
+    project: Option<String>,
+) -> Result<crate::mcp_integration::Preview, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::mcp_integration::preview(client, scope, action, project.as_deref().map(Path::new))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "integration_preview_unavailable".to_owned())?
+}
+
+#[tauri::command]
+pub async fn apply_integration_change(
+    id: String,
+) -> Result<crate::mcp_integration::ApplyResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::mcp_integration::apply(&id).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "integration_apply_unavailable".to_owned())?
+}
+
+#[tauri::command]
+pub async fn test_integration_client(
+    client: crate::mcp_integration::Client,
+    scope: crate::mcp_integration::Scope,
+    project: Option<String>,
+) -> Result<crate::verify::VerifyReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::mcp_integration::test(client, scope, project.as_deref().map(Path::new))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "integration_test_unavailable".to_owned())?
+}
+
+#[tauri::command]
+pub fn open_integration_configuration(
+    app: AppHandle,
+    client: crate::mcp_integration::Client,
+    scope: crate::mcp_integration::Scope,
+    project: Option<String>,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let path =
+        crate::mcp_integration::config_path(client, scope, project.as_deref().map(Path::new))
+            .map_err(|error| error.to_string())?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| "Configuration location unavailable".to_owned())?;
+    if !directory.is_dir() {
+        return Err("The configuration directory does not exist yet. Preview setup first.".into());
+    }
+    app.opener()
+        .open_path(directory.to_string_lossy(), None::<String>)
+        .map_err(|_| {
+            "Could not open the configuration directory. Copy the displayed path instead."
+                .to_owned()
+        })
+}
+
 #[tauri::command]
 pub fn list_external_events(
     state: State<'_, Arc<AppState>>,
