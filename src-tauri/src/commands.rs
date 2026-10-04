@@ -538,8 +538,12 @@ pub async fn write_export(
     let extension = match format.as_str() {
         "csv" => "csv",
         "json" => "json",
-        _ => return Err("export format must be csv or json".into()),
+        "html" => "html",
+        _ => return Err("export format must be csv, json, or html".into()),
     };
+    if extension == "html" && content.len() > 8 * 1024 * 1024 {
+        return Err("HTML export exceeds the 8 MiB safety limit".into());
+    }
     if content.len() > 128 * 1024 * 1024 {
         return Err("export exceeds the 128 MiB safety limit".into());
     }
@@ -3498,7 +3502,7 @@ mod tests {
     }
 
     #[test]
-    fn export_writer_accepts_only_csv_and_json() {
+    fn export_writer_preserves_reviewed_content_and_rejects_wrong_extensions() {
         let dir = tempfile::tempdir().unwrap();
         let csv = dir.path().join("usage.csv");
         let unicode = "name,note\r\n\"Δelta\",\"comma, quote \"\" and\nnewline\"\r\n";
@@ -3507,6 +3511,10 @@ mod tests {
         let json = dir.path().join("empty.json");
         write_export_file(&json, "json", "[]\n").unwrap();
         assert_eq!(std::fs::read_to_string(json).unwrap(), "[]\n");
+        let html = dir.path().join("transcript.html");
+        let preview = "<!doctype html><meta charset=\"utf-8\"><p>Reviewed Δ text</p>";
+        write_export_file(&html, "html", preview).unwrap();
+        assert_eq!(std::fs::read_to_string(html).unwrap(), preview);
         let text = dir.path().join("usage.txt");
         assert!(write_export_file(&text, "csv", "nope").is_err());
         let missing_parent = dir.path().join("missing/usage.csv");

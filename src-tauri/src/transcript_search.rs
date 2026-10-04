@@ -519,6 +519,7 @@ mod tests {
                 message_id: None,
                 issue: None,
                 presentation: Some(crate::transcript_view::present(value)),
+                context_evidence: None,
             })
             .collect();
         let matcher = matcher("needle").unwrap();
@@ -555,6 +556,7 @@ mod tests {
                 message_id: None,
                 issue: None,
                 presentation: Some(crate::transcript_view::present(value)),
+                context_evidence: None,
             })
             .collect();
         let (hits, _) = search_records(

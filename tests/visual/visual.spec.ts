@@ -28,6 +28,10 @@ function visualUrl(scenario: string): string {
 }
 
 function isAllowedConsoleError(page: Page, text: string): boolean {
+  // Playwright's installed clock tries to run inside every frame. The export's
+  // script-free opaque sandbox correctly rejects that injected harness script.
+  if (text === "Blocked script execution in 'about:srcdoc' because the document's frame is sandboxed and the 'allow-scripts' permission is not set."
+    && page.frames().some(frame => frame.url() === 'about:srcdoc')) return true;
   const scenario = new URL(page.url()).searchParams.get('visualScenario');
   return scenario === 'updater-error'
     && /^update install failed: Error: Fixture updater install failed\.(?:\n|$)/.test(text);
@@ -36,6 +40,8 @@ function isAllowedConsoleError(page: Page, text: string): boolean {
 async function visit(page: Page, options: VisitOptions = {}): Promise<void> {
   const { scenario = 'default', theme = 'light', view = 'all' } = options;
   await page.addInitScript(({ selectedTheme, css }) => {
+    // Only configure the application. Export previews deliberately have opaque origins.
+    if (window !== window.top) return;
     localStorage.setItem('themePreference', selectedTheme);
     const applyVisualCss = () => {
       const style = document.createElement('style');
@@ -593,6 +599,35 @@ visualTest('transcript-bookmarks-narrow', 'private record bookmarks preserve exa
   await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
   const bounds = await inspector.boundingBox();
   expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
+visualTest('transcript-export-preview', 'export previews conversation text before local save', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Export transcript', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Export transcript', exact: true });
+  await dialog.getByRole('button', { name: 'Build preview' }).click();
+  await expect(dialog.getByRole('button', { name: 'Save reviewed HTML…' })).toBeDisabled();
+  const preview = page.frameLocator('iframe[title="Exact transcript export preview"]');
+  await expect(preview.locator('script,img,object,link,iframe')).toHaveCount(0);
+  await expect(preview.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await expect(preview.getByText('export const greeting = "Hello";', { exact: true })).toHaveCount(0);
+});
+
+visualTest('transcript-export-narrow', 'export inclusion changes require a new reviewed preview', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Export transcript', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Export transcript', exact: true });
+  await dialog.getByRole('checkbox', { name: 'Tool calls and arguments' }).check();
+  await dialog.getByRole('checkbox', { name: 'Tool results and errors' }).check();
+  await dialog.getByRole('button', { name: 'Build preview' }).click();
+  await expect(page.frameLocator('iframe').getByText('export const greeting = "Hello";', { exact: true })).toBeVisible();
+  await dialog.getByRole('checkbox', { name: /I reviewed every/ }).check();
+  await expect(dialog.getByRole('button', { name: 'Save reviewed HTML…' })).toBeEnabled();
+  const bounds = await dialog.boundingBox();
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
 });
 

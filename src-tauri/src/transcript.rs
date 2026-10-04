@@ -78,6 +78,7 @@ pub struct TranscriptRecord {
     pub message_id: Option<String>,
     pub issue: Option<String>,
     pub presentation: Option<crate::transcript_view::TranscriptPresentation>,
+    pub context_evidence: Option<crate::context_evidence::ContextEvidence>,
 }
 
 #[derive(Debug, Serialize)]
@@ -689,6 +690,7 @@ fn read_page_inner(
                 .or_else(|| field("/id")),
             issue,
             presentation: parsed.as_ref().map(crate::transcript_view::present),
+            context_evidence: parsed.as_ref().map(crate::context_evidence::project),
         };
         let mut bytes = serde_json::to_vec(&record)?.len();
         if page.records.is_empty()
@@ -709,6 +711,7 @@ fn read_page_inner(
             }
             record.raw_json = None;
             record.presentation = None;
+            record.context_evidence = None;
             record.issue = Some("record_exceeds_page_limit".into());
             bytes = serde_json::to_vec(&record)?.len();
             if returned + bytes > max_bytes {
