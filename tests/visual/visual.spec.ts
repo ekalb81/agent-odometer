@@ -576,6 +576,53 @@ visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigat
   await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
 });
 
+visualTest('organization-saved-search', 'organization saved search and tag management', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByLabel('Pin this session').check();
+  await editor.getByLabel('Tags (comma separated)').fill('review');
+  await editor.getByLabel('Private note').fill('Synthetic local note.');
+  await editor.getByRole('button', { name: 'Save organization' }).click();
+  await expect(editor.getByText(/Pinned.*review.*Private note/)).toBeVisible();
+  await page.getByText('Organize', { exact: true }).click();
+  const toolbar = page.locator('[aria-label="Local session organization"]');
+  await toolbar.getByLabel('Pinned sessions only').check();
+  await toolbar.getByLabel('New search name').fill('Review work');
+  await toolbar.getByRole('button', { name: 'Save current search' }).click();
+  await toolbar.getByRole('combobox', { name: 'Saved search', exact: true }).selectOption({ label: 'Review work · summary · codex' });
+  await expect(toolbar.getByRole('button', { name: 'Run saved search' })).toBeVisible();
+  await expect(toolbar.getByText('Local organization saved.', { exact: true })).toBeVisible();
+});
+
+visualTest('organization-editor-narrow', 'private organization editor and keyboard at narrow width', async (page) => {
+  await page.setViewportSize({ width: 800, height: 900 });
+  await visit(page, { view: 'codex' });
+  await expect(page.getByRole('button', { name: 'Filters', exact: true })).toBeVisible();
+  await page.getByText('Organize', { exact: true }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('details[open] [aria-label="Local session organization"]')).toHaveCount(0);
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByLabel('Pin this session').check();
+  await editor.getByLabel('Tags (comma separated)').fill('review, follow-up');
+  await editor.getByLabel('Private note').fill('Synthetic private note for this session only.');
+  await editor.scrollIntoViewIfNeeded();
+  await expect(editor.getByRole('button', { name: 'Discard changes' })).toBeVisible();
+});
+
+visualTest('organization-recovery-unavailable', 'recovered organization filters fail unavailable', async (page) => {
+  await visit(page, { scenario: 'organization-recovered', view: 'codex' });
+  await page.getByText('Organize', { exact: true }).click();
+  const toolbar = page.locator('[aria-label="Local session organization"]');
+  await expect(toolbar).toContainText('They were not reconstructed from source transcripts.');
+  await toolbar.getByLabel('Pinned sessions only').check();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('alert').filter({ visible: true })).toContainText('Organization-filtered results are unavailable.');
+});
+
 visualTest('content-search-scopes', 'content search exposes explicit tool scope and exact source landing', async (page) => {
   await visit(page, { view: 'codex', theme: 'dark' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();

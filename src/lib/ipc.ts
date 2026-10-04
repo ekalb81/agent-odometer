@@ -2,6 +2,7 @@
 // All IPC between the Svelte frontend and Rust backend goes through this module.
 
 import { invoke } from '@tauri-apps/api/core';
+import type { AnnotationIdentity, AnnotationEdit, OrganizationSummary, SessionAnnotation, SavedSearch, SavedSearchDefinition } from './types';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { SummaryPricing } from './types';
 import type { TranscriptPage, TranscriptRequest } from './types';
@@ -16,6 +17,29 @@ import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, H
 
 export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>('list_sessions');
+}
+
+/** Explicit private desktop reads; never called by export or MCP flows. */
+export function getOrganizationRecoveryState(): Promise<boolean> { return invoke('get_organization_recovery_state'); }
+export function getOrganizationSummaries(keys: string[]): Promise<OrganizationSummary[]> {
+  return invoke('get_organization_summaries', { keys });
+}
+export function getSessionAnnotation(identity: AnnotationIdentity): Promise<SessionAnnotation> {
+  return invoke('get_session_annotation', { identity });
+}
+export function editSessionAnnotation(edit: AnnotationEdit): Promise<SessionAnnotation> {
+  return invoke('edit_session_annotation', { edit });
+}
+export function listOrganizationTags(): Promise<string[]> { return invoke('list_organization_tags'); }
+export function changeOrganizationTag(label: string, replacement: string | null): Promise<void> {
+  return invoke('change_organization_tag', { label, replacement });
+}
+export function listSavedSearches(): Promise<SavedSearch[]> { return invoke('list_saved_searches'); }
+export function saveSearch(id: number | null, revision: number, definition: SavedSearchDefinition): Promise<SavedSearch> {
+  return invoke('save_search', { id, revision, definition });
+}
+export function deleteSavedSearch(id: number, revision: number): Promise<void> {
+  return invoke('delete_saved_search', { id, revision });
 }
 
 export function getSpeedReport(query: SpeedQuery): Promise<SpeedReport> {

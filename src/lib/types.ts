@@ -1388,6 +1388,7 @@ export interface TranscriptContentScope {
   tool_calls: boolean;
   tool_results: boolean;
 }
+
 export type TranscriptSearchTarget =
   | { kind: 'source_record'; session_id: string; record_id: string; block_index: number }
   | { kind: 'retained_turn'; session_id: string; session_identity: string; snapshot_revision: string; turn_id: string; field: 'user_message' | 'last_agent_message' };
@@ -1472,3 +1473,22 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
+/** Private desktop organization; never part of SessionSummary or exports. */
+export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
+export interface OrganizationSummary {
+  identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
+}
+export interface SessionAnnotation { summary: OrganizationSummary; note: string; recovery_backup_unrestored?: boolean }
+export interface AnnotationEdit {
+  identity: AnnotationIdentity; revision: number; pinned: boolean; note: string; tags: string[];
+}
+export interface SavedSearchDefinition {
+  name: string; query: string; scope: string;
+  content_scope: 'summary' | 'session_content';
+  content_classes: TranscriptContentScope;
+  session_key: string | null; fingerprint: string | null;
+  from: string | null; to: string | null; model: string;
+  show_active: boolean; show_archived: boolean; show_subagents: boolean;
+  pinned_only: boolean; tags: string[];
+}
+export interface SavedSearch { id: number; revision: number; definition: SavedSearchDefinition }

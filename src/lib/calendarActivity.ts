@@ -78,7 +78,6 @@ export function calendarEvidence(history: Pick<HistoryStatus, 'status'> & {
 /** Preserve inclusive millisecond bounds when drilling into datetime-local
  * filters; rounding an end to 23:59 would silently omit its last minute. */
 export function calendarFilterValue(iso: string): string {
-  const date = new Date(iso);
-  const pad = (value: number, width = 2) => String(value).padStart(width, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+  return toLocalInputValuePrecise(new Date(iso));
 }
+import { toLocalInputValuePrecise } from './dateRange';
