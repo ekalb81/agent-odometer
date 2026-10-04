@@ -409,4 +409,21 @@ fn stale_fallback_never_proves_speed_or_borrows_dated_model_evidence() {
     )
     .amount
     .is_some());
+    rates
+        .flat_rate_expires_at
+        .insert("gpt-6-astra".into(), now.date_naive());
+    let expired = price_buckets_detailed(
+        &rates,
+        "codex",
+        &[TierBucket {
+            model: "unknown".into(),
+            service_tier: None,
+            tokens: usage(),
+        }],
+        RateTable::PurchasedCredits,
+        now,
+    )
+    .unwrap();
+    assert_eq!(expired.missing_models, ["unknown"]);
+    assert_eq!(expired.unpriced_models, ["unknown"]);
 }

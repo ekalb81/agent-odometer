@@ -627,6 +627,9 @@ pub(crate) fn price_buckets_detailed_controlled(
         check()?;
         let is_unpriced = rates.unpriced_models.contains(&bucket.model);
         let resolution = rates.resolve_model_pricing(&bucket.model, harness, rate_table, now);
+        if resolution.fallback_used {
+            missing.insert(bucket.model.clone());
+        }
 
         if resolution.basis == PricingBasis::Unavailable
             && (is_unpriced || rate_table.contains_key(&resolution.resolved_model))
@@ -637,7 +640,7 @@ pub(crate) fn price_buckets_detailed_controlled(
                 .or_insert((0.0, PricingBasis::Unavailable, true));
             continue;
         }
-        if resolution.fallback_used || resolution.basis == PricingBasis::Unavailable {
+        if resolution.basis == PricingBasis::Unavailable {
             missing.insert(bucket.model.clone());
         }
 

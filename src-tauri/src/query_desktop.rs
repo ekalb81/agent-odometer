@@ -200,7 +200,6 @@ pub fn price_turn(
     }
     result.basis = resolution.basis;
     result.unpriced |= resolution.basis == PricingBasis::Unavailable;
-    result.fallback_used = resolution.fallback_used;
     if resolution.basis != PricingBasis::Unavailable {
         if let Some(rate) = rate_table.get(&resolution.resolved_model) {
             if let Some(multiplier) = crate::query::tier_multiplier(
