@@ -95,6 +95,11 @@ fn serialized_detail_pricing_matches_legacy_desktop_for_every_case() {
             expected["flat_api"] = serde_json::json!({ "total": 0, "by_model": [{"model":"gpt-5.5","cost":0,"basis":"unavailable","unpriced":true}], "missing_models":["gpt-5.5"],"unpriced_models":["gpt-5.5"] });
             expected["turn_prices"]["fast"]["api"] = serde_json::json!({"cost":0,"fallback_used":true,"unpriced":true,"basis":"unavailable"});
         }
+        // #248: an absent legacy rate is unavailable in the model row and total.
+        if case["name"] == "no history unavailable model retains zero breakdown" {
+            expected["plan"]["by_model"][0]["unpriced"] = serde_json::json!(true);
+            expected["plan"]["unpriced_models"] = serde_json::json!(["unknown"]);
+        }
         normalize(&mut actual);
         normalize(&mut expected);
         assert_eq!(actual, expected, "{}", case["name"]);

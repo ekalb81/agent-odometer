@@ -430,6 +430,7 @@ fn stale_fallback_never_proves_speed_or_borrows_dated_model_evidence() {
     legacy.tokens_history.clear();
     legacy.tokens_by_model.insert("unknown".into(), usage());
     let legacy = price_session_details(legacy, &rates, now).pricing.plan;
+    assert_eq!(legacy.unpriced_models, ["unknown"]);
     let row = legacy
         .by_model
         .iter()

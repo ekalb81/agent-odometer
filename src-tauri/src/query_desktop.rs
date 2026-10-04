@@ -257,15 +257,20 @@ pub fn price_session_details(
         for model in session.tokens_by_model.keys() {
             if !plan.by_model.iter().any(|entry| &entry.model == model) {
                 let resolution = rates.resolve_model_pricing(model, harness, &rates.models, now);
+                let unpriced = resolution.basis == PricingBasis::Unavailable;
+                if unpriced && !plan.unpriced_models.contains(model) {
+                    plan.unpriced_models.push(model.clone());
+                }
                 plan.by_model.push(PricedModel {
                     model: model.clone(),
                     cost: 0.0,
                     basis: resolution.basis,
-                    unpriced: resolution.basis == PricingBasis::Unavailable,
+                    unpriced,
                 });
             }
         }
         plan.by_model.sort_by(|a, b| a.model.cmp(&b.model));
+        plan.unpriced_models.sort();
     }
     // API reference has always used event history, including an empty zero
     // when history is absent, independently of the plan fallback above.
