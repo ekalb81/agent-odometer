@@ -140,12 +140,7 @@ fn normalized_scope(value: &str) -> String {
 const REDACTED_PROJECT_SCOPE_PREFIX: &str = "project:";
 
 fn stable_hash(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    format!("{:016x}", crate::stable_hash::fnv1a64(bytes))
 }
 
 pub(crate) fn project_scope_identity(value: &str) -> String {

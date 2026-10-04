@@ -5428,12 +5428,7 @@ fn stable_hash(value: &str) -> String {
 /// FNV-1a is sufficient for deterministic local reconciliation keys. It is
 /// not used as a security boundary and avoids adding a hashing dependency.
 fn stable_hash_bytes(bytes: &[u8]) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    format!("{:016x}", crate::stable_hash::fnv1a64(bytes))
 }
 
 fn load_project_overrides(connection: &Connection) -> Result<HashMap<String, ProjectOverrideRow>> {

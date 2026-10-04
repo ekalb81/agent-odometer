@@ -30,6 +30,8 @@ mod report_output;
 pub mod scan_cache;
 pub mod scanner;
 pub mod session_index;
+pub mod speed;
+mod stable_hash;
 pub mod store;
 pub mod telemetry;
 pub mod tool_impact;
@@ -44,10 +46,10 @@ use commands::{
     get_bundled_rates, get_config, get_history_rebuild_status, get_history_status,
     get_performance_live_status, get_performance_status, get_provider_diagnostics,
     get_quota_config, get_quota_snapshots, get_rates, get_scan_status, get_session_details,
-    get_session_pricing, get_subscription_usage, get_turn_receipt_status, list_external_events,
-    list_instruction_files, list_providers, list_sessions, list_tool_impact_targets,
-    merge_projects, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
-    reassign_session_project, rebuild_history, record_frontend_performance,
+    get_session_pricing, get_speed_report, get_subscription_usage, get_turn_receipt_status,
+    list_external_events, list_instruction_files, list_providers, list_sessions,
+    list_tool_impact_targets, merge_projects, open_instruction_file, open_task_in_chatgpt,
+    read_instruction_file, reassign_session_project, rebuild_history, record_frontend_performance,
     repair_turn_receipt_integrations, resolve_projects, resolve_working_directories,
     reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges, set_config, set_project_alias,
     set_quota_config, set_rates, set_tray_totals, unmerge_project, write_export,
@@ -100,6 +102,7 @@ pub fn run() {
             list_tool_impact_targets,
             compare_tool_impact,
             get_scan_status,
+            get_speed_report,
             get_config,
             list_providers,
             resolve_working_directories,

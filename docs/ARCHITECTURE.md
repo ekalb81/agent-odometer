@@ -289,6 +289,40 @@ attributing usage to its detected project.
 
 ## Performance measurements
 
+### Codex speed
+
+`get_speed_report` defaults to whole-turn throughput from the existing parsed
+Codex sessions. `speed.rs` uses completed turns, reconciled output tokens, and
+explicit `duration_ms`, falling back to recorded start/end timestamps. Optional
+time to first token comes only from the explicit recorded field. Full session
+content resolves through `AppState` and durable history, in bounded batches;
+preparation, read failures, and truncation are surfaced rather than hidden.
+Timing never changes accounting, pricing, or persisted session contracts.
+
+The separately selected response measurement reads local `logs_2.sqlite` with a
+read-only connection, honoring `$CODEX_HOME`. Odometer does not install a collector,
+change logging, or configure OpenTelemetry. This optional source depends on Codex's
+version, settings, and retention. Response IDs deduplicate records internally;
+responses under five seconds or 100 output tokens, invalid timestamps/usage, and
+non-text or built-in-tool responses are excluded.
+
+Only sanitized timing, token counts, model, effort, mode, and measurement provenance
+cross IPC. Raw payloads, identifiers, prompts, credentials, tool output, and paths
+are excluded. Turn tiers describe configured settings; response tiers describe
+observed service. Unknown modes stay separate. Duration-weighted throughput divides
+total output by total measured time, keeping turns and responses separate. Turn time
+includes tools, waiting, and reasoning; response time includes reasoning and request
+latency. Parent/subagent durations may overlap. These observations do not establish
+pure decode speed, causal speedups, or accepted-task delivery performance.
+
+`SpeedMonitor.svelte` polls only while its panel and Codex tab are active and the
+document is visible. Today uses local midnight; rolling 7/14-day bounds cross IPC
+as UTC timestamps. Request generations discard obsolete responses and failures
+when either the window or measurement changes. CSV exports the displayed
+model/reasoning projection with measurement provenance, without transcript identifiers.
+
+### Application timings
+
 Application performance tracking is local-only, explicitly opt-in, and disabled by default through `Config.performance_tracking_enabled`. `PerformanceRecorder` starts its bounded writer lazily when enabled, so the off path performs only an atomic flag check. Backend measurements cover setup, watcher/config discovery, bulk discovery and scanning, cache hit/miss/open time, aggregate parser time, incremental parsing, range rollups, correlations, Git evaluation, detail/list IPC, and exports. `src/lib/performance.ts` records frontend initialization, batched store updates and paints, virtual-list paints, range fetches, detail fetches, and export projection work.
 
 Events use a versioned, redacted contract: timestamp, app/platform/process identity, operation name, duration, success, and bounded aggregate metadata. Prompts, tool arguments/output, session IDs, repository paths, and commands are forbidden. A bounded channel keeps measurements off hot paths; overflow increments a dropped counter instead of blocking work. JSONL data lives under the OS local-data directory, rotates between current and previous segments at the Settings-configured size, and can be exported through backend-owned native dialogs as JSONL or CSV.

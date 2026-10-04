@@ -23,6 +23,7 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Turn-by-turn detail** — click any session for its full story: prompts, replies, per-turn tokens and cost, context-window fill, and a tokens-over-time sparkline.
 - **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
 - **Live** — sessions update in the list while your agents are still running.
+- **Codex speed** — open **Codex → Analytics & exports → Codex speed** for Today, 7-day, and 14-day reports, Fast/Standard comparisons, model and reasoning filters, and CSV export. The default turn throughput uses session-log tokens and recorded turn durations, including tools, reasoning, and waiting; recorded time to first token is shown when available. An optional response view uses retained local SQLite telemetry. The two measurements stay separate, and neither measures pure decoding or accepted-task delivery. Missing timing or mode evidence is labeled unavailable or unknown. See [measurement details](docs/CODEX_SPEED.md).
 - **Time-scoped answers** — filter by date range and the token/cost columns re-total to exactly that window ("what did I burn last week?").
 - **Export and compare** — save the exact filtered projection as CSV/JSON and compare every model's token mix, cost, calls, retries, failures, and one-shot mutation rate.
 - **Local efficiency signals** — normalized tool metrics, deterministic task categories, prioritized optimization opportunities with turn-level evidence and next actions, configuration-change correlations, and opt-in local Git outcome scans never retain raw tool arguments or output.
@@ -230,6 +231,8 @@ git push origin vX.Y.Z                        # triggers the cross-platform buil
 Bump the version first, on a normal PR, with `npm run version:bump -- <major|minor|patch|X.Y.Z>`. It rewrites all **five** manifests together — `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json` — refuses a non-increasing version, and verifies they agree. Preflight only compares three of them (`package.json`, `Cargo.toml`, `tauri.conf.json`), so the two lockfiles can drift silently if edited by hand; that is why the script exists.
 
 All three checked version fields must already equal `X.Y.Z`; the release workflow rejects a mismatched `vX.Y.Z` tag before any platform builds start. The tagged commit must also have a successful CI run.
+
+Use Tauri CLI 2.12 or newer so updater signatures include the app version. Odometer requires that signed version to match the update manifest; the release validator rejects missing or mismatched versions. Existing installations can still update to these bundles through the same endpoint and public key.
 
 A repository ruleset forbids updating **or deleting** tag refs. A tag pushed at the wrong commit is permanently unusable and its version number is burned, so never tag before the bump commit is on `main` with green CI.
 

@@ -16,6 +16,7 @@
   } from '../lib/ipc';
   import { instructionScanStore } from '../lib/stores/instructionScan.svelte';
   import { providersStore } from '../lib/stores/providers.svelte';
+  import { formatBytes } from '../lib/format';
   import type { ExternalEvent, InstructionFile, InstructionInventory } from '../lib/types';
 
   interface Props { onhide: () => void | Promise<void>; }
@@ -122,12 +123,6 @@
       current = parent;
     }
     return depth;
-  }
-
-  function formatBytes(value: number): string {
-    if (value < 1024) return `${value} B`;
-    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`;
-    return `${(value / 1024 / 1024).toFixed(1)} MiB`;
   }
 
   function formatDuration(value: number): string {

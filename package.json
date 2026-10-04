@@ -1,6 +1,6 @@
 {
   "name": "agent-odometer",
-  "version": "0.8.19",
+  "version": "0.8.20",
   "engines": {
     "node": "^22.22.2 || ^24.15.0 || >=26.0.0"
   },
@@ -28,7 +28,7 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2.5.4",
     "@tauri-apps/plugin-process": "^2.3.1",
-    "@tauri-apps/plugin-updater": "^2.10.1",
+    "@tauri-apps/plugin-updater": "^2.12.0",
     "dompurify": "^3.4.13",
     "marked": "^18.0.10"
   },
@@ -36,7 +36,7 @@
     "@playwright/test": "^1.62.1",
     "@sveltejs/vite-plugin-svelte": "^7.3.0",
     "@tailwindcss/vite": "^4.3.3",
-    "@tauri-apps/cli": "^2",
+    "@tauri-apps/cli": "^2.12.0",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/svelte": "^5.4.2",
     "@testing-library/user-event": "^14.6.5",

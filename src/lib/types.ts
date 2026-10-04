@@ -1211,3 +1211,36 @@ export interface QuotaAlert {
   threshold: number;
   fired_at: string;
 }
+
+/** Sanitized turn or response timing from Codex's retained local logs, separate from accounting. */
+export interface SpeedSample {
+  completed_at: string;
+  model: string;
+  reasoning_effort: string | null;
+  mode: 'fast' | 'standard' | 'unknown';
+  output_tokens: number;
+  reasoning_tokens: number | null;
+  duration_ms: number;
+  output_tps: number;
+  visible_tps: number | null;
+  time_to_first_token_ms: number | null;
+  timing_source: 'explicit' | 'timestamps' | 'response';
+}
+
+export interface SpeedReport {
+  status: 'ready' | 'unavailable';
+  reason: string | null;
+  measurement: 'turn' | 'response';
+  source: 'codex_session_logs' | 'codex_local_logs';
+  generated_at: string;
+  rows: SpeedSample[];
+  excluded_count: number;
+  scanned_rows: number;
+  truncated: boolean;
+}
+
+export interface SpeedQuery {
+  from: string;
+  to: string;
+  measurement: 'turn' | 'response';
+}

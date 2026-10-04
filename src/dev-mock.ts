@@ -18,6 +18,7 @@ import type {
   RangeTotals,
   RateCard,
   SubscriptionUsageEntry,
+  SpeedReport,
   TurnReceiptIntegrationStatus,
 } from './lib/types';
 
@@ -439,6 +440,27 @@ mockIPC((cmd, payload) => {
   switch (cmd) {
     case 'list_sessions':
       return visibleFixtures().map(summary);
+    case 'get_speed_report': {
+      const { query } = payload as { query: { from: string; to: string; measurement: 'turn' | 'response' } };
+      // Synthetic speed rows never participate in ledger/pricing fixtures.
+      const turns: SpeedReport['rows'] = [
+        { completed_at: new Date(now - 60_000).toISOString(), model: 'gpt-5.5', reasoning_effort: 'high', mode: 'fast', output_tokens: 1800, reasoning_tokens: 600, duration_ms: 60_000, output_tps: 30, visible_tps: 20, time_to_first_token_ms: 1_100, timing_source: 'explicit' },
+        { completed_at: new Date(now - 120_000).toISOString(), model: 'gpt-5.5', reasoning_effort: 'high', mode: 'standard', output_tokens: 900, reasoning_tokens: 300, duration_ms: 60_000, output_tps: 15, visible_tps: 10, time_to_first_token_ms: 1_700, timing_source: 'timestamps' },
+        { completed_at: new Date(now - 180_000).toISOString(), model: 'gpt-5.5', reasoning_effort: 'high', mode: 'unknown', output_tokens: 800, reasoning_tokens: 200, duration_ms: 40_000, output_tps: 20, visible_tps: 15, time_to_first_token_ms: null, timing_source: 'response' },
+      ];
+      const responses: SpeedReport['rows'] = [
+        { completed_at: new Date(now - 60_000).toISOString(), model: 'gpt-5.5', reasoning_effort: 'high', mode: 'fast', output_tokens: 1800, reasoning_tokens: 600, duration_ms: 20_000, output_tps: 90, visible_tps: 60, time_to_first_token_ms: 1_100, timing_source: 'explicit' },
+        { completed_at: new Date(now - 120_000).toISOString(), model: 'gpt-5.5', reasoning_effort: 'high', mode: 'standard', output_tokens: 1200, reasoning_tokens: 400, duration_ms: 30_000, output_tps: 40, visible_tps: 800 / 30, time_to_first_token_ms: 1_700, timing_source: 'timestamps' },
+        { completed_at: new Date(now - 180_000).toISOString(), model: 'gpt-5.5', reasoning_effort: 'high', mode: 'unknown', output_tokens: 800, reasoning_tokens: 200, duration_ms: 20_000, output_tps: 40, visible_tps: 30, time_to_first_token_ms: null, timing_source: 'response' },
+      ];
+      const rows = (query.measurement === 'turn' ? turns : responses)
+        .filter(row => row.completed_at >= query.from && row.completed_at <= query.to);
+      return {
+        status: 'ready', reason: null, measurement: query.measurement,
+        source: query.measurement === 'turn' ? 'codex_session_logs' : 'codex_local_logs',
+        generated_at: new Date(now).toISOString(), rows, excluded_count: 2, scanned_rows: 5, truncated: false,
+      } satisfies SpeedReport;
+    }
     case 'get_session_pricing': {
       const { sessionIds } = payload as { sessionIds: string[] };
       const ids = new Set(sessionIds);

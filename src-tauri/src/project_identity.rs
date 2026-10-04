@@ -105,12 +105,7 @@ const MAX_ANCESTOR_WALK: usize = 24;
 /// `correlation::stable_hash`). Not a security boundary; no hashing
 /// dependency is added for it.
 fn stable_hash(value: &str) -> String {
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in value.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
+    format!("{:016x}", crate::stable_hash::fnv1a64(value.as_bytes()))
 }
 
 fn strip_git_suffix(name: &str) -> &str {
