@@ -53,6 +53,7 @@ describe('local activity summary', () => {
   it('does not expose opaque provider names and rejects absent or unsafe measurements', () => {
     expect(activitySummary(options({ harness: '/private/provider' })).svg).not.toContain('/private/provider');
     expect(activitySummary(options({ harness: null })).svg).toContain('All providers');
+    expect(activitySummary(options({ harness: 'all' })).svg).toContain('All providers');
     expect(() => activitySummary(options({ days: [] }))).toThrow('1–366');
     expect(() => activitySummary(options({ days: Array(367).fill(options().days[0]) as ActivityDay[] }))).toThrow('1–366');
     const invalid = options(); invalid.days[0].tokens = NaN;

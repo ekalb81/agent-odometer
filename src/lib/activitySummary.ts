@@ -24,7 +24,7 @@ export function activitySummary(options: ActivitySummaryOptions): { svg: string;
   const label = metric === 'tokens' ? 'tokens' : 'tool calls';
   const zone = options.zone === 'utc' ? 'UTC' : Intl.DateTimeFormat().resolvedOptions().timeZone;
   const provider = new Map([['codex', 'Codex'], ['claude_code', 'Claude Code'], ['gemini_cli', 'Gemini CLI']]).get(options.harness ?? '')
-    ?? (options.harness ? 'Selected provider' : 'All providers');
+    ?? (options.harness && options.harness !== 'all' ? 'Selected provider' : 'All providers');
   const scope = `${provider} · ${options.selectedProject ? 'selected project (name omitted)' : 'all projects'} · current session filters`;
   const first = days[0]; const last = days[days.length - 1];
   const bounds = `${new Date(first.from).toISOString()} — ${new Date(last.to).toISOString()}`;
