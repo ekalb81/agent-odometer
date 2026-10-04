@@ -352,6 +352,24 @@ The app registers `tauri-plugin-updater` and `tauri-plugin-process`. `App.svelte
 
 ## Dates and ranges
 
+`CalendarActivity.svelte` requests daily `sessions_in_ranges` windows for the
+current provider/session filters and optionally the shared project store's
+effective merged or reassigned project. It batches at most 64 inclusive UTC
+windows per call and reuses the existing mutation/range cache. Svelte sums raw
+token and tool-call facts; it does not price tokens or persist a second history.
+Local boundaries advance by calendar date, preserving 23/25-hour DST days; UTC
+is a separate selectable calendar. The default shows the latest 90 calendar
+days, while explicit scopes are bounded to 366 days with a narrowing message.
+
+The calendar waits for scan/history readiness and requires the archive's
+additive `coverage_complete` provenance. A ready but recovered archive shows
+partial recorded totals; absent coverage or an unavailable archive prevents a
+zero claim. A successful empty bucket means recorded zero only, and partial
+history keeps that distinction visible. Bucket selection preserves inclusive
+millisecond bounds and the actual event-session IDs when opening the existing
+filtered session list. Daily active-session counts are not summed or presented
+as a distinct range total. Price authorities and existing cost views are unchanged.
+
 UI `datetime-local` values are local wall-clock values and must be converted to UTC ISO strings before comparison with rollout timestamps.
 
 - A session matches a date filter when `[started_at, last_event_at]` overlaps the selected interval.

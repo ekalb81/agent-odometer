@@ -260,14 +260,15 @@ function scanStatus() {
   return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240, cold_reason: null };
 }
 
-function historyStatus(): HistoryStatus {
+function historyStatus(): HistoryStatus & { coverage_complete: boolean | null } {
   // No visual scenario models a still-migrating archive: every fixture
   // scenario represents an already-warm install, and browser dev mode has
   // no Rust backend to actually migrate. `get_history_status` always
   // resolves 'ready' here so the mount sequence proceeds exactly like a
   // normal warm start.
   return {
-    status: 'ready',
+    status: visualScenario === 'history-unavailable' ? 'unavailable' : 'ready',
+    coverage_complete: visualScenario === 'history-unavailable' ? null : visualScenario !== 'history-partial',
     step: null,
     step_index: null,
     step_total: null,
@@ -619,7 +620,9 @@ mockIPC((cmd, payload) => {
     case 'get_scan_status':
       return scanStatus();
     case 'get_history_status':
-      return { ...historyStatus(), status: visualScenario === 'history-recovery' ? 'unavailable' : 'ready', coverage_complete: visualScenario === 'history-recovery' ? null : true, failure: null };
+      return visualScenario === 'history-recovery'
+        ? { ...historyStatus(), status: 'unavailable', coverage_complete: null, failure: null }
+        : { ...historyStatus(), failure: null };
     case 'get_history_recovery_status':
       return visualScenario === 'history-recovery' ? { status: 'unavailable', coverage_complete: null, failure: { kind: 'corrupt', message: 'The history database could not be read. Live source transcripts remain accessible.' }, backup_directory: null, can_recover: true, can_retry: true } : { status: 'ready', coverage_complete: true, failure: null, backup_directory: null, can_recover: false, can_retry: false };
     case 'get_retention_status':
