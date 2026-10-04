@@ -246,7 +246,7 @@ mod tests {
             .iter()
             .any(|value| value.code == DiagnosticCode::HistoryIncomplete));
         std::fs::write(
-            store.exclusion_path_identity(),
+            directory.path().join("history.sqlite3.exclusions.jsonl"),
             b"invalid complete journal record\n",
         )
         .unwrap();

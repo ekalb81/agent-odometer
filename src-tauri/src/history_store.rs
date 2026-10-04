@@ -6620,7 +6620,10 @@ mod tests {
             .contains("cutoff exceeds"));
         assert_eq!(store.retention_status().unwrap().retained_sessions, 1);
         assert_eq!(store.retention_status().unwrap().purged_sessions, 0);
-        assert!(!store.exclusion_path_identity().exists());
+        assert!(!directory
+            .path()
+            .join("history.sqlite3.exclusions.jsonl")
+            .exists());
         store
             .purge_retained(&store.preview_purge(now).unwrap(), now)
             .unwrap();
