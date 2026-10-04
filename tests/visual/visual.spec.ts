@@ -707,6 +707,47 @@ test('content search lands on a source record and Escape returns to the search w
   await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
 });
 
+visualTest('handoff-reviewed-source', 'handoff selects source records and returns from exact inspection', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Prepare handoff', exact: true }).click();
+  const handoff = page.getByRole('dialog', { name: 'Prepare handoff', exact: true });
+  await expect(handoff.getByRole('button', { name: 'Build handoff preview' })).toBeDisabled();
+  await handoff.getByRole('button', { name: 'Read source records' }).click();
+  await handoff.getByRole('button', { name: 'Inspect exact source' }).first().click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await expect(handoff).toBeVisible();
+  await handoff.getByRole('checkbox', { name: /Source record at byte/ }).first().check();
+  await handoff.getByRole('textbox', { name: /User-written/ }).fill('Next: review the recorded greeting change.');
+  await handoff.getByRole('button', { name: 'Build handoff preview' }).click();
+  await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
+  const preview = page.frameLocator('iframe[title="Exact handoff HTML preview"]');
+  await expect(preview.locator('script,img,object,link,iframe,a')).toHaveCount(0);
+  await expect(preview.locator('pre')).toContainText('Update the greeting in the synthetic demo.');
+  await handoff.getByRole('checkbox', { name: /I reviewed every/ }).check();
+  await expect(handoff.getByRole('button', { name: 'Save reviewed handoff…' })).toBeEnabled();
+});
+
+visualTest('handoff-retained-narrow', 'handoff labels missing source and stays usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { scenario: 'content-search-retained', view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Prepare handoff', exact: true }).click();
+  const handoff = page.getByRole('dialog', { name: 'Prepare handoff', exact: true });
+  await handoff.getByRole('button', { name: 'Read source records' }).click();
+  await expect(handoff.getByText(/Incomplete original source/)).toBeVisible();
+  await handoff.getByRole('checkbox', { name: /Retained turn.*user_message/ }).first().check();
+  await handoff.getByRole('button', { name: 'Build handoff preview' }).click();
+  const bounds = await handoff.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+  await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
+  await handoff.getByRole('textbox', { name: /Exact handoff Markdown/ }).scrollIntoViewIfNeeded();
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {

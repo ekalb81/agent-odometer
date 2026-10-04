@@ -17,7 +17,7 @@ export interface TranscriptExportPreview {
 const MAX_PAGES = 40;
 const MAX_HTML_BYTES = 4 * 1024 * 1024;
 const encoder = new TextEncoder();
-const escape = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+export const escapeTranscriptHtml = (value: string) => value.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
 
 /** ponytail: heuristic redaction is not exhaustive; add provider-specific rules when demonstrated gaps require them. Review remains mandatory. Never log input. */
 export function redactTranscriptText(text: string, phrases: string[]): { text: string; count: number } {
@@ -68,7 +68,7 @@ export async function previewTranscriptExport(
   const clean = (value: string) => {
     const redacted = redactTranscriptText(value, options.redactPhrases);
     redactions += redacted.count;
-    return escape(redacted.text);
+    return escapeTranscriptHtml(redacted.text);
   };
   outer: for (let pageIndex = 0; pageIndex < MAX_PAGES; pageIndex++) {
     if (cancelled()) throw new Error('Preview cancelled.');

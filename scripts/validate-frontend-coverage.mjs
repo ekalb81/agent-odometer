@@ -11,6 +11,7 @@ export const COVERAGE_SLICE = [
   'src/components/SessionGridControls.svelte',
   'src/components/SessionProjectEditor.svelte',
   'src/components/TranscriptExport.svelte',
+  'src/components/TranscriptHandoff.svelte',
   'src/components/SessionOrganizationEditor.svelte',
   'src/components/OrganizationToolbar.svelte',
   'src/lib/organization.ts',
@@ -29,6 +30,7 @@ export const COVERAGE_SLICE = [
   'src/lib/stores/sessionGrid.svelte.ts',
   'src/lib/trayTotals.ts',
   'src/lib/transcriptExport.ts',
+  'src/lib/transcriptHandoff.ts',
 ];
 export const MINIMUM_LINE_COVERAGE = 90;
 

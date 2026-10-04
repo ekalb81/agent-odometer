@@ -1,5 +1,7 @@
 {
   "snapshots": [
+    "handoff-reviewed-source",
+    "handoff-retained-narrow",
     "organization-saved-search",
     "organization-editor-narrow",
     "organization-recovery-unavailable",
