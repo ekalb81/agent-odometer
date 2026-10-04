@@ -688,6 +688,38 @@ export interface TurnReceiptIntegrationStatus {
   gemini_cli?: HarnessIntegrationStatus;
 }
 
+export type IntegrationClient = 'codex' | 'claude_code';
+export type IntegrationScope = 'user' | 'project';
+export type IntegrationChange = 'install' | 'remove' | 'restore';
+export type IntegrationDiagnosticCode = 'integration_not_configured' | 'server_launch_failed' | 'protocol_version_mismatch' | 'tool_catalog_mismatch' | 'ledger_not_ready' | 'scan_in_progress' | 'session_not_found' | 'pricing_incomplete' | 'query_too_broad' | 'snapshot_expired' | 'query_failed' | 'query_cancelled';
+export interface IntegrationDiagnostic { code: IntegrationDiagnosticCode; evidence: string; next_action: string; }
+export interface IntegrationStatus {
+  schema_version: number; server_version: string; protocol_version: string; generated_at: string;
+  ledger_available: boolean; scan_status: string; sessions: number | null;
+  observation: { captured_at: string | null; age_seconds: number | null; generation: string | null; token_event_from: string | null; token_event_to: string | null; };
+  providers: Array<{ provider: string; registered: boolean; roots: Array<{ kind: string; path: string | null; exists: boolean; }>; ledger: { durable_sessions: number; available_sessions: number; collision_sessions: number; } | null; models: Array<{ model: string; basis: PricingBasis; resolved_model: string | null; }>; quota_status: string; }>;
+  pricing_authority: string; quota_authority: string; dimensions: string[]; filters: string[];
+  pricing_models: Array<{ provider: string; model: string; plan_basis: PricingBasis; api_estimate_basis: PricingBasis; resolved_plan_model: string; resolved_api_model: string; }>;
+  suggested_next_calls: string[]; diagnostics: IntegrationDiagnostic[]; limitations: string[];
+}
+export interface IntegrationClientCard {
+  client: IntegrationClient; scope: IntegrationScope; configuration_path: string;
+  executable: string | null; version: string | null; installed: boolean; configured: boolean; managed: boolean;
+  backup_path: string | null; restore_available: boolean; diagnostic: IntegrationDiagnostic | null;
+  manual_command: string; instructions: string;
+}
+export interface IntegrationActivity {
+  timestamp: string; initialized_at: string; client: IntegrationClient | 'verifier' | 'other';
+  client_version: string | null; identity_authority: string; tool: string; duration_ms: number;
+  success: boolean; error_code: string | null; result_bytes: number; result_rows: number | null;
+  schema_version: number | null; fallback_or_unavailable: boolean | null;
+  observation_generation?: string | null; ledger_available?: boolean | null;
+}
+export interface IntegrationCenterReport { schema_version: number; status: IntegrationStatus; cards: IntegrationClientCard[]; activity: IntegrationActivity[]; activity_available: boolean; supported_client_task_proof: 'not_verified'; }
+export interface IntegrationPreview { id: string; client: IntegrationClient; scope: IntegrationScope; action: IntegrationChange; configuration_path: string; entry_preview: string; warning: string; }
+export interface IntegrationApplyResult { configuration_path: string; backup_path: string | null; restart_required: boolean; }
+export interface IntegrationVerifyReport { schema_version: number; ok: boolean; checks: Array<{ id: string; status: 'pass' | 'fail' | 'unknown'; detail: string; }>; }
+
 export interface PerformanceStatus {
   enabled: boolean;
   max_log_mb: number;

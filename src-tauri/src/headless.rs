@@ -13,6 +13,7 @@ pub const LEDGER_UNAVAILABLE: &str =
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryKind {
     Status,
+    IntegrationStatus,
     Report,
     Models,
     Projects,
@@ -33,6 +34,7 @@ impl QueryKind {
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "status" => Self::Status,
+            "integration-status" => Self::IntegrationStatus,
             "report" => Self::Report,
             "models" => Self::Models,
             "projects" => Self::Projects,
@@ -54,7 +56,12 @@ impl QueryKind {
     pub fn accepts_window(self) -> bool {
         !matches!(
             self,
-            Self::Status | Self::Diagnostics | Self::Quota | Self::Mirrors | Self::Statusline
+            Self::Status
+                | Self::IntegrationStatus
+                | Self::Diagnostics
+                | Self::Quota
+                | Self::Mirrors
+                | Self::Statusline
         )
     }
 }
@@ -161,6 +168,9 @@ pub fn execute_optional(
     };
     let required_store = || store.ok_or_else(|| anyhow::anyhow!(LEDGER_UNAVAILABLE));
     let mut result = match kind {
+        QueryKind::IntegrationStatus => serde_json::to_value(crate::integration_status::status(
+            store, rates, config, now, control,
+        )?)?,
         QueryKind::Status => json!({
             "schema_version": 1,
             "ledger_available": store.is_some(),

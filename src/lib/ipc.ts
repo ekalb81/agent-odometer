@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { SummaryPricing } from './types';
 import type { TranscriptPage, TranscriptRequest } from './types';
+import type { IntegrationClient, IntegrationScope, IntegrationChange, IntegrationCenterReport, IntegrationPreview, IntegrationApplyResult, IntegrationVerifyReport } from './types';
 import type { SpeedQuery, SpeedReport } from './types';
 import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, HistoryRebuildStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
 
@@ -244,6 +245,22 @@ export function openInstructionFile(path: string): Promise<void> {
 
 export function getTurnReceiptStatus(): Promise<TurnReceiptIntegrationStatus> {
   return invoke<TurnReceiptIntegrationStatus>('get_turn_receipt_status');
+}
+
+export function getIntegrationStatus(scope: IntegrationScope, project: string | null): Promise<IntegrationCenterReport> {
+  return invoke<IntegrationCenterReport>('get_integration_status', { scope, project });
+}
+export function previewIntegrationChange(client: IntegrationClient, scope: IntegrationScope, action: IntegrationChange, project: string | null): Promise<IntegrationPreview> {
+  return invoke<IntegrationPreview>('preview_integration_change', { client, scope, action, project });
+}
+export function applyIntegrationChange(id: string): Promise<IntegrationApplyResult> {
+  return invoke<IntegrationApplyResult>('apply_integration_change', { id });
+}
+export function testIntegrationClient(client: IntegrationClient, scope: IntegrationScope, project: string | null): Promise<IntegrationVerifyReport> {
+  return invoke<IntegrationVerifyReport>('test_integration_client', { client, scope, project });
+}
+export function openIntegrationConfiguration(client: IntegrationClient, scope: IntegrationScope, project: string | null): Promise<void> {
+  return invoke<void>('open_integration_configuration', { client, scope, project });
 }
 
 export function repairTurnReceiptIntegrations(): Promise<TurnReceiptIntegrationStatus> {

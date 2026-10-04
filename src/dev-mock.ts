@@ -3,6 +3,7 @@
 // main.ts. Production builds tree-shake this module away entirely.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
+import { integrationFixture } from './dev-mock/integration';
 import { mockRangePricing, mockSessionPricing, mockSummaryPricing, assertFixtureRates } from './dev-mock/pricing';
 import { createFixtureData, tok, scaleTok, toolMetrics, type Fixture } from './dev-mock/fixtures';
 import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } from './dev-mock/visualScenario';
@@ -630,6 +631,18 @@ mockIPC((cmd, payload) => {
     case 'get_turn_receipt_status':
     case 'repair_turn_receipt_integrations':
       return turnReceiptStatus();
+    case 'get_integration_status': {
+      const request = (payload ?? {}) as Record<string, unknown>;
+      return integrationFixture(request.scope === 'project' ? 'project' : 'user');
+    }
+    case 'preview_integration_change': {
+      const request = (payload ?? {}) as Record<string, unknown>;
+      return { id: 'synthetic-preview', client: request.client, scope: request.scope, action: request.action, configuration_path: '/synthetic/config', entry_preview: '{"command":"/synthetic/odometer","args":["mcp"]}', warning: 'Synthetic preview only. Browser mocks do not write client configuration.' };
+    }
+    case 'apply_integration_change':
+      return { configuration_path: '/synthetic/config', backup_path: null, restart_required: true };
+    case 'test_integration_client':
+      return { schema_version: 1, ok: false, checks: [{ id: 'mcp_launch', status: 'unknown', detail: 'Browser fixtures cannot launch or verify a native server.' }] };
     case 'get_config':
       // Mirrors the backend's normalized shape: versioned provider map with
       // the legacy flat fields as its builtin mirror.

@@ -62,6 +62,7 @@ pub fn try_run_cli() -> bool {
     if !matches!(
         command,
         "status"
+            | "integration-status"
             | "report"
             | "quota"
             | "projects"
@@ -155,7 +156,8 @@ fn run_native(command: &str, args: &[String], format: Format) -> Result<String> 
         "sessions" => run_sessions(args, format),
         "activity" => run_activity(args, format),
         "verify" => run_verify(format),
-        "categories" | "tools" | "context" | "findings" | "diagnostics" | "statusline" => {
+        "categories" | "tools" | "context" | "findings" | "diagnostics" | "statusline"
+        | "integration-status" => {
             let control = if command == "statusline" {
                 QueryControl::with_timeout(std::time::Duration::from_millis(250))
             } else {
@@ -174,6 +176,14 @@ fn run_native(command: &str, args: &[String], format: Format) -> Result<String> 
                     &rates,
                     Utc::now(),
                     args.iter().any(|arg| arg == "--include-paths"),
+                )?)?
+            } else if command == "integration-status" {
+                serde_json::to_value(crate::integration_status::status(
+                    store.as_ref().ok(),
+                    &rates,
+                    &config,
+                    Utc::now(),
+                    Some(&control),
                 )?)?
             } else {
                 crate::headless::execute(
@@ -204,7 +214,7 @@ fn run_native(command: &str, args: &[String], format: Format) -> Result<String> 
 
 fn help() -> &'static str {
     "Odometer read-only reports\n\n\
-Commands: status, report, models, projects, sessions, categories, tools, context,\n\
+Commands: status, integration-status, report, models, projects, sessions, categories, tools, context,\n\
           findings, diagnostics, metrics, activity, quota, mirrors, statusline, verify\n\
 Export:   export --report <command> [--format json|csv|markdown|text]\n\n\
 Options:  --from YYYY-MM-DD --to YYYY-MM-DD (inclusive UTC dates)\n\

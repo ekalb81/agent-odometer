@@ -69,11 +69,48 @@ fn fixture() -> (tempfile::TempDir, HistoryStore, RateCard) {
 }
 
 #[test]
+fn integration_status_reports_recorded_coverage_without_claiming_a_current_scan() {
+    let (_directory, store, rates) = fixture();
+    let now = Utc.with_ymd_and_hms(2026, 9, 1, 13, 0, 0).unwrap();
+    let status = odometer_lib::integration_status::status(
+        Some(&store),
+        &rates,
+        &Config::default(),
+        now,
+        None,
+    )
+    .unwrap();
+    assert!(status.ledger_available);
+    assert_eq!(status.sessions, Some(2));
+    assert_eq!(status.scan_status, "unknown_in_headless_query");
+    assert_eq!(
+        status.observation.token_event_from,
+        Some(Utc.with_ymd_and_hms(2026, 9, 1, 12, 30, 0).unwrap())
+    );
+    assert_eq!(
+        status.observation.token_event_to,
+        status.observation.token_event_from
+    );
+    assert!(status.observation.generation.is_some());
+    assert!(status
+        .providers
+        .iter()
+        .any(|provider| provider.provider == "codex"));
+    let wire = serde_json::to_string(&status).unwrap();
+    assert!(!wire.contains("synthetic-codex"));
+    assert!(!wire.contains("sample-session.jsonl"));
+    assert!(status
+        .quota_authority
+        .contains("not an authoritative live quota"));
+}
+
+#[test]
 fn every_mcp_report_matches_shared_dispatch_for_identical_facts_and_clock() {
     let (_directory, store, rates) = fixture();
     let config = Config::default();
     let now = Utc.with_ymd_and_hms(2026, 9, 1, 13, 0, 0).unwrap();
     for (name, kind) in [
+        ("odometer_status", QueryKind::IntegrationStatus),
         ("usage_report", QueryKind::Report),
         ("model_report", QueryKind::Models),
         ("project_report", QueryKind::Projects),
