@@ -2,22 +2,22 @@
 
 ## System overview
 
-Odometer is a local companion to agent CLI harnesses — the ChatGPT desktop app's Codex experience and Claude Code — with two halves:
+Odometer is a local companion to Codex (the ChatGPT desktop app), Claude Code, and Gemini CLI. It provides a Tauri desktop UI plus headless reports and a read-only stdio MCP server:
 
 - `src-tauri/`: Rust/Tauri backend for discovery, incremental JSONL parsing, filesystem watching, persistence, and native commands.
-- `src/`: Svelte 5/TypeScript frontend for reactive state, scoped tabs (`all` plus each harness), filtering, projection/export, tables, details, settings, and presentation of backend-priced costs.
+- `src/`: Svelte 5/TypeScript frontend for reactive state, an All tab plus one tab per provider, filtering, projection/export, tables, details, settings, and presentation of backend-priced costs.
 
-Every session carries a `harness` tag (`codex` | `claude_code`). All three scopes share one session store, `SessionsView`, detail pane, filter predicates, pricing projection, and model aggregate. The All scope never adds plan credits to USD.
+Each session carries a `harness` tag (`codex` | `claude_code` | `gemini_cli`). The All tab and all three provider tabs share one session store, `SessionsView`, detail pane, filter predicates, pricing projection, and model aggregate. The All tab never adds plan credits to USD.
 
-The frontend starts at `src/main.ts` and `src/App.svelte`. The native process starts at `src-tauri/src/main.rs`. Normal launches call `src-tauri/src/lib.rs::run`; an explicitly installed harness hook exits through the headless `turn_receipts::try_run_cli` path before Tauri starts.
+The frontend starts at `src/main.ts` and `src/App.svelte`. The native process starts at `src-tauri/src/main.rs`. Normal launches call `src-tauri/src/lib.rs::run`; an explicitly installed harness hook exits through the headless `turn_receipts::try_run_cli` path before Tauri starts. The `agent-odometer` report CLI and stdio MCP server bypass Tauri and query the same Rust services through a read-only connection to the prepared durable-history database; they do not discover transcripts, migrate the database, or write accounting data.
 
 ## Startup and live-update flow
 
 1. `Config::load` reads the platform config file or creates defaults.
 2. `watcher::start` begins watching all configured roots immediately, so changes during the initial scan are not missed.
 3. `scanner::scan_all` bulk-loads existing sessions on a background thread, parsing files in parallel (rayon) and emitting a `session-updated` summary per file — the window is interactive immediately and the list populates progressively. A persistent SQLite scan cache (`scan_cache.rs`, stored under the OS cache directory and keyed by file size+mtime, versioned by app release) serves unchanged files without re-reading them. Each scan touches or replaces individual rows and prunes unseen generations, avoiding whole-corpus cache deserialization and rewrites. The previous JSON cache is imported on first use. Progress flows to the UI via throttled `scan-progress` events and the `get_scan_status` command.
-4. `parser::parse_file` (Codex) or `claude_parser::parse_file` (Claude Code) builds a `Session` for each file. Before publication, `history_store.rs` reconciles the parsed source with the durable archive, assigns a path-independent `storage_id`, and records the source observation and normalized token-event suffix transactionally.
-5. `AppState.sessions` stores the resulting projection by durable `storage_id`. Multiple paths on one event lineage converge on one session; reused provider IDs with divergent lineages remain separate collision records.
+4. The provider registry dispatches each source to `parser.rs` (Codex), `claude_parser.rs` (Claude Code), or `gemini_parser.rs` (Gemini CLI JSONL, version 0.39 and later). Before publication, `history_store.rs` reconciles the parsed source with the durable archive, assigns a path-independent `storage_id`, and records the source observation and normalized token-event suffix transactionally.
+5. `AppState.sessions` keeps the live session projection by durable `storage_id` for the desktop UI. Date-window accounting uses the durable ledger's event and rollup tables when available, with a bounded in-memory fallback for stale or unavailable session records. Multiple paths on one event lineage converge on one session; reused provider IDs with divergent lineages remain separate collision records.
 6. `session_index::read` overlays current thread names from Codex's session index after the scan and advances the current materialized snapshot without changing source ownership.
 7. `App.svelte` invokes `list_sessions`, `get_config`, and `get_rates`, then subscribes to update/removal events.
 8. The watcher debounces filesystem activity, incrementally parses complete appended records, reconciles each result through the same durable-history boundary, updates the `DashMap`, and emits Tauri events.
@@ -34,7 +34,7 @@ The durable history in `history_store.rs` is a source of retained session truth,
 
 Identity and reconciliation follow these invariants:
 
-- Provider IDs are harness-namespaced: `codex:thread:<id>` and `claude_code:session:<id>`. Claude subagents use `claude_code:subagent:<parent-session-id>:<agent-id>`; only legacy subagents without a provider `agentId` may use a filename-stem fallback.
+- Provider IDs are harness-namespaced: `codex:thread:<id>`, `claude_code:session:<id>`, and `gemini_cli:session:<id>`. Claude subagents use `claude_code:subagent:<parent-session-id>:<agent-id>`; only legacy subagents without a provider `agentId` may use a filename-stem fallback.
 - A filesystem path is an availability observation, never logical identity. Stored path keys normalize separators, remove Windows verbatim prefixes, and fold case on Windows so scanner and watcher events address the same location.
 - Provider identity, the first-event fingerprint, and an append-compatible token-event lineage reconcile copies and moves. Equal histories and prefix histories are one lineage. Divergence after a shared prefix creates a deterministic `:collision:<lineage-hash>` storage ID and marks every final session claiming that provider identity as a collision; neither transcript overwrites the other.
 - A source observation can advance the materialized snapshot only when it has more token-history events, or the same event count with an equal-or-newer `last_event_at`. Metadata overlays such as session-index names advance the snapshot version and may update display metadata without creating or reassigning a source location; only the current full snapshot is retained.
@@ -42,7 +42,7 @@ Identity and reconciliation follow these invariants:
 
 Availability publication is generation-safe. A completed scan marks unseen paths missing only when it is still the newest durable generation and the scan had zero parse failures; an incomplete scan retains the previous availability rather than inventing deletions. Per-path tombstones and the settings-transition lock prevent an older bulk-scan callback from resurrecting a watcher-removed or reconfigured source. If the history database cannot be opened or written, Odometer logs a warning and keeps live parsing available, but it makes no durability, move-reconciliation, or collision-preservation claim for that failed operation.
 
-This is the first durable-history slice, not the complete normalized ledger tracked by issue #38. Existing desktop, tray, export, and range consumers still query the in-memory session projection; the archive currently retains the latest materialized session snapshot plus normalized token events rather than aggregate-only facts and exposes no user-controlled purge/rebuild or read-only recovery workflow. Those boundaries must be resolved before #38 can be considered complete.
+The durable archive now provides normalized session facts and hourly rollups for date-window accounting. Desktop range queries use the ledger when it is ready and return a retryable error while history is pending; they fall back to full session data only for stale or failed ledger reads. The desktop can explicitly rebuild history from source transcripts, with progress and cancellation. CLI/MCP reports and `verify` use a read-only connection and require an initialized database with the current schema; they do not perform that rebuild.
 
 ## Opt-in turn-receipt flow
 
@@ -129,11 +129,13 @@ focused receipt tests protect subset accounting, model resolution, and Fast-tier
 | --- | --- |
 | `src-tauri/src/lib.rs` | Tauri setup, shared state, command registration, initial scan, watcher lifetime |
 | `src-tauri/src/model.rs` | Serialized session, harness, turn-status, and token wire models |
+| `src-tauri/src/provider.rs` | Built-in provider registry, parser adapters, and capability descriptors |
 | `src-tauri/src/parser.rs` | Full and incremental Codex rollout JSONL parsing |
 | `src-tauri/src/claude_parser.rs` | Full and incremental Claude Code session JSONL parsing |
+| `src-tauri/src/gemini_parser.rs` | Full and incremental Gemini CLI session JSONL parsing |
 | `src-tauri/src/scanner.rs` | Recursive JSONL discovery, cached parallel initial parse |
 | `src-tauri/src/scan_cache.rs` | Incremental SQLite parsed-session cache keyed by file size+mtime |
-| `src-tauri/src/history_store.rs` | Durable SQLite session archive, source availability, identity reconciliation, and schema migration |
+| `src-tauri/src/history_store.rs` | Durable SQLite session archive, normalized events and rollups, source availability, identity reconciliation, and schema migration |
 | `src-tauri/src/performance.rs` | Default-off, bounded local performance event writer and JSONL/CSV export |
 | `src-tauri/src/watcher.rs` | Debounced file watching, per-harness parser dispatch, frontend events |
 | `src-tauri/src/session_index.rs` | Thread-name overlay from `session_index.jsonl` |
@@ -398,7 +400,7 @@ can still have retained summaries and historical usage, and never implies purge.
 No transcript index, raw-body persistence, retention policy or purge is added here;
 source deletion removes access to those bodies without changing historical totals.
 
-Default inputs are resolved below `$CODEX_HOME`, falling back to `~/.codex`:
+Codex sessions are resolved below `$CODEX_HOME`, falling back to `~/.codex`:
 
 - `$CODEX_HOME/sessions`
 - `$CODEX_HOME/archived_sessions`
@@ -407,6 +409,8 @@ Default inputs are resolved below `$CODEX_HOME`, falling back to `~/.codex`:
 Claude Code sessions are resolved below `$CLAUDE_CONFIG_DIR`, falling back to `~/.claude`:
 
 - `$CLAUDE_CONFIG_DIR/projects`
+
+Gemini CLI JSONL sessions are resolved below `~/.gemini/tmp`; Gemini CLI does not document an environment override for this root.
 
 User-owned app data is stored under the platform configuration directory in `agent-odometer/config.json` and, after rate edits, `agent-odometer/rates.json`. The fallback rate card is compiled from `src-tauri/rates.json`. Durable parsed session history lives separately under the platform local-data directory in `agent-odometer/history-v1.sqlite3`; it is retained independently of transcript availability and scan-cache eviction. Enabled turn receipts also keep independent bounded `turn-receipt-status-codex.json` and `turn-receipt-status-claude-code.json`, and `turn-receipt-status-gemini_cli.json` health records under the OS local-data directory; they contain no session IDs or paths. Reads retain compatibility with the earlier shared development-format file.
 
@@ -420,7 +424,7 @@ Session files can contain full prompts, responses, system/developer instructions
 - `forked_from_id` is represented in the model/UI but may be absent when the source rollout does not provide or the parser does not extract it.
 - Claude Code's `Stop` payload does not include subscription rate-limit windows, so its first receipt version shows tokens and API-rate estimates but no per-turn subscription delta. Codex quota values come from its transcript snapshots.
 - Hook commands parse one transcript from disk in a short-lived process. Very large transcripts can make a receipt late or unavailable, but the harness turn still completes and the dashboard watcher remains unaffected.
-- Frontend behavior is checked by TypeScript/Svelte validation and manual Tauri runs; no frontend unit-test framework is configured.
+- Frontend checks include Svelte/TypeScript validation, Vitest unit and component tests, source-backed coverage enforcement, and Playwright visual regression against committed fixture baselines. Runtime changes still require an affected-flow Tauri run.
 
 ## Safe extension patterns
 
