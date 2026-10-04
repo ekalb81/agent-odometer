@@ -3,6 +3,8 @@
   import type { BudgetUnit, ProjectInfo, QuotaAlert, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire } from '../lib/types';
   import type { ViewScope } from '../lib/sessionProjection';
   import { providersStore } from '../lib/stores/providers.svelte';
+  import { historyStore } from '../lib/stores/history.svelte';
+  import { rates } from '../lib/stores/rates';
 
   interface Props {
     active?: boolean;
@@ -79,6 +81,12 @@
   }
 
   $effect(() => {
+    // Purge/recovery and same-version rate replacements invalidate headroom
+    // immediately. Cleanup rejects in-flight results from the previous inputs.
+    void historyStore.status.status;
+    void historyStore.status.coverage_complete;
+    void $rates;
+    report = null;
     const token = ++lifecycleGeneration;
     if (!active) return;
     void refresh(token);

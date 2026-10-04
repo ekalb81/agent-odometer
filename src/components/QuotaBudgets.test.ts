@@ -3,7 +3,9 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
 import QuotaBudgets from './QuotaBudgets.svelte';
-import type { ProjectInfo, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire } from '../lib/types';
+import { historyStore } from '../lib/stores/history.svelte';
+import { rates } from '../lib/stores/rates';
+import type { ProjectInfo, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire, RateCard } from '../lib/types';
 
 const { checkQuotaBudgets, getQuotaConfig, resolveProjects, setQuotaConfig } = vi.hoisted(() => ({
   checkQuotaBudgets: vi.fn(),
@@ -49,6 +51,8 @@ function deferred<T>() {
 
 describe('QuotaBudgets', () => {
   beforeEach(() => {
+    historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: true });
+    rates.set(null);
     checkQuotaBudgets.mockReset().mockResolvedValue(report());
     persistedConfig = config;
     getQuotaConfig.mockReset().mockImplementation(async () => persistedConfig);
@@ -60,6 +64,30 @@ describe('QuotaBudgets', () => {
   });
 
   afterEach(() => vi.useRealTimers());
+
+  it.each(['history', 'rates'] as const)('invalidates displayed budget values on %s changes and rejects late prior results', async (source) => {
+    const row = (value: number) => report([{ budget_id: existingBudget.id, current_value: value, unavailable: null }]);
+    checkQuotaBudgets.mockResolvedValueOnce(row(123));
+    render(QuotaBudgets);
+    await screen.findByText('123 tokens now');
+    const stale = deferred<QuotaBudgetCheck>();
+    checkQuotaBudgets.mockReturnValueOnce(stale.promise);
+    const invalidate = (complete: boolean) => {
+      if (source === 'history') historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: complete });
+      // Only object identity changes; pricing invalidation must not use version.
+      else rates.set({ version: 13 } as RateCard);
+    };
+    invalidate(false);
+    await waitFor(() => expect(checkQuotaBudgets).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('123 tokens now')).not.toBeInTheDocument();
+    checkQuotaBudgets.mockResolvedValueOnce(row(456));
+    invalidate(true);
+    await screen.findByText('456 tokens now');
+    stale.resolve(row(999));
+    await tick();
+    expect(screen.queryByText('999 tokens now')).not.toBeInTheDocument();
+    expect(screen.getByText('456 tokens now')).toBeInTheDocument();
+  });
 
   it('notifies every provider crossing while keeping budget rows scoped to the selected harness', async () => {
     const alert = {
