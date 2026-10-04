@@ -23,6 +23,8 @@ export default defineConfig({
         'src/components/TranscriptExport.svelte',
         'src/components/SessionOrganizationEditor.svelte',
         'src/components/OrganizationToolbar.svelte',
+        'src/components/HumanOutcomes.svelte',
+        'src/lib/humanOutcomes.ts',
         'src/lib/organization.ts',
         'src/lib/stores/organization.svelte.ts',
         'src/components/TranscriptSearch.svelte',

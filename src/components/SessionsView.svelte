@@ -36,6 +36,7 @@
   import DetailPane from './DetailPane.svelte';
   import ConfigTimeline from './ConfigTimeline.svelte';
   import GitOutcomes from './GitOutcomes.svelte';
+  import HumanOutcomes from './HumanOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
   import SpeedMonitor from './SpeedMonitor.svelte';
   import CalendarActivity from './CalendarActivity.svelte';
@@ -2034,6 +2035,7 @@
       </details>
 
       <ConfigTimeline active={active && analyticsOpen} events={configEvents} />
+      <HumanOutcomes sessions={filtered} />
       <GitOutcomes />
 
       <div class="flex items-center gap-2 text-xs">

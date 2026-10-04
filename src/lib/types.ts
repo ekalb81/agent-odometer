@@ -1477,12 +1477,20 @@ export interface TranscriptPage {
 export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
 export interface RecordBookmark { identity: AnnotationIdentity; revision: number; bookmarked: boolean }
 export interface RecordBookmarkList { identity: AnnotationIdentity; bookmarks: RecordBookmark[]; recovery_backup_unrestored: boolean }
+export interface HumanOutcome {
+  label: 'not_rated' | 'accepted' | 'rejected' | 'unresolved';
+  repair_minutes: number | null;
+  first_pass_accepted: boolean | null;
+}
 export interface OrganizationSummary {
   identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
+  outcome?: HumanOutcome;
 }
 export interface SessionAnnotation { summary: OrganizationSummary; note: string; recovery_backup_unrestored?: boolean }
 export interface AnnotationEdit {
   identity: AnnotationIdentity; revision: number; pinned: boolean; note: string; tags: string[];
+  /** Omitted by older editors: preserve the existing human outcome. */
+  outcome?: HumanOutcome;
 }
 export interface SavedSearchDefinition {
   name: string; query: string; scope: string;
