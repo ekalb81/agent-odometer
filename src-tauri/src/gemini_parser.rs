@@ -190,6 +190,7 @@ impl GeminiSessionParser {
             agent_nickname: None,
             file_path: self.file_path.to_string_lossy().into_owned(),
             source_availability: SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at,
             last_event_at: started_at,

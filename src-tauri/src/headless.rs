@@ -167,7 +167,7 @@ pub fn execute_optional(
             .unwrap_or_default()
     };
     let required_store = || store.ok_or_else(|| anyhow::anyhow!(LEDGER_UNAVAILABLE));
-    let result = match kind {
+    let mut result = match kind {
         QueryKind::IntegrationStatus => serde_json::to_value(crate::integration_status::status(
             store, rates, config, now, control,
         )?)?,
@@ -178,6 +178,7 @@ pub fn execute_optional(
             "ledger_bytes": store.and_then(|store| store.database_footprint().total_bytes()),
             "rate_card_version": rates.version,
             "rate_card_fetched_at": rates.fetched_at,
+            "retention": store.map(HistoryStore::retention_status).transpose()?,
         }),
         QueryKind::Report | QueryKind::Models => serde_json::to_value(query::range_report(
             required_store()?,
@@ -263,6 +264,12 @@ pub fn execute_optional(
             request.utc_offset,
         )?)?,
     };
+    if let Some(object) = result.as_object_mut() {
+        object.insert(
+            "coverage_complete".into(),
+            serde_json::to_value(store.map(HistoryStore::has_complete_coverage).transpose()?)?,
+        );
+    }
     if let Some(store) = store {
         store.check_query()?;
     }

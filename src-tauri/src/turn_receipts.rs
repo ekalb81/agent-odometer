@@ -652,6 +652,7 @@ mod tests {
             agent_nickname: None,
             file_path: "fixture.jsonl".into(),
             source_availability: Default::default(),
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: started,
             last_event_at: completed,

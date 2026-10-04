@@ -351,6 +351,7 @@ impl SessionParser {
             agent_nickname,
             file_path: self.file_path.to_string_lossy().into_owned(),
             source_availability: SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: self.archived,
             started_at,
             last_event_at,

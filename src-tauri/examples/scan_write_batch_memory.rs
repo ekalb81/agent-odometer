@@ -646,6 +646,7 @@ fn build_session(
         agent_nickname: None,
         file_path: format!("C:/synthetic-sessions/session-{index:06}.jsonl"),
         source_availability: SourceAvailability::Present,
+        lifecycle: odometer_lib::model::SessionLifecycle::Present,
         archived: true,
         started_at: base_time,
         last_event_at,
