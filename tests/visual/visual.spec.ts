@@ -143,6 +143,25 @@ function assertManifestCasesAreRegistered(): void {
   }
 }
 
+visualTest('calendar-activity', 'calendar heatmap and daily trend', async (page) => {
+  await visit(page, { view: 'codex' });
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toBeVisible();
+  await calendar.scrollIntoViewIfNeeded();
+});
+
+visualTest('calendar-partial-narrow', 'partial recorded history calendar at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { scenario: 'history-partial', view: 'codex' });
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toContainText('partial history');
+  await calendar.scrollIntoViewIfNeeded();
+});
+
 test.beforeEach(async ({ page }) => {
   await page.clock.install({ time: FIXED_TIME });
   page.on('pageerror', (error) => {

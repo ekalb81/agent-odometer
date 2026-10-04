@@ -257,14 +257,15 @@ function scanStatus() {
   return { done: sessions.length, total: sessions.length, complete: true, elapsed_ms: 1240, cold_reason: null };
 }
 
-function historyStatus(): HistoryStatus {
+function historyStatus(): HistoryStatus & { coverage_complete: boolean | null } {
   // No visual scenario models a still-migrating archive: every fixture
   // scenario represents an already-warm install, and browser dev mode has
   // no Rust backend to actually migrate. `get_history_status` always
   // resolves 'ready' here so the mount sequence proceeds exactly like a
   // normal warm start.
   return {
-    status: 'ready',
+    status: visualScenario === 'history-unavailable' ? 'unavailable' : 'ready',
+    coverage_complete: visualScenario === 'history-unavailable' ? null : visualScenario !== 'history-partial',
     step: null,
     step_index: null,
     step_total: null,

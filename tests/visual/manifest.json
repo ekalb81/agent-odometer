@@ -22,6 +22,8 @@
     "sessions-subagent-drilldown",
     "sessions-availability-fallback",
     "tool-dimensions",
+    "calendar-activity",
+    "calendar-partial-narrow",
     "session-narrow-detail-overlay",
     "instructions-preview",
     "instructions-raw",
