@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { SummaryPricing } from './types';
 import type { TranscriptPage, TranscriptRequest } from './types';
+import type { TranscriptSearchRequest, TranscriptSearchPage, TranscriptSearchTarget, RetainedSearchLanding } from './types';
 import type { IntegrationClient, IntegrationScope, IntegrationChange, IntegrationCenterReport, IntegrationPreview, IntegrationApplyResult, IntegrationVerifyReport } from './types';
 import type { SpeedQuery, SpeedReport } from './types';
 import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, HistoryRebuildStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
@@ -34,6 +35,16 @@ export function getSessionDetails(sessionId: string): Promise<Session | null> {
 /** Explicit source inspection; never called by list, pricing, diagnostics or MCP flows. */
 export function getTranscriptPage(request: TranscriptRequest): Promise<TranscriptPage> {
   return invoke<TranscriptPage>('get_transcript_page', { request });
+}
+
+/** Opt-in bounded content search; query and snippets remain ephemeral. */
+export function searchSessionContent(request: TranscriptSearchRequest): Promise<TranscriptSearchPage> {
+  return invoke<TranscriptSearchPage>('search_session_content', { request });
+}
+
+/** Resolve a retained field by its lineage and snapshot, never a nearby turn. */
+export function resolveRetainedSearchTarget(target: TranscriptSearchTarget): Promise<RetainedSearchLanding> {
+  return invoke<RetainedSearchLanding>('resolve_retained_search_target', { target });
 }
 
 /** Date-scoped rollups for all sessions, one result map per requested window.

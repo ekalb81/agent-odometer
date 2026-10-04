@@ -1372,6 +1372,51 @@ export interface TranscriptContentScope {
   tool_calls: boolean;
   tool_results: boolean;
 }
+export type TranscriptSearchTarget =
+  | { kind: 'source_record'; session_id: string; record_id: string; block_index: number }
+  | { kind: 'retained_turn'; session_id: string; session_identity: string; snapshot_revision: string; turn_id: string; field: 'user_message' | 'last_agent_message' };
+export type TranscriptSearchPosition =
+  | { phase: 'source'; cursor: TranscriptCursor; incomplete: boolean }
+  | { phase: 'retained'; session_identity: string; snapshot_revision: string; next_turn: number };
+export interface TranscriptSearchCursor {
+  session_id: string;
+  query: string;
+  scope: TranscriptContentScope;
+  position: TranscriptSearchPosition;
+}
+export interface TranscriptSearchRequest {
+  session_id: string;
+  query: string;
+  scope: TranscriptContentScope;
+  cursor?: TranscriptSearchCursor | null;
+}
+export interface TranscriptSearchSnippet {
+  text: string;
+  match_start: number;
+  match_end: number;
+  truncated_before: boolean;
+  truncated_after: boolean;
+}
+export interface TranscriptSearchHit {
+  target: TranscriptSearchTarget;
+  content_kind: string;
+  snippet: TranscriptSearchSnippet;
+}
+export interface TranscriptSearchPage {
+  phase: 'source' | 'retained';
+  hits: TranscriptSearchHit[];
+  next_cursor: TranscriptSearchCursor | null;
+  issues: string[];
+  source_complete: boolean;
+  retained_complete: boolean;
+  scanned_records: number;
+  scanned_messages: number;
+}
+export interface RetainedSearchLanding {
+  target: TranscriptSearchTarget;
+  text: string;
+  truncated: boolean;
+}
 export interface TranscriptBlock {
   kind: string;
   text: string;
