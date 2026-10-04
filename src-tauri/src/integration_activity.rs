@@ -255,14 +255,25 @@ fn read_locked(file: &mut File) -> Result<Vec<Activity>> {
     }
     Ok(entries)
 }
+// A duplicated/inherited descriptor can outlive this scope. Closing only our
+// descriptor does not release a Unix flock on the shared open-file description.
+// Explicit unlock also runs on read/write errors and unwinding.
+struct ActivityLock(File);
+impl Drop for ActivityLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 fn append_at(path: &Path, activity: Activity) -> Result<()> {
     std::fs::create_dir_all(
         path.parent()
             .ok_or_else(|| anyhow::anyhow!("activity path has no parent"))?,
     )?;
-    let mut file = open_regular(path, true)?;
+    let file = open_regular(path, true)?;
     file.try_lock()?;
-    let mut entries = read_locked(&mut file)?;
+    let mut locked = ActivityLock(file);
+    let mut entries = read_locked(&mut locked.0)?;
     entries.push(activity);
     if entries.len() > MAX_ENTRIES {
         entries.drain(..entries.len() - MAX_ENTRIES);
@@ -271,10 +282,10 @@ fn append_at(path: &Path, activity: Activity) -> Result<()> {
     if bytes.len() as u64 > MAX_BYTES {
         bail!("activity store exceeds its bound");
     }
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&bytes)?;
-    file.set_len(bytes.len() as u64)?;
-    file.sync_all()?;
+    locked.0.seek(SeekFrom::Start(0))?;
+    locked.0.write_all(&bytes)?;
+    locked.0.set_len(bytes.len() as u64)?;
+    locked.0.sync_all()?;
     Ok(())
 }
 pub fn recent() -> Result<Vec<Activity>> {
@@ -286,14 +297,33 @@ pub fn recent() -> Result<Vec<Activity>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let mut file = open_regular(&path, false)?;
+    let file = open_regular(&path, false)?;
     file.try_lock_shared()?;
-    read_locked(&mut file)
+    let mut locked = ActivityLock(file);
+    read_locked(&mut locked.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn completed_activity_scope_releases_lock_while_duplicated_descriptor_lives() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("activity.json");
+        let file = open_regular(&path, true).unwrap();
+        file.try_lock().unwrap();
+        let locked = ActivityLock(file);
+        // dup and fork inheritance share the same open-file description. Keep
+        // it alive to reproduce the lock contention observed in parallel CI.
+        let duplicated = locked.0.try_clone().unwrap();
+        let competing = open_regular(&path, true).unwrap();
+        assert!(competing.try_lock().is_err());
+        drop(locked);
+        competing.try_lock().unwrap();
+        competing.unlock().unwrap();
+        drop(duplicated);
+    }
     #[test]
     fn initialize_metadata_cannot_store_arbitrary_client_text() {
         let connection = Connection::from_initialize(
