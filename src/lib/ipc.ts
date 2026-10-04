@@ -306,7 +306,7 @@ export function openTaskInChatGPT(sessionId: string): Promise<void> {
 /** Opens a backend-owned native save dialog and writes only its selected path. */
 export function writeExport(
   defaultName: string,
-  format: 'csv' | 'json',
+  format: 'csv' | 'json' | 'svg',
   content: string,
 ): Promise<boolean> {
   return invoke<boolean>('write_export', { defaultName, format, content });

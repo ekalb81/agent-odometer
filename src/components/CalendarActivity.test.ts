@@ -13,6 +13,7 @@ function setHistory(status: HistoryStatus['status'], coverage_complete: boolean)
   historyStore.set({ status, coverage_complete, step: null, step_index: null, step_total: null, items_done: null, items_total: null, elapsed_ms: null } as HistoryStatus);
 }
 beforeEach(() => {
+  Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function(this: HTMLDialogElement) { this.setAttribute('open', ''); } });
   vi.stubEnv('TZ', 'UTC');
   setHistory('ready', true); mocks.scan = { complete: true };
   mocks.query.mockReset().mockImplementation(async (bounds: unknown[]) => bounds.map(() => ({})));
@@ -21,6 +22,19 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 const props = { from: '2026-07-28T00:00:00Z', to: '2026-07-29T23:59:59.999Z', sessionIds: ['codex:parent', 'codex:tools'], onbucket: vi.fn() };
 describe('calendar activity', () => {
+  it('previews only settled measured data and invalidates the snapshot when its scope changes', async () => {
+    mocks.query.mockResolvedValue([{ 'codex:parent': range }, {}]);
+    const view = render(CalendarActivity, props);
+    expect(screen.getByRole('button', { name: 'Preview summary card' })).toBeDisabled();
+    await screen.findByTestId('calendar-total');
+    await userEvent.click(screen.getByRole('button', { name: 'Preview summary card' }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect((screen.getByLabelText('Companion Markdown') as HTMLTextAreaElement).value).toContain('70 recorded tokens');
+    await view.rerender({ ...props, sessionIds: ['claude:other'] });
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    setHistory('unavailable', false);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Preview summary card' })).toBeDisabled());
+  });
   it('scopes an effective project independently of the provider and session filter', async () => {
     render(CalendarActivity, { ...props, projects: [{ key: 'merged:work', label: 'Merged work', sessionIds: ['codex:tools'] }] });
     await screen.findByTestId('calendar-total');

@@ -538,8 +538,12 @@ pub async fn write_export(
     let extension = match format.as_str() {
         "csv" => "csv",
         "json" => "json",
-        _ => return Err("export format must be csv or json".into()),
+        "svg" => "svg",
+        _ => return Err("export format must be csv, json, or svg".into()),
     };
+    if extension == "svg" && content.len() > 1024 * 1024 {
+        return Err("SVG export exceeds the 1 MiB safety limit".into());
+    }
     if content.len() > 128 * 1024 * 1024 {
         return Err("export exceeds the 128 MiB safety limit".into());
     }
@@ -3498,7 +3502,7 @@ mod tests {
     }
 
     #[test]
-    fn export_writer_accepts_only_csv_and_json() {
+    fn export_writer_preserves_selected_format_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let csv = dir.path().join("usage.csv");
         let unicode = "name,note\r\n\"Δelta\",\"comma, quote \"\" and\nnewline\"\r\n";
@@ -3507,6 +3511,10 @@ mod tests {
         let json = dir.path().join("empty.json");
         write_export_file(&json, "json", "[]\n").unwrap();
         assert_eq!(std::fs::read_to_string(json).unwrap(), "[]\n");
+        let svg = dir.path().join("activity.svg");
+        let preview = "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>Activity Δ</title></svg>";
+        write_export_file(&svg, "svg", preview).unwrap();
+        assert_eq!(std::fs::read_to_string(svg).unwrap(), preview);
         let text = dir.path().join("usage.txt");
         assert!(write_export_file(&text, "csv", "nope").is_err());
         let missing_parent = dir.path().join("missing/usage.csv");
