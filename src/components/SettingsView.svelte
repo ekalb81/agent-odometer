@@ -6,6 +6,7 @@
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations, rebuildHistory, cancelHistoryRebuild, getHistoryRebuildStatus, onHistoryRebuildProgress } from '../lib/ipc';
   import ProjectManagement from './ProjectManagement.svelte';
+  import IntegrationCenter from './IntegrationCenter.svelte';
 
   /**
    * Matches `provider::gemini_cli_provider_id()`. Gemini CLI's roots live in
@@ -1286,6 +1287,7 @@
   </section>
 
   <!-- Opt-in harness turn receipts -->
+  <IntegrationCenter />
   <section>
     <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Turn receipts</h2>
     <p class="text-xs text-ink-faint mb-3 max-w-3xl">

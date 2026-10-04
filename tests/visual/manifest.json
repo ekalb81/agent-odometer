@@ -31,6 +31,8 @@
     "instructions-content-error",
     "settings-roots",
     "settings-instructions",
+    "integration-dark",
+    "integration-narrow-preview",
     "settings-rates",
     "settings-rate-validation-error",
     "settings-save-error",

@@ -117,6 +117,7 @@ The server uses JSON-RPC 2.0 over stdio, with one JSON message per line, and adv
 
 | MCP tool | Corresponding report |
 | --- | --- |
+| `odometer_status` | integration-status |
 | `usage_report` | report |
 | `model_report` | models |
 | `project_report` | projects |
@@ -161,6 +162,8 @@ Clients must continue draining stdout. Standard blocking pipe backpressure can d
 The existing `quota_status` tool preserves its raw-array result. `quota_report` returns `{ "schema_version": 1, "snapshots": [...] }`; `mirrored_sessions` returns `{ "schema_version": 1, "groups": [...] }`. These are report contracts, independent of the CLI's version-2 export envelope. Quota reports read stored observations only; they do not contact providers or reuse credentials.
 
 ## Privacy boundary
+
+See [Integration Center](INTEGRATION_CENTER.md) for safe client setup, status-first discovery and the distinction between a direct server canary and actual fresh-task use. Tool descriptions include use/avoid guidance, interpretation and example requests. Query failures return a bounded diagnostic object in the text-content item; activity retains only allowlisted metadata, never request/result/error bodies. `ledger_status` keeps its legacy schema.
 
 Aggregate reports expose normalized measurements and bounded metadata. They do not return prompts, responses, tool arguments, tool output, or raw finding evidence. Project and diagnostic paths are redacted by default; opting into a path-bearing report makes its output private local data. Session and mirror reports may contain durable session identifiers, so even a prompt-free report should be reviewed before sharing.
 
