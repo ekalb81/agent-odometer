@@ -55,22 +55,26 @@ pub mod workflow;
 
 use commands::{
     add_defender_exclusions, apply_integration_change, cancel_history_rebuild,
-    cancel_instruction_scan, check_quota_alerts, clear_session_project_override,
-    compare_tool_impact, correlate_events, export_performance_data, get_bundled_rates, get_config,
+    cancel_instruction_scan, change_organization_tag, check_quota_alerts,
+    clear_session_project_override, compare_tool_impact, correlate_events, delete_saved_search,
+    edit_session_annotation, export_performance_data, get_bundled_rates, get_config,
     get_history_rebuild_status, get_history_recovery_status, get_history_status,
-    get_integration_status, get_performance_live_status, get_performance_status,
-    get_provider_diagnostics, get_quota_config, get_quota_snapshots, get_rates,
-    get_retention_status, get_scan_status, get_session_details, get_session_pricing,
-    get_speed_report, get_subscription_usage, get_transcript_page, get_turn_receipt_status,
-    get_workflow_report, list_external_events, list_instruction_files, list_providers,
-    list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
-    open_integration_configuration, open_task_in_chatgpt, preview_history_purge,
-    preview_integration_change, purge_retained_history, read_instruction_file,
-    reassign_session_project, rebuild_history, record_frontend_performance, recover_history,
-    repair_turn_receipt_integrations, resolve_projects, resolve_working_directories,
-    retry_history_open, reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges, set_config,
-    set_project_alias, set_quota_config, set_rates, set_retention_policy, set_tray_totals,
-    test_integration_client, unmerge_project, write_export,
+    get_workflow_report,
+    get_integration_status, get_organization_summaries, get_performance_live_status,
+    get_performance_status, get_provider_diagnostics, get_quota_config, get_quota_snapshots,
+    get_rates, get_retention_status, get_scan_status, get_session_annotation, get_session_details,
+    get_session_pricing, get_speed_report, get_subscription_usage, get_transcript_page,
+    get_turn_receipt_status, list_external_events, list_instruction_files, list_organization_tags,
+    list_providers, list_saved_searches, list_sessions, list_tool_impact_targets, merge_projects,
+    open_instruction_file, open_integration_configuration, open_task_in_chatgpt,
+    preview_history_purge, preview_integration_change, purge_retained_history,
+    read_instruction_file, reassign_session_project, rebuild_history, record_frontend_performance,
+    recover_history, repair_turn_receipt_integrations, resolve_projects,
+    resolve_working_directories, retry_history_open, reveal_in_file_manager, save_search,
+    scan_git_outcomes, sessions_in_ranges, set_config, set_project_alias, set_quota_config,
+    set_rates, set_retention_policy, set_tray_totals, test_integration_client, unmerge_project,
+    write_export,
+
 };
 use config::Config;
 use std::sync::Arc;
@@ -112,6 +116,14 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
+            get_organization_summaries,
+            get_session_annotation,
+            edit_session_annotation,
+            list_organization_tags,
+            change_organization_tag,
+            list_saved_searches,
+            save_search,
+            delete_saved_search,
             list_sessions,
             get_session_details,
             get_transcript_page,
