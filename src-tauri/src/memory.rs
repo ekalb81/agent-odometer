@@ -1524,6 +1524,17 @@ mod tests {
         PhaseProgress::default()
     }
 
+    fn wait_until(ready: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
     #[test]
     fn phase_sampler_does_not_start_when_tracking_is_disabled() {
         let _guard = serial_guard();
@@ -1560,13 +1571,14 @@ mod tests {
         )
         .expect("sampler starts when tracking is enabled");
 
-        std::thread::sleep(Duration::from_millis(30));
+        // A short sleep is not evidence that the OS scheduled the worker.
+        let sampled = wait_until(|| recent_phase_samples().len() >= 2);
         sampler.stop();
 
         let samples = recent_phase_samples();
         assert!(
-            samples.len() >= 2,
-            "expected multiple ticks over 30ms at a 2ms interval, got {}",
+            sampled,
+            "sampler did not publish multiple ticks before the deadline, got {}",
             samples.len()
         );
         assert!(samples.iter().all(|s| s.phase == "lifecycle_phase"));
@@ -1606,10 +1618,10 @@ mod tests {
         )
         .expect("sampler starts when tracking is enabled");
 
-        // The sampler stops itself once it reaches the cap; give it ample
-        // time to do so rather than calling `stop()` (which would race the
-        // sampler's own natural exit).
-        std::thread::sleep(Duration::from_millis(100));
+        // Observe natural completion before stop() can request an early exit.
+        let finished = wait_until(|| sampler.handle.as_ref().is_some_and(|h| h.is_finished()));
+        sampler.stop();
+        assert!(finished, "sampler did not finish at its cap");
 
         let samples = recent_phase_samples();
         assert_eq!(
@@ -1622,21 +1634,11 @@ mod tests {
             "the sample that hits the cap must say so, not go quiet silently"
         );
         assert!(samples[..samples.len() - 1].iter().all(|s| !s.capped));
-
-        // Confirm the thread really exited (no further growth) rather than
-        // merely pausing.
-        std::thread::sleep(Duration::from_millis(20));
-        assert_eq!(recent_phase_samples().len(), CAP as usize);
-
-        drop(sampler); // exercises the Drop safety net; already stopped.
     }
 
-    /// Starts a sampler and gives its background thread enough wall-clock
-    /// time to emit every tick up to `cap` before stopping it, so a test
-    /// doesn't race the thread's first OS scheduling quantum — a real call
-    /// site never calls `stop()` this soon after `start()` (a real phase
-    /// runs for seconds to minutes), so nothing here needs to tolerate zero
-    /// ticks the way production code does.
+    /// Waits for the capped worker to finish, then joins it before a test
+    /// reads shared samples or starts the next phase. A stalled worker still
+    /// fails within a bounded deadline, and is stopped before the assertion.
     fn run_sampler_to_completion(
         recorder: &PerformanceRecorder,
         phase: &str,
@@ -1646,8 +1648,9 @@ mod tests {
     ) {
         let sampler = PhaseSampler::start_for_test(recorder, phase, interval, progress, cap)
             .expect("sampler starts when tracking is enabled");
-        std::thread::sleep(interval * cap.max(1) + Duration::from_millis(20));
+        let finished = wait_until(|| sampler.handle.as_ref().is_some_and(|h| h.is_finished()));
         sampler.stop();
+        assert!(finished, "sampler did not finish phase {phase} at its cap");
     }
 
     #[test]
