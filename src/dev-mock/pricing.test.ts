@@ -25,6 +25,12 @@ describe('Rust-generated browser pricing responses', () => {
     const claude = data.fixtures.find(f => f.harness === 'claude_code')!;
     const full = mockRangePricing(data.pricingKey(fallback), 1);
     const partial = mockRangePricing(data.pricingKey(fallback), 0.5);
+    expect(full.current).toBeDefined();
+    expect(partial.current?.as_of).toBe(full.current?.as_of);
+    expect(partial.current?.purchased_credits.total).toBe(full.current!.purchased_credits.total * 0.5);
+    expect(partial.current?.included_allowance.total).toBe(full.current!.included_allowance.total * 0.5);
+    expect(partial.current?.api_estimate.total).toBe(full.current!.api_estimate.total * 0.5);
+    expect(partial.current?.purchased_credits.missing_models).toEqual(full.current!.purchased_credits.missing_models);
     expect(partial.plan.total).toBe(full.plan.total / 2);
     expect(partial.plan.missing_models).toEqual(['gpt-5.7-visual-preview']);
     expect(partial.plan.by_model[0].basis).toBe('fallback');
