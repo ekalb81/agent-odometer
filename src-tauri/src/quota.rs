@@ -1917,6 +1917,7 @@ mod tests {
             agent_nickname: None,
             file_path: String::new(),
             source_availability: crate::model::SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: last_event_at,
             last_event_at,

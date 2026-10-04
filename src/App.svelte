@@ -448,6 +448,7 @@
           if (disposed) return;
           historyEventRevision += 1;
           historyStore.set(status);
+          if (status.status === 'ready') void reloadSessions('frontend.history_list_sessions');
         })),
         attach('instruction-scan-progress', onInstructionScanProgress((status) => {
           if (!disposed) instructionScanStore.set(status);
@@ -681,6 +682,10 @@
         </svg>
         {historyLabel}
       </span>
+    {:else if historyStore.status.status === 'unavailable' || historyStore.status.coverage_complete === false}
+      <button class="text-amber-500 hover:underline" onclick={() => (activeView = 'settings')}>
+        {historyStore.status.status === 'unavailable' ? 'History unavailable — recovery settings' : 'Historical coverage incomplete — history settings'}
+      </button>
     {:else if !scanStore.status.complete}
       <span class="flex items-center gap-1.5" role="status">
         <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
