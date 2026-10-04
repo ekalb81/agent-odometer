@@ -14,6 +14,7 @@ export const COVERAGE_SLICE = [
   'src/components/OrganizationToolbar.svelte',
   'src/lib/organization.ts',
   'src/lib/stores/organization.svelte.ts',
+  'src/components/TranscriptSearch.svelte',
   'src/lib/configTimeline.ts',
   'src/lib/defenderStatus.ts',
   'src/lib/diagnosticsExport.ts',

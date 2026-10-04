@@ -75,7 +75,7 @@ async function expectVisualReady(page: Page): Promise<void> {
 
 async function expectSessionRollup(page: Page, visible: number, total = visible): Promise<void> {
   const sessionKpi = page
-    .getByText('Sessions · All time', { exact: true })
+    .getByText('Sessions Â· All time', { exact: true })
     .filter({ visible: true })
     .locator('..');
   await expect(sessionKpi).toContainText(`${visible} of ${total}`);
@@ -253,8 +253,8 @@ visualTest('sessions-subagent-drilldown', 'session subagent drill-down with per-
 
 visualTest('sessions-availability-fallback', 'session availability, fallback, and unpriced indicators', async (page) => {
   await visit(page, { scenario: 'sessions-availability-fallback', view: 'codex' });
-  await expect(page.getByText(/^estimate · 1 unpriced model excluded$/i)).toBeVisible();
-  await expect(page.getByText(/^1 unpriced model excluded · 1 fallback rate used$/i)).toBeVisible();
+  await expect(page.getByText(/^estimate Â· 1 unpriced model excluded$/i)).toBeVisible();
+  await expect(page.getByText(/^1 unpriced model excluded Â· 1 fallback rate used$/i)).toBeVisible();
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
   await page.clock.runFor(500);
   await expect(page.locator('[aria-label="Session details"]:visible')).toContainText('source missing');
@@ -264,13 +264,13 @@ visualTest('sessions-availability-fallback', 'session availability, fallback, an
 
 visualTest('tool-dimensions', 'issue #44 tool, MCP, shell, and context attribution', async (page) => {
   // Issue #44's aggregate panel (ToolImpact.svelte) had zero visual coverage
-  // before this test — the fixtures never rendered it. The 'tool-dimensions'
+  // before this test â€” the fixtures never rendered it. The 'tool-dimensions'
   // scenario adds a genuine Gemini CLI session (dev-mock.ts) rather than
-  // overriding any provider's capability flags — Gemini CLI truly lacks
+  // overriding any provider's capability flags â€” Gemini CLI truly lacks
   // mcp_dimension/shell_dimension in provider.rs, so viewing only its tab
   // makes the panel render a real "Unavailable" for those two dimensions
   // while still showing real language and context-source data (both
-  // provider-agnostic signals it does support) — the exact
+  // provider-agnostic signals it does support) â€” the exact
   // unavailable-vs-zero distinction this issue exists to capture, with no
   // fixture-only fiction involved.
   await visit(page, { scenario: 'tool-dimensions' });
@@ -282,7 +282,7 @@ visualTest('tool-dimensions', 'issue #44 tool, MCP, shell, and context attributi
   await expect(dimensionSummary).toBeVisible();
   await dimensionSummary.click();
   await expect(page.getByText('Context source', { exact: true }).filter({ visible: true })).toBeVisible();
-  await expect(page.getByText(/Unavailable — no provider/).filter({ visible: true }).first()).toBeVisible();
+  await expect(page.getByText(/Unavailable â€” no provider/).filter({ visible: true }).first()).toBeVisible();
   await expect(page.getByText('python', { exact: true }).filter({ visible: true })).toBeVisible();
   const conversationCacheRow = page.getByText('Conversation / cache reuse').filter({ visible: true });
   await expect(conversationCacheRow).toBeVisible();
@@ -345,7 +345,7 @@ visualTest('instructions-content-error', 'instructions content error', async (pa
 
 visualTest('history-purge-review', 'history purge review requires confirmation', async (page) => {
   await visit(page, { scenario: 'history-purge', view: 'settings' });
-  await page.getByRole('button', { name: 'Review eligible history…' }).click();
+  await page.getByRole('button', { name: 'Review eligible historyâ€¦' }).click();
   await expect(page.getByLabel('Purge confirmation')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Purge reviewed history' })).toBeDisabled();
   await scrollHeadingToTop(page, 'Retention and recovery');
@@ -354,7 +354,7 @@ visualTest('history-purge-review', 'history purge review requires confirmation',
 visualTest('history-recovery-review', 'history recovery review stays usable at narrow width', async (page) => {
   await page.setViewportSize({ width: 640, height: 900 });
   await visit(page, { scenario: 'history-recovery', view: 'settings' });
-  await page.getByRole('button', { name: 'Preserve and rebuild readable history…' }).click();
+  await page.getByRole('button', { name: 'Preserve and rebuild readable historyâ€¦' }).click();
   await expect(page.getByLabel('Recovery confirmation')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Preserve and rebuild', exact: true })).toBeDisabled();
   await scrollHeadingToTop(page, 'Retention and recovery');
@@ -448,7 +448,7 @@ visualTest('defender-slow-banner', 'defender slow scan banner', async (page) => 
 
 visualTest('defender-error', 'defender error', async (page) => {
   await visit(page, { scenario: 'defender-error', view: 'all' });
-  await page.getByRole('button', { name: 'Add exclusions…', exact: true }).click();
+  await page.getByRole('button', { name: 'Add exclusionsâ€¦', exact: true }).click();
   await expect(page.getByText(/could not|failed|error/i).first()).toBeVisible();
   await expectSessionRollup(page, 15);
 });
@@ -456,12 +456,12 @@ visualTest('defender-error', 'defender error', async (page) => {
 test('Defender verification survives Settings remount and suppresses the slow-scan prompt', async ({ page }) => {
   await visit(page, { scenario: 'defender-slow', view: 'settings' });
   await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
-  await page.getByRole('button', { name: 'Exclude session folders from Defender…', exact: true }).click();
+  await page.getByRole('button', { name: 'Exclude session folders from Defenderâ€¦', exact: true }).click();
   const verifiedStatus = page.getByRole('status').filter({ hasText: 'Last verified' });
   await expect(verifiedStatus).toContainText('for 3 session folders.');
 
   await page.getByRole('button', { name: 'All', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Add exclusions…', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Add exclusionsâ€¦', exact: true })).toHaveCount(0);
 
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
@@ -477,14 +477,14 @@ visualTest('updater-available', 'updater available banner', async (page) => {
 visualTest('updater-installing', 'updater installing banner', async (page) => {
   await visit(page, { scenario: 'updater-installing', view: 'all' });
   await page.getByRole('button', { name: 'Update & restart', exact: true }).click();
-  await expect(page.getByText('Downloading v9.9.9… 40%')).toBeVisible();
+  await expect(page.getByText('Downloading v9.9.9â€¦ 40%')).toBeVisible();
   await expectSessionRollup(page, 15);
 });
 
 visualTest('updater-error', 'updater installation error', async (page) => {
   await visit(page, { scenario: 'updater-error', view: 'all' });
   await page.getByRole('button', { name: 'Update & restart', exact: true }).click();
-  await expect(page.getByText('Install failed — see console; you can retry.')).toBeVisible();
+  await expect(page.getByText('Install failed â€” see console; you can retry.')).toBeVisible();
   await expectSessionRollup(page, 15);
 });
 
@@ -553,7 +553,7 @@ visualTest('transcript-recorded-edit', 'inspector shows recorded tool result and
   await inspector.getByRole('button', { name: 'Next page' }).click();
   await inspector.getByRole('button', { name: 'Expand tool', exact: true }).click();
   await inspector.getByRole('button', { name: 'Expand assistant', exact: true }).click();
-  await expect(inspector.getByText('Recorded replacement · demo.ts')).toBeVisible();
+  await expect(inspector.getByText('Recorded replacement Â· demo.ts')).toBeVisible();
   await expect(inspector.getByRole('button', { name: 'Jump to tool call', exact: true })).toBeVisible();
 });
 
@@ -591,7 +591,7 @@ visualTest('organization-saved-search', 'organization saved search and tag manag
   await toolbar.getByLabel('Pinned sessions only').check();
   await toolbar.getByLabel('New search name').fill('Review work');
   await toolbar.getByRole('button', { name: 'Save current search' }).click();
-  await toolbar.getByRole('combobox', { name: 'Saved search', exact: true }).selectOption({ label: 'Review work · summary · codex' });
+  await toolbar.getByRole('combobox', { name: 'Saved search', exact: true }).selectOption({ label: 'Review work Â· summary Â· codex' });
   await expect(toolbar.getByRole('button', { name: 'Run saved search' })).toBeVisible();
   await expect(toolbar.getByText('Local organization saved.', { exact: true })).toBeVisible();
 });
@@ -621,6 +621,55 @@ visualTest('organization-recovery-unavailable', 'recovered organization filters 
   await toolbar.getByLabel('Pinned sessions only').check();
   await page.keyboard.press('Escape');
   await expect(page.getByRole('alert').filter({ visible: true })).toContainText('Organization-filtered results are unavailable.');
+});
+
+visualTest('content-search-scopes', 'content search exposes explicit tool scope and exact source landing', async (page) => {
+  await visit(page, { view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await expect(search.getByText(/Matching records on this page: 1/)).toBeVisible();
+  await search.getByLabel('Tool results and errors').check();
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await expect(search.getByText(/Matching records on this page: 2/)).toBeVisible();
+});
+
+visualTest('content-search-retained-narrow', 'missing source search shows separate retained coverage and exact field', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { scenario: 'content-search-retained', view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await search.getByRole('button', { name: 'Search retained messages' }).click();
+  await search.getByRole('button', { name: 'Open retained message Â· user message' }).click();
+  await expect(search.getByRole('region', { name: 'Selected retained message' })).toBeFocused();
+  await expect(search.getByText(/may overlap them/)).toBeVisible();
+  const bounds = await search.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
+test('content search lands on a source record and Escape returns to the search without deselecting the session', async ({ page }) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await search.getByRole('button', { name: 'Open source record Â· text' }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await expect(inspector.locator('[id="transcript-synthetic:0-block-0"]')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await expect(search).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(search).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
 });
 
 assertManifestCasesAreRegistered();

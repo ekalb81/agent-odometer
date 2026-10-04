@@ -72,10 +72,11 @@ use commands::{
     open_integration_configuration, open_task_in_chatgpt, preview_history_purge,
     preview_integration_change, purge_retained_history, read_instruction_file,
     reassign_session_project, rebuild_history, record_frontend_performance, recover_history,
-    repair_turn_receipt_integrations, resolve_projects, resolve_working_directories,
-    retry_history_open, reveal_in_file_manager, save_search, scan_git_outcomes, sessions_in_ranges,
-    set_config, set_project_alias, set_quota_config, set_rates, set_retention_policy,
-    set_tray_totals, test_integration_client, unmerge_project, write_export,
+    repair_turn_receipt_integrations, resolve_projects, resolve_retained_search_target,
+    resolve_working_directories, retry_history_open, reveal_in_file_manager, save_search,
+    scan_git_outcomes, search_session_content, sessions_in_ranges, set_config, set_project_alias,
+    set_quota_config, set_rates, set_retention_policy, set_tray_totals, test_integration_client,
+    unmerge_project, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -88,13 +89,13 @@ use tracing_subscriber::EnvFilter;
 /// there can only be one, and why this replaces the `#[cfg(test)]`-only
 /// counting allocator earlier probes used to define locally). Behavior is
 /// identical to the default system allocator unless heap tracking is
-/// explicitly enabled via `memory::configure_heap_tracking` — off by
+/// explicitly enabled via `memory::configure_heap_tracking` â€” off by
 /// default, matching every other opt-in in this app.
 ///
 /// Do not add another `#[global_allocator]` anywhere in this crate or its
-/// tests: a binary may declare at most one, and a second one — even a
+/// tests: a binary may declare at most one, and a second one â€” even a
 /// `#[cfg(test)]`-only one, which is exactly how this crate had two before
-/// this instrumentation unified them — fails the build with a "duplicate
+/// this instrumentation unified them â€” fails the build with a "duplicate
 /// lang item" error that does not point back at this line. If a probe needs
 /// exact heap-byte deltas, drive this allocator via
 /// `memory::configure_heap_tracking` and its raw accessors instead.
@@ -129,6 +130,8 @@ pub fn run() {
             list_sessions,
             get_session_details,
             get_transcript_page,
+            search_session_content,
+            resolve_retained_search_target,
             get_session_pricing,
             get_subscription_usage,
             sessions_in_ranges,

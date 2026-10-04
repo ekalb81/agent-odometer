@@ -12,7 +12,7 @@ export interface TokenTotals {
   cached_input_tokens: number;
   /** Anthropic cache-creation ("cache write") tokens: a subset of
    * input_tokens distinct from cached_input_tokens (cache reads). Always 0
-   * for Codex. See query.rs token_cost — never double-price this against
+   * for Codex. See query.rs token_cost â€” never double-price this against
    * cached_input_tokens or the plain input rate. */
   cache_creation_input_tokens: number;
   output_tokens: number;
@@ -195,7 +195,7 @@ export interface Session {
   credits_unlimited: boolean | null;
   credits_balance: number | null;
   context_window: number | null;
-  /** Context fill of the most recent API call — comparable to context_window, unlike the cumulative tokens_total. */
+  /** Context fill of the most recent API call â€” comparable to context_window, unlike the cumulative tokens_total. */
   latest_context_tokens: number | null;
   total_turns: number;
   first_user_message: string | null;
@@ -220,7 +220,7 @@ export interface Session {
   /** Auto-computed project-identity key (#41); null when there is no working directory. */
   project_key: string | null;
   /** Auto-computed local display label for `project_key`. A local alias may override the effective
-   *  label shown in the UI — join through `resolveProjects()`/the project store rather than reading
+   *  label shown in the UI â€” join through `resolveProjects()`/the project store rather than reading
    *  this field directly when displaying to the user. */
   project_label: string | null;
   project_provenance: ProjectProvenance | null;
@@ -350,7 +350,7 @@ export interface RangeTotals {
   optimization_findings_count: number;
   optimization_summary?: OptimizationSummary;
   /** Outer key is the dimension kind, inner key the dimension value. A
-   *  missing kind means no ledger-durable data for this window — consult
+   *  missing kind means no ledger-durable data for this window â€” consult
    *  `ProviderDescriptor`'s matching `*_dimension` flag to tell a real zero
    *  from a provider that cannot supply the dimension at all. */
   tool_dimensions?: Partial<Record<ToolDimensionKind, Record<string, ToolDimensionMetrics>>>;
@@ -448,7 +448,7 @@ export interface ScanStatus {
 }
 
 /** Issue #162: re-parse every archived session from its source transcript,
- *  then VACUUM. `vacuuming` has no `done`/`total` of its own — SQLite
+ *  then VACUUM. `vacuuming` has no `done`/`total` of its own â€” SQLite
  *  reports no per-page VACUUM progress. */
 export type HistoryRebuildPhase =
   | 'idle'
@@ -474,7 +474,7 @@ export interface HistoryRebuildStatus {
   rate_limit_points_after: number | null;
   session_json_bytes_before: number | null;
   session_json_bytes_after: number | null;
-  /** Total on-disk footprint — main database file plus its `-wal` sidecar
+  /** Total on-disk footprint â€” main database file plus its `-wal` sidecar
    *  (issue #167). Not the main file alone: a rebuild that shrinks the
    *  database while leaving an oversized WAL behind must still show up here. */
   file_size_before: number | null;
@@ -491,7 +491,7 @@ export type HistoryReadinessStatus = 'pending' | 'ready' | 'unavailable';
 /**
  * Durable-history open/migration progress, from get_history_status and
  * "history-progress" events (#116). `step`/`step_index`/`step_total`
- * describe the migration step most recently reported — in progress while
+ * describe the migration step most recently reported â€” in progress while
  * `status` is 'pending', otherwise the last one that ran, or all null if the
  * archive needed no migration at all. `items_done`/`items_total` are
  * non-null only while a step that streams per-row progress is running.
@@ -666,7 +666,7 @@ export interface ProviderDescriptor {
   quota_source: boolean;
   /** Issue #44 open-set tool/context dimension availability. `false` means
    *  this provider's transcript shape is not corroborated to support the
-   *  dimension — the panel must render "unavailable", never a fabricated
+   *  dimension â€” the panel must render "unavailable", never a fabricated
    *  zero, for a session from this provider. */
   mcp_dimension: boolean;
   shell_dimension: boolean;
@@ -740,7 +740,7 @@ export interface PerformanceStatus {
 }
 
 /** OS-reported process memory (see `memory.rs::ProcessMemorySample`). A
- *  field is `null` where the platform/query is unavailable — never a
+ *  field is `null` where the platform/query is unavailable â€” never a
  *  fabricated zero. */
 export interface ProcessMemorySample {
   rss_bytes: number | null;
@@ -751,7 +751,7 @@ export interface ProcessMemorySample {
 /** Allocator-tracked heap (see `memory.rs::HeapSample`). Both byte fields are
  *  `null` when heap tracking itself is off, distinct from "0 bytes tracked".
  *  `possibly_undercounted` is `true` once tracking has seen a free of an
- *  allocation that predates the current enable — freeing memory `alloc`
+ *  allocation that predates the current enable â€” freeing memory `alloc`
  *  never saw is indistinguishable, without per-allocation provenance, from
  *  freeing tracked memory, so `current_bytes`/`peak_bytes` become a lower
  *  bound / delta since enable rather than a verified live total. Render that
@@ -774,13 +774,13 @@ export interface PhaseSampleEvent {
   heap_peak_bytes: number | null;
   progress_done: number | null;
   progress_total: number | null;
-  /** True on the sample that hit the phase's sample cap — the sampler
+  /** True on the sample that hit the phase's sample cap â€” the sampler
    *  stopped there rather than continuing silently. */
   capped: boolean;
 }
 
 /** On-disk database size plus volume headroom for one connection
- *  (`"history_store"` or `"scan_cache"`) — see `memory.rs::DatabaseFootprint`. */
+ *  (`"history_store"` or `"scan_cache"`) â€” see `memory.rs::DatabaseFootprint`. */
 export interface DatabaseFootprintEntry {
   connection: string;
   db_bytes: number | null;
@@ -799,7 +799,7 @@ export interface RecentOperation {
 }
 
 /** `DiagnosticsPanel`'s live-telemetry data source (issue #163). When
- *  `enabled` is false every other field is empty/null — render that as
+ *  `enabled` is false every other field is empty/null â€” render that as
  *  "tracking is off", never as zeros or an empty chart. */
 export interface PerformanceLiveStatus {
   enabled: boolean;
@@ -817,7 +817,7 @@ export interface PerformanceLiveStatus {
 export interface ModelRate {
   input: number;
   cached_input: number;
-  /** Cache-creation ("cache write") rate — a normalized dimension distinct
+  /** Cache-creation ("cache write") rate â€” a normalized dimension distinct
    * from both `input` and `cached_input`.
    *
    * Deliberately nullable, and `null`/absent is NOT "free": it means the
@@ -891,13 +891,13 @@ export interface PricingCatalog {
   notes: string[];
 }
 
-/** Provenance recorded for every priced amount — see rates.rs PricingBasis.
+/** Provenance recorded for every priced amount â€” see rates.rs PricingBasis.
  * These states must render as visually and structurally distinct in the UI,
  * never collapsed into one number. */
 export type PricingBasis =
   | 'direct'
   | 'aliased'
-  /** Resolved via a provider-declared *floating* alias — a mapping the
+  /** Resolved via a provider-declared *floating* alias â€” a mapping the
    * provider repoints as new models ship. Correct as of the card's fetch and
    * priced from a real published rate, but carrying a known expiry, past
    * which resolution falls through to `fallback`. Render as a soft note, not
@@ -912,7 +912,7 @@ export type PricingBasis =
 
 /** A provider-declared floating model alias: a name the provider repoints
  * without renaming, so a static mapping is right today and silently wrong
- * later. Mirrors `FloatingAlias` in rates.rs — keep both in sync. */
+ * later. Mirrors `FloatingAlias` in rates.rs â€” keep both in sync. */
 export interface FloatingAlias {
   target: string;
   /** Last date (inclusive, `YYYY-MM-DD`, UTC) on which `target` is trusted. */
@@ -937,7 +937,7 @@ export interface SubscriptionPlan {
   currency: string | null;
   notes: string | null;
   /** User-declared estimated monthly savings from a local/proxy baseline
-   * versus a metered API-equivalent cost — never derived from token counts. */
+   * versus a metered API-equivalent cost â€” never derived from token counts. */
   local_baseline_savings: number | null;
 }
 
@@ -957,7 +957,7 @@ export interface CurrencyConversion {
 export type RateFreshness = 'fresh' | 'stale' | 'unknown';
 
 /** Bounded-cache-age bookkeeping for the (currently unimplemented) price
- * refresh/rollback flow — see rates.rs module docs for the network seam. */
+ * refresh/rollback flow â€” see rates.rs module docs for the network seam. */
 export interface RateRefreshState {
   last_success_at: string | null;
   last_attempt_at: string | null;
@@ -977,7 +977,7 @@ export interface RateCard {
   currencies: Record<string, string>;
   /** Per-harness fallback models; falls back to fallback_model when absent. */
   fallback_models: Record<string, string>;
-  /** OpenAI API USD rates for Codex models — powers the est.-cost column. */
+  /** OpenAI API USD rates for Codex models â€” powers the est.-cost column. */
   api_models: Record<string, ModelRate>;
   /** Known models without a published price; excluded rather than fallback-priced. */
   unpriced_models: string[];
@@ -990,7 +990,7 @@ export interface RateCard {
    * with the date it stops being trusted. Checked before `model_aliases`;
    * mirrors `RateCard::floating_model_aliases` in rates.rs (issue #177). */
   floating_model_aliases?: Record<string, FloatingAlias>;
-  /** Models explicitly zero-cost (free tier, local/self-hosted) — distinct
+  /** Models explicitly zero-cost (free tier, local/self-hosted) â€” distinct
    * from unpriced_models and from an ordinary unresolved rate. */
   free_local_models: string[];
   /** Per-harness user-declared subscription/custom plan configuration. */
@@ -1064,7 +1064,7 @@ export interface GitOutcome {
 }
 
 /** How one session working directory should be labelled in the grid.
- *  A working directory is not necessarily a repository — scratch directories
+ *  A working directory is not necessarily a repository â€” scratch directories
  *  have none, and their final path segment identifies nothing. */
 export interface WorkingDirectoryInfo {
   directory: string;
@@ -1077,11 +1077,11 @@ export interface WorkingDirectoryInfo {
 
 /** One resolved project (#41), after local alias/merge/split overrides.
  *  The one backend aggregation the dashboard, tables, and export all join
- *  a session's `project_key` against — see `resolveProjects()`. */
+ *  a session's `project_key` against â€” see `resolveProjects()`. */
 export interface ProjectInfo {
   /** Effective (post-merge) project key. */
   project_key: string;
-  /** Effective display label — a local alias when set, else the auto-computed label. */
+  /** Effective display label â€” a local alias when set, else the auto-computed label. */
   label: string;
   provenance: ProjectProvenance;
   /** Every auto-computed `project_key` folded into this project; more than one only after a merge. */
@@ -1093,7 +1093,7 @@ export interface ProjectInfo {
 
 // ---------------------------------------------------------------------------
 // Provider diagnostics (issue #39). Local display may show exact paths;
-// export redaction is a frontend transform — see lib/diagnosticsExport.ts.
+// export redaction is a frontend transform â€” see lib/diagnosticsExport.ts.
 // ---------------------------------------------------------------------------
 
 export type ProviderHealthState = 'ready' | 'degraded' | 'unsupported' | 'not_detected';
@@ -1160,7 +1160,7 @@ export interface RetentionHealth {
 }
 
 /** 'transcript_derived' means at least one quota window has been observed
- *  from this provider's own transcripts (see QuotaSnapshot below) — never a
+ *  from this provider's own transcripts (see QuotaSnapshot below) â€” never a
  *  live-polled API; no provider has one implemented. */
 export type QuotaStatus = 'not_available' | 'transcript_derived';
 
@@ -1201,7 +1201,7 @@ export interface DiagnosticsReport {
 
 // ---------------------------------------------------------------------------
 // Quota windows, budgets, and alerts (issue #43). One backend service
-// (src-tauri/src/quota.rs) computes every number here — pace, projected
+// (src-tauri/src/quota.rs) computes every number here â€” pace, projected
 // exhaustion, reserve/deficit, and budget-crossing decisions. The frontend
 // only formats and renders (see lib/subscriptionUsage.ts).
 // ---------------------------------------------------------------------------
@@ -1218,7 +1218,7 @@ export type QuotaConfidence = 'high' | 'medium' | 'low';
 
 /** `no_quota_source` and `no_observation` are the only reasons the current
  *  (transcript-only) backend ever produces. The rest are reserved for a
- *  future, reviewed live-polling source — see quota.rs's module docs. */
+ *  future, reviewed live-polling source â€” see quota.rs's module docs. */
 export type QuotaUnavailableReason =
   | 'no_quota_source'
   | 'no_observation'
@@ -1244,11 +1244,11 @@ export interface QuotaWindow {
   unit: QuotaUnit;
   window_minutes: number | null;
   /** `null` exactly when `unavailable` is set, or (for `credits`) the plan
-   *  is unlimited — never a fabricated zero. */
+   *  is unlimited â€” never a fabricated zero. */
   used: number | null;
   remaining: number | null;
   limit: number | null;
-  /** A known state ("unlimited"), not a number — `used`/`remaining` stay
+  /** A known state ("unlimited"), not a number â€” `used`/`remaining` stay
    *  `null` when this is true. */
   unlimited: boolean;
   resets_at: string | null;
@@ -1258,7 +1258,7 @@ export interface QuotaWindow {
   window_started_at_estimated: boolean;
   observed_at: string;
   confidence: QuotaConfidence;
-  /** Numbers are still populated when stale — see QuotaSnapshot's honesty
+  /** Numbers are still populated when stale â€” see QuotaSnapshot's honesty
    *  contract in quota.rs: stale is a different, more honest fact than
    *  "no reading at all". */
   stale: boolean;
@@ -1381,6 +1381,7 @@ export interface TranscriptRequest {
   max_bytes?: number;
   record_id?: string | null;
 }
+
 /** Explicit search/saved-query content choice. Tool bodies are off by default. */
 export interface TranscriptContentScope {
   conversation: boolean;
@@ -1388,6 +1389,51 @@ export interface TranscriptContentScope {
   tool_results: boolean;
 }
 
+export type TranscriptSearchTarget =
+  | { kind: 'source_record'; session_id: string; record_id: string; block_index: number }
+  | { kind: 'retained_turn'; session_id: string; session_identity: string; snapshot_revision: string; turn_id: string; field: 'user_message' | 'last_agent_message' };
+export type TranscriptSearchPosition =
+  | { phase: 'source'; cursor: TranscriptCursor; incomplete: boolean }
+  | { phase: 'retained'; session_identity: string; snapshot_revision: string; next_turn: number; incomplete: boolean };
+export interface TranscriptSearchCursor {
+  session_id: string;
+  query: string;
+  scope: TranscriptContentScope;
+  position: TranscriptSearchPosition;
+}
+export interface TranscriptSearchRequest {
+  session_id: string;
+  query: string;
+  scope: TranscriptContentScope;
+  cursor?: TranscriptSearchCursor | null;
+}
+export interface TranscriptSearchSnippet {
+  text: string;
+  match_start: number;
+  match_end: number;
+  truncated_before: boolean;
+  truncated_after: boolean;
+}
+export interface TranscriptSearchHit {
+  target: TranscriptSearchTarget;
+  content_kind: string;
+  snippet: TranscriptSearchSnippet;
+}
+export interface TranscriptSearchPage {
+  phase: 'source' | 'retained';
+  hits: TranscriptSearchHit[];
+  next_cursor: TranscriptSearchCursor | null;
+  issues: string[];
+  source_complete: boolean;
+  retained_complete: boolean;
+  scanned_records: number;
+  scanned_messages: number;
+}
+export interface RetainedSearchLanding {
+  target: TranscriptSearchTarget;
+  text: string;
+  truncated: boolean;
+}
 export interface TranscriptBlock {
   kind: string;
   text: string;

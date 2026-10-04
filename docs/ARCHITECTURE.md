@@ -445,6 +445,25 @@ User-owned app data is stored under the platform configuration directory in `age
 
 Session files can contain full prompts, responses, system/developer instructions, local paths, and tool output. Keep processing local, avoid logging message bodies, and use synthetic/redacted test data. Tauri capabilities in `src-tauri/capabilities/default.json` should remain narrowly scoped.
 
+### Explicit session content search (#251)
+
+`search_session_content` / `searchSessionContent` is private desktop IPC using
+the existing bounded transcript reader. Rust matches escaped Unicode literals
+against typed message blocks, with conversation-only defaults and independent
+tool-call/result consent flags. One source page returns at most one bounded
+snippet per matching record and pins continuation to the query, scope, session
+and existing source cursor. Unknown and omitted content remains explicitly
+unsearched.
+
+Incomplete source coverage offers a separate retained phase. `history_search.rs`
+reads at most 25 turns from a snapshot capped at 8 MiB using SQLite JSON field
+projection, without decoding a whole Session or building an index. Prompt and
+final-reply fields retain the parser's 500-character limits; other messages and
+tools are absent. Retained targets bind opaque lineage, current snapshot revision,
+turn and field. `resolve_retained_search_target` fails closed after changes,
+purge or ambiguity. Query/snippet/body data never enters summaries, telemetry,
+accounting, exports or MCP. See [Session content search](TRANSCRIPT_SEARCH.md).
+
 ## Known limitations
 
 Durable enumeration, lifecycle states, confirmed local-history purge and preserved

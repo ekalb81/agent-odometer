@@ -33,6 +33,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "rayon",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

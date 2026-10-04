@@ -657,6 +657,34 @@ pub async fn get_transcript_page(
     .map_err(|_| "transcript_reader_unavailable".to_owned())
 }
 
+/// Explicit desktop search only. Queries and snippets never enter diagnostics,
+/// performance recordings, summaries, accounting, or the public MCP API.
+#[tauri::command]
+pub async fn search_session_content(
+    state: State<'_, Arc<AppState>>,
+    request: crate::transcript_search::SearchRequest,
+) -> Result<crate::transcript_search::SearchPage, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::transcript_search::search_for_session(&state, request)
+    })
+    .await
+    .map_err(|_| "content_search_unavailable".to_owned())?
+}
+
+#[tauri::command]
+pub async fn resolve_retained_search_target(
+    state: State<'_, Arc<AppState>>,
+    target: crate::transcript_search::SearchTarget,
+) -> Result<crate::transcript_search::RetainedSearchLanding, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::transcript_search::resolve_retained_target(&state, target)
+    })
+    .await
+    .map_err(|_| "retained_target_unavailable".to_owned())?
+}
+
 /// Batched, response-only all-time pricing from lightweight resident buckets.
 #[tauri::command]
 pub async fn get_session_pricing(

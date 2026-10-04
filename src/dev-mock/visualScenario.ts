@@ -19,6 +19,7 @@ export const VISUAL_SCENARIOS = [
   'history-purge',
   'history-recovery',
   'organization-recovered',
+  'content-search-retained',
   'defender-slow',
   'defender-error',
   'updater-available',
