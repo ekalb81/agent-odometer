@@ -25,3 +25,5 @@ export function formatCredits(amount: number, currency: string): string {
   }).format(amount);
   return `${num} ${currency === 'credits' ? 'legacy credits' : currency}`;
 }
+/** Supported offline FX money units; entitlement labels are excluded. */
+export const FX_CURRENCIES = ['USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'NZD', 'CNY', 'INR', 'BRL', 'MXN', 'SGD', 'HKD', 'KRW', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'ZAR'];

@@ -75,6 +75,9 @@ describe('Rust-generated browser pricing responses', () => {
       fetched_at: null,
       source_url: 'https://example.invalid/updated',
       floating_model_aliases: {},
+      rate_provenance: {}, upgrade_review: [], flat_rate_expires_at: {},
+      display_currency: { from_currency: 'USD', target_currency: 'EUR', rate: .9, as_of: '2026-10-01T12:30:00Z', source: 'Synthetic offline quote' },
+      delivery: { source: 'saved_override' as const, app_version: '0.0.0-fixture', card_version: original.version, last_failure_reason: null },
       models: Object.fromEntries(Object.entries(original.models).reverse().map(([model, rate]) => [model, {
         input: Number(String(rate.input)), cached_input: Number(String(rate.cached_input)),
         cache_creation_input: rate.cache_creation_input ?? null,

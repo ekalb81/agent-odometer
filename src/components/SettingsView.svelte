@@ -3,6 +3,8 @@
   import { defenderActionStore } from '../lib/stores/defender.svelte';
   import { rates } from '../lib/stores/rates';
   import { updaterStore } from '../lib/stores/updater.svelte';
+  import FxSettings from './FxSettings.svelte';
+  import { FX_CURRENCIES } from '../lib/currency';
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations, rebuildHistory, cancelHistoryRebuild, getHistoryRebuildStatus, onHistoryRebuildProgress } from '../lib/ipc';
   import ProjectManagement from './ProjectManagement.svelte';
@@ -642,9 +644,8 @@
   // editor does not modify them yet, so preserve the complete object verbatim.
   let pricingCatalog = $state<PricingCatalog>({ rate_periods: [], conditional_modifiers: [], notes: [] });
   // Alias table, free/local declarations, subscription plans, display
-  // currency, and refresh bookkeeping are not editable in the base rate
-  // editor yet (#42 ships the data model and offline plumbing first); carry
-  // them through unchanged so saving the rate table never silently drops them.
+  // currency and refresh bookkeeping survive base-rate edits. FX editing is
+  // separate from token rates and is saved in the same explicit transaction.
   let ratesModelAliases = $state<RateCard['model_aliases']>({});
   let ratesFloatingAliases = $state<RateCard['floating_model_aliases']>({});
   let rateProvenance = $state<NonNullable<RateCard['rate_provenance']>>({});
@@ -761,6 +762,15 @@
   }
 
   function buildRateCard(): RateCard | null {
+    const conversion = ratesDisplayCurrency;
+    if (conversion && (!FX_CURRENCIES.includes(conversion.from_currency ?? ratesCurrency)
+      || !FX_CURRENCIES.includes(conversion.target_currency)
+      || !Number.isFinite(conversion.rate) || conversion.rate <= 0
+      || !Number.isFinite(Date.parse(conversion.as_of)) || !conversion.source.trim()
+      || new TextEncoder().encode(conversion.source).length > 256)) {
+      validationError = 'FX requires supported monetary currencies, a finite positive rate, UTC timestamp and source of at most 256 bytes.';
+      return null;
+    }
     // Validate fallback model.
     if (!fallbackModel) {
       validationError = 'A fallback model must be selected.';
@@ -845,9 +855,9 @@
     saving = true;
     saveError = null;
     try {
-      await setRates(card);
-      // rates store will update via the rates-updated event, but also set locally.
-      rates.set(card);
+      const saved = await setRates(card);
+      // The command and event carry the same validated backend provenance.
+      rates.set(saved);
       dirty = false;
       const now = new Date();
       savedAt = now.toLocaleTimeString();
@@ -864,8 +874,8 @@
     saveError = null;
     try {
       const bundled = await getBundledRates();
-      await setRates(bundled);
-      rates.set(bundled);
+      const saved = await setRates(bundled);
+      rates.set(saved);
       dirty = false;
       const now = new Date();
       savedAt = now.toLocaleTimeString();
@@ -1605,6 +1615,11 @@
           <span class="text-xs text-amber-500">{validationError}</span>
         {/if}
       </div>
+
+      <p class="mb-3 text-xs text-ink-faint">Price cards ship inside app updates through the existing signed installer channel. There is no independent card or FX download. Loaded source: {$rates.delivery?.source.replaceAll('_', ' ') ?? 'saved or embedded card'}{#if $rates.delivery} · card v{$rates.delivery.card_version} · app v{$rates.delivery.app_version}{/if}.</p>
+      {#if $rates.delivery?.last_failure_reason}<p role="status" class="mb-3 text-xs text-amber-500">{$rates.delivery.last_failure_reason}</p>{/if}
+      {#if ratesRefresh.last_failure_reason}<p role="status" class="mb-3 text-xs text-amber-500">Last candidate rejected: {ratesRefresh.last_failure_reason}</p>{/if}
+      <FxSettings bind:conversion={ratesDisplayCurrency} originalCurrency={ratesCurrency} onchange={markDirty} />
 
       {#if upgradeReview.length > 0}
         <p class="mb-3 text-xs text-amber-600" role="status">

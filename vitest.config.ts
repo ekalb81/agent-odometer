@@ -13,7 +13,9 @@ export default defineConfig({
       reporter: ['json'],
       reportsDirectory: './coverage/frontend',
       include: [
+        'src/components/ConvertedCost.svelte',
         'src/components/DiagnosticsPanel.svelte',
+        'src/components/FxSettings.svelte',
         'src/components/IntegrationCenter.svelte',
         'src/components/SessionContextMenu.svelte',
         'src/components/SessionGridControls.svelte',

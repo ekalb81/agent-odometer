@@ -8,6 +8,18 @@ import { collectReleaseBundleAssets, releaseBundleAssetNames } from './release-a
 
 const VERSION = '0.6.4';
 
+test('embedded pricing uses the existing version-bound signed app delivery channel', () => {
+  const config = JSON.parse(fs.readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  assert.equal(config.bundle.createUpdaterArtifacts, true);
+  assert.equal(config.plugins.updater.requireSignedVersion, true);
+  assert.deepEqual(config.plugins.updater.endpoints, ['https://github.com/ekalb81/agent-odometer/releases/latest/download/latest.json']);
+  assert.ok(config.plugins.updater.pubkey);
+  const bundle = JSON.parse(fs.readFileSync(new URL('../src-tauri/rates.json', import.meta.url), 'utf8'));
+  assert.ok(Number.isInteger(bundle.version) && bundle.version > 0);
+  assert.ok(Object.keys(bundle.models).length > 0);
+  assert.ok(Object.keys(bundle.api_models).length > 0);
+});
+
 function withArtifactDirectory(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'odometer-release-artifacts-'));
   try {
