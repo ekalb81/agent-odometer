@@ -15,7 +15,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 const CANDIDATE_TTL: Duration = Duration::from_secs(300);
 const MAX_ACCOUNTS: usize = 8;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaAccountConsent {
     pub account_id: String,
     pub label: String,
@@ -23,7 +23,7 @@ pub struct QuotaAccountConsent {
     pub enabled: bool,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ConsentFile {
     #[serde(default = "version")]
     version: u32,
@@ -60,6 +60,7 @@ pub struct LiveQuotaStatus {
 struct Runtime {
     loaded: bool,
     file: ConsentFile,
+    durable_file: Option<ConsentFile>,
     configuration_error: Option<&'static str>,
     candidate: Option<(DiscoveredQuotaAccount, Instant)>,
     generation: u64,
@@ -77,6 +78,7 @@ impl Default for Runtime {
                 version: 1,
                 accounts: vec![],
             },
+            durable_file: None,
             configuration_error: None,
             candidate: None,
             generation: 0,
@@ -126,7 +128,10 @@ fn validate_file(file: &ConsentFile) -> Result<(), &'static str> {
 }
 fn read_file(path: &Path) -> Result<ConsentFile, &'static str> {
     use std::io::Read;
-    let file = match std::fs::File::open(path) {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    regular_file_options(&mut options);
+    let file = match options.open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ConsentFile {
@@ -136,6 +141,7 @@ fn read_file(path: &Path) -> Result<ConsentFile, &'static str> {
         }
         Err(_) => return Err("Live quota settings are unreadable; polling is off."),
     };
+    require_regular(&file)?;
     let mut bytes = Vec::new();
     file.take(32_769)
         .read_to_end(&mut bytes)
@@ -148,29 +154,101 @@ fn read_file(path: &Path) -> Result<ConsentFile, &'static str> {
     validate_file(&file)?;
     Ok(file)
 }
-fn save_file(path: &Path, file: &ConsentFile) -> Result<(), &'static str> {
+// Reject links and special files before any read can block on them.
+fn regular_file_options(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+fn require_regular(file: &std::fs::File) -> Result<(), &'static str> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| "Live quota settings are unreadable; polling is off.")?;
+    if !metadata.is_file() {
+        return Err("Live quota settings must be a regular file; polling is off.");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err("Live quota settings must not be a link; polling is off.");
+        }
+    }
+    Ok(())
+}
+fn save_file(path: &Path, expected: &ConsentFile, file: &ConsentFile) -> Result<(), &'static str> {
+    use std::io::Write;
     validate_file(file)?;
     let parent = path
         .parent()
         .ok_or("Live quota settings location is unavailable.")?;
     std::fs::create_dir_all(parent).map_err(|_| "Live quota settings could not be saved.")?;
-    let temporary = path.with_extension("json.tmp");
+    // Serialize cooperating app instances and compare the last observed consent
+    // before writing, so a stale approval cannot resurrect another app's revoke.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    regular_file_options(&mut options);
+    let lock = options
+        .open(path.with_extension("lock"))
+        .map_err(|_| "Live quota settings could not be locked; retry the action.")?;
+    require_regular(&lock)?;
+    lock.try_lock()
+        .map_err(|_| "Live quota settings are changing in another app; retry the action.")?;
+    if &read_file(path)? != expected {
+        return Err("Live quota consent changed in another app; review it and retry.");
+    }
     let bytes = serde_json::to_vec(file).map_err(|_| "Live quota settings could not be saved.")?;
-    std::fs::write(&temporary, bytes)
-        .and_then(|()| std::fs::rename(&temporary, path))
-        .map_err(|_| "Live quota settings could not be saved.")
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|_| "Live quota settings could not be saved.")?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|_| "Live quota settings could not be saved.")?;
+    temporary
+        .persist(path)
+        .map_err(|_| "Live quota settings could not be saved.")?;
+    Ok(())
 }
 
 impl Runtime {
-    fn load(&mut self, path: Result<PathBuf, &'static str>) {
-        if self.loaded {
-            return;
+    fn load(&mut self, path: Result<PathBuf, &'static str>) -> bool {
+        // Check every action and before publishing a completed poll. Consent is
+        // shared between app instances; a startup-only cache can outlive revoke.
+        let mut changed = false;
+        match path.and_then(|path| read_file(&path)) {
+            Ok(file) => {
+                if !self.loaded || self.durable_file.as_ref() != Some(&file) {
+                    self.invalidate();
+                    self.file = file.clone();
+                    self.durable_file = Some(file);
+                    changed = self.loaded;
+                }
+                changed |= self.configuration_error.take().is_some();
+            }
+            Err(error) => {
+                if !self.loaded || self.configuration_error != Some(error) {
+                    self.invalidate();
+                    self.file
+                        .accounts
+                        .iter_mut()
+                        .for_each(|account| account.enabled = false);
+                    changed = true;
+                }
+                self.configuration_error = Some(error);
+            }
         }
         self.loaded = true;
-        match path.and_then(|path| read_file(&path)) {
-            Ok(file) => self.file = file,
-            Err(error) => self.configuration_error = Some(error),
-        }
+        changed
     }
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
@@ -252,6 +330,7 @@ impl LiveQuotaService {
             .codex()
             .and_then(|path| quota_live::discover_codex_account(&path));
         let mut runtime = self.runtime.lock().unwrap();
+        runtime.load(self.path());
         runtime.busy = false;
         if runtime.generation != generation {
             return Err("Quota consent changed during this request.");
@@ -293,7 +372,12 @@ impl LiveQuotaService {
             version: 1,
             accounts,
         };
-        save_file(&self.path()?, &file)?;
+        let expected = runtime
+            .durable_file
+            .as_ref()
+            .ok_or("Live quota settings are unavailable.")?;
+        save_file(&self.path()?, expected, &file)?;
+        runtime.durable_file = Some(file.clone());
         runtime.file = file;
         runtime.invalidate();
         Ok(())
@@ -343,7 +427,12 @@ impl LiveQuotaService {
             .accounts
             .iter_mut()
             .for_each(|account| account.enabled = false);
-        save_file(&self.path()?, &file)?;
+        let expected = runtime
+            .durable_file
+            .as_ref()
+            .ok_or("Live quota settings are unavailable.")?;
+        save_file(&self.path()?, expected, &file)?;
+        runtime.durable_file = Some(file.clone());
         runtime.file = file;
         Ok(())
     }
@@ -351,15 +440,15 @@ impl LiveQuotaService {
     pub fn poll(&self) -> bool {
         let (generation, account_id) = {
             let mut runtime = self.runtime.lock().unwrap();
-            runtime.load(self.path());
+            let changed = runtime.load(self.path());
             if runtime.configuration_error.is_some()
                 || runtime.busy
                 || Instant::now() < runtime.next_poll
             {
-                return false;
+                return changed;
             }
             let Some(account) = runtime.file.accounts.iter().find(|account| account.enabled) else {
-                return false;
+                return changed;
             };
             let account_id = account.account_id.clone();
             runtime.busy = true;
@@ -368,10 +457,9 @@ impl LiveQuotaService {
         let result = self
             .codex()
             .and_then(|path| quota_live::read_codex_quota(&path, &account_id));
-        self.runtime
-            .lock()
-            .unwrap()
-            .finish_read(generation, result, Instant::now());
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.load(self.path());
+        runtime.finish_read(generation, result, Instant::now());
         true
     }
 
@@ -513,7 +601,8 @@ mod tests {
         candidate(&service, "a");
         service.approve("a", "A").unwrap();
         let before = std::fs::read(&path).unwrap();
-        std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        let lock = std::fs::File::open(path.with_extension("lock")).unwrap();
+        lock.try_lock().unwrap();
         assert!(service.change("a", false, true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(
@@ -521,9 +610,83 @@ mod tests {
             Some("disabled")
         );
         assert!(!service.poll());
-        std::fs::remove_dir(path.with_extension("json.tmp")).unwrap();
+        drop(lock);
         service.change("a", false, true).unwrap();
         assert!(isolated(&path).status(Utc::now()).accounts.is_empty());
+    }
+    #[test]
+    fn another_instances_revoke_invalidates_cached_and_inflight_readings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let first = isolated(&path);
+        first.status(Utc::now());
+        candidate(&first, "a");
+        first.approve("a", "A").unwrap();
+        let second = isolated(&path);
+        assert!(second.status(Utc::now()).accounts[0].consent.enabled);
+        let (generation, before) = {
+            let runtime = second.runtime.lock().unwrap();
+            (runtime.generation, runtime.durable_file.clone().unwrap())
+        };
+        first.change("a", false, true).unwrap();
+        assert!(
+            save_file(&path, &before, &before).is_err(),
+            "stale writes cannot resurrect consent"
+        );
+        assert!(
+            second.poll(),
+            "publish the externally changed consent without launching a CLI"
+        );
+        assert!(second.status(Utc::now()).accounts.is_empty());
+        let mut runtime = second.runtime.lock().unwrap();
+        runtime.finish_read(
+            generation,
+            Ok(LiveQuotaReading {
+                account_id: "a".into(),
+                ordinary_usage_allowed: Some(true),
+                observed_at: Utc::now(),
+                limit_buckets: vec![],
+            }),
+            Instant::now(),
+        );
+        assert!(
+            runtime.reading.is_none(),
+            "discard a response from before external revocation"
+        );
+        drop(runtime);
+        assert!(!second.poll());
+    }
+    #[test]
+    fn unreadable_consent_stops_a_previously_enabled_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let service = isolated(&path);
+        service.status(Utc::now());
+        candidate(&service, "a");
+        service.approve("a", "A").unwrap();
+        std::fs::write(&path, "{broken").unwrap();
+        let status = service.status(Utc::now());
+        assert!(status.configuration_error.is_some());
+        assert!(!status.accounts[0].consent.enabled);
+        assert!(!service.poll());
+        assert!(service.change("a", true, false).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn consent_reads_reject_links_and_pipes_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let regular = dir.path().join("regular.json");
+        std::fs::write(&regular, r#"{"version":1,"accounts":[]}"#).unwrap();
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        assert!(read_file(&link).is_err());
+        let pipe = dir.path().join("pipe.json");
+        let name = std::ffi::CString::new(pipe.as_os_str().as_bytes()).unwrap();
+        // SAFETY: name is a live, NUL-terminated path inside the test's temp dir.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(read_file(&pipe).is_err());
     }
     #[cfg(unix)]
     #[test]
@@ -562,6 +725,8 @@ mod tests {
     #[test]
     fn account_permission_expires_with_the_reading_and_rejects_clock_skew() {
         let observed_at = Utc::now();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
         let service = LiveQuotaService {
             runtime: Mutex::new(Runtime {
                 loaded: true,
@@ -593,8 +758,13 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            ..Default::default()
+            ..isolated(&path)
         };
+        {
+            let mut runtime = service.runtime.lock().unwrap();
+            std::fs::write(&path, serde_json::to_vec(&runtime.file).unwrap()).unwrap();
+            runtime.durable_file = Some(runtime.file.clone());
+        }
         let current = service.status(observed_at + chrono::Duration::minutes(5));
         assert_eq!(current.accounts[0].ordinary_usage_allowed, Some(false));
         assert_eq!(current.accounts[0].unavailable, None);
