@@ -216,7 +216,7 @@
   button { color: var(--accent); border: 1px solid var(--border); background: var(--card); border-radius: 4px; padding: 4px 8px; } button:disabled { opacity: .45; }
   button:focus-visible, input:focus-visible, article:focus-visible, .block:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .records { overflow: auto; padding: 12px; min-height: 0; }
-  .bookmarks { padding: 8px 14px; border-bottom: 1px solid var(--border); max-height: 220px; overflow: auto; }
+  .bookmarks { flex-shrink: 0; padding: 8px 14px; border-bottom: 1px solid var(--border); max-height: 220px; overflow: auto; }
   .bookmarks li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
   .bookmarks code { min-width: 0; font-size: 10px; }
   article { padding: 10px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; background: var(--card); }
