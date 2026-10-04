@@ -4,8 +4,9 @@ import WorkflowIntelligence from './WorkflowIntelligence.svelte';
 import type { WorkflowReport, WorkflowWindow } from '../lib/types';
 import { rates } from '../lib/stores/rates';
 
-const { getWorkflowReport } = vi.hoisted(() => ({ getWorkflowReport: vi.fn() }));
-vi.mock('../lib/ipc', () => ({ getWorkflowReport }));
+const { getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression } = vi.hoisted(() => ({
+  getWorkflowReport: vi.fn(), recordWorkflowMeasurement: vi.fn(), setWorkflowFindingSuppression: vi.fn() }));
+vi.mock('../lib/ipc', () => ({ getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression }));
 
 function period(): WorkflowWindow {
   return {
@@ -17,12 +18,15 @@ function period(): WorkflowWindow {
     additional_metrics: [{ id: 'median_time_to_first_edit', value: null, unit: 'milliseconds',
       numerator: 0, denominator: 3, denominator_is: 'timestamped turns', coverage_is: 'linked mutation timestamps',
       covered_samples: 0, eligible_samples: 3, missing_data: 'no_linked_timed_mutations' }],
-    analyzed_sessions: 3, unavailable_sessions: 0,
+    analyzed_sessions: 3, unavailable_sessions: 0, drilldowns: [
+      { dimension: 'project', value: 'opaque-project', sessions: 3, tool_calls: 20, classified_turns: 0 },
+      { dimension: 'model', value: 'gpt-5.4', sessions: 0, tool_calls: 20, classified_turns: 0 },
+    ],
   };
 }
 function report(count = 3): WorkflowReport {
   return { version: 1, generated_at: '2026-10-04T00:00:00Z', analyzer_version: 3,
-    selected_sessions: count, coverage_complete: true, before: period(), after: period(), findings: [], setup_health: null, limitations: [] };
+    selected_sessions: count, coverage_complete: true, before: period(), after: period(), findings: [], historical_findings: [], setup_health: null, limitations: [] };
 }
 async function open(): Promise<void> {
   const details = screen.getByTestId('workflow-panel') as HTMLDetailsElement;
@@ -77,7 +81,7 @@ it('keeps finding limitations visible and follows opaque evidence identity', asy
     before: observation, after: observation, comparison: { version: 1, state: 'not_applicable', comparable: false,
       before_calls_per_100: 50, after_calls_per_100: 50, observed_change_per_100_calls: null,
       limitations: ['low_sample_size', 'incomplete_coverage'] },
-    evidence: [{ session_id: 'codex:one', turn_id: 'turn', timestamp: null }], evidence_truncated: true }];
+    evidence: [{ session_id: 'codex:one', turn_id: 'turn', timestamp: null }], evidence_truncated: true, lifecycle: null }];
   getWorkflowReport.mockResolvedValue(measured);
   const onReview = vi.fn();
   render(WorkflowIntelligence, { sessionIds: ['codex:one'], onReview });
@@ -87,4 +91,24 @@ it('keeps finding limitations visible and follows opaque evidence identity', asy
   expect(screen.getByText(/First 20 evidence anchors/)).toBeTruthy();
   await fireEvent.click(screen.getByRole('button', { name: 'Review session evidence 1' }));
   expect(onReview).toHaveBeenCalledWith('codex:one');
+});
+
+it('records only on explicit action, using the displayed measurement window', async () => {
+  recordWorkflowMeasurement.mockResolvedValue(report(6));
+  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  await open();
+  await screen.findByText(/3 selected sessions/);
+  expect(recordWorkflowMeasurement).not.toHaveBeenCalled();
+  await fireEvent.click(screen.getByRole('button', { name: 'Record measurement' }));
+  await screen.findByText(/6 selected sessions/);
+  expect(recordWorkflowMeasurement).toHaveBeenCalledWith({session_ids:['codex:one'],
+    from:period().from,to:period().to});
+  expect(setWorkflowFindingSuppression).not.toHaveBeenCalled();
+});
+
+it('labels the call scenario as hypothetical and does not turn it into cost or quality savings', async () => {
+  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  await open();
+  expect(await screen.findByText(/20 observed calls × 10% = 2 hypothetical calls avoided/)).toBeTruthy();
+  expect(screen.getByText(/Token, cost, quality and delivery effects are unknown/)).toBeTruthy();
 });

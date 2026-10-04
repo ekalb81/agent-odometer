@@ -1429,6 +1429,8 @@ export interface WorkflowWindow {
   additional_metrics: WorkflowMeasure[];
   analyzed_sessions: number;
   unavailable_sessions: number;
+  drilldowns: { dimension: 'project' | 'model' | 'category'; value: string;
+    sessions: number; tool_calls: number; classified_turns: number }[];
 }
 export interface FindingObservation {
   sessions: number;
@@ -1439,7 +1441,16 @@ export interface FindingObservation {
   coverage_complete: boolean;
   window_duration_ms: number;
 }
+export interface FindingLifecycle {
+  first_observed_at: string; last_observed_at: string; state: FindingState;
+  suppressed: boolean; revision: number; analyzer_changed: boolean;
+}
+export interface FindingSuppressionEdit {
+  provider: string; project_id: string | null; rule_id: string;
+  expected_revision: number; suppressed: boolean;
+}
 export interface WorkflowFinding {
+  lifecycle: FindingLifecycle | null;
   id: string;
   provider: string;
   project_id: string | null;
@@ -1459,6 +1470,8 @@ export interface WorkflowFinding {
   evidence_truncated: boolean;
 }
 export interface WorkflowReport {
+  historical_findings: { id: string; provider: string; project_id: string | null;
+    rule_id: string; lifecycle: FindingLifecycle }[];
   version: number;
   generated_at: string;
   analyzer_version: number;

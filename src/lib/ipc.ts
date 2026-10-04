@@ -22,6 +22,12 @@ export function listSessions(): Promise<SessionSummary[]> {
 export function getWorkflowReport(request: WorkflowRequest): Promise<WorkflowReport> {
   return invoke<WorkflowReport>('get_workflow_report', { request });
 }
+export function recordWorkflowMeasurement(request: WorkflowRequest): Promise<WorkflowReport> {
+  return invoke<WorkflowReport>('record_workflow_measurement', { request });
+}
+export function setWorkflowFindingSuppression(edit: import('./types').FindingSuppressionEdit): Promise<void> {
+  return invoke('set_workflow_finding_suppression', { edit });
+}
 /** Explicit private desktop reads; never called by export or MCP flows. */
 export function getOrganizationSummaries(keys: string[]): Promise<OrganizationSummary[]> {
   return invoke('get_organization_summaries', { keys });

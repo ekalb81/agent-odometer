@@ -4,6 +4,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
+#[path = "workflow_lifecycle.rs"]
+pub(crate) mod lifecycle;
+pub use lifecycle::{FindingLifecycle, FindingSuppressionEdit};
+
 pub const COMPARISON_VERSION: u32 = 1;
 pub const MINIMUM_COMPARISON_SESSIONS: u64 = 3;
 
@@ -105,6 +109,17 @@ pub struct WorkflowWindow {
     pub additional_metrics: Vec<WorkflowMeasure>,
     pub analyzed_sessions: u64,
     pub unavailable_sessions: u64,
+    /// Descriptive counts only; category is the existing versioned classifier.
+    pub drilldowns: Vec<WorkflowDrilldown>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct WorkflowDrilldown {
+    pub dimension: &'static str,
+    pub value: String,
+    pub sessions: u64,
+    pub tool_calls: u64,
+    pub classified_turns: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -125,6 +140,7 @@ pub struct WorkflowFinding {
     pub comparison: FindingComparison,
     pub evidence: Vec<WorkflowEvidence>,
     pub evidence_truncated: bool,
+    pub lifecycle: Option<FindingLifecycle>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,8 +153,18 @@ pub struct WorkflowReport {
     pub before: WorkflowWindow,
     pub after: WorkflowWindow,
     pub findings: Vec<WorkflowFinding>,
+    pub historical_findings: Vec<HistoricalWorkflowFinding>,
     pub setup_health: Option<WorkflowSetupHealth>,
     pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HistoricalWorkflowFinding {
+    pub id: String,
+    pub provider: String,
+    pub project_id: Option<String>,
+    pub rule_id: String,
+    pub lifecycle: FindingLifecycle,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +229,19 @@ struct WindowSignals {
     timestamped_turns: u64,
     first_edit_ms: Vec<u64>,
     delegated_sessions: u64,
+    drilldowns: BTreeMap<(&'static str, String), WorkflowDrilldown>,
+}
+
+impl WindowSignals {
+    fn drilldown(&mut self, dimension: &'static str, value: String) -> &mut WorkflowDrilldown {
+        self.drilldowns
+            .entry((dimension, value.clone()))
+            .or_insert_with(|| WorkflowDrilldown {
+                dimension,
+                value,
+                ..Default::default()
+            })
+    }
 }
 
 fn metric_signals(signals: &mut WindowSignals) -> Vec<WorkflowMeasure> {
@@ -368,6 +407,15 @@ pub fn report(
             if let Some(range) = range {
                 let signals = if index == 0 { &mut before } else { &mut after };
                 signals.tool_calls += range.tool_metrics.calls;
+                let project_name = project.unwrap_or("unattributed").to_owned();
+                let project_row = signals.drilldown("project", project_name);
+                project_row.tool_calls += range.tool_metrics.calls;
+                if range.tool_metrics.calls > 0 || range.tokens.total_tokens > 0 {
+                    project_row.sessions += 1;
+                }
+                for (model, totals) in &range.tool_metrics_by_model {
+                    signals.drilldown("model", model.clone()).tool_calls += totals.calls;
+                }
                 if range.tool_metrics.calls > 0 || range.tokens.total_tokens > 0 {
                     if index == 0 {
                         scope.before_sessions += 1;
@@ -442,6 +490,11 @@ pub fn report(
                 signals.timestamped_turns += 1;
                 if let Some(classification) = &turn.classification {
                     signals.classified_turns += 1;
+                    let category = serde_json::to_value(classification.category)?
+                        .as_str()
+                        .unwrap_or("other")
+                        .to_owned();
+                    signals.drilldown("category", category).classified_turns += 1;
                     signals.planning_turns +=
                         u64::from(classification.category == crate::model::TaskCategory::Planning);
                 }
@@ -511,11 +564,7 @@ pub fn report(
                 rule.after_avoidable,
             );
             findings.push(WorkflowFinding {
-                id: finding_identity(
-                    &provider,
-                    project.as_deref().unwrap_or("unassigned"),
-                    &rule_id,
-                ),
+                id: finding_identity(&provider, project.as_deref().unwrap_or(""), &rule_id),
                 provider: provider.clone(),
                 project_id: project.clone(),
                 rule_id,
@@ -529,6 +578,7 @@ pub fn report(
                 after: after_observation,
                 evidence: rule.evidence,
                 evidence_truncated: rule.evidence_truncated,
+                lifecycle: None,
             });
         }
     }
@@ -554,6 +604,7 @@ pub fn report(
             additional_metrics: metric_signals(&mut before),
             analyzed_sessions: before.sessions,
             unavailable_sessions: before.unavailable,
+            drilldowns: before.drilldowns.into_values().collect(),
         },
         after: WorkflowWindow {
             from: after_from,
@@ -562,8 +613,10 @@ pub fn report(
             additional_metrics: metric_signals(&mut after),
             analyzed_sessions: after.sessions,
             unavailable_sessions: after.unavailable,
+            drilldowns: after.drilldowns.into_values().collect(),
         },
         findings,
+        historical_findings: Vec::new(),
         setup_health: None,
         limitations,
     })
@@ -691,6 +744,76 @@ pub fn compare_finding(
 mod tests {
     use super::*;
 
+    #[test]
+    fn explicit_measurement_persists_but_read_only_reports_and_new_project_scopes_do_not_write() {
+        let (_directory, store, keys, now) = measured_ledger();
+        let measure = |at| {
+            report(
+                &store.workflow_reader().unwrap(),
+                &crate::rates::RateCard::default(),
+                WorkflowRequest {
+                    session_ids: keys.clone(),
+                    from: None,
+                    to: None,
+                },
+                &[],
+                at,
+            )
+            .unwrap()
+        };
+        let mut first = measure(now);
+        store.load_workflow_lifecycle(&mut first).unwrap();
+        assert!(first
+            .findings
+            .iter()
+            .all(|finding| finding.lifecycle.is_none()));
+        let mut second = measure(now);
+        store.load_workflow_lifecycle(&mut second).unwrap();
+        assert!(second.historical_findings.is_empty());
+        assert!(second
+            .findings
+            .iter()
+            .all(|finding| finding.lifecycle.is_none()));
+        store.record_workflow_measurement(&mut first).unwrap();
+        let original = &first.findings[0];
+        store
+            .suppress_workflow_finding(&FindingSuppressionEdit {
+                provider: original.provider.clone(),
+                project_id: original.project_id.clone(),
+                rule_id: original.rule_id.clone(),
+                expected_revision: original.lifecycle.as_ref().unwrap().revision,
+                suppressed: true,
+            })
+            .unwrap();
+        let mut reopened = measure(now + Duration::milliseconds(1));
+        store.load_workflow_lifecycle(&mut reopened).unwrap();
+        assert_eq!(
+            reopened.findings[0].comparison.state,
+            FindingState::Suppressed
+        );
+        assert_eq!(
+            reopened.findings[0]
+                .lifecycle
+                .as_ref()
+                .unwrap()
+                .first_observed_at,
+            now
+        );
+        for key in &keys {
+            store
+                .reassign_session_project(key, Some("manual:new-scope"))
+                .unwrap();
+        }
+        let mut moved = measure(now + Duration::milliseconds(2));
+        store.load_workflow_lifecycle(&mut moved).unwrap();
+        assert!(moved.findings[0].lifecycle.is_none());
+        assert_ne!(moved.findings[0].id, first.findings[0].id);
+        assert_ne!(moved.findings[0].comparison.state, FindingState::Suppressed);
+        assert_eq!(moved.historical_findings.len(), 1);
+        assert_eq!(moved.historical_findings[0].id, first.findings[0].id);
+        assert!(moved.historical_findings[0].lifecycle.suppressed);
+    }
+
     fn measured_ledger() -> (
         tempfile::TempDir,
         crate::history_store::HistoryStore,
@@ -719,6 +842,7 @@ mod tests {
             session.tool_observations.clear();
             session.turns.truncate(1);
             let turn = &mut session.turns[0];
+            turn.tokens = crate::model::TokenTotals::default();
             turn.turn_id = "synthetic-turn".into();
             turn.started_at = Some(start);
             turn.completed_at = Some(start + Duration::minutes(3));
@@ -784,6 +908,28 @@ mod tests {
         assert_eq!(tools.numerator, 9.0);
         assert_eq!(tools.denominator, 3.0);
         assert_eq!(tools.value, Some(3.0));
+        for dimension in ["project", "model"] {
+            assert_eq!(
+                report
+                    .after
+                    .drilldowns
+                    .iter()
+                    .filter(|row| row.dimension == dimension)
+                    .map(|row| row.tool_calls)
+                    .sum::<u64>(),
+                9
+            );
+        }
+        assert_eq!(
+            report
+                .after
+                .drilldowns
+                .iter()
+                .filter(|row| row.dimension == "project")
+                .map(|row| row.sessions)
+                .sum::<u64>(),
+            report.after.analyzed_sessions
+        );
         let serialized = serde_json::to_string(&report).unwrap();
         for private in [
             "PRIVATE",

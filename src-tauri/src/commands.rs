@@ -116,6 +116,40 @@ pub async fn get_workflow_report(
     state: State<'_, Arc<AppState>>,
     request: crate::workflow::WorkflowRequest,
 ) -> Result<crate::workflow::WorkflowReport, String> {
+    workflow_report(state, request, false).await
+}
+
+/// Explicit local observation metadata write; no configurations or accounting are changed.
+#[tauri::command]
+pub async fn record_workflow_measurement(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    workflow_report(state, request, true).await
+}
+
+#[tauri::command]
+pub async fn set_workflow_finding_suppression(
+    state: State<'_, Arc<AppState>>,
+    edit: crate::workflow::FindingSuppressionEdit,
+) -> Result<(), String> {
+    let history = state
+        .history_ready()
+        .ok_or("Workflow history is unavailable or still preparing.")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history.suppress_workflow_finding(&edit).map_err(|_| {
+            "Finding changed or is unavailable; refresh before editing suppression.".to_owned()
+        })
+    })
+    .await
+    .map_err(|_| "Finding suppression could not finish.".to_owned())?
+}
+
+async fn workflow_report(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+    record: bool,
+) -> Result<crate::workflow::WorkflowReport, String> {
     let history = state
         .history_ready()
         .ok_or_else(|| "Workflow history is unavailable or still preparing.".to_owned())?;
@@ -135,6 +169,21 @@ pub async fn get_workflow_report(
             report.setup_health = Some(crate::workflow::WorkflowSetupHealth::from_diagnostics(
                 crate::diagnostics::generate_report(&app_state, &config, &rates),
             ));
+        }
+        reader
+            .load_workflow_lifecycle(&mut report)
+            .map_err(|_| "Workflow lifecycle metadata is unavailable.".to_owned())?;
+        drop(reader);
+        if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
+            return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
+        }
+        if record {
+            history
+                .record_workflow_measurement(&mut report)
+                .map_err(|_| {
+                    "Measurement changed or could not be recorded; refresh and try again."
+                        .to_owned()
+                })?;
         }
         if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
             return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
