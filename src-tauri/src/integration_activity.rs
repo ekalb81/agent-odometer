@@ -307,6 +307,42 @@ mod tests {
         assert_eq!(verifier.client, ClientIdentity::Verifier);
     }
     #[test]
+    fn damaged_or_unallowlisted_activity_is_unavailable_instead_of_empty_or_trusted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("activity.json");
+        let activity = summarize(
+            &Connection::default(),
+            "odometer_status",
+            std::time::Instant::now(),
+            &Ok("{}".into()),
+        )
+        .unwrap();
+        for (field, value) in [
+            ("identity_authority", "authenticated"),
+            ("tool", "synthetic private text"),
+            ("client_version", "synthetic credential"),
+            ("error_code", "synthetic private error"),
+            ("observation_generation", "synthetic private path"),
+        ] {
+            let mut entry = serde_json::to_value(&activity).unwrap();
+            entry[field] = serde_json::json!(value);
+            std::fs::write(&path, serde_json::to_vec(&[entry]).unwrap()).unwrap();
+            assert!(read_locked(&mut open_regular(&path, false).unwrap()).is_err());
+        }
+        std::fs::write(&path, b"{ incomplete synthetic metadata").unwrap();
+        assert!(read_locked(&mut open_regular(&path, false).unwrap()).is_err());
+        std::fs::write(&path, b"").unwrap();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(MAX_BYTES + 1).unwrap();
+        assert!(read_locked(&mut open_regular(&path, false).unwrap()).is_err());
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&vec![activity; MAX_ENTRIES + 1]).unwrap(),
+        )
+        .unwrap();
+        assert!(read_locked(&mut open_regular(&path, false).unwrap()).is_err());
+    }
+    #[test]
     fn bounded_activity_retains_metadata_without_response_or_error_bodies() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("activity.json");

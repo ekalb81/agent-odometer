@@ -544,11 +544,21 @@ fn discover(client: Client) -> Option<PathBuf> {
 fn client_version(path: &Path) -> Result<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    VERSION_READERS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < 4).then_some(count + 1)
-        })
-        .map_err(|_| anyhow::anyhow!("Client version reader capacity unavailable"))?;
+    let mut readers = VERSION_READERS.load(Ordering::Acquire);
+    loop {
+        if readers >= 4 {
+            bail!("Client version reader capacity unavailable");
+        }
+        match VERSION_READERS.compare_exchange_weak(
+            readers,
+            readers + 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(current) => readers = current,
+        }
+    }
     let permit = VersionReaderPermit;
     let mut command = Command::new(path);
     command
@@ -770,6 +780,28 @@ mod tests {
             Path::new("synthetic")
         )
         .is_ok());
+    }
+
+    #[test]
+    fn project_scope_requires_an_existing_absolute_directory_and_selects_only_client_config() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            config_path(Client::Codex, Scope::Project, Some(directory.path())).unwrap(),
+            directory.path().join(".codex/config.toml")
+        );
+        assert_eq!(
+            config_path(Client::ClaudeCode, Scope::Project, Some(directory.path())).unwrap(),
+            directory.path().join(".mcp.json")
+        );
+        assert!(config_path(Client::Codex, Scope::Project, None).is_err());
+        assert!(config_path(Client::Codex, Scope::Project, Some(Path::new("."))).is_err());
+        assert!(config_path(
+            Client::ClaudeCode,
+            Scope::Project,
+            Some(&directory.path().join("absent"))
+        )
+        .is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
