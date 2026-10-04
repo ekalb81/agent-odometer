@@ -13,6 +13,7 @@
     summarizeOptimizationFindings,
   } from '../lib/optimization';
   import Sparkline from './Sparkline.svelte';
+  import TranscriptInspector from './TranscriptInspector.svelte';
   import SessionProjectEditor from './SessionProjectEditor.svelte';
 
   interface Props {
@@ -20,9 +21,13 @@
     /** Subagent sessions spawned by this one (for the "N subagents" pill). */
     childCount?: number;
     onclose: () => void;
+    /** Stable source record target for search/bookmark navigation. */
+    transcriptAnchor?: string | null;
   }
 
-  let { session, childCount = 0, onclose }: Props = $props();
+  let { session, childCount = 0, onclose, transcriptAnchor = null }: Props = $props();
+  let inspectorOpen = $state(false);
+
 
   const numFmt = new Intl.NumberFormat();
   const pctFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
@@ -117,8 +122,11 @@
     if (id !== lastSessionId) {
       lastSessionId = id;
       expandedTurn = null;
+      inspectorOpen = !!transcriptAnchor;
     }
   });
+
+  $effect(() => { if (transcriptAnchor) inspectorOpen = true; });
 
   let copied = $state(false);
   function copyId() {
@@ -274,6 +282,11 @@
         {/if}
       </div>
     </div>
+
+    <div class="px-5 py-2 border-b border-edge shrink-0"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { inspectorOpen = true; }}>Inspect transcript</button></div>
+    {#if inspectorOpen}
+      <TranscriptInspector sessionId={session.storage_id} recordId={transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
+    {/if}
 
     <!-- 2×2 stat grid -->
     <div class="grid grid-cols-2 gap-px bg-edge border-b border-edge shrink-0">
