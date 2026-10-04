@@ -52,7 +52,7 @@
     <button type="button" onclick={prepare} disabled={loading || saving}>{loading ? 'Reading bounded source pages…' : 'Build preview'}</button>
     {#if loading}<button type="button" onclick={() => { generation++; loading = false; }}>Cancel preview</button>{/if}
     {#if preview}
-      <p role="status">{preview.complete ? 'Source read to its end.' : 'Incomplete source excerpt.'} {preview.records} records read; {preview.omitted} records or blocks omitted; {preview.redactions} redactions.{preview.limited ? ' Safety limit reached.' : ''}</p>
+      <p role="status">{`${preview.complete ? 'Source read to its end.' : 'Incomplete source excerpt.'} ${preview.records} records read; ${preview.omitted} records or blocks omitted; ${preview.redactions} redactions.${preview.limited ? ' Safety limit reached.' : ''}`}</p>
       <label><input type="checkbox" bind:checked={reviewed} disabled={saving} /> I reviewed every included section for sensitive content.</label>
       <button type="button" onclick={save} disabled={!reviewed || saving}>{saving ? 'Saving…' : 'Save reviewed HTML…'}</button>
     {/if}

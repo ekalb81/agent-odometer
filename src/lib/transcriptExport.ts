@@ -97,7 +97,7 @@ export async function previewTranscriptExport(
         entry.blocks.push({ kind: block.kind, html, call: block.call_id, name, anchor });
       }
       if (entry.blocks.length) entries.push(entry);
-      else omitted++;
+      else if (!view?.blocks.length) omitted++;
     }
     if (!page.next_cursor) { complete = page.source_complete && !gap; break; }
     const key = JSON.stringify(page.next_cursor);
