@@ -89,13 +89,13 @@ use tracing_subscriber::EnvFilter;
 /// there can only be one, and why this replaces the `#[cfg(test)]`-only
 /// counting allocator earlier probes used to define locally). Behavior is
 /// identical to the default system allocator unless heap tracking is
-/// explicitly enabled via `memory::configure_heap_tracking` â€” off by
+/// explicitly enabled via `memory::configure_heap_tracking` — off by
 /// default, matching every other opt-in in this app.
 ///
 /// Do not add another `#[global_allocator]` anywhere in this crate or its
-/// tests: a binary may declare at most one, and a second one â€” even a
+/// tests: a binary may declare at most one, and a second one — even a
 /// `#[cfg(test)]`-only one, which is exactly how this crate had two before
-/// this instrumentation unified them â€” fails the build with a "duplicate
+/// this instrumentation unified them — fails the build with a "duplicate
 /// lang item" error that does not point back at this line. If a probe needs
 /// exact heap-byte deltas, drive this allocator via
 /// `memory::configure_heap_tracking` and its raw accessors instead.
