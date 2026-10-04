@@ -2,8 +2,9 @@ import { render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import TranscriptInspector from './TranscriptInspector.svelte';
+import { organizationStore } from '../lib/stores/organization.svelte';
 import type { TranscriptCursor, TranscriptPage, TranscriptRecord } from '../lib/types';
-const mocks = vi.hoisted(() => ({ getTranscriptPage: vi.fn() }));
+const mocks = vi.hoisted(() => ({ getTranscriptPage: vi.fn(), getRecordBookmarks: vi.fn(), editRecordBookmark: vi.fn() }));
 vi.mock('../lib/ipc', () => mocks);
 const cursor: TranscriptCursor = { session_id: 'session-a', source_id: 'source', generation: 'g', offset: 100, record_start: 100, partial: false };
 const call: TranscriptRecord = { id: 'source:call', byte_offset: 0, byte_length: 90, raw_json: '{"synthetic":"call"}', kind: 'response_item', message_id: null, issue: null, presentation: { role: 'assistant', timestamp: null, blocks: [{ kind: 'tool_call', name: 'Read', call_id: 'call-1', text: 'synthetic.rs', edit: null }] } };
@@ -11,7 +12,69 @@ const output: TranscriptRecord = { ...call, id: 'source:result', byte_offset: 10
 function page(records: TranscriptRecord[], next = false): TranscriptPage { return { provider: 'codex', availability: 'available', issues: [], records, next_cursor: next ? cursor : null, source_complete: !next }; }
 beforeEach(() => {
   vi.resetAllMocks();
+  organizationStore.invalidate('reset');
+  mocks.getRecordBookmarks.mockImplementation(async key => ({ identity: { session_key: key, fingerprint: 'lineage', anchor: '' }, bookmarks: [], recovery_backup_unrestored: false }));
+  mocks.editRecordBookmark.mockImplementation(async edit => ({ ...edit, revision: edit.revision + 1 }));
   Object.defineProperty(HTMLDialogElement.prototype, 'showModal', { configurable: true, value: function(this: HTMLDialogElement) { this.setAttribute('open', ''); } });
+});
+it('bookmarks a record across pages and opens the exact anchor with keyboard navigation', async () => {
+  mocks.getTranscriptPage.mockImplementation(async request => request.cursor ? page([output]) : page([call], true));
+  render(TranscriptInspector, { sessionId: 'session-a', onclose: vi.fn() });
+  await userEvent.click(await screen.findByRole('button', { name: 'Bookmark record' }));
+  await screen.findByRole('button', { name: 'Remove record bookmark' });
+  expect(mocks.editRecordBookmark).toHaveBeenCalledWith({ identity: { session_key: 'session-a', fingerprint: 'lineage', anchor: call.id }, revision: 0, bookmarked: true });
+  await userEvent.click(screen.getByRole('button', { name: 'Next page' }));
+  await screen.findByRole('button', { name: 'Expand tool' });
+  await userEvent.click(screen.getByText('Record bookmarks (1)'));
+  const open = screen.getByRole('button', { name: 'Open bookmarked record 1' });
+  open.focus(); await userEvent.keyboard('{Enter}');
+  await waitFor(() => expect(mocks.getTranscriptPage).toHaveBeenLastCalledWith(expect.objectContaining({ record_id: call.id, cursor: null })));
+  await waitFor(() => expect(document.getElementById(`transcript-${call.id}`)).toHaveFocus());
+  expect(screen.getByRole('button', { name: 'Collapse assistant' })).toBeInTheDocument();
+});
+it('keeps a missing bookmark target honest and permits removing it without source content', async () => {
+  const bookmark = { identity: { session_key: 'session-a', fingerprint: 'lineage', anchor: call.id }, revision: 3, bookmarked: true };
+  mocks.getRecordBookmarks.mockResolvedValue({ identity: { ...bookmark.identity, anchor: '' }, bookmarks: [bookmark], recovery_backup_unrestored: false });
+  mocks.getTranscriptPage.mockResolvedValue({ ...page([]), availability: 'missing', issues: ['source_missing'], source_complete: false });
+  render(TranscriptInspector, { sessionId: 'session-a', onclose: vi.fn() });
+  await userEvent.click(await screen.findByText('Record bookmarks (1)'));
+  await userEvent.click(screen.getByRole('button', { name: 'Open bookmarked record 1' }));
+  await screen.findByText(/Transcript missing/);
+  expect(screen.queryByText('synthetic.rs')).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Remove bookmark 1' }));
+  await screen.findByText('No bookmarked records.');
+  expect(mocks.editRecordBookmark).toHaveBeenCalledWith({ ...bookmark, bookmarked: false });
+});
+it('labels unavailable private metadata and refuses adds instead of inventing an empty bookmark list', async () => {
+  mocks.getRecordBookmarks.mockRejectedValue(new Error('History still preparing'));
+  mocks.getTranscriptPage.mockResolvedValue(page([call]));
+  render(TranscriptInspector, { sessionId: 'session-a', onclose: vi.fn() });
+  await screen.findByRole('alert');
+  expect(screen.getByText('Record bookmarks (unavailable)')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Bookmark record' })).toBeDisabled();
+  expect(screen.queryByText('No bookmarked records.')).not.toBeInTheDocument();
+});
+it('retains a removed anchor revision so re-bookmarking after reopening is valid', async () => {
+  const identity = { session_key: 'session-a', fingerprint: 'lineage', anchor: call.id };
+  mocks.getRecordBookmarks.mockResolvedValue({ identity: { ...identity, anchor: '' }, bookmarks: [{ identity, revision: 2, bookmarked: false }], recovery_backup_unrestored: false });
+  mocks.getTranscriptPage.mockResolvedValue(page([call]));
+  render(TranscriptInspector, { sessionId: 'session-a', onclose: vi.fn() });
+  await userEvent.click(await screen.findByRole('button', { name: 'Bookmark record' }));
+  await screen.findByRole('button', { name: 'Remove record bookmark' });
+  expect(mocks.editRecordBookmark).toHaveBeenCalledWith({ identity, revision: 2, bookmarked: true });
+});
+it('discards a delayed bookmark success after history invalidation and replacement', async () => {
+  let finish!: (value: unknown) => void;
+  mocks.getTranscriptPage.mockResolvedValue(page([call]));
+  mocks.editRecordBookmark.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+  render(TranscriptInspector, { sessionId: 'session-a', onclose: vi.fn() });
+  await userEvent.click(await screen.findByRole('button', { name: 'Bookmark record' }));
+  mocks.getRecordBookmarks.mockResolvedValue({ identity: { session_key: 'session-a', fingerprint: 'replacement', anchor: '' }, bookmarks: [], recovery_backup_unrestored: false });
+  organizationStore.invalidate('History purged');
+  await waitFor(() => expect(mocks.getRecordBookmarks).toHaveBeenCalledTimes(2));
+  finish({ identity: { session_key: 'session-a', fingerprint: 'lineage', anchor: call.id }, revision: 1, bookmarked: true });
+  await waitFor(() => expect(screen.getByText('Record bookmarks (0)')).toBeInTheDocument());
+  expect(screen.queryByRole('button', { name: 'Remove record bookmark' })).not.toBeInTheDocument();
 });
 it('pairs explicit tool IDs across bounded pages and returns to an anchored page', async () => {
   mocks.getTranscriptPage.mockImplementation(async (request) => request.cursor ? page([output]) : page([call], true));

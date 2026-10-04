@@ -2,7 +2,7 @@
 // All IPC between the Svelte frontend and Rust backend goes through this module.
 
 import { invoke } from '@tauri-apps/api/core';
-import type { AnnotationIdentity, AnnotationEdit, OrganizationSummary, SessionAnnotation, SavedSearch, SavedSearchDefinition } from './types';
+import type { AnnotationIdentity, AnnotationEdit, OrganizationSummary, SessionAnnotation, SavedSearch, SavedSearchDefinition, RecordBookmark, RecordBookmarkList } from './types';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { SummaryPricing } from './types';
 import type { TranscriptPage, TranscriptRequest } from './types';
@@ -20,6 +20,8 @@ export function listSessions(): Promise<SessionSummary[]> {
 }
 
 /** Explicit private desktop reads; never called by export or MCP flows. */
+export function getRecordBookmarks(sessionKey: string): Promise<RecordBookmarkList> { return invoke('get_record_bookmarks', { sessionKey }); }
+export function editRecordBookmark(edit: RecordBookmark): Promise<RecordBookmark> { return invoke('edit_record_bookmark', { edit }); }
 export function getOrganizationRecoveryState(): Promise<boolean> { return invoke('get_organization_recovery_state'); }
 export function getOrganizationSummaries(keys: string[]): Promise<OrganizationSummary[]> {
   return invoke('get_organization_summaries', { keys });
@@ -330,7 +332,7 @@ export function openTaskInChatGPT(sessionId: string): Promise<void> {
 /** Opens a backend-owned native save dialog and writes only its selected path. */
 export function writeExport(
   defaultName: string,
-  format: 'csv' | 'json' | 'svg',
+  format: 'csv' | 'json' | 'html' | 'svg',
   content: string,
 ): Promise<boolean> {
   return invoke<boolean>('write_export', { defaultName, format, content });

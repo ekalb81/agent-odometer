@@ -54,6 +54,9 @@
     "quota-live-off-and-lookup-error",
     "transcript-recorded-edit",
     "transcript-narrow-anchor",
+    "transcript-bookmarks-narrow",
+    "transcript-export-preview",
+    "transcript-export-narrow",
     "content-search-scopes",
     "content-search-retained-narrow"
   ]

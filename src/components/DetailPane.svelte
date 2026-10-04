@@ -14,7 +14,9 @@
   } from '../lib/optimization';
   import Sparkline from './Sparkline.svelte';
   import TranscriptInspector from './TranscriptInspector.svelte';
+  import TranscriptExport from './TranscriptExport.svelte';
   import TranscriptSearch from './TranscriptSearch.svelte';
+  import ContextExplanation from './ContextExplanation.svelte';
   import SessionProjectEditor from './SessionProjectEditor.svelte';
   import SessionOrganizationEditor from './SessionOrganizationEditor.svelte';
 
@@ -29,7 +31,10 @@
 
   let { session, childCount = 0, onclose, transcriptAnchor = null }: Props = $props();
   let inspectorOpen = $state(false);
+  let exportOpen = $state(false);
   let contentSearchOpen = $state(false);
+  let contextOpen = $state(false);
+  let contextAnchor = $state<string | null>(null);
 
 
   const numFmt = new Intl.NumberFormat();
@@ -126,11 +131,14 @@
       lastSessionId = id;
       expandedTurn = null;
       inspectorOpen = !!transcriptAnchor;
+      exportOpen = false;
       contentSearchOpen = false;
+      contextOpen = false;
+      contextAnchor = null;
     }
   });
 
-  $effect(() => { if (transcriptAnchor) inspectorOpen = true; });
+  $effect(() => { if (transcriptAnchor) { contextAnchor = null; inspectorOpen = true; } });
 
   let copied = $state(false);
   function copyId() {
@@ -287,10 +295,14 @@
       </div>
     </div>
 
-    <div class="px-5 py-2 border-b border-edge shrink-0 space-x-4"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { inspectorOpen = true; }}>Inspect transcript</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contentSearchOpen = true; }}>Search content</button></div>
+    <div class="px-5 py-2 border-b border-edge shrink-0 space-x-4"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contextAnchor = null; inspectorOpen = true; }}>Inspect transcript</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contentSearchOpen = true; }}>Search content</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contextOpen = true; }}>Explain context</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { exportOpen = true; }}>Export transcript</button></div>
+    {#if contextOpen}<ContextExplanation sessionId={session.storage_id} onclose={() => { contextOpen = false; }} oninspect={(anchor) => { contextOpen = false; contextAnchor = anchor; inspectorOpen = true; }} />{/if}
+    {#if exportOpen}
+      <TranscriptExport sessionId={session.storage_id} onclose={() => { exportOpen = false; }} />
+    {/if}
     {#if contentSearchOpen}<TranscriptSearch sessionId={session.storage_id} onclose={() => { contentSearchOpen = false; }} />{/if}
     {#if inspectorOpen}
-      <TranscriptInspector sessionId={session.storage_id} recordId={transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
+      <TranscriptInspector sessionId={session.storage_id} recordId={contextAnchor ?? transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
     {/if}
 
     <!-- 2×2 stat grid -->
