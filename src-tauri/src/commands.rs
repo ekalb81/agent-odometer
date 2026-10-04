@@ -3211,6 +3211,78 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
+    #[test]
+    fn dollar_budget_uses_current_api_surface_and_rejects_partial_prices() {
+        use crate::query::{CurrentPricing, PricedSurface, RangePricing};
+        let amount = |total| PricedSurface {
+            total,
+            converted: None,
+            by_model: vec![],
+            missing_models: vec![],
+            unpriced_models: vec![],
+        };
+        let mut range: RangeTotals = serde_json::from_value(serde_json::json!({
+            "tokens": {"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0}, "buckets":[]
+        })).unwrap();
+        range.pricing = Some(RangePricing {
+            plan: amount(900.0),
+            api: Some(amount(800.0)),
+            current: Some(CurrentPricing {
+                as_of: chrono::Utc::now(),
+                included_allowance_basis: String::new(),
+                purchased_credits: amount(700.0),
+                included_allowance: amount(600.0),
+                api_estimate: amount(2.25),
+            }),
+        });
+        let mut ranges = HashMap::from([("codex:thread:test".into(), range)]);
+        let rates = crate::rates::RateCard::load_bundled().unwrap();
+        let provider = crate::provider::codex_provider_id();
+        assert_eq!(
+            super::budget_usd_total(&ranges, &provider, &rates),
+            Ok(2.25)
+        );
+        ranges
+            .values_mut()
+            .next()
+            .unwrap()
+            .pricing
+            .as_mut()
+            .unwrap()
+            .current
+            .as_mut()
+            .unwrap()
+            .api_estimate
+            .missing_models
+            .push("unknown".into());
+        assert_eq!(
+            super::budget_usd_total(&ranges, &provider, &rates),
+            Err("pricing_incomplete")
+        );
+        let range = ranges.values_mut().next().unwrap();
+        range
+            .pricing
+            .as_mut()
+            .unwrap()
+            .current
+            .as_mut()
+            .unwrap()
+            .api_estimate
+            .missing_models
+            .clear();
+        range.tokens.total_tokens = 100;
+        assert_eq!(
+            super::budget_usd_total(&ranges, &provider, &rates),
+            Err("pricing_incomplete"),
+            "unbucketed usage cannot look free"
+        );
+        assert_eq!(
+            super::budget_usd_total(&HashMap::new(), &provider, &rates),
+            Ok(0.0),
+            "a complete empty range is genuinely zero"
+        );
+    }
+
     /// Issue #185: the rebuild's own recording. A cancelled rebuild is a
     /// legitimate outcome — everything already rewritten stays rewritten —
     /// so it must be distinguishable from a failure rather than folded into
@@ -4387,9 +4459,9 @@ pub fn get_quota_snapshots(state: State<'_, Arc<AppState>>) -> Vec<crate::quota:
 /// Current soft-budget/notification configuration (never includes the
 /// internal dedup log — see `QuotaConfigWire`).
 #[tauri::command]
-pub fn get_quota_config() -> crate::quota_store::QuotaConfigWire {
-    let store = crate::quota_store::QuotaStoreFile::load();
-    crate::quota_store::QuotaConfigWire::from(&store)
+pub fn get_quota_config() -> Result<crate::quota_store::QuotaConfigWire, String> {
+    let store = crate::quota_store::QuotaStoreFile::load_checked()?;
+    Ok(crate::quota_store::QuotaConfigWire::from(&store))
 }
 
 /// Replaces the whole soft-budget/notification configuration, mirroring
@@ -4401,19 +4473,7 @@ pub fn set_quota_config(
     state: State<'_, Arc<AppState>>,
     config: crate::quota_store::QuotaConfigWire,
 ) -> Result<crate::quota_store::QuotaConfigWire, String> {
-    crate::quota_store::validate_quota_config(&config)?;
-    let mut store = crate::quota_store::QuotaStoreFile::load();
-    store.budgets = config.budgets;
-    store.notifications = config.notifications;
-    store.max_cache_age_secs = config.max_cache_age_secs;
-    store.save().map_err(|error| error.to_string())?;
-    let wire = crate::quota_store::QuotaConfigWire::from(&store);
-    // Issue #128: `get_quota_snapshots` no longer reloads this file per
-    // call, so the in-memory cache must be brought current here, at the
-    // one write path — and the (small, one-per-provider) snapshot cache
-    // invalidated, since `max_cache_age_secs` feeds it directly.
-    state.set_quota_store(store);
-    Ok(wire)
+    state.save_quota_config(config)
 }
 
 /// Durable project assignments shared across one alert-evaluation batch.
@@ -4436,54 +4496,258 @@ impl ProjectBudgetScope {
     }
 }
 
-/// Token usage for one budget's provider/project scope over its rolling
-/// period, from the in-memory session projection. Only ever called for
-/// `Tokens`-unit budgets; `PercentOfWindow` budgets read their current
-/// value directly off the matching `QuotaWindow` instead.
-/// `None` means the value could not be computed this poll (issue #139: full
-/// `tokens_history` for this budget's scoped sessions is a possible ledger
-/// read now that `state.sessions` holds only resident summaries) — the same
-/// "unavailable" signal `BudgetEvaluation::current_value` already uses for
-/// an unavailable `PercentOfWindow` snapshot, never a fabricated zero.
-fn token_budget_current_value(
+/// One shared computation supplies both the editor and threshold alerts.
+/// Budget scopes include retained keys even before resident hydration.
+pub(crate) fn quota_budget_statuses(
     state: &AppState,
-    budget: &crate::quota_store::QuotaBudget,
+    budgets: &[crate::quota_store::QuotaBudget],
     now: DateTime<Utc>,
-    project_scope: Option<&ProjectBudgetScope>,
-) -> Option<f64> {
-    // Missing durable overrides makes the project scope unavailable, not empty.
-    if budget.project_key.is_some() && project_scope.is_none() {
-        return None;
-    }
-    let period_hours = budget.period_hours.unwrap_or(24).max(1) as i64;
-    let since = now - chrono::Duration::hours(period_hours);
-    let ids: Vec<String> = state
-        .sessions
+    max_cache_age: chrono::Duration,
+) -> Vec<crate::quota::QuotaBudgetStatus> {
+    use crate::quota_store::BudgetUnit;
+    let snapshots = state.quota_snapshots(max_cache_age, now);
+    let needs_ledger = budgets
         .iter()
-        .filter(|entry| entry.value().summary.harness == budget.provider)
-        .filter(|entry| {
-            budget.project_key.as_deref().is_none_or(|key| {
-                project_scope.is_some_and(|scope| scope.includes(&entry.value().summary, key))
-            })
+        .any(|budget| budget.enabled && budget.unit != BudgetUnit::PercentOfWindow);
+    // Purged/recovered archives remain readable but cannot establish complete
+    // budget headroom. Check once per batch; provider windows stay independent.
+    let history = needs_ledger
+        .then(|| state.history_ready())
+        .flatten()
+        .filter(|history| history.has_complete_coverage().unwrap_or(false));
+    let durable_projects = history
+        .as_ref()
+        .and_then(|history| history.session_project_rows().ok());
+    let mut detected_projects: HashMap<String, Option<String>> = durable_projects
+        .as_ref()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| (row.session_key.clone(), row.project_key.clone()))
+                .collect()
         })
-        .map(|entry| entry.key().clone())
-        .collect();
-    match state.full_sessions(&ids) {
-        Ok(sessions) => Some(
-            sessions
-                .iter()
-                .map(|session| session.range_totals(Some(since), None).tokens.total_tokens as f64)
-                .sum(),
-        ),
-        Err(error) => {
-            tracing::warn!(
-                "could not compute token budget current value for {:?}: {}",
-                budget.provider,
-                error
-            );
-            None
+        .unwrap_or_default();
+    if needs_ledger {
+        for entry in &state.sessions {
+            detected_projects.insert(entry.key().clone(), entry.summary.project_key.clone());
         }
     }
+    let project_scope = history.as_ref().and_then(|history| {
+        Some(ProjectBudgetScope {
+            sessions: history.list_session_project_overrides().ok()?,
+            projects: history
+                .list_project_overrides()
+                .ok()?
+                .into_iter()
+                .map(|row| (row.project_key.clone(), row))
+                .collect(),
+        })
+    });
+    let rates = needs_ledger.then(get_rates);
+    // ponytail: at most 64 budgets, one bounded range per budget; batch shared
+    // periods if profiling shows this dominates refresh time.
+    let mut statuses: Vec<_> = budgets
+        .iter()
+        .map(|budget| {
+            let value = (|| -> Result<f64, &'static str> {
+                if !budget.enabled {
+                    return Err("disabled");
+                }
+                if budget.unit == BudgetUnit::PercentOfWindow {
+                    let window = snapshots
+                        .iter()
+                        .find(|snapshot| snapshot.provider == budget.provider)
+                        .and_then(|snapshot| {
+                            snapshot.windows.iter().find(|window| {
+                                budget.window_kind.as_deref() == Some(window.kind.as_str())
+                                    && window.unit == crate::quota::QuotaUnit::Percent
+                            })
+                        })
+                        .ok_or("quota_unavailable")?;
+                    if window.stale {
+                        return Err("stale_quota");
+                    }
+                    if window.unavailable.is_some() {
+                        return Err("quota_unavailable");
+                    }
+                    return window.used.ok_or("quota_unavailable");
+                }
+                if durable_projects.is_none() {
+                    return Err("history_unavailable");
+                }
+                let scope = project_scope.as_ref().ok_or("project_scope_unavailable")?;
+                if let Some(project) = &budget.project_key {
+                    let canonical = crate::history_store::resolve_canonical_project_key(
+                        &scope.projects,
+                        project,
+                    );
+                    let exists = scope.projects.keys().any(|key| {
+                        crate::history_store::resolve_canonical_project_key(&scope.projects, key)
+                            == canonical
+                    }) || detected_projects.iter().any(|(key, detected)| {
+                        scope
+                            .sessions
+                            .get(key)
+                            .or(detected.as_ref())
+                            .is_some_and(|effective| {
+                                crate::history_store::resolve_canonical_project_key(
+                                    &scope.projects,
+                                    effective,
+                                ) == canonical
+                            })
+                    });
+                    if !exists {
+                        return Err("project_unavailable");
+                    }
+                }
+                let keys: Vec<String> = detected_projects
+                    .iter()
+                    .filter(|(key, detected)| {
+                        let in_provider = state
+                            .sessions
+                            .get(*key)
+                            .map(|entry| entry.summary.harness == budget.provider)
+                            .unwrap_or_else(|| {
+                                key.split(':').next() == Some(budget.provider.as_str())
+                            });
+                        in_provider
+                            && budget.project_key.as_deref().is_none_or(|project| {
+                                if let Some(entry) = state.sessions.get(*key) {
+                                    scope.includes(&entry.summary, project)
+                                } else {
+                                    scope.sessions.get(*key).or(detected.as_ref()).is_some_and(
+                                    |effective| {
+                                        crate::history_store::resolve_canonical_project_key(
+                                            &scope.projects,
+                                            effective,
+                                        ) == crate::history_store::resolve_canonical_project_key(
+                                            &scope.projects,
+                                            project,
+                                        )
+                                    },
+                                )
+                                }
+                            })
+                    })
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                let rates = rates.as_ref().ok_or("pricing_incomplete")?;
+                let since = now
+                    .checked_sub_signed(chrono::Duration::hours(
+                        budget.period_hours.unwrap_or(24) as i64
+                    ))
+                    .ok_or("invalid_period")?;
+                let (mut ranges, _) =
+                    range_totals_for_sessions(state, keys, &[(Some(since), Some(now))], rates, now)
+                        .map_err(|_| "history_unavailable")?;
+                let values = ranges.pop().ok_or("history_unavailable")?;
+                if budget.unit == BudgetUnit::Tokens {
+                    return Ok(values
+                        .values()
+                        .map(|range| range.tokens.total_tokens as f64)
+                        .sum());
+                }
+                budget_usd_total(&values, &budget.provider, rates)
+            })();
+            crate::quota::QuotaBudgetStatus {
+                budget_id: budget.id.clone(),
+                current_value: value.as_ref().ok().copied(),
+                unavailable: value.err(),
+            }
+        })
+        .collect();
+    finalize_quota_budget_statuses(state, history.as_ref(), budgets, &mut statuses);
+    statuses
+}
+
+/// Queries use separate ledger readers. A purge or replacement between them
+/// must not publish a partial batch or consume ledger notification state.
+pub(crate) fn finalize_quota_budget_statuses(
+    state: &AppState,
+    approved_history: Option<&Arc<crate::history_store::HistoryStore>>,
+    budgets: &[crate::quota_store::QuotaBudget],
+    statuses: &mut [crate::quota::QuotaBudgetStatus],
+) {
+    use crate::quota_store::BudgetUnit;
+    if !budgets
+        .iter()
+        .any(|budget| budget.enabled && budget.unit != BudgetUnit::PercentOfWindow)
+    {
+        return;
+    }
+    let current = state.history_ready();
+    let unchanged_and_complete =
+        approved_history
+            .zip(current.as_ref())
+            .is_some_and(|(approved, current)| {
+                Arc::ptr_eq(approved, current) && current.has_complete_coverage().unwrap_or(false)
+            });
+    if !unchanged_and_complete {
+        for (budget, status) in budgets.iter().zip(statuses) {
+            if budget.enabled && budget.unit != BudgetUnit::PercentOfWindow {
+                status.current_value = None;
+                status.unavailable = Some("history_unavailable");
+            }
+        }
+    }
+}
+
+fn budget_usd_total(
+    ranges: &HashMap<String, RangeTotals>,
+    provider: &crate::provider::ProviderId,
+    rates: &RateCard,
+) -> Result<f64, &'static str> {
+    let is_codex = provider.as_str() == "codex";
+    if !is_codex
+        && rates
+            .currencies
+            .get(provider.as_str())
+            .unwrap_or(&rates.currency)
+            != "USD"
+    {
+        return Err("non_usd_rates");
+    }
+    ranges.values().try_fold(0.0, |total, range| {
+        let priced_tokens = range.buckets.iter().fold(0_u64, |sum, bucket| {
+            sum.saturating_add(bucket.tokens.total_tokens)
+        });
+        if priced_tokens != range.tokens.total_tokens {
+            return Err("pricing_incomplete");
+        }
+        let pricing = range.pricing.as_ref().ok_or("pricing_incomplete")?;
+        let surface = if is_codex {
+            &pricing
+                .current
+                .as_ref()
+                .ok_or("pricing_incomplete")?
+                .api_estimate
+        } else {
+            &pricing.plan
+        };
+        if !surface.missing_models.is_empty()
+            || !surface.unpriced_models.is_empty()
+            || !surface.total.is_finite()
+        {
+            return Err("pricing_incomplete");
+        }
+        let sum = total + surface.total;
+        if sum.is_finite() {
+            Ok(sum)
+        } else {
+            Err("pricing_incomplete")
+        }
+    })
+}
+
+/// Evaluates current values and edge-triggered notifications together so
+/// the editor does not issue a second set of range/pricing reads.
+#[tauri::command]
+pub async fn check_quota_budgets(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::quota::QuotaBudgetCheck, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || check_quota_budgets_impl(&state))
+        .await
+        .map_err(|_| "budget evaluation failed".to_string())
 }
 
 /// Recomputes quota snapshots against configured soft budgets and returns
@@ -4519,6 +4783,12 @@ pub fn check_quota_alerts(state: State<'_, Arc<AppState>>) -> Vec<crate::quota::
 /// `check_quota_alerts_with_a_configured_budget_reads_the_points_index_not_the_corpus`
 /// there calls this function directly.
 pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::QuotaAlert> {
+    check_quota_budgets_impl(state).alerts
+}
+
+pub(crate) fn check_quota_budgets_impl(state: &AppState) -> crate::quota::QuotaBudgetCheck {
+    // Serialize crossing evaluation so concurrent dashboard/tray requests cannot double-notify.
+    let _evaluation = state.quota_evaluation.lock().unwrap();
     let started = Instant::now();
     let store = state.quota_store();
     if store.budgets.is_empty() {
@@ -4535,80 +4805,41 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
                 ("alerts".into(), "0".to_string()),
             ]),
         );
-        return Vec::new();
+        return crate::quota::QuotaBudgetCheck {
+            as_of: Utc::now(),
+            statuses: Vec::new(),
+            alerts: Vec::new(),
+        };
     }
     let now = Utc::now();
     let max_cache_age = chrono::Duration::seconds(store.max_cache_age_secs);
-    let snapshots = state.quota_snapshots(max_cache_age, now);
-    let snapshot_by_provider: HashMap<&str, &crate::quota::QuotaSnapshot> = snapshots
-        .iter()
-        .map(|snapshot| (snapshot.provider.as_str(), snapshot))
-        .collect();
-
-    // A readable replacement may contain only part of historical usage. Check
-    // once per batch; provider-reported quota windows remain independent.
-    let token_history_complete = store
-        .budgets
-        .iter()
-        .any(|budget| budget.unit == crate::quota_store::BudgetUnit::Tokens)
-        && state
-            .history_ready()
-            .is_some_and(|history| matches!(history.has_complete_coverage(), Ok(true)));
-
-    // One durable assignment read per batch, shared by every project budget.
-    let project_scope = if store.budgets.iter().any(|budget| {
-        budget.project_key.is_some() && budget.unit == crate::quota_store::BudgetUnit::Tokens
-    }) {
-        state.history_ready().and_then(|history| {
-            let sessions = history.list_session_project_overrides().ok()?;
-            let projects = history.list_project_overrides().ok()?;
-            Some(ProjectBudgetScope {
-                sessions,
-                projects: projects
-                    .into_iter()
-                    .map(|row| (row.project_key.clone(), row))
-                    .collect(),
-            })
-        })
-    } else {
-        None
-    };
-
+    let statuses = quota_budget_statuses(state, &store.budgets, now, max_cache_age);
     let evaluations: Vec<crate::quota::BudgetEvaluation> = store
         .budgets
         .iter()
-        .map(|budget| {
-            let current_value = match budget.unit {
-                crate::quota_store::BudgetUnit::PercentOfWindow => snapshot_by_provider
-                    .get(budget.provider.as_str())
-                    .and_then(|snapshot| {
-                        snapshot.windows.iter().find(|window| {
-                            window.unavailable.is_none()
-                                && budget.window_kind.as_deref() == Some(window.kind.as_str())
-                        })
-                    })
-                    .and_then(|window| window.used),
-                crate::quota_store::BudgetUnit::Tokens => token_history_complete
-                    .then(|| token_budget_current_value(state, budget, now, project_scope.as_ref()))
-                    .flatten(),
-            };
-            crate::quota::BudgetEvaluation {
-                budget,
-                current_value,
-            }
+        .zip(&statuses)
+        .map(|(budget, status)| crate::quota::BudgetEvaluation {
+            budget,
+            current_value: status.current_value,
         })
         .collect();
 
     let local_hour = Local::now().hour() as u8;
-    let (alerts, updated_log) = crate::quota::evaluate_alerts(
+    let (mut alerts, updated_log) = crate::quota::evaluate_alerts(
         &evaluations,
         &store.notifications,
         &store.notification_log,
         now,
         local_hour,
     );
-    if let Err(error) = state.persist_quota_notification_log(updated_log, now) {
-        tracing::warn!("could not persist quota notification log: {}", error);
+    if state
+        .persist_quota_notification_log(updated_log, now, &store.config_revision())
+        .is_err()
+    {
+        alerts.clear();
+        tracing::warn!(
+            "quota notifications suppressed because their deduplication state could not be saved"
+        );
     }
     state.performance.record_backend(
         "ipc.check_quota_alerts",
@@ -4619,5 +4850,59 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
             ("alerts".into(), alerts.len().to_string()),
         ]),
     );
-    alerts
+    crate::quota::QuotaBudgetCheck {
+        as_of: now,
+        statuses,
+        alerts,
+    }
+}
+
+/// Read-only status never triggers credential use or network access.
+#[tauri::command]
+pub fn get_live_quota_status(
+    state: State<'_, Arc<AppState>>,
+) -> crate::quota_accounts::LiveQuotaStatus {
+    state.live_quota.status(Utc::now())
+}
+
+/// Called only by the explicit consent-to-identify action in the account editor.
+#[tauri::command]
+pub async fn identify_quota_account(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::quota_live::DiscoveredQuotaAccount, String> {
+    let service = state.live_quota.clone();
+    tauri::async_runtime::spawn_blocking(move || service.identify().map_err(str::to_owned))
+        .await
+        .map_err(|_| "Account identification failed.".to_string())?
+}
+
+#[tauri::command]
+pub fn approve_quota_account(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    account_id: String,
+    label: String,
+) -> Result<(), String> {
+    let result = state
+        .live_quota
+        .approve(&account_id, &label)
+        .map_err(str::to_owned);
+    let _ = app.emit("live-quota-updated", ());
+    result
+}
+
+#[tauri::command]
+pub fn change_quota_account(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    account_id: String,
+    enabled: bool,
+    revoke: bool,
+) -> Result<(), String> {
+    let result = state
+        .live_quota
+        .change(&account_id, enabled, revoke)
+        .map_err(str::to_owned);
+    let _ = app.emit("live-quota-updated", ());
+    result
 }

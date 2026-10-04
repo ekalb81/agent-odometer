@@ -1274,20 +1274,20 @@ export interface QuotaSnapshot {
   unavailable: QuotaUnavailableReason | null;
 }
 
-export type BudgetUnit = 'percent_of_window' | 'tokens';
+export type BudgetUnit = 'percent_of_window' | 'tokens' | 'usd';
 
 export interface QuotaBudget {
   id: string;
   provider: Harness;
-  /** `null` = provider-wide; only valid combined with `unit: 'tokens'`. */
+  /** `null` = provider-wide; valid with token and USD estimates. */
   project_key: string | null;
   unit: BudgetUnit;
   /** Matches `QuotaWindowKind` ("burst"/"daily"/"weekly"/"monthly").
    *  Required for `percent_of_window`; ignored for `tokens`. */
   window_kind: string | null;
-  /** Rolling period for a `tokens` budget; ignored for `percent_of_window`. */
+  /** Rolling period for token/USD budgets; ignored for `percent_of_window`. */
   period_hours: number | null;
-  /** Percent-used (0-100) for `percent_of_window`, or a raw token count for `tokens`. */
+  /** Percent-used (0-100), raw token count, or USD API estimate threshold. */
   threshold: number;
   enabled: boolean;
 }
@@ -1302,9 +1302,25 @@ export interface NotificationSettings {
 /** get_quota_config / set_quota_config payload. Never includes the backend's
  *  internal notification dedup log. */
 export interface QuotaConfigWire {
+  /** Optimistic edit revision. Preserve it on writes to reject stale edits. */
+  revision?: string | null;
   budgets: QuotaBudget[];
   notifications: NotificationSettings;
   max_cache_age_secs: number;
+}
+
+export interface QuotaBudgetStatus {
+  budget_id: string;
+  /** Null when no trustworthy current value is available. */
+  current_value: number | null;
+  /** Fixed backend reason code; never a provider body or local path. */
+  unavailable: string | null;
+}
+
+export interface QuotaBudgetCheck {
+  as_of: string;
+  statuses: QuotaBudgetStatus[];
+  alerts: QuotaAlert[];
 }
 
 export interface QuotaAlert {
