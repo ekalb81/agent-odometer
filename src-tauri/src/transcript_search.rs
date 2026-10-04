@@ -65,6 +65,8 @@ pub enum SearchPosition {
         session_identity: String,
         snapshot_revision: String,
         next_turn: usize,
+        #[serde(default)]
+        incomplete: bool,
     },
 }
 
@@ -232,6 +234,7 @@ fn retained_position(
                 session_identity: info.identity,
                 snapshot_revision: info.revision,
                 next_turn: 0,
+                incomplete: false,
             })
         }
         Ok(info) => {
@@ -250,6 +253,68 @@ fn retained_position(
             None
         }
     }
+}
+
+pub(crate) fn retained_page(
+    session_id: &str,
+    earlier_incomplete: bool,
+    messages: crate::history_store::RetainedSearchMessages,
+    matcher: &Regex,
+) -> (SearchPage, Option<SearchPosition>) {
+    let scanned_messages = messages.messages.len();
+    let incomplete =
+        earlier_incomplete || messages.messages.iter().any(|message| message.truncated);
+    let hits = messages
+        .messages
+        .into_iter()
+        .filter_map(|message| {
+            let mut snippet = snippet(&message.text, matcher)?;
+            snippet.truncated_after |= message.truncated;
+            Some(SearchHit {
+                target: SearchTarget::RetainedTurn {
+                    session_id: session_id.into(),
+                    session_identity: messages.info.identity.clone(),
+                    snapshot_revision: messages.info.revision.clone(),
+                    turn_id: message.turn_id,
+                    field: message.field,
+                },
+                content_kind: match message.field {
+                    RetainedMessageField::UserMessage => "user_message",
+                    RetainedMessageField::LastAgentMessage => "last_agent_message",
+                }
+                .into(),
+                snippet,
+            })
+        })
+        .collect();
+    let position = messages
+        .next_turn
+        .map(|next_turn| SearchPosition::Retained {
+            session_identity: messages.info.identity,
+            snapshot_revision: messages.info.revision,
+            next_turn,
+            incomplete,
+        });
+    let mut issues = vec![
+        "retained_prompt_and_final_reply_only".into(),
+        "retained_matches_may_overlap_source".into(),
+    ];
+    if incomplete {
+        issues.push("retained_fields_truncated".into());
+    }
+    (
+        SearchPage {
+            phase: SearchPhase::Retained,
+            hits,
+            next_cursor: None,
+            issues,
+            source_complete: false,
+            retained_complete: position.is_none() && !incomplete,
+            scanned_records: 0,
+            scanned_messages,
+        },
+        position,
+    )
 }
 
 /// One call examines one bounded source page or 25 retained turns. All bodies
@@ -275,6 +340,7 @@ pub fn search_for_session(state: &AppState, request: SearchRequest) -> Result<Se
         session_identity,
         snapshot_revision,
         next_turn,
+        incomplete,
     }) = cursor
     {
         if !request.scope.conversation
@@ -294,50 +360,9 @@ pub fn search_for_session(state: &AppState, request: SearchRequest) -> Result<Se
                 next_turn,
             )
             .map_err(|_| "retained_target_unavailable".to_string())?;
-        let scanned_messages = messages.messages.len();
-        let hits = messages
-            .messages
-            .into_iter()
-            .filter_map(|message| {
-                let mut snippet = snippet(&message.text, &matcher)?;
-                snippet.truncated_after |= message.truncated;
-                Some(SearchHit {
-                    target: SearchTarget::RetainedTurn {
-                        session_id: request.session_id.clone(),
-                        session_identity: messages.info.identity.clone(),
-                        snapshot_revision: messages.info.revision.clone(),
-                        turn_id: message.turn_id,
-                        field: message.field,
-                    },
-                    content_kind: match message.field {
-                        RetainedMessageField::UserMessage => "user_message",
-                        RetainedMessageField::LastAgentMessage => "last_agent_message",
-                    }
-                    .into(),
-                    snippet,
-                })
-            })
-            .collect();
-        position = messages
-            .next_turn
-            .map(|next_turn| SearchPosition::Retained {
-                session_identity,
-                snapshot_revision,
-                next_turn,
-            });
-        SearchPage {
-            phase: SearchPhase::Retained,
-            hits,
-            next_cursor: None,
-            issues: vec![
-                "retained_prompt_and_final_reply_only".into(),
-                "retained_matches_may_overlap_source".into(),
-            ],
-            source_complete: false,
-            retained_complete: position.is_none(),
-            scanned_records: 0,
-            scanned_messages,
-        }
+        let (page, next) = retained_page(&request.session_id, incomplete, messages, &matcher);
+        position = next;
+        page
     } else {
         let (cursor, earlier_incomplete) = match cursor {
             Some(SearchPosition::Source { cursor, incomplete }) => (Some(cursor), incomplete),

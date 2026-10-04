@@ -1377,7 +1377,7 @@ export type TranscriptSearchTarget =
   | { kind: 'retained_turn'; session_id: string; session_identity: string; snapshot_revision: string; turn_id: string; field: 'user_message' | 'last_agent_message' };
 export type TranscriptSearchPosition =
   | { phase: 'source'; cursor: TranscriptCursor; incomplete: boolean }
-  | { phase: 'retained'; session_identity: string; snapshot_revision: string; next_turn: number };
+  | { phase: 'retained'; session_identity: string; snapshot_revision: string; next_turn: number; incomplete: boolean };
 export interface TranscriptSearchCursor {
   session_id: string;
   query: string;

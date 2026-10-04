@@ -369,4 +369,46 @@ mod tests {
             )
             .is_err());
     }
+
+    #[test]
+    fn truncated_retained_fields_keep_final_page_coverage_incomplete() {
+        let (_root, history, key) = fixture();
+        let matcher = regex::Regex::new("suffix-only").unwrap();
+        // A suffix stored beyond the preview limit is not searched or silently
+        // presented as a complete absence, including after page continuation.
+        history.connection().unwrap().execute("UPDATE session_snapshots SET session_json=json_set(CAST(session_json AS TEXT),'$.turns[0].user_message',?1) WHERE session_key=?2",params![format!("{}suffix-only","x".repeat(500)),key]).unwrap();
+        let first = history
+            .retained_search_messages(&key, None, None, 0)
+            .unwrap();
+        let (page, next) = crate::transcript_search::retained_page(&key, false, first, &matcher);
+        assert!(page.hits.is_empty());
+        assert!(!page.retained_complete);
+        let Some(crate::transcript_search::SearchPosition::Retained {
+            session_identity,
+            snapshot_revision,
+            next_turn,
+            incomplete,
+        }) = next
+        else {
+            panic!("expected continuation");
+        };
+        assert!(incomplete);
+        let last = history
+            .retained_search_messages(
+                &key,
+                Some(&session_identity),
+                Some(&snapshot_revision),
+                next_turn,
+            )
+            .unwrap();
+        let (page, next) =
+            crate::transcript_search::retained_page(&key, incomplete, last, &matcher);
+        assert!(next.is_none());
+        assert!(page.hits.is_empty());
+        assert!(!page.retained_complete);
+        assert!(page
+            .issues
+            .iter()
+            .any(|issue| issue == "retained_fields_truncated"));
+    }
 }
