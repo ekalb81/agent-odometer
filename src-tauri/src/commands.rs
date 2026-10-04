@@ -3212,6 +3212,7 @@ mod tests {
         use crate::query::{CurrentPricing, PricedSurface, RangePricing};
         let amount = |total| PricedSurface {
             total,
+            converted: None,
             by_model: vec![],
             missing_models: vec![],
             unpriced_models: vec![],
