@@ -522,7 +522,9 @@ pub(crate) fn price_buckets_detailed_controlled(
         let is_unpriced = rates.unpriced_models.contains(&bucket.model);
         let resolution = rates.resolve_model_pricing(&bucket.model, harness, rate_table, now);
 
-        if is_unpriced && resolution.basis == PricingBasis::Unavailable {
+        if resolution.basis == PricingBasis::Unavailable
+            && (is_unpriced || rate_table.contains_key(&resolution.resolved_model))
+        {
             unpriced.insert(bucket.model.clone());
             by_model
                 .entry(bucket.model.clone())

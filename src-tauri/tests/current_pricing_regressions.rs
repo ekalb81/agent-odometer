@@ -153,11 +153,14 @@ fn gemini_rollover_uses_event_dates_but_expired_flat_reference_is_unavailable() 
     let expired =
         price_buckets_detailed(&rates, "gemini_cli", &[bucket], RateTable::Plan, after).unwrap();
     assert_eq!(expired.total, 0.0);
-    assert!(expired.by_model.is_empty());
-    assert_eq!(expired.missing_models, ["gemini-3.8-flash"]);
+    assert!(expired.by_model[0].unpriced);
+    assert!(expired.missing_models.is_empty());
+    assert_eq!(expired.unpriced_models, ["gemini-3.8-flash"]);
     let details = price_session_details(session, &rates, after);
     assert_eq!(details.pricing.plan.total, 0.0);
-    assert_eq!(details.pricing.plan.missing_models, ["gemini-3.8-flash"]);
+    assert_eq!(details.pricing.plan.unpriced_models, ["gemini-3.8-flash"]);
+    assert_eq!(details.session.tokens_history.len(), 2);
+    assert_eq!(details.session.tokens_history[1].delta, tokens(false));
     assert!(
         details
             .pricing
@@ -184,6 +187,101 @@ fn gemini_rollover_uses_event_dates_but_expired_flat_reference_is_unavailable() 
         .amount,
         None
     );
+    // A deliberate custom reference is usable, but has no bundled verification.
+    rates.models.get_mut("gemini-3.8-flash").unwrap().input = 1.5;
+    rates
+        .models
+        .get_mut("gemini-3.8-flash")
+        .unwrap()
+        .cached_input = 0.15;
+    rates.models.get_mut("gemini-3.8-flash").unwrap().output = 7.5;
+    rates.models.get_mut("gemini-3.8-flash").unwrap().reasoning = 7.5;
+    rates.flat_rate_expires_at.remove("gemini-3.8-flash");
+    rates.rate_provenance.remove("models/gemini-3.8-flash");
+    rates.upgrade_review.push("models/gemini-3.8-flash".into());
+    let revised: RateCard = serde_json::from_value(serde_json::to_value(rates).unwrap()).unwrap();
+    assert!(
+        (price_tokens(
+            &revised,
+            "gemini_cli",
+            "gemini-3.8-flash",
+            None,
+            &tokens(false),
+            RateTable::Plan,
+            after
+        )
+        .amount
+        .unwrap()
+            - 4.98)
+            .abs()
+            < 1e-10
+    );
+    assert!(!revised
+        .rate_provenance
+        .contains_key("models/gemini-3.8-flash"));
+}
+
+#[test]
+fn aliases_and_fallbacks_cannot_charge_an_excluded_historical_row() {
+    let mut rates = RateCard::load_bundled().unwrap();
+    rates
+        .model_aliases
+        .insert("user-review".into(), "codex-auto-review".into());
+    rates.floating_model_aliases.insert(
+        "floating-review".into(),
+        odometer_lib::rates::FloatingAlias {
+            target: "codex-auto-review".into(),
+            expires_at: instant("2027-01-01T00:00:00Z").date_naive(),
+            source_url: "https://example.test/synthetic".into(),
+        },
+    );
+    rates
+        .fallback_models
+        .insert("codex".into(), "codex-auto-review".into());
+    let now = instant("2026-10-04T00:00:00Z");
+    for model in ["user-review", "floating-review", "unknown-synthetic"] {
+        assert_eq!(
+            price_tokens(
+                &rates,
+                "codex",
+                model,
+                None,
+                &tokens(false),
+                RateTable::Plan,
+                now
+            )
+            .amount,
+            None
+        );
+        let bucket = TierBucket {
+            model: model.into(),
+            service_tier: None,
+            tokens: tokens(false),
+        };
+        let totals =
+            price_buckets_detailed(&rates, "codex", &[bucket], RateTable::Plan, now).unwrap();
+        assert_eq!(totals.unpriced_models, [model]);
+        assert_eq!(totals.by_model[0].basis, PricingBasis::Unavailable);
+        let source: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/conformance/detail-pricing-cases.json"
+        ))
+        .unwrap();
+        let mut session: Session = serde_json::from_value(source["base_session"].clone()).unwrap();
+        session.model = Some(model.into());
+        session.tokens_total = tokens(false);
+        session.tokens_by_model = std::collections::HashMap::from([(model.into(), tokens(false))]);
+        session.tokens_history.clear();
+        session.turns = vec![odometer_lib::model::TurnInfo {
+            turn_id: "excluded".into(),
+            model: session.model.clone(),
+            tokens: tokens(false),
+            ..Default::default()
+        }];
+        let details = price_session_details(session, &rates, now);
+        assert_eq!(details.pricing.plan.unpriced_models, [model]);
+        assert!(details.pricing.turn_prices["excluded"].plan.unpriced);
+        assert_eq!(details.session.tokens_total, tokens(false));
+    }
 }
 
 #[test]

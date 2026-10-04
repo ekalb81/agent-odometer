@@ -1701,7 +1701,7 @@
         <div>
           <div class="text-[11px] text-ink-muted font-medium">{spendCardLabel}</div>
           <div class="text-[30px] font-bold tracking-[-0.03em] font-mono mt-0.5 {showApiCost ? 'text-accent-cost' : 'text-ink'}">
-            {harness === 'all' && !allUsdAvailable ? 'Unavailable' : fmtMoney(windowTotals.cost)}
+            {(harness === 'all' && !allUsdAvailable) || costIsUnmeasured(windowTotals.unpricedModels, windowTotals.cost) ? 'Unavailable' : fmtMoney(windowTotals.cost)}
           </div>
         </div>
         {#if costDelta !== null}

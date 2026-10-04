@@ -796,6 +796,7 @@
     }
     // User edits do not inherit the bundled row's verification evidence.
     const evidence = { ...rateProvenance };
+    const expiries = { ...flatRateExpiresAt };
     const review = new Set(upgradeReview);
     for (const [model, rate] of Object.entries(models)) {
       const previous = $rates?.models[model];
@@ -803,6 +804,8 @@
         || (rate.cache_creation_input ?? null) !== (previous.cache_creation_input ?? null)
         || rate.output !== previous.output || rate.reasoning !== previous.reasoning) {
         delete evidence[`models/${model}`];
+        // A deliberate custom reference supersedes that row's promo expiry.
+        delete expiries[model];
         review.add(`models/${model}`);
       }
     }
@@ -824,7 +827,7 @@
       floating_model_aliases: ratesFloatingAliases,
       rate_provenance: evidence,
       upgrade_review: [...review].sort(),
-      flat_rate_expires_at: flatRateExpiresAt,
+      flat_rate_expires_at: expiries,
       free_local_models: ratesFreeLocalModels,
       subscription_plans: ratesSubscriptionPlans,
       display_currency: ratesDisplayCurrency,

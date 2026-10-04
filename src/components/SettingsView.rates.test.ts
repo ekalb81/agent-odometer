@@ -44,7 +44,7 @@ it('preserves alias expiry and review metadata on save, removes edited-row evide
   const saved = mocks.setRates.mock.calls[0][0] as RateCard;
   expect(saved.models['synthetic-model'].input).toBe(7);
   expect(saved.floating_model_aliases).toEqual(card.floating_model_aliases);
-  expect(saved.flat_rate_expires_at).toEqual(card.flat_rate_expires_at);
+  expect(saved.flat_rate_expires_at).toEqual({});
   expect(saved.rate_provenance).toEqual({});
   expect(saved.upgrade_review).toContain('models/synthetic-model');
   const confirm = vi.fn().mockReturnValue(false);

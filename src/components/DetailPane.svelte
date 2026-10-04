@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { PricingBasis, Session } from '../lib/types';
+  import type { PricedSurface, PricingBasis, Session } from '../lib/types';
+  import { costIsUnmeasured } from '../lib/sessionProjection';
   import { rates } from '../lib/stores/rates';
   import { formatCredits, harnessCurrency } from '../lib/currency';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
@@ -162,11 +163,16 @@
 
   // The headline money figure: Codex shows the API-rate estimate, Claude the
   // Anthropic-rate cost.
+  function surfaceMoney(surface: PricedSurface, api = false): string {
+    if (costIsUnmeasured(surface.unpriced_models, surface.total)) return 'Unavailable';
+    const amount = api ? formatCredits(surface.total, 'USD') : fmtCredit(surface.total);
+    return amount + (surface.unpriced_models.length > 0 ? ' · excludes unpriced' : '');
+  }
   const heroCost = $derived(
     session?.harness === 'codex'
-      ? (sessionApiCost ? { label: 'Est. API', text: formatCredits(sessionApiCost.total, 'USD') } :
-         sessionCredits ? { label: 'Credits', text: fmtCredit(sessionCredits.total) } : null)
-      : (sessionCredits ? { label: 'Cost', text: fmtCredit(sessionCredits.total) } : null),
+      ? (sessionApiCost ? { label: 'Est. API', text: surfaceMoney(sessionApiCost, true) } :
+         sessionCredits ? { label: 'Credits', text: surfaceMoney(sessionCredits) } : null)
+      : (sessionCredits ? { label: 'Cost', text: surfaceMoney(sessionCredits) } : null),
   );
 
   // Per-turn costs, priced from the same table as the headline figure —
@@ -434,7 +440,7 @@
                     </span>
                     <span class="flex items-center gap-1.5 shrink-0">
                       {#if credit}
-                        <span class="font-mono text-pos">{fmtMoney(credit.cost)}</span>
+                        <span class="font-mono text-pos">{credit.unpriced && credit.cost === 0 ? 'Unavailable' : fmtMoney(credit.cost)}</span>
                         {#if credit.unpriced && turn.tokens.total_tokens > 0}
                           <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
                         {:else if credit.basis === 'aliased' && turn.tokens.total_tokens > 0}
@@ -557,19 +563,19 @@
                     <td class="py-1 px-1 text-right font-mono text-ink-muted">{fmt(t.cached_input_tokens)}</td>
                     <td class="py-1 px-1 text-right font-mono text-ink-2">{fmt(t.output_tokens)}</td>
                     <td class="py-1 pl-1 text-right font-mono text-ink">{fmt(t.total_tokens)}</td>
-                    <td class="py-1 pl-1 text-right font-mono text-ink-2">{modelCredit ? fmtCredit(modelCredit.cost) : '—'}</td>
+                    <td class="py-1 pl-1 text-right font-mono text-ink-2">{modelCredit ? (modelCredit.unpriced ? 'Unavailable' : fmtCredit(modelCredit.cost)) : '—'}</td>
                   </tr>
                 {/each}
               </tbody>
             </table>
             {#if session.credits_unlimited === true && sessionCredits}
               <p class="mt-1.5 text-[11px] text-ink-faint">
-                Reference: {fmtCredit(sessionCredits.total)} à-la-carte equivalent
+                Reference: {surfaceMoney(sessionCredits)} à-la-carte equivalent
               </p>
             {/if}
             {#if flatApiReference}
               <p class="mt-1.5 text-[11px] text-ink-faint">
-                Flat {session.harness === 'codex' ? 'OpenAI' : 'Anthropic'} API reference: <span class="text-accent-cost">{formatCredits(flatApiReference.total, 'USD')}</span>
+                Flat {session.harness === 'codex' ? 'OpenAI' : session.harness === 'gemini_cli' ? 'Gemini' : 'Anthropic'} API reference: <span class="text-accent-cost">{surfaceMoney(flatApiReference, true)}</span>
                 at the legacy rate table{#if session.harness === 'codex' && session.plan_type}&nbsp;— informational on the {session.plan_type} plan{/if}
               </p>
               {#if flatApiReference.unpriced_models.length > 0}
@@ -580,7 +586,7 @@
             {/if}
             {#if timeAwareApiScenario}
               <p class="mt-1.5 text-[11px] text-ink-faint">
-                Time-aware API scenario: <span class="text-accent-cost">{formatCredits(timeAwareApiScenario.total, 'USD')}</span>
+                Time-aware API scenario: <span class="text-accent-cost">{surfaceMoney(timeAwareApiScenario, true)}</span>
                 — not a claim about Codex or ChatGPT subscription billing.
               </p>
               {#if timeAwarePricingRules.length > 0}

@@ -54,6 +54,22 @@ beforeEach(() => { rates.set({
 afterEach(() => { cleanup(); rates.set(null); });
 
 describe('DetailPane server pricing', () => {
+  it('renders expired-only usage as unavailable and mixed prices as partial, retaining raw tokens', () => {
+    const value = session();
+    value.harness = 'gemini_cli';
+    value.tokens_total = { ...zeroTotals(), input_tokens: 100, total_tokens: 100 };
+    value.pricing!.plan = { ...surface(0), unpriced_models: ['expired-promo'] };
+    value.pricing!.turn_prices.one.plan = { cost: 0, unpriced: true, basis: 'unavailable', fallback_used: false };
+    const rendered = render(DetailPane, { session: value, onclose: () => {} });
+    expect(screen.getAllByText('Unavailable').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('100').length).toBeGreaterThan(0);
+    expect(screen.queryByText('$0.00')).not.toBeInTheDocument();
+    rendered.unmount();
+    value.pricing!.plan.total = 7;
+    render(DetailPane, { session: value, onclose: () => {} });
+    expect(screen.getAllByText(/7.00.*excludes unpriced/).length).toBeGreaterThan(0);
+    expect(value.tokens_total.total_tokens).toBe(100);
+  });
   it('uses server API prices for headline and turns while retaining the plan model table and unlimited reference', () => {
     render(DetailPane, { session: session(), onclose: () => {} });
     expect(screen.getAllByText('$42.50').length).toBeGreaterThan(0);
