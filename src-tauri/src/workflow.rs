@@ -7,6 +7,25 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 pub const COMPARISON_VERSION: u32 = 1;
 pub const MINIMUM_COMPARISON_SESSIONS: u64 = 3;
 
+pub(crate) fn fits_output_budget(value: &impl Serialize, limit: usize) -> bool {
+    struct Counter {
+        remaining: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("workflow output limit"));
+            }
+            self.remaining -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Counter { remaining: limit }, value).is_ok()
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct WorkflowSnapshot {
     #[serde(default)]
@@ -118,7 +137,58 @@ pub struct WorkflowReport {
     pub before: WorkflowWindow,
     pub after: WorkflowWindow,
     pub findings: Vec<WorkflowFinding>,
+    pub setup_health: Option<WorkflowSetupHealth>,
     pub limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowProviderHealth {
+    pub provider: String,
+    pub state: crate::diagnostics::ProviderHealthState,
+    pub configured_roots: usize,
+    pub available_roots: usize,
+    pub parsed_files: u64,
+    pub parse_failures: u64,
+    pub durable_sessions: u64,
+    pub fallback_pricing_used: bool,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkflowSetupHealth {
+    pub source_configuration_valid: bool,
+    pub generated_at: DateTime<Utc>,
+    pub last_scan_at: Option<DateTime<Utc>>,
+    pub providers: Vec<WorkflowProviderHealth>,
+}
+
+impl WorkflowSetupHealth {
+    pub(crate) fn from_diagnostics(report: crate::diagnostics::DiagnosticsReport) -> Self {
+        Self {
+            source_configuration_valid: report.source_configuration_valid,
+            generated_at: report.generated_at,
+            last_scan_at: report.last_scan_at,
+            providers: report
+                .providers
+                .into_iter()
+                .map(|provider| WorkflowProviderHealth {
+                    provider: provider.id.to_string(),
+                    state: provider.state,
+                    configured_roots: provider.roots.len(),
+                    available_roots: provider.roots.iter().filter(|root| root.exists).count(),
+                    parsed_files: provider.discovery.parsed_files,
+                    parse_failures: provider.discovery.parse_failures,
+                    durable_sessions: provider.ledger.durable_sessions,
+                    fallback_pricing_used: provider.pricing.fallback_used,
+                    reasons: provider
+                        .reasons
+                        .into_iter()
+                        .map(|reason| reason.code)
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -207,7 +277,8 @@ struct RuleSignals {
 }
 
 fn in_window(timestamp: DateTime<Utc>, from: DateTime<Utc>, to: DateTime<Utc>) -> bool {
-    from <= timestamp && timestamp <= to
+    from.timestamp_millis() <= timestamp.timestamp_millis()
+        && timestamp.timestamp_millis() <= to.timestamp_millis()
 }
 
 /// Local, explicit read. Both periods use the same analyzer on existing normalized
@@ -221,6 +292,11 @@ pub fn report(
 ) -> Result<WorkflowReport> {
     if request.session_ids.len() > 10_000 {
         bail!("workflow analysis is limited to 10,000 selected sessions");
+    }
+    if request.session_ids.iter().any(|id| id.len() > 1024)
+        || request.session_ids.iter().map(String::len).sum::<usize>() > 1024 * 1024
+    {
+        bail!("workflow identity input exceeds its metadata limit");
     }
     let after_to = request.to.unwrap_or(now);
     let after_from = request.from.unwrap_or(after_to - Duration::days(7));
@@ -488,6 +564,7 @@ pub fn report(
             unavailable_sessions: after.unavailable,
         },
         findings,
+        setup_health: None,
         limitations,
     })
 }
@@ -744,6 +821,112 @@ mod tests {
             report.findings[0].comparison.state,
             FindingState::NotApplicable
         );
+    }
+
+    #[test]
+    fn finding_scope_follows_durable_reassignment_and_canonical_merge() {
+        let (_directory, store, keys, now) = measured_ledger();
+        for key in &keys {
+            store
+                .reassign_session_project(key, Some("manual:source"))
+                .unwrap();
+        }
+        store
+            .merge_project("manual:source", "manual:canonical")
+            .unwrap();
+        let query = || WorkflowRequest {
+            session_ids: keys.clone(),
+            from: None,
+            to: None,
+        };
+        let merged = report(
+            &store.workflow_reader().unwrap(),
+            &crate::rates::RateCard::default(),
+            query(),
+            &[],
+            now,
+        )
+        .unwrap();
+        assert_eq!(merged.findings.len(), 1);
+        assert_eq!(
+            merged.findings[0].project_id.as_deref(),
+            Some("manual:canonical")
+        );
+        assert_eq!(
+            merged.findings[0].id,
+            finding_identity("codex", "manual:canonical", "repeated-read")
+        );
+        let before_key = merged.findings[0].evidence[0].session_id.clone();
+        store
+            .reassign_session_project(&before_key, Some("manual:split"))
+            .unwrap();
+        let split = report(
+            &store.workflow_reader().unwrap(),
+            &crate::rates::RateCard::default(),
+            query(),
+            &[],
+            now,
+        )
+        .unwrap();
+        assert_eq!(split.findings.len(), 2);
+        let moved = split
+            .findings
+            .iter()
+            .find(|finding| finding.project_id.as_deref() == Some("manual:split"))
+            .unwrap();
+        assert!(moved
+            .evidence
+            .iter()
+            .all(|evidence| evidence.session_id == before_key));
+        assert_eq!(moved.comparison.state, FindingState::NotApplicable);
+        assert!(split
+            .findings
+            .iter()
+            .all(|finding| finding.project_id.as_deref() != Some("manual:source")));
+    }
+
+    #[test]
+    fn serialized_output_budget_counts_json_escaping_without_allocating_output() {
+        let value = "\n\"\\😀".repeat(10);
+        let actual = serde_json::to_vec(&value).unwrap().len();
+        assert!(fits_output_budget(&value, actual));
+        assert!(!fits_output_budget(&value, actual - 1));
+    }
+
+    #[test]
+    fn unicode_text_snapshot_is_limited_by_bytes_and_does_not_hide_ledger_usage() {
+        let (directory, store, keys, now) = measured_ledger();
+        let key = keys.iter().find(|key| key.ends_with("workflow-8")).unwrap();
+        let connection =
+            rusqlite::Connection::open(directory.path().join("history.sqlite3")).unwrap();
+        let multibyte = "😀".repeat(4 * 1024 * 1024);
+        connection.execute("UPDATE session_snapshots SET session_json = CAST(json_set(CAST(session_json AS TEXT),'$.first_user_message',?2) AS TEXT) WHERE session_key=?1", rusqlite::params![key, multibyte]).unwrap();
+        let (characters, bytes): (i64, i64) = connection.query_row("SELECT length(session_json),length(CAST(session_json AS BLOB)) FROM session_snapshots WHERE session_key=?1", [key], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert!(characters < 16 * 1024 * 1024);
+        assert!(bytes > 16 * 1024 * 1024);
+        drop(connection);
+        let measured = report(
+            &store.workflow_reader().unwrap(),
+            &crate::rates::RateCard::default(),
+            WorkflowRequest {
+                session_ids: keys,
+                from: None,
+                to: None,
+            },
+            &[],
+            now,
+        )
+        .unwrap();
+        assert_eq!(measured.before.unavailable_sessions, 1);
+        assert_eq!(measured.before.ledger_metrics.metrics[0].denominator, 9.0);
+        assert!(measured
+            .limitations
+            .iter()
+            .any(|reason| reason == "snapshot_analysis_limit"));
+        assert!(measured
+            .findings
+            .iter()
+            .all(|finding| finding.comparison.state == FindingState::NotApplicable));
     }
 
     fn observed(findings: u64, avoidable: u64, calls: u64) -> FindingObservation {

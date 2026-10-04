@@ -87,6 +87,17 @@
         <p>Before {utcDate(report.before.from)}–{utcDate(report.before.to)} · after {utcDate(report.after.from)}–{utcDate(report.after.to)} · UTC</p>
       </div>
       <div class="overflow-x-auto">
+        <details class="mb-2 rounded-sm border border-edge p-2">
+          <summary class="cursor-pointer text-ink">Local setup health</summary>
+          {#if report.setup_health}
+            <p class="mt-2 text-ink-muted">Source configuration: {report.setup_health.source_configuration_valid ? 'valid' : 'needs attention'}. Root availability is separate from durable evidence coverage.</p>
+            <ul class="mt-1 flex flex-col gap-1 text-ink-muted">
+              {#each report.setup_health.providers as provider (provider.provider)}
+                <li>{provider.provider} · {provider.state.replaceAll('_', ' ')} · {provider.available_roots}/{provider.configured_roots} roots available · {provider.parse_failures} parse failures · {provider.durable_sessions} durable sessions{#if provider.fallback_pricing_used} · fallback pricing{/if}{#if provider.reasons.length} · {provider.reasons.map((reason) => reason.replaceAll('_', ' ')).join(', ')}{/if}</li>
+              {/each}
+            </ul>
+          {:else}<p class="mt-2 text-ink-muted">Setup health is unavailable because saved source configuration could not be read.</p>{/if}
+        </details>
         <table class="w-full min-w-96 text-left text-[11px]">
           <thead class="text-ink-muted"><tr><th class="py-1">Measurement</th><th>Before</th><th>After</th><th>Current evidence</th></tr></thead>
           <tbody>

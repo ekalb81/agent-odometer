@@ -120,18 +120,23 @@ pub async fn get_workflow_report(
         .history_ready()
         .ok_or_else(|| "Workflow history is unavailable or still preparing.".to_owned())?;
     let events = state.external_events_snapshot();
+    let app_state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let reader = history
             .workflow_reader()
             .map_err(|_| "Workflow history is incomplete or could not be read.".to_owned())?;
-        let report = crate::workflow::report(&reader, &get_rates(), request, &events, Utc::now())
+        let rates = get_rates();
+        let mut report = crate::workflow::report(&reader, &rates, request, &events, Utc::now())
             .map_err(|_| {
-            "Workflow analysis is unavailable: check the selected window and history coverage."
-                .to_owned()
-        })?;
-        let bytes = serde_json::to_vec(&report)
-            .map_err(|_| "Workflow analysis could not be encoded.".to_owned())?;
-        if bytes.len() > 8 * 1024 * 1024 {
+                "Workflow analysis is unavailable: check the selected window and history coverage."
+                    .to_owned()
+            })?;
+        if let Ok(config) = Config::load_read_only() {
+            report.setup_health = Some(crate::workflow::WorkflowSetupHealth::from_diagnostics(
+                crate::diagnostics::generate_report(&app_state, &config, &rates),
+            ));
+        }
+        if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
             return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
         }
         Ok(report)

@@ -22,7 +22,7 @@ function period(): WorkflowWindow {
 }
 function report(count = 3): WorkflowReport {
   return { version: 1, generated_at: '2026-10-04T00:00:00Z', analyzer_version: 3,
-    selected_sessions: count, coverage_complete: true, before: period(), after: period(), findings: [], limitations: [] };
+    selected_sessions: count, coverage_complete: true, before: period(), after: period(), findings: [], setup_health: null, limitations: [] };
 }
 async function open(): Promise<void> {
   const details = screen.getByTestId('workflow-panel') as HTMLDetailsElement;

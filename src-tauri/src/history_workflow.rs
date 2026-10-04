@@ -18,26 +18,38 @@ impl HistoryStore {
         const TOTAL_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
         let connection = self.open_reader()?;
         self.check_session_count(&connection)?;
+        let overrides =
+            load_project_overrides_controlled(&connection, self.query_control.as_ref())?;
+        let mut selected: Vec<_> = session_keys.iter().collect();
+        selected.sort();
+        let selection = serde_json::to_string(&selected)?;
         let mut statement = connection.prepare(
-            "SELECT d.session_key,d.project_key,s.session_json FROM durable_sessions d
+            "SELECT d.session_key,COALESCE(o.project_key,d.project_key),length(CAST(s.session_json AS BLOB)),
+               CASE WHEN length(CAST(s.session_json AS BLOB)) <= ?2 THEN s.session_json END
+             FROM durable_sessions d
+             LEFT JOIN project_session_overrides o ON o.session_key=d.session_key
              LEFT JOIN session_snapshots s ON s.session_key=d.session_key
-               AND s.version=d.current_snapshot_version ORDER BY d.session_key",
+               AND s.version=d.current_snapshot_version
+             WHERE d.session_key IN (SELECT value FROM json_each(?1)) ORDER BY d.session_key",
         )?;
-        let mut rows = statement.query([])?;
+        let mut rows = statement.query(params![selection, PER_SNAPSHOT_BYTES as i64])?;
         let mut consumed = 0usize;
         while let Some(row) = rows.next()? {
             self.check_query()?;
             let key: String = row.get(0)?;
-            if !session_keys.contains(&key) {
-                continue;
-            }
             if let Some(control) = &self.query_control {
                 control.consume_row()?;
             }
             let project: Option<String> = row.get(1)?;
-            let source = match row.get_ref(2)? {
+            let project = project.map(|key| resolve_canonical_project_key(&overrides, &key));
+            let snapshot_bytes: Option<i64> = row.get(2)?;
+            let source = match row.get_ref(3)? {
                 rusqlite::types::ValueRef::Null => {
-                    WorkflowSource::Unavailable("snapshot_not_retained")
+                    WorkflowSource::Unavailable(if snapshot_bytes.is_some() {
+                        "snapshot_analysis_limit"
+                    } else {
+                        "snapshot_not_retained"
+                    })
                 }
                 value => {
                     let raw = value.as_bytes()?;

@@ -1467,5 +1467,13 @@ export interface WorkflowReport {
   before: WorkflowWindow;
   after: WorkflowWindow;
   findings: WorkflowFinding[];
+  setup_health: {
+    source_configuration_valid: boolean;
+    generated_at: string;
+    last_scan_at: string | null;
+    providers: { provider: string; state: ProviderHealthState; configured_roots: number;
+      available_roots: number; parsed_files: number; parse_failures: number;
+      durable_sessions: number; fallback_pricing_used: boolean; reasons: string[] }[];
+  } | null;
   limitations: string[];
 }
