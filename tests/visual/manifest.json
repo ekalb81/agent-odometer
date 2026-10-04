@@ -42,6 +42,8 @@
     "defender-error",
     "updater-available",
     "updater-installing",
-    "updater-error"
+    "updater-error",
+    "transcript-recorded-edit",
+    "transcript-narrow-anchor"
   ]
 }

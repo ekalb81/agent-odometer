@@ -1352,11 +1352,24 @@ export interface TranscriptRequest {
   max_bytes?: number;
   record_id?: string | null;
 }
+export interface TranscriptBlock {
+  kind: string;
+  text: string;
+  call_id: string | null;
+  name: string | null;
+  edit: { path: string | null; before: string; after: string } | null;
+}
+export interface TranscriptPresentation {
+  role: string | null;
+  timestamp: string | null;
+  blocks: TranscriptBlock[];
+}
 export interface TranscriptRecord {
   id: string;
   byte_offset: number;
   byte_length: number;
   raw_json: string | null;
+  presentation?: TranscriptPresentation | null;
   kind: string | null;
   message_id: string | null;
   issue: string | null;
