@@ -576,6 +576,34 @@ visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigat
   await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
 });
 
+visualTest('transcript-export-preview', 'export previews conversation text before local save', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Export transcript', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Export transcript', exact: true });
+  await dialog.getByRole('button', { name: 'Build preview' }).click();
+  await expect(dialog.getByRole('button', { name: 'Save reviewed HTML…' })).toBeDisabled();
+  const preview = page.frameLocator('iframe[title="Exact transcript export preview"]');
+  await expect(preview.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await expect(preview.getByText('export const greeting = "Hello";', { exact: true })).toHaveCount(0);
+});
+
+visualTest('transcript-export-narrow', 'export inclusion changes require a new reviewed preview', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Export transcript', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Export transcript', exact: true });
+  await dialog.getByRole('checkbox', { name: 'Tool calls and arguments' }).check();
+  await dialog.getByRole('checkbox', { name: 'Tool results and errors' }).check();
+  await dialog.getByRole('button', { name: 'Build preview' }).click();
+  await expect(page.frameLocator('iframe').getByText('export const greeting = "Hello";', { exact: true })).toBeVisible();
+  await dialog.getByRole('checkbox', { name: /I reviewed every/ }).check();
+  await expect(dialog.getByRole('button', { name: 'Save reviewed HTML…' })).toBeEnabled();
+  const bounds = await dialog.boundingBox();
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {
