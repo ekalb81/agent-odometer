@@ -164,6 +164,7 @@ visualTest('calendar-partial-narrow', 'partial recorded history calendar at narr
 
 visualTest('activity-summary-preview', 'local activity SVG and Markdown preview', async (page) => {
   await visit(page, { view: 'codex' });
+  await page.clock.setFixedTime(FIXED_TIME);
   const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
   await analytics.locator('summary').first().click();
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
@@ -176,6 +177,7 @@ visualTest('activity-summary-preview', 'local activity SVG and Markdown preview'
 visualTest('activity-summary-partial-narrow', 'partial activity summary keeps coverage at narrow width', async (page) => {
   await page.setViewportSize({ width: 520, height: 900 });
   await visit(page, { scenario: 'history-partial', view: 'codex' });
+  await page.clock.setFixedTime(FIXED_TIME);
   const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
   await analytics.locator('summary').first().click();
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
