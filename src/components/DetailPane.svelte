@@ -3,6 +3,7 @@
   import { costIsUnmeasured } from '../lib/sessionProjection';
   import { rates } from '../lib/stores/rates';
   import { formatCredits, harnessCurrency } from '../lib/currency';
+  import ConvertedCost from './ConvertedCost.svelte';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
   import { providersStore } from '../lib/stores/providers.svelte';
   import {
@@ -299,6 +300,10 @@
       {#key session.storage_id}
         <SessionProjectEditor {session} />
       {/key}
+      {#if (session.harness === 'codex' ? sessionApiCost : sessionCredits)?.converted}
+        {@const displayedPrice = (session.harness === 'codex' ? sessionApiCost : sessionCredits)!}
+        <div class="px-5 py-3 border-b border-edge"><ConvertedCost value={displayedPrice.converted} incomplete={displayedPrice.unpriced_models.length > 0} /></div>
+      {/if}
       <!-- Context bar -->
       {#if ctxPercent !== null}
         <div class="px-5 py-3 border-b border-edge">
@@ -587,6 +592,7 @@
                     { label: 'API base estimate', value: current.api_estimate, unit: 'USD' },
                   ] as scenario}
                     <p>{scenario.label}: <span class="font-mono">{surfaceMoney(scenario.value, scenario.unit === 'USD', scenario.unit)}</span></p>
+                    <ConvertedCost value={scenario.value.converted} incomplete={scenario.value.unpriced_models.length > 0} />
                   {/each}
                 {:else}
                   <p>Current purchased-credit and included-allowance estimates: Unavailable</p>

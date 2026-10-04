@@ -2486,11 +2486,11 @@ pub fn get_bundled_rates() -> RateCard {
 /// Persists an updated rate card to disk and emits a rates-updated event so all
 /// frontend subscribers can refresh their computed credits immediately.
 #[tauri::command]
-pub fn set_rates(app: tauri::AppHandle, rates: RateCard) -> Result<(), String> {
-    rates.save().map_err(|e| e.to_string())?;
-    app.emit("rates-updated", &rates)
+pub fn set_rates(app: tauri::AppHandle, rates: RateCard) -> Result<RateCard, String> {
+    let saved = rates.save().map_err(|e| e.to_string())?;
+    app.emit("rates-updated", &saved)
         .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(saved)
 }
 
 /// Reveals the given file in the system file manager, highlighting it where

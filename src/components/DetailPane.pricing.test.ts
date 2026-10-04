@@ -54,6 +54,15 @@ beforeEach(() => { rates.set({
 afterEach(() => { cleanup(); rates.set(null); });
 
 describe('DetailPane server pricing', () => {
+  it('keeps the original monetary estimate beside a backend FX restatement and its evidence', () => {
+    const value = session();
+    value.pricing!.flat_api.converted = { from_currency: 'USD', target_currency: 'EUR', amount: 38.25, rate: .9, as_of: '2026-10-01T12:30:00Z', source: 'Synthetic offline quote' };
+    render(DetailPane, { session: value, onclose: () => {} });
+    expect(screen.getAllByText('$42.50').length).toBeGreaterThan(0);
+    expect(screen.getByText('€38.25')).toBeInTheDocument();
+    expect(screen.getByText(/Synthetic offline quote/)).toHaveTextContent('from USD; rate 0.9');
+    expect(screen.getByText(/Synthetic offline quote/)).toHaveTextContent('2026-10-01T12:30:00Z');
+  });
   it('renders distinct server billing scenarios and keeps unsupported surfaces unavailable', () => {
     const value = session();
     value.pricing!.current = { as_of: '2026-10-04T00:00:00Z', purchased_credits: surface(20), included_allowance: surface(25), api_estimate: surface(0) };
