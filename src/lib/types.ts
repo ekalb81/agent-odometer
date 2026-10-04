@@ -1352,6 +1352,13 @@ export interface TranscriptRequest {
   max_bytes?: number;
   record_id?: string | null;
 }
+/** Explicit search/saved-query content choice. Tool bodies are off by default. */
+export interface TranscriptContentScope {
+  conversation: boolean;
+  tool_calls: boolean;
+  tool_results: boolean;
+}
+
 export interface TranscriptRecord {
   id: string;
   byte_offset: number;
