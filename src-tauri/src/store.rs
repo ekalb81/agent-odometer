@@ -455,6 +455,7 @@ pub struct AppState {
     pub config_watcher: Mutex<Option<ConfigWatcherHandle>>,
     instruction_paths: Mutex<HashSet<String>>,
     session_paths: DashMap<String, PathSessionState>,
+    transcript_observations: DashMap<String, (u64, String)>,
     /// Storage ids whose most recent history-store persist failed: their
     /// ledger rows may be stale or absent, so ledger-backed aggregation must
     /// compute exactly these sessions from in-memory history instead.
@@ -530,6 +531,7 @@ impl AppState {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            transcript_observations: DashMap::new(),
             ledger_stale: DashMap::new(),
             rollup_deferred_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(
@@ -740,6 +742,38 @@ impl AppState {
 
     pub fn clear_sessions(&self) {
         self.session_paths.clear();
+        self.transcript_observations.clear();
+    }
+
+    pub(crate) fn record_transcript_observation(
+        &self,
+        generation: u64,
+        path: &Path,
+        stamp: Option<String>,
+    ) {
+        if generation != self.current_scan_generation() {
+            return;
+        }
+        let key = path_key(path);
+        if let Some(stamp) = stamp {
+            self.transcript_observations
+                .insert(key, (generation, stamp));
+        } else {
+            self.transcript_observations.remove(&key);
+        }
+    }
+
+    pub(crate) fn transcript_observation(&self, session_id: &str, path: &Path) -> Option<String> {
+        let key = path_key(path);
+        let owner = self.session_paths.get(&key)?;
+        if owner.storage_id != session_id
+            || owner.removed
+            || owner.generation != self.current_scan_generation()
+        {
+            return None;
+        }
+        let observation = self.transcript_observations.get(&key)?;
+        (observation.0 == owner.generation).then(|| observation.1.clone())
     }
 
     /// Starts a durable location-observation generation for a bulk scan.
@@ -806,6 +840,38 @@ impl AppState {
             self.full_session_fallback.remove(&storage_id);
         }
         Arc::new(ResidentSession::of(session))
+    }
+
+    /// Only a path still owned by this exact storage identity can be read.
+    pub(crate) fn registered_transcript_source(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::transcript::TranscriptSource> {
+        let resident = self.sessions.get(session_id)?;
+        let path = &resident.summary.file_path;
+        let ownership = self.session_paths.get(&path_key(Path::new(path)))?;
+        (ownership.storage_id == session_id
+            && !ownership.removed
+            && ownership.generation == self.current_scan_generation())
+        .then(|| {
+            let summary = &resident.summary;
+            let identity = if summary.source.as_deref() == Some("subagent") {
+                summary
+                    .parent_thread_id
+                    .as_ref()
+                    .map(|parent| crate::model::storage_id_for_claude_subagent(parent, &summary.id))
+                    .unwrap_or_else(|| {
+                        crate::model::storage_id_for_session(&summary.harness, &summary.id)
+                    })
+            } else {
+                crate::model::storage_id_for_session(&summary.harness, &summary.id)
+            };
+            crate::transcript::TranscriptSource {
+                path: path.clone(),
+                source_id: session_id.to_owned(),
+                identity,
+            }
+        })
     }
 
     /// Resolves one session's full content (issue #139): from the resident

@@ -237,6 +237,10 @@ impl ScanCache {
             )?;
             invalidation_ms = invalidation_started.elapsed().as_secs_f64() * 1_000.0;
         }
+        let has_identity: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'source_identity')", [], |row| row.get(0))?;
+        if !has_identity {
+            transaction.execute_batch("ALTER TABLE sessions ADD COLUMN source_identity TEXT;")?;
+        }
         transaction.execute(
             "INSERT INTO cache_meta(key, value) VALUES('app_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -365,6 +369,26 @@ impl ScanCache {
     /// distinguish "more lock contention" from "the same number of hits
     /// each doing more work because cached `Session` snapshots got bigger".
     pub fn lookup_with_stats(&self, key: &str, size: u64, mtime_ms: u64) -> Option<CacheHit> {
+        self.lookup_identity_with_stats(key, size, mtime_ms, None)
+    }
+
+    pub(crate) fn lookup_observed_with_stats(
+        &self,
+        key: &str,
+        size: u64,
+        mtime_ms: u64,
+        identity: &str,
+    ) -> Option<CacheHit> {
+        self.lookup_identity_with_stats(key, size, mtime_ms, Some(identity))
+    }
+
+    fn lookup_identity_with_stats(
+        &self,
+        key: &str,
+        size: u64,
+        mtime_ms: u64,
+        identity: Option<&str>,
+    ) -> Option<CacheHit> {
         let size = i64::try_from(size).ok()?;
         let mtime_ms = i64::try_from(mtime_ms).ok()?;
         let connection = self.connection.as_ref()?;
@@ -375,9 +399,9 @@ impl ScanCache {
                 .query_row(
                     "UPDATE sessions
                      SET seen_generation = MAX(seen_generation, ?4)
-                     WHERE path = ?1 AND size = ?2 AND mtime_ms = ?3
+                     WHERE path = ?1 AND size = ?2 AND mtime_ms = ?3 AND (?5 IS NULL OR source_identity = ?5)
                      RETURNING session_json",
-                    params![key, size, mtime_ms, self.generation],
+                    params![key, size, mtime_ms, self.generation, identity],
                     |row| row.get(0),
                 )
                 .optional()
@@ -426,6 +450,17 @@ impl ScanCache {
     /// Inserts or replaces one parsed session without materializing the rest
     /// of the cache in memory.
     pub fn store(&self, key: &str, size: u64, mtime_ms: u64, session: &Session) {
+        self.store_observed(key, size, mtime_ms, session, None);
+    }
+
+    pub(crate) fn store_observed(
+        &self,
+        key: &str,
+        size: u64,
+        mtime_ms: u64,
+        session: &Session,
+        identity: Option<&str>,
+    ) {
         let Some(connection) = &self.connection else {
             return;
         };
@@ -442,14 +477,15 @@ impl ScanCache {
             return;
         };
         if let Err(error) = connection.execute(
-            "INSERT INTO sessions(path, size, mtime_ms, session_json, seen_generation)
-             VALUES(?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO sessions(path, size, mtime_ms, session_json, seen_generation, source_identity)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(path) DO UPDATE SET
                  size = excluded.size,
                  mtime_ms = excluded.mtime_ms,
                  session_json = excluded.session_json,
+                 source_identity = excluded.source_identity,
                  seen_generation = MAX(sessions.seen_generation, excluded.seen_generation)",
-            params![key, size, mtime_ms, raw, self.generation],
+            params![key, size, mtime_ms, raw, self.generation, identity],
         ) {
             tracing::warn!("could not store scan-cache entry {:?}: {}", key, error);
         }

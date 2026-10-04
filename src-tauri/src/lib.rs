@@ -1,3 +1,10 @@
+// Cargo library tests do not inherit the application manifest. MSVC creates
+// an adjacent test-executable manifest from this test-only linker directive.
+#[cfg(all(test, target_os = "windows", target_env = "msvc"))]
+#[used]
+#[unsafe(link_section = ".drectve")]
+static TEST_COMMON_CONTROLS: [u8; 168] = *b" \"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\" ";
+
 pub mod claude_parser;
 pub mod commands;
 pub mod config;
@@ -35,6 +42,7 @@ mod stable_hash;
 pub mod store;
 pub mod telemetry;
 pub mod tool_impact;
+pub mod transcript;
 pub mod tray;
 pub mod turn_receipts;
 pub mod verify;
@@ -46,13 +54,14 @@ use commands::{
     get_bundled_rates, get_config, get_history_rebuild_status, get_history_status,
     get_performance_live_status, get_performance_status, get_provider_diagnostics,
     get_quota_config, get_quota_snapshots, get_rates, get_scan_status, get_session_details,
-    get_session_pricing, get_speed_report, get_subscription_usage, get_turn_receipt_status,
-    list_external_events, list_instruction_files, list_providers, list_sessions,
-    list_tool_impact_targets, merge_projects, open_instruction_file, open_task_in_chatgpt,
-    read_instruction_file, reassign_session_project, rebuild_history, record_frontend_performance,
-    repair_turn_receipt_integrations, resolve_projects, resolve_working_directories,
-    reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges, set_config, set_project_alias,
-    set_quota_config, set_rates, set_tray_totals, unmerge_project, write_export,
+    get_session_pricing, get_speed_report, get_subscription_usage, get_transcript_page,
+    get_turn_receipt_status, list_external_events, list_instruction_files, list_providers,
+    list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
+    open_task_in_chatgpt, read_instruction_file, reassign_session_project, rebuild_history,
+    record_frontend_performance, repair_turn_receipt_integrations, resolve_projects,
+    resolve_working_directories, reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges,
+    set_config, set_project_alias, set_quota_config, set_rates, set_tray_totals, unmerge_project,
+    write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -96,6 +105,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             get_session_details,
+            get_transcript_page,
             get_session_pricing,
             get_subscription_usage,
             sessions_in_ranges,

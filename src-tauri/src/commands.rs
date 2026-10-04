@@ -558,6 +558,20 @@ pub async fn get_session_details(
     result
 }
 
+/// Raw bodies are returned only by this explicit command; no performance bodies are recorded.
+#[tauri::command]
+pub async fn get_transcript_page(
+    state: State<'_, Arc<AppState>>,
+    request: crate::transcript::TranscriptRequest,
+) -> Result<crate::transcript::TranscriptPage, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::transcript::read_for_session(&state, request)
+    })
+    .await
+    .map_err(|_| "transcript_reader_unavailable".to_owned())
+}
+
 /// Batched, response-only all-time pricing from lightweight resident buckets.
 #[tauri::command]
 pub async fn get_session_pricing(
@@ -1420,7 +1434,7 @@ pub fn spawn_scan(
         // be inside `reconcile_scanned_batch_if_current` when this one
         // starts, and these counters describe one scan's contention.
         state.scan_write_lock.reset();
-        let report = crate::scanner::scan_all(
+        let report = crate::scanner::scan_all_observed(
             &provider_sources,
             cache,
             |batch| {
@@ -1478,6 +1492,7 @@ pub fn spawn_scan(
                     );
                 }
             },
+            |path, stamp| state.record_transcript_observation(generation, path, stamp),
         );
         if let Some(phase_sampler) = phase_sampler {
             phase_sampler.stop();

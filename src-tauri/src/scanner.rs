@@ -194,6 +194,22 @@ where
     F: Fn(Vec<(PathBuf, crate::model::Session)>) + Send + Sync,
     P: Fn(usize, usize) + Send + Sync,
 {
+    scan_all_observed(sources, cache, on_session_batch, on_progress, |_, _| {})
+}
+
+/// Adds metadata-only before/after evidence for explicit transcript inspection.
+pub(crate) fn scan_all_observed<F, P, O>(
+    sources: &ProviderSourceSet,
+    cache: Option<ScanCache>,
+    on_session_batch: F,
+    on_progress: P,
+    on_observed: O,
+) -> ScanReport
+where
+    F: Fn(Vec<(PathBuf, crate::model::Session)>) + Send + Sync,
+    P: Fn(usize, usize) + Send + Sync,
+    O: Fn(&Path, Option<String>) + Send + Sync,
+{
     let discovery_started = Instant::now();
     let registry = ProviderRegistry::builtin();
     let mut work: Vec<(PathBuf, &'static dyn ProviderAdapter, ProviderSourceKind)> = Vec::new();
@@ -256,6 +272,7 @@ where
     work.par_chunks(write_batch_size).for_each(|chunk| {
         let mut batch: Vec<(PathBuf, crate::model::Session)> = Vec::with_capacity(chunk.len());
         for (path, adapter, kind) in chunk {
+            let transcript_before = crate::transcript::source_generation(path);
             let provider_counters = provider_atomics.get(&adapter.descriptor().id);
             let key = path.to_string_lossy().into_owned();
             // The stamp is taken BEFORE parsing so a file that grows mid-parse
@@ -268,9 +285,16 @@ where
             // fetch, unlocked deserialize, bytes fetched), not whether the
             // scanner ultimately reused the row.
             let cache_hit = stamp.and_then(|(size, mtime_ms)| {
-                cache
-                    .as_ref()
-                    .and_then(|cache| cache.lookup_with_stats(&key, size, mtime_ms))
+                cache.as_ref().and_then(|cache| {
+                    transcript_before.as_deref().and_then(|before| {
+                        cache.lookup_observed_with_stats(
+                            &key,
+                            size,
+                            mtime_ms,
+                            crate::transcript::generation_identity(before),
+                        )
+                    })
+                })
             });
             if let Some(hit) = &cache_hit {
                 cache_lookup_sql_ns.fetch_add(hit.sql_ns, Ordering::Relaxed);
@@ -309,8 +333,19 @@ where
                     }
                     match result {
                         Ok(Some(session)) => {
-                            if let (Some(cache), Some((size, mtime_ms))) = (&cache, stamp) {
-                                cache.store(&key, size, mtime_ms, &session);
+                            let after = crate::transcript::source_generation(path);
+                            if let (Some(cache), Some((size, mtime_ms)), Some(before)) =
+                                (&cache, stamp, transcript_before.as_deref())
+                            {
+                                if Some(before) == after.as_deref() {
+                                    cache.store_observed(
+                                        &key,
+                                        size,
+                                        mtime_ms,
+                                        &session,
+                                        Some(crate::transcript::generation_identity(before)),
+                                    );
+                                }
                             }
                             Some(session)
                         }
@@ -333,6 +368,9 @@ where
             };
 
             if let Some(session) = session {
+                let after = crate::transcript::source_generation(path);
+                let stamp = transcript_before.filter(|before| Some(before) == after.as_ref());
+                on_observed(path, stamp);
                 batch.push((path.clone(), session));
             }
 

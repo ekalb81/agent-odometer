@@ -22,6 +22,7 @@ pub struct WatcherHandle {
 struct ParserSlot {
     parser: Box<dyn IncrementalProviderParser>,
     last_touch: Instant,
+    transcript_identity: Option<String>,
 }
 
 /// Idle parsers are dropped after this long without file activity.
@@ -145,12 +146,17 @@ pub fn start(
                         }
                     } else {
                         // Create or Modify — parse incrementally.
+                        let transcript_before = crate::transcript::source_generation(path);
                         let mut entry = match parsers_cb.entry(path.clone()).or_try_insert_with(
                             || -> anyhow::Result<ParserSlot> {
                                 Ok(ParserSlot {
                                     parser: adapter
                                         .incremental_parser(path.clone(), source_kind)?,
                                     last_touch: Instant::now(),
+                                    transcript_identity: transcript_before
+                                        .as_deref()
+                                        .map(crate::transcript::generation_identity)
+                                        .map(str::to_owned),
                                 })
                             },
                         ) {
@@ -169,6 +175,17 @@ pub fn start(
 
                         let parse_started = Instant::now();
                         let parse_result = entry.parser.parse_to_end();
+                        let transcript_after = crate::transcript::source_generation(path);
+                        let transcript_stamp = transcript_before.filter(|before| {
+                            Some(before) == transcript_after.as_ref()
+                                && entry.transcript_identity.as_deref()
+                                    == Some(crate::transcript::generation_identity(before))
+                        });
+                        state_cb.record_transcript_observation(
+                            state_cb.current_scan_generation(),
+                            path,
+                            parse_result.as_ref().ok().and(transcript_stamp),
+                        );
                         state_cb.performance.record_backend(
                             "watcher.incremental_parse",
                             parse_started,

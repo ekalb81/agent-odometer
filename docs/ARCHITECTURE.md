@@ -349,6 +349,55 @@ This distinction matters for sessions that began before the requested range or r
 
 ## Persistence and privacy
 
+### Explicit transcript access (#250)
+
+`get_transcript_page` / `getTranscriptPage` is an explicit read-only IPC request.
+It returns complete, validated JSONL records as raw JSON strings plus Rust-extracted
+provider, record kind, and message ID metadata. It does not run from session lists,
+pricing, summaries, aggregate exports, diagnostics, performance recordings or MCP.
+Accounting continues to use the existing provider parsers and Rust query service.
+
+Requests identify a session storage ID, never a path. Registered ownership or a
+bounded durable source-location lookup supplies candidate paths; configured provider
+roots, opened-file identity, and a bounded provider identity/timestamp check gate
+reads. Retained sources currently require the resident summary's hydrated start
+timestamp and a registered observation to verify ownership; before hydration or
+observation, access honestly reports unverified. Scanner/watcher observations bind
+size/mtime/OS identity before and after the existing parse (or validated cache read).
+A changed file is unreadable through this API until a stable observation publishes
+it again. A reused incremental parser cannot vouch for a replacement file. Known
+durable collisions report ambiguous identity rather than guessing a lineage.
+The disposable scan cache also binds hits to the OS identity observed before and
+after parsing; legacy entries without that evidence miss once and then warm normally.
+This metadata-only cache format change ships with the v0.8.21 version bump.
+This is not an independent durable-session enumeration API.
+
+Pages clamp to 1–100 records and 4–256 KiB of serialized JSON, with a 1 MiB scan
+budget and 64 KiB per-record buffer. Oversized records produce omission markers and
+may require multiple continuations; malformed records and incomplete trailing lines
+are explicit partial states. Only newline-terminated records are returned.
+Eight source locations are inspected at most; further candidates are an explicit
+coverage limitation. A valid empty source page differs from missing, unreadable,
+unsupported, unknown-session and invalid-continuation responses.
+
+`next_cursor` binds the session/source and opened file identity, length and modified
+time. Any observed append, replacement, truncation or rewrite invalidates it; restart
+from the first page rather than combining generations. Record anchors separately
+include source/artifact identity, OS file identity, byte offset and a content-change
+fingerprint, so unchanged records retain IDs on append and application restart.
+Moves preserving file identity retain anchors; copies across filesystems do not.
+`record_id` seeks directly to a returned anchor and validates the boundary and exact
+anchor before returning content. It cannot be combined with a cursor. Seeking into
+the middle reports earlier records as uninspected. Metadata IDs/kinds are bounded to
+64 characters; full original fields remain in the validated raw record.
+
+Follow continuations and combine their issues. `source_complete` is true only when
+the selected generation reaches its end without known omissions or uninspected
+earlier records. Source availability is separate from #38 lifecycle: a missing source
+can still have retained summaries and historical usage, and never implies purge.
+No transcript index, raw-body persistence, retention policy or purge is added here;
+source deletion removes access to those bodies without changing historical totals.
+
 Default inputs are resolved below `$CODEX_HOME`, falling back to `~/.codex`:
 
 - `$CODEX_HOME/sessions`
