@@ -17,6 +17,8 @@ pub enum DiagnosticCode {
     ProtocolVersionMismatch,
     ToolCatalogMismatch,
     LedgerNotReady,
+    HistoryIncomplete,
+    HistoryCoverageUnavailable,
     ScanInProgress,
     SessionNotFound,
     PricingIncomplete,
@@ -41,6 +43,8 @@ impl DiagnosticCode {
             Self::ProtocolVersionMismatch => ("The server handshake does not match the supported protocol.", "Update the client/server and start a fresh task."),
             Self::ToolCatalogMismatch => ("The advertised tool names or input schemas differ from this version.", "Restart the client after updating Odometer, then test again."),
             Self::LedgerNotReady => ("A readable durable ledger is unavailable.", "Open Odometer and wait for history preparation; do not treat missing usage as zero."),
+            Self::HistoryIncomplete => ("Readable history was recovered, but missing historical sources were not recovered.", "Treat usage as recorded partial totals, not complete spend or allowance usage."),
+            Self::HistoryCoverageUnavailable => ("Historical coverage could not be verified.", "Inspect retention and recovery settings; do not treat recorded totals as complete."),
             Self::ScanInProgress => ("The desktop has not completed its current source scan.", "Wait for the scan to finish before drawing completeness conclusions."),
             Self::SessionNotFound => ("The requested session is not in the current query snapshot.", "Use session_report to discover a current session key first."),
             Self::PricingIncomplete => ("Some observed models lack direct current pricing evidence.", "Inspect diagnostics_report and pricing provenance before comparing costs."),
@@ -88,6 +92,7 @@ pub struct IntegrationStatus {
     pub protocol_version: &'static str,
     pub generated_at: DateTime<Utc>,
     pub ledger_available: bool,
+    pub coverage_complete: Option<bool>,
     pub scan_status: &'static str,
     pub sessions: Option<u64>,
     pub observation: Observation,
@@ -128,8 +133,13 @@ pub fn status(
         .and_then(|value| value.captured_at_ms)
         .and_then(DateTime::from_timestamp_millis);
     let mut diagnostics = Vec::new();
+    let coverage_complete = store.and_then(|store| store.has_complete_coverage().ok());
     if store.is_none() {
         diagnostics.push(DiagnosticCode::LedgerNotReady.diagnostic());
+    } else if coverage_complete == Some(false) {
+        diagnostics.push(DiagnosticCode::HistoryIncomplete.diagnostic());
+    } else if coverage_complete.is_none() {
+        diagnostics.push(DiagnosticCode::HistoryCoverageUnavailable.diagnostic());
     }
     if report
         .providers
@@ -184,7 +194,7 @@ pub fn status(
     Ok(IntegrationStatus {
         schema_version: SCHEMA_VERSION, server_version: env!("CARGO_PKG_VERSION"),
         protocol_version: crate::mcp_server::PROTOCOL_VERSION, generated_at: now,
-        ledger_available: store.is_some(), scan_status: "unknown_in_headless_query",
+        ledger_available: store.is_some(), coverage_complete, scan_status: "unknown_in_headless_query",
         sessions: store.map(HistoryStore::session_count).transpose()?,
         observation: Observation {
             captured_at: captured, age_seconds: captured.filter(|value| *value <= now).map(|value| (now - value).num_seconds()),
@@ -206,6 +216,50 @@ pub fn status(
 mod tests {
     use super::*;
     #[test]
+    fn recovered_and_unverified_coverage_are_distinct_from_complete_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let store = HistoryStore::open(&path).unwrap();
+        let report = || {
+            status(
+                Some(&store),
+                &RateCard::default(),
+                &Config::default(),
+                Utc::now(),
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(report().coverage_complete, Some(true));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE history_meta SET value='0' WHERE key='coverage_complete'",
+                [],
+            )
+            .unwrap();
+        let partial = report();
+        assert!(partial.ledger_available);
+        assert_eq!(partial.coverage_complete, Some(false));
+        assert!(partial
+            .diagnostics
+            .iter()
+            .any(|value| value.code == DiagnosticCode::HistoryIncomplete));
+        std::fs::write(
+            store.exclusion_path_identity(),
+            b"invalid complete journal record\n",
+        )
+        .unwrap();
+        let unverified = report();
+        assert!(unverified.ledger_available);
+        assert_eq!(unverified.coverage_complete, None);
+        assert!(unverified
+            .diagnostics
+            .iter()
+            .any(|value| value.code == DiagnosticCode::HistoryCoverageUnavailable));
+    }
+
+    #[test]
     fn absent_ledger_is_not_a_priced_empty_snapshot() {
         let report = status(
             None,
@@ -216,6 +270,7 @@ mod tests {
         )
         .unwrap();
         assert!(!report.ledger_available);
+        assert_eq!(report.coverage_complete, None);
         assert_eq!(report.sessions, None);
         assert_eq!(report.observation.age_seconds, None);
         assert_eq!(report.observation.generation, None);

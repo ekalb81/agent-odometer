@@ -6595,6 +6595,39 @@ mod tests {
     }
 
     #[test]
+    fn retention_purge_rejects_a_cutoff_newer_than_active_policy() {
+        let (directory, store) = store();
+        let path = directory.path().join("tampered-cutoff.jsonl");
+        store
+            .observe(&path, &session("tampered-cutoff", 100), 1)
+            .unwrap();
+        store.mark_path_missing(&path).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        let mut preview = store.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        // All candidates are unchanged, so the candidate hash alone cannot
+        // validate the policy boundary supplied by an IPC caller.
+        preview.cutoff_utc_day = "2026-10-05".into();
+        assert!(store
+            .purge_retained(&preview, now)
+            .unwrap_err()
+            .to_string()
+            .contains("cutoff exceeds"));
+        assert_eq!(store.retention_status().unwrap().retained_sessions, 1);
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 0);
+        assert!(!store.exclusion_path_identity().exists());
+        store
+            .purge_retained(&store.preview_purge(now).unwrap(), now)
+            .unwrap();
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 1);
+    }
+
+    #[test]
     fn retention_policy_changes_invalidate_preview_even_when_original_policy_is_restored() {
         let (directory, store) = store();
         let path = directory.path().join("policy.jsonl");

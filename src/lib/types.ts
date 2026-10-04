@@ -691,11 +691,12 @@ export interface TurnReceiptIntegrationStatus {
 export type IntegrationClient = 'codex' | 'claude_code';
 export type IntegrationScope = 'user' | 'project';
 export type IntegrationChange = 'install' | 'remove' | 'restore';
-export type IntegrationDiagnosticCode = 'integration_not_configured' | 'server_launch_failed' | 'protocol_version_mismatch' | 'tool_catalog_mismatch' | 'ledger_not_ready' | 'scan_in_progress' | 'session_not_found' | 'pricing_incomplete' | 'query_too_broad' | 'snapshot_expired' | 'query_failed' | 'query_cancelled';
+export type IntegrationDiagnosticCode = 'integration_not_configured' | 'server_launch_failed' | 'protocol_version_mismatch' | 'tool_catalog_mismatch' | 'ledger_not_ready' | 'history_incomplete' | 'history_coverage_unavailable' | 'scan_in_progress' | 'session_not_found' | 'pricing_incomplete' | 'query_too_broad' | 'snapshot_expired' | 'query_failed' | 'query_cancelled';
 export interface IntegrationDiagnostic { code: IntegrationDiagnosticCode; evidence: string; next_action: string; }
 export interface IntegrationStatus {
   schema_version: number; server_version: string; protocol_version: string; generated_at: string;
   ledger_available: boolean; scan_status: string; sessions: number | null;
+  coverage_complete?: boolean | null;
   observation: { captured_at: string | null; age_seconds: number | null; generation: string | null; token_event_from: string | null; token_event_to: string | null; };
   providers: Array<{ provider: string; registered: boolean; roots: Array<{ kind: string; path: string | null; exists: boolean; }>; ledger: { durable_sessions: number; available_sessions: number; collision_sessions: number; } | null; models: Array<{ model: string; basis: PricingBasis; resolved_model: string | null; }>; quota_status: string; }>;
   pricing_authority: string; quota_authority: string; dimensions: string[]; filters: string[];

@@ -550,6 +550,16 @@ impl HistoryStore {
         if policy.retained_days.is_none() || revision != preview.policy_revision {
             bail!("retention policy changed after the purge preview; review a fresh preview");
         }
+        // IPC preview fields are untrusted. An older reviewed cutoff remains
+        // conservative across midnight, but cannot exceed the active policy.
+        let allowed_cutoff =
+            now.date_naive() - chrono::Duration::days(i64::from(policy.retained_days.unwrap()));
+        let reviewed_cutoff =
+            chrono::NaiveDate::parse_from_str(&preview.cutoff_utc_day, "%Y-%m-%d")
+                .map_err(|_| anyhow!("invalid purge cutoff; review a fresh preview"))?;
+        if reviewed_cutoff > allowed_cutoff {
+            bail!("purge cutoff exceeds the current retention policy; review a fresh preview");
+        }
         let (mut current, candidates) = purge_candidates(&transaction, &preview.cutoff_utc_day)?;
         current.policy_revision = revision;
         if &current != preview {

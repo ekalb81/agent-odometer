@@ -60,3 +60,15 @@ declare whether they reference a session or own independent data. Any
 session-owned derived records must join the same purge transaction, and any
 independent copies need an explicit retention policy and confirmation scope.
 Those features do not exist in this delivery; purge does not imply otherwise.
+# Policy and coverage boundaries
+
+Purge previews bind the saved policy revision. Confirmation rechecks that revision,
+the candidate identities and their facts inside the deletion transaction. A supplied
+cutoff newer than the current policy allows is rejected. An older reviewed cutoff
+remains conservative across a UTC midnight; review again to include newly eligible
+history. Changing and restoring the policy still invalidates the prior preview.
+
+Integration Center and headless `odometer_status` expose `coverage_complete` and
+diagnostics for recovered partial history or unverified coverage. These are recorded
+totals; a readable ledger, completed scan, or successful MCP call does not establish
+that missing historical sources were recovered.
