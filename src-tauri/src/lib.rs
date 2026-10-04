@@ -48,6 +48,7 @@ pub mod store;
 pub mod telemetry;
 pub mod tool_impact;
 pub mod transcript;
+pub mod transcript_search;
 mod transcript_view;
 pub mod tray;
 pub mod turn_receipts;
@@ -69,9 +70,10 @@ use commands::{
     preview_history_purge, preview_integration_change, purge_retained_history,
     read_instruction_file, reassign_session_project, rebuild_history, record_frontend_performance,
     recover_history, repair_turn_receipt_integrations, resolve_projects,
-    resolve_working_directories, retry_history_open, reveal_in_file_manager, scan_git_outcomes,
-    sessions_in_ranges, set_config, set_project_alias, set_quota_config, set_rates,
-    set_retention_policy, set_tray_totals, test_integration_client, unmerge_project, write_export,
+    resolve_retained_search_target, resolve_working_directories, retry_history_open,
+    reveal_in_file_manager, scan_git_outcomes, search_session_content, sessions_in_ranges,
+    set_config, set_project_alias, set_quota_config, set_rates, set_retention_policy,
+    set_tray_totals, test_integration_client, unmerge_project, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -116,6 +118,8 @@ pub fn run() {
             list_sessions,
             get_session_details,
             get_transcript_page,
+            search_session_content,
+            resolve_retained_search_target,
             get_session_pricing,
             get_subscription_usage,
             sessions_in_ranges,

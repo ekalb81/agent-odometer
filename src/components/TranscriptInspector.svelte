@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { getTranscriptPage } from '../lib/ipc';
   import type { TranscriptCursor, TranscriptPage, TranscriptRecord } from '../lib/types';
-  let { sessionId, recordId = null, onclose }: { sessionId: string; recordId?: string | null; onclose: () => void } = $props();
+  let { sessionId, recordId = null, blockIndex = null, onclose }: { sessionId: string; recordId?: string | null; blockIndex?: number | null; onclose: () => void } = $props();
   let dialog: HTMLDialogElement;
   let page = $state<TranscriptPage | null>(null);
   let loading = $state(false);
@@ -42,7 +42,10 @@
       if (target) { selected = target; expanded = new Set([target]); }
       else { expanded = new Set([...expanded].filter(id => result.records.some(record => record.id === id))); }
       await tick();
-      if (request === generation && target) document.getElementById(`transcript-${target}`)?.focus();
+      if (request === generation && target) {
+        const block = target === recordId && blockIndex !== null ? document.getElementById(`transcript-${target}-block-${blockIndex}`) : null;
+        (block ?? document.getElementById(`transcript-${target}`))?.focus();
+      }
     } catch { if (request === generation) { error = 'The transcript could not be read. Retry or reopen it.'; page = null; } }
     finally { if (request === generation) loading = false; }
   }
@@ -115,7 +118,7 @@
           {#if record.issue}<p role="status">{issueLabel(record.issue)} · payload unavailable</p>{/if}
           {#if expanded.has(record.id)}
             {#each record.presentation?.blocks ?? [] as block, index (index)}
-              <section class="block">
+              <section class="block" id={`transcript-${record.id}-block-${index}`} tabindex="-1">
                 <h3>{issueLabel(block.kind)}{block.name ? ` · ${block.name}` : ''}</h3>
                 {#if block.call_id}
                   <p>Call ID <code>{block.call_id}</code>
@@ -151,7 +154,7 @@
   label { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 180px; }
   input { min-width: 0; flex: 1; padding: 5px; border: 1px solid var(--border); border-radius: 4px; }
   button { color: var(--accent); border: 1px solid var(--border); background: var(--card); border-radius: 4px; padding: 4px 8px; } button:disabled { opacity: .45; }
-  button:focus-visible, input:focus-visible, article:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button:focus-visible, input:focus-visible, article:focus-visible, .block:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .records { overflow: auto; padding: 12px; min-height: 0; }
   article { padding: 10px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; background: var(--card); }
   article.selected { border-color: var(--accent); }

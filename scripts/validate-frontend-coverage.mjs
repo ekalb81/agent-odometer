@@ -11,6 +11,7 @@ export const COVERAGE_SLICE = [
   'src/components/SessionGridControls.svelte',
   'src/components/SessionProjectEditor.svelte',
   'src/components/TranscriptExport.svelte',
+  'src/components/TranscriptSearch.svelte',
   'src/lib/configTimeline.ts',
   'src/lib/defenderStatus.ts',
   'src/lib/diagnosticsExport.ts',

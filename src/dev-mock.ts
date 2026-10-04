@@ -4,6 +4,8 @@
 
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
+import { contentSearchFixture, retainedLandingFixture } from './dev-mock/contentSearch';
+import type { TranscriptSearchRequest, TranscriptSearchTarget } from './lib/types';
 import type { TranscriptRequest } from './lib/types';
 import { integrationFixture } from './dev-mock/integration';
 import { mockRangePricing, mockSessionPricing, mockSummaryPricing, assertFixtureRates } from './dev-mock/pricing';
@@ -487,6 +489,10 @@ mockIPC((cmd, payload) => {
     }
     case 'get_transcript_page':
       return transcriptFixture((payload as { request: TranscriptRequest }).request);
+    case 'search_session_content':
+      return contentSearchFixture((payload as { request: TranscriptSearchRequest }).request, visualScenario === 'content-search-retained');
+    case 'resolve_retained_search_target':
+      return retainedLandingFixture((payload as { target: TranscriptSearchTarget }).target);
     case 'get_session_details': {
       const { sessionId } = payload as { sessionId: string };
       const f = visibleFixtures().find((x) => summary(x).storage_id === sessionId);

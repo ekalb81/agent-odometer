@@ -611,6 +611,55 @@ visualTest('transcript-export-narrow', 'export inclusion changes require a new r
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
 });
 
+visualTest('content-search-scopes', 'content search exposes explicit tool scope and exact source landing', async (page) => {
+  await visit(page, { view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await expect(search.getByText(/Matching records on this page: 1/)).toBeVisible();
+  await search.getByLabel('Tool results and errors').check();
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await expect(search.getByText(/Matching records on this page: 2/)).toBeVisible();
+});
+
+visualTest('content-search-retained-narrow', 'missing source search shows separate retained coverage and exact field', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { scenario: 'content-search-retained', view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await search.getByRole('button', { name: 'Search retained messages' }).click();
+  await search.getByRole('button', { name: 'Open retained message · user message' }).click();
+  await expect(search.getByRole('region', { name: 'Selected retained message' })).toBeFocused();
+  await expect(search.getByText(/may overlap them/)).toBeVisible();
+  const bounds = await search.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
+test('content search lands on a source record and Escape returns to the search without deselecting the session', async ({ page }) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await search.getByRole('button', { name: 'Open source record · text' }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await expect(inspector.locator('[id="transcript-synthetic:0-block-0"]')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await expect(search).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(search).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {

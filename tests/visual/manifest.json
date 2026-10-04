@@ -50,6 +50,8 @@
     "transcript-recorded-edit",
     "transcript-narrow-anchor",
     "transcript-export-preview",
-    "transcript-export-narrow"
+    "transcript-export-narrow",
+    "content-search-scopes",
+    "content-search-retained-narrow"
   ]
 }
