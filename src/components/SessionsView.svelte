@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, untrack } from 'svelte';
+  import { organizationStore } from '../lib/stores/organization.svelte';
+  import { matchesOrganization } from '../lib/organization';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
   import { sessionDetailPaneStore } from '../lib/stores/sessionDetailPane.svelte';
@@ -27,7 +29,7 @@
     projectSessions,
     rowsToCsv,
     sessionName,
-    toUtcIso,
+    filterBounds,
     type ViewScope,
     zeroTotals,
   } from '../lib/sessionProjection';
@@ -55,11 +57,13 @@
   interface Props {
     harness?: ViewScope;
     active?: boolean;
+    pinnedOnly?: boolean;
+    organizationTags?: string[];
     filters: FilterState;
     onfilterschange: (f: FilterState) => void;
   }
 
-  let { harness = 'all', active = true, filters, onfilterschange }: Props = $props();
+  let { harness = 'all', active = true, pinnedOnly = false, organizationTags = [], filters, onfilterschange }: Props = $props();
 
   const fmt = new Intl.NumberFormat();
   const fmt2 = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -180,13 +184,21 @@
   // Convert datetime-local strings (local time) to UTC ISO once, so the rest
   // of the pipeline can do lexical comparison against the UTC ISO timestamps
   // we store on sessions and history points.
-  const fromUtc = $derived(toUtcIso(filters.dateFrom));
-  const toUtc = $derived(toUtcIso(filters.dateTo));
+  const fromUtc = $derived(filterBounds(filters).from);
+  const toUtc = $derived(filterBounds(filters).to);
 
   // Everything except the date bounds. Kept separate so the analytics
   // previous-window totals can include sessions that were active then but
   // fall outside the current date range.
-  const filteredNoDate = $derived(filterSessions(allSessions, harness, filters, false));
+  const organizationRequired = $derived(pinnedOnly || organizationTags.length > 0);
+  const organizationUnavailable = $derived(organizationRequired && (
+    !!organizationStore.error || organizationStore.recoveryUnrestored || organizationTags.some(tag => !organizationStore.tagLabels.includes(tag)) ||
+    allSessions.some(session => !organizationStore.summaries[session.storage_id])
+  ));
+  const organizedSessions = $derived(organizationRequired
+    ? allSessions.filter(session => matchesOrganization(organizationStore.summaries[session.storage_id], pinnedOnly, organizationTags))
+    : allSessions);
+  const filteredNoDate = $derived(filterSessions(organizedSessions, harness, filters, false));
 
   // Datetime range — overlap semantics: include any session whose
   // [started_at, last_event_at] window intersects the filter range.
@@ -1717,6 +1729,13 @@
   const gridCols = $derived(`grid-template-columns: ${visibleColumns.map((column) => column.width).join(' ')};`);
 </script>
 
+{#if organizationUnavailable}
+  <div class="p-5 text-sm text-amber-500" role="alert">
+    Organization-filtered results are unavailable. {organizationStore.recoveryUnrestored ? 'Earlier organization remains in the recovery backup and was not restored.' : organizationStore.error ?? 'Organization is loading, or a selected tag was renamed or deleted.'}
+    <button class="ml-2 underline" onclick={() => void organizationStore.load(allSessions.map(session => session.storage_id))}>Retry organization</button>
+    <p class="mt-2 text-ink-muted">Clear pin/tag filters in Organize to view ordinary session summaries.</p>
+  </div>
+{:else}
 <div class="flex flex-col h-full overflow-hidden">
   <!-- Analytics band -->
   <div class="grid gap-3.5 p-4 shrink-0" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
@@ -2214,4 +2233,6 @@
       onclose={deselect}
     />
   </div>
+{/if}
+
 {/if}

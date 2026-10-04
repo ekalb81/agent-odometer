@@ -4616,6 +4616,21 @@ pub(crate) fn check_quota_alerts_impl(state: &AppState) -> Vec<crate::quota::Quo
 
 // Private desktop organization: never exposed by headless/MCP projections.
 #[tauri::command]
+pub async fn get_organization_recovery_state(
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private organization requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .organization_recovery_pending()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Private organization operation failed".to_owned())?
+}
+#[tauri::command]
 pub async fn get_organization_summaries(
     state: State<'_, Arc<AppState>>,
     keys: Vec<String>,

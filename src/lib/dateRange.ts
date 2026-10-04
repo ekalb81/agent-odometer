@@ -12,6 +12,11 @@ export function toLocalInputValue(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+/** Preserve inclusive saved UTC bounds, including seconds and milliseconds. */
+export function toLocalInputValuePrecise(d: Date): string {
+  return `${toLocalInputValue(d)}:${pad(d.getSeconds())}.${d.getMilliseconds().toString().padStart(3, '0')}`;
+}
+
 function startOfToday(): Date {
   const d = new Date();
   d.setHours(0, 0, 0, 0);

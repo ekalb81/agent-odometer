@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
   import InstructionsView from './components/InstructionsView.svelte';
   import Filters from './components/Filters.svelte';
+  import OrganizationToolbar from './components/OrganizationToolbar.svelte';
+  import { organizationStore } from './lib/stores/organization.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
   import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, getHistoryStatus, onHistoryProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
@@ -27,7 +29,7 @@
   import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
   import { renderedSessionRows } from './lib/paintContext';
-  import { appViews, providerIdForTab, type AppView } from './lib/appViews';
+  import { appViews, providerIdForTab, tabIdForProvider, type AppView } from './lib/appViews';
   import { providersStore } from './lib/stores/providers.svelte';
   import { providerAccent } from './lib/providerAccents';
 
@@ -43,6 +45,16 @@
   // active tab while every sessions view remains mounted. 'all' is always
   // present; a provider's entry is added the first time its descriptor is
   // observed and then persists for the life of the app.
+  let organizationFilters = $state<Record<string, { pinned: boolean; tags: string[] }>>({});
+  $effect(() => {
+    const readiness = historyStore.status.status;
+    const keys = [...sessionsStore.map.values()].map(session => session.storage_id);
+    untrack(() => {
+      if (readiness === 'ready') void organizationStore.load(keys);
+      else organizationStore.invalidate('Private organization requires ready durable history.');
+    });
+  });
+
   let filtersByScope = $state<Record<string, FilterState>>({
     all: defaultFilters(),
   });
@@ -621,8 +633,17 @@
     </nav>
 
     {#if activeScope}
-      <div class="ml-auto">
+      <div class="ml-auto flex items-center gap-1">
         {#key activeScope}
+          <OrganizationToolbar scope={activeScope} filters={filtersByScope[activeScope] ?? defaultFilters()}
+            pinnedOnly={organizationFilters[activeScope]?.pinned ?? false}
+            selectedTags={organizationFilters[activeScope]?.tags ?? []}
+            scopes={['all', ...providersStore.descriptors.map(provider => provider.id)]}
+            onchange={(pinned, tags) => { if (activeScope) organizationFilters[activeScope] = { pinned, tags }; }}
+            onrestore={(scope, filters, pinned, tags) => {
+              filtersByScope[scope] = filters; organizationFilters[scope] = { pinned, tags };
+              activeView = scope === 'all' ? 'all' : tabIdForProvider(scope);
+            }} />
           <Filters
             filters={filtersByScope[activeScope] ?? defaultFilters()}
             sessions={toolbarSessions}
@@ -640,6 +661,8 @@
         harness="all"
         active={activeView === 'all'}
         filters={filtersByScope.all}
+        pinnedOnly={organizationFilters.all?.pinned ?? false}
+        organizationTags={organizationFilters.all?.tags ?? []}
         onfilterschange={(f) => (filtersByScope.all = f)}
       />
     </div>
@@ -649,6 +672,8 @@
           harness={descriptor.id}
           active={activeScope === descriptor.id}
           filters={filtersByScope[descriptor.id] ?? defaultFilters()}
+          pinnedOnly={organizationFilters[descriptor.id]?.pinned ?? false}
+          organizationTags={organizationFilters[descriptor.id]?.tags ?? []}
           onfilterschange={(f) => (filtersByScope[descriptor.id] = f)}
         />
       </div>

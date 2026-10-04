@@ -1394,7 +1394,7 @@ export interface AnnotationIdentity { session_key: string; fingerprint: string; 
 export interface OrganizationSummary {
   identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
 }
-export interface SessionAnnotation { summary: OrganizationSummary; note: string }
+export interface SessionAnnotation { summary: OrganizationSummary; note: string; recovery_backup_unrestored?: boolean }
 export interface AnnotationEdit {
   identity: AnnotationIdentity; revision: number; pinned: boolean; note: string; tags: string[];
 }

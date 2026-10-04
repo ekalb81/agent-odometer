@@ -4,6 +4,7 @@
 
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
+import { mockOrganization } from './dev-mock/organization';
 import type { TranscriptRequest } from './lib/types';
 import { integrationFixture } from './dev-mock/integration';
 import { mockRangePricing, mockSessionPricing, mockSummaryPricing, assertFixtureRates } from './dev-mock/pricing';
@@ -441,6 +442,16 @@ function emitUpdateProgress(channelId: number) {
 
 mockIPC((cmd, payload) => {
   switch (cmd) {
+    case 'get_organization_recovery_state': return visualScenario === 'history-recovery';
+    case 'get_organization_summaries':
+    case 'get_session_annotation':
+    case 'edit_session_annotation':
+    case 'list_organization_tags':
+    case 'change_organization_tag':
+    case 'list_saved_searches':
+    case 'save_search':
+    case 'delete_saved_search':
+      return mockOrganization(cmd, (payload ?? {}) as Record<string, unknown>);
     case 'list_sessions':
       return visibleFixtures().map(summary);
     case 'get_speed_report': {

@@ -14,6 +14,7 @@
   import Sparkline from './Sparkline.svelte';
   import TranscriptInspector from './TranscriptInspector.svelte';
   import SessionProjectEditor from './SessionProjectEditor.svelte';
+  import SessionOrganizationEditor from './SessionOrganizationEditor.svelte';
 
   interface Props {
     session: Session | null;
@@ -311,6 +312,7 @@
     <div class="flex-1 overflow-y-auto min-h-0">
       {#key session.storage_id}
         <SessionProjectEditor {session} />
+        <SessionOrganizationEditor sessionKey={session.storage_id} />
       {/key}
       <!-- Context bar -->
       {#if ctxPercent !== null}

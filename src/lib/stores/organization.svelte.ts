@@ -1,21 +1,30 @@
-import { getOrganizationSummaries } from '../ipc';
+import { getOrganizationSummaries, listOrganizationTags, getOrganizationRecoveryState } from '../ipc';
 import type { OrganizationSummary } from '../types';
 
 let summaries = $state<Record<string, OrganizationSummary>>({});
 let busy = $state(false);
 let error = $state<string | null>(null);
+let tagLabels = $state<string[]>([]);
+let recoveryUnrestored = $state(false);
 let generation = 0;
+let editSequence = 0;
+const edits = new Map<string, number>();
 
 export const organizationStore = {
   get summaries() { return summaries; },
   get busy() { return busy; },
   get error() { return error; },
+  get tagLabels() { return tagLabels; },
+  get recoveryUnrestored() { return recoveryUnrestored; },
+  invalidate(reason: string) { generation++; busy = false; summaries = {}; tagLabels = []; edits.clear(); error = reason; },
   update(summary: OrganizationSummary) {
-    generation++; busy = false;
+    edits.set(summary.identity.session_key, ++editSequence);
     summaries = { ...summaries, [summary.identity.session_key]: summary };
+    tagLabels = [...new Set([...tagLabels, ...summary.tags])];
   },
   async load(keys: string[]) {
     const request = ++generation;
+    const startedBeforeEdit = editSequence;
     busy = true; error = null;
     try {
       const next: Record<string, OrganizationSummary> = {};
@@ -25,7 +34,14 @@ export const organizationStore = {
         if (request !== generation) return;
         for (const row of rows) next[row.identity.session_key] = row;
       }
-      if (request === generation) summaries = next;
+      const [labels, recovered] = await Promise.all([listOrganizationTags(), getOrganizationRecoveryState()]);
+      if (request === generation) {
+        for (const key of keys) {
+          if ((edits.get(key) ?? 0) > startedBeforeEdit && summaries[key]) next[key] = summaries[key];
+        }
+        summaries = next; tagLabels = [...new Set([...labels, ...Object.values(next).flatMap(row => row.tags)])];
+        recoveryUnrestored = recovered;
+      }
     } catch (cause) {
       if (request === generation) { summaries = {}; error = String(cause); }
     } finally { if (request === generation) busy = false; }

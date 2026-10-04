@@ -19,6 +19,7 @@ export function listSessions(): Promise<SessionSummary[]> {
 }
 
 /** Explicit private desktop reads; never called by export or MCP flows. */
+export function getOrganizationRecoveryState(): Promise<boolean> { return invoke('get_organization_recovery_state'); }
 export function getOrganizationSummaries(keys: string[]): Promise<OrganizationSummary[]> {
   return invoke('get_organization_summaries', { keys });
 }

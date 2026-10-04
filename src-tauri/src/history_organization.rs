@@ -46,6 +46,8 @@ pub struct OrganizationSummary {
 pub struct SessionAnnotation {
     pub summary: OrganizationSummary,
     pub note: String,
+    #[serde(default)]
+    pub recovery_backup_unrestored: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +100,19 @@ fn validate_label(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn changed_annotations(tx: &Transaction<'_>) -> Result<()> {
+    tx.execute("INSERT INTO history_meta(key,value) VALUES('organization_revision','1') ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)", [])?;
+    Ok(())
+}
+
+fn validate_tag(value: &str) -> Result<()> {
+    validate_label(value)?;
+    if value.contains(',') {
+        bail!("Tag labels cannot contain commas");
+    }
+    Ok(())
+}
+
 fn validate_identity(identity: &AnnotationIdentity) -> Result<()> {
     if identity.session_key.is_empty()
         || identity.session_key.len() > 1024
@@ -130,7 +145,7 @@ fn validate_search(value: &SavedSearchDefinition) -> Result<()> {
         bail!("Content searches require a specific session identity");
     }
     for tag in &value.tags {
-        validate_label(tag)?;
+        validate_tag(tag)?;
     }
     let mut bounds = Vec::new();
     for date in [&value.from, &value.to] {
@@ -180,10 +195,24 @@ fn read_annotation(conn: &Connection, identity: &AnnotationIdentity) -> Result<S
             tags,
         },
         note,
+        recovery_backup_unrestored: conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM history_meta WHERE key='recovered_at_ms')",
+            [],
+            |r| r.get(0),
+        )?,
     })
 }
 
 impl HistoryStore {
+    pub fn organization_recovery_pending(&self) -> Result<bool> {
+        let marker = self.recovery_receipt()?.is_some();
+        let recorded: bool = self.open_reader()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM history_meta WHERE key='recovered_at_ms')",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(marker || recorded)
+    }
     /// Bounded session metadata projection: no private note content or snapshots.
     pub fn organization_summaries(&self, keys: &[String]) -> Result<Vec<OrganizationSummary>> {
         if keys.len() > 10_000 || keys.iter().any(|k| k.len() > 1024) {
@@ -226,6 +255,7 @@ impl HistoryStore {
 
     pub fn get_annotation(&self, identity: &AnnotationIdentity) -> Result<SessionAnnotation> {
         validate_identity(identity)?;
+        self.recovery_receipt()?;
         {
             let conn = self.open_reader()?;
             read_annotation(&conn, identity)
@@ -241,7 +271,7 @@ impl HistoryStore {
             bail!("Note or tag selection is too large");
         }
         for tag in &edit.tags {
-            validate_label(tag)?;
+            validate_tag(tag)?;
         }
         // Record bookmark writes are enabled only through the inspector's anchor
         // validation API. A generic organization edit cannot fabricate one.
@@ -280,6 +310,7 @@ impl HistoryStore {
             bail!("At most 1000 tag labels are supported");
         }
         let result = read_annotation(&tx, &edit.identity)?;
+        changed_annotations(&tx)?;
         tx.commit()?;
         Ok(result)
     }
@@ -298,9 +329,9 @@ impl HistoryStore {
     }
 
     pub fn change_organization_tag(&self, label: &str, replacement: Option<&str>) -> Result<()> {
-        validate_label(label)?;
+        validate_tag(label)?;
         if let Some(replacement) = replacement {
-            validate_label(replacement)?;
+            validate_tag(replacement)?;
         }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -317,6 +348,7 @@ impl HistoryStore {
         } else {
             tx.execute("DELETE FROM organization_tags WHERE label=?1", [label])?;
         }
+        changed_annotations(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -541,7 +573,17 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let preview = store.preview_purge(now).unwrap();
         assert_eq!(preview.sessions, 1);
-        store.purge_retained(&preview, now).unwrap();
+        let latest = store.get_annotation(&initial.identity).unwrap();
+        let mut new_note = edit(&latest.summary);
+        new_note.note = "Edited after purge preview".into();
+        store.edit_annotation(&new_note).unwrap();
+        assert!(store.purge_retained(&preview, now).is_err());
+        assert_eq!(
+            store.get_annotation(&initial.identity).unwrap().note,
+            "Edited after purge preview"
+        );
+        let refreshed = store.preview_purge(now).unwrap();
+        store.purge_retained(&refreshed, now).unwrap();
         assert!(store.get_annotation(&initial.identity).is_err());
         assert_eq!(
             store
@@ -587,5 +629,42 @@ mod tests {
         invalid = search();
         invalid.from = Some("bad-date".into());
         assert!(store.save_search(None, 0, &invalid).is_err());
+    }
+
+    #[test]
+    fn recovery_preserves_private_backup_without_claiming_source_reconstruction_restored_notes() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("history.sqlite");
+        let source = root.path().join("source.jsonl");
+        std::fs::write(&source, b"synthetic source remains unchanged\n").unwrap();
+        let source_before = std::fs::read(&source).unwrap();
+        let store = HistoryStore::open(&db).unwrap();
+        let session = fixture("recovery-organization");
+        let key = store.observe(&source, &session, 1).unwrap().key;
+        let identity = store
+            .organization_summaries(std::slice::from_ref(&key))
+            .unwrap()
+            .remove(0);
+        store.edit_annotation(&edit(&identity)).unwrap();
+        assert!(!store.organization_recovery_pending().unwrap());
+        drop(store);
+        let original = std::fs::read(&db).unwrap();
+        let (replacement, receipt) = HistoryStore::recover_unavailable(&db).unwrap();
+        let backup = receipt.backup_directory.join("history.sqlite");
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert!(replacement.organization_recovery_pending().unwrap());
+        let key = replacement.observe(&source, &session, 1).unwrap().key;
+        let target = replacement
+            .organization_summaries(&[key])
+            .unwrap()
+            .remove(0);
+        let annotation = replacement.get_annotation(&target.identity).unwrap();
+        assert!(annotation.note.is_empty() && annotation.recovery_backup_unrestored);
+        let preserved = HistoryStore::open_read_only(&backup, QueryControl::default()).unwrap();
+        assert_eq!(
+            preserved.get_annotation(&identity.identity).unwrap().note,
+            "PRIVATE_SENTINEL_252"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), source_before);
     }
 }

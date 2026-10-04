@@ -59,6 +59,9 @@
       <button class="text-accent hover:underline" disabled={busy} aria-expanded={editing} onclick={() => { editing ? cancel() : editing = true; }}>{editing ? 'Cancel' : 'Edit organization'}</button>
     {/if}
   </div>
+  {#if annotation?.recovery_backup_unrestored}
+    <p class="mt-2 text-amber-500">Recovery rebuilt source history. Earlier pins, tags, and notes remain in the preserved database backup and were not restored. Edits here belong to the rebuilt history.</p>
+  {/if}
   {#if editing}
     <div class="mt-3 space-y-2">
       <label class="flex items-center gap-2"><input type="checkbox" bind:checked={pinned} disabled={busy} /> Pin this session</label>
