@@ -198,7 +198,11 @@ fn search_records(
             .blocks
             .iter()
             .enumerate()
-            .filter(|(_, block)| includes(scope, block.kind))
+            .filter(|(_, block)| {
+                includes(scope, block.kind)
+                    && (block.kind != "text"
+                        || matches!(presentation.role.as_deref(), Some("user" | "assistant")))
+            })
             .find_map(|(index, block)| {
                 snippet(&block.text, matcher).map(|snippet| (index, block, snippet))
             })
@@ -530,5 +534,38 @@ mod tests {
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].content_kind, "tool_result");
         assert_eq!(hits[1].content_kind, "tool_call");
+    }
+
+    #[test]
+    fn default_search_excludes_reasoning_summaries_even_with_assistant_role() {
+        let values = [
+            serde_json::json!({"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"text","text":"private needle"}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"reasoning","role":"assistant","summary":[{"type":"text","text":"private needle"}]}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"text","text":"public needle"}]}}),
+        ];
+        let records: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| transcript::TranscriptRecord {
+                id: format!("record-{index}"),
+                byte_offset: 0,
+                byte_length: 0,
+                raw_json: None,
+                kind: Some("response_item".into()),
+                message_id: None,
+                issue: None,
+                presentation: Some(crate::transcript_view::present(value)),
+            })
+            .collect();
+        let (hits, _) = search_records(
+            "synthetic",
+            ContentScope::default(),
+            &matcher("needle").unwrap(),
+            &records,
+        );
+        assert_eq!(hits.len(), 1);
+        assert!(
+            matches!(&hits[0].target,SearchTarget::SourceRecord {record_id,..} if record_id=="record-2")
+        );
     }
 }
