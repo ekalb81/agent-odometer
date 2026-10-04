@@ -20,6 +20,7 @@ export default defineConfig({
         'src/components/SessionContextMenu.svelte',
         'src/components/SessionGridControls.svelte',
         'src/components/SessionProjectEditor.svelte',
+        'src/components/TranscriptSearch.svelte',
         'src/lib/configTimeline.ts',
         'src/lib/defenderStatus.ts',
         'src/lib/diagnosticsExport.ts',

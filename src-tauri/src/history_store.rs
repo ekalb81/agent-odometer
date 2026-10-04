@@ -36,6 +36,9 @@ pub use lifecycle::{
 #[path = "history_recovery.rs"]
 mod recovery;
 pub use recovery::{HistoryFailure, HistoryFailureKind, RecoveryReceipt};
+#[path = "history_search.rs"]
+mod search;
+pub(crate) use search::RetainedSearchMessages;
 
 const SCHEMA_VERSION: i64 = 11;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
