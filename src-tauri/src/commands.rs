@@ -4536,7 +4536,7 @@ pub(crate) fn quota_budget_statuses(
     let rates = needs_ledger.then(get_rates);
     // ponytail: at most 64 budgets, one bounded range per budget; batch shared
     // periods if profiling shows this dominates refresh time.
-    budgets
+    let mut statuses: Vec<_> = budgets
         .iter()
         .map(|budget| {
             let value = (|| -> Result<f64, &'static str> {
@@ -4645,7 +4645,41 @@ pub(crate) fn quota_budget_statuses(
                 unavailable: value.err(),
             }
         })
-        .collect()
+        .collect();
+    finalize_quota_budget_statuses(state, history.as_ref(), budgets, &mut statuses);
+    statuses
+}
+
+/// Queries use separate ledger readers. A purge or replacement between them
+/// must not publish a partial batch or consume ledger notification state.
+pub(crate) fn finalize_quota_budget_statuses(
+    state: &AppState,
+    approved_history: Option<&Arc<crate::history_store::HistoryStore>>,
+    budgets: &[crate::quota_store::QuotaBudget],
+    statuses: &mut [crate::quota::QuotaBudgetStatus],
+) {
+    use crate::quota_store::BudgetUnit;
+    if !budgets
+        .iter()
+        .any(|budget| budget.enabled && budget.unit != BudgetUnit::PercentOfWindow)
+    {
+        return;
+    }
+    let current = state.history_ready();
+    let unchanged_and_complete =
+        approved_history
+            .zip(current.as_ref())
+            .is_some_and(|(approved, current)| {
+                Arc::ptr_eq(approved, current) && current.has_complete_coverage().unwrap_or(false)
+            });
+    if !unchanged_and_complete {
+        for (budget, status) in budgets.iter().zip(statuses) {
+            if budget.enabled && budget.unit != BudgetUnit::PercentOfWindow {
+                status.current_value = None;
+                status.unavailable = Some("history_unavailable");
+            }
+        }
+    }
 }
 
 fn budget_usd_total(
