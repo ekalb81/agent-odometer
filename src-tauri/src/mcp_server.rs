@@ -15,7 +15,7 @@ use crate::history_store::HistoryStore;
 use crate::query_control::QueryControl;
 use crate::rates::RateCard;
 
-const PROTOCOL_VERSION: &str = "2025-06-18";
+pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -36,11 +36,12 @@ pub fn try_run_cli() -> bool {
 /// Drain accepted work on EOF. At most two queries run, with no pending
 /// queue; excess calls receive an explicit busy error and may be retried.
 pub fn serve<R: BufRead, W: Write + Send>(input: R, output: W) {
-    serve_with_executor(input, output, execute_local);
+    serve_inner(input, output, execute_local, true);
 }
 
 #[derive(Debug, Clone)]
 struct PreparedCall {
+    name: &'static str,
     kind: QueryKind,
     request: Request,
     envelope_key: Option<&'static str>,
@@ -59,7 +60,20 @@ impl ToolError {
     }
 }
 
-fn serve_with_executor<R, W, F>(mut input: R, output: W, executor: F)
+#[cfg(test)]
+fn serve_with_executor<
+    R: BufRead,
+    W: Write + Send,
+    F: Fn(PreparedCall, QueryControl) -> Result<String, ToolError> + Sync,
+>(
+    input: R,
+    output: W,
+    executor: F,
+) {
+    serve_inner(input, output, executor, false);
+}
+
+fn serve_inner<R, W, F>(mut input: R, output: W, executor: F, record_activity: bool)
 where
     R: BufRead,
     W: Write + Send,
@@ -67,6 +81,7 @@ where
 {
     let output = Mutex::new(output);
     let active = Arc::new(Mutex::new(HashMap::<String, QueryControl>::new()));
+    let mut connection = crate::integration_activity::Connection::default();
     std::thread::scope(|scope| {
         let mut workers: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
         loop {
@@ -155,7 +170,10 @@ where
                 continue;
             };
             let immediate = match method {
-                "initialize" => Some(success(id.clone(), initialize_result())),
+                "initialize" => {
+                    connection = crate::integration_activity::Connection::from_initialize(&params);
+                    Some(success(id.clone(), initialize_result()))
+                }
                 "ping" => Some(success(id.clone(), json!({}))),
                 "tools/list" => Some(success(id.clone(), json!({"tools": tool_descriptors()}))),
                 "tools/call" => match prepare_call(&params) {
@@ -184,19 +202,26 @@ where
                             active_guard.insert(key.clone(), control.clone());
                             drop(active_guard);
                             let active = Arc::clone(&active);
+                            let connection = connection.clone();
                             let executor = &executor;
                             let output = &output;
                             workers.push(scope.spawn(move || {
                                 let limit = control.max_output_bytes().min(MAX_OUTPUT_BYTES);
+                                let name = call.name;
+                                let started = std::time::Instant::now();
                                 let result = control.check().map_err(ToolError::failed)
                                     .and_then(|()| executor(call, control.clone()))
                                     .and_then(|result| control.check().map(|()| result).map_err(ToolError::failed));
+                                let mut activity = record_activity.then(|| crate::integration_activity::summarize(&connection, name, started, &result)).flatten();
                                 let mut response = tool_response(id.clone(), result);
                                 if response.len() > limit {
+                                    if let Some(activity) = &mut activity { activity.success = false; activity.error_code = Some("query_too_broad".into()); activity.result_bytes = 0; activity.result_rows = None; }
                                     response = tool_response(id, Err(ToolError::Failed("query output exceeds the response limit; request a narrower range".into())));
                                 }
                                 if !write_response(output, &response) {
                                     cancel_all(&active);
+                                } else if let Some(activity) = activity {
+                                    crate::integration_activity::record(activity);
                                 }
                                 active.lock().expect("active queries").remove(&key);
                             }));
@@ -279,12 +304,13 @@ fn initialize_result() -> Value {
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {"tools": {}},
         "serverInfo": {"name": "agent-odometer", "version": env!("CARGO_PKG_VERSION")},
-        "instructions": "Read-only local usage analytics. Every tool answers from the durable ledger and never changes application records or settings, scans transcripts, or reaches the network. SQLite may maintain WAL coordination sidecars. Results are aggregates, not prompts, replies, or tool output. Session keys and project labels are sensitive metadata. Project paths are always redacted. At most two queries run concurrently; requests are limited to 64 KiB and responses to 8 MiB. Cancel running work with notifications/cancelled and requestId. Activity and statusline use UTC.",
+        "instructions": "Read-only local usage analytics. Call odometer_status first when readiness, freshness, pricing or coverage is uncertain. Every tool answers from the durable ledger and never changes application records or settings, scans transcripts, or reaches the network. SQLite may maintain WAL coordination sidecars. Results are aggregates, not prompts, replies, or tool output. Session keys and project labels are sensitive metadata. Project paths are always redacted. At most two queries run concurrently; requests are limited to 64 KiB and responses to 8 MiB. Cancel running work with notifications/cancelled and requestId. Activity and statusline use UTC.",
     })
 }
 
 fn tool_specs() -> &'static [(&'static str, QueryKind, &'static str)] {
     &[
+        ("odometer_status", QueryKind::IntegrationStatus, "Front-door ledger, provider, pricing and quota coverage with snapshot observation metadata, safe next calls and explicit limitations."),
         ("usage_report", QueryKind::Report, "Token usage and cost by model, with separate currency totals and pricing provenance. Aggregates only."),
         ("model_report", QueryKind::Models, "Model usage, tier-aware cost, and pricing provenance. Aggregates only."),
         ("project_report", QueryKind::Projects, "Usage and costs by project. Local filesystem paths are always redacted to stable identifiers; labels can still identify sensitive work."),
@@ -304,7 +330,7 @@ fn tool_specs() -> &'static [(&'static str, QueryKind, &'static str)] {
     ]
 }
 
-fn tool_descriptors() -> Vec<Value> {
+pub(crate) fn tool_descriptors() -> Vec<Value> {
     tool_specs().iter().map(|(name, kind, description)| {
         let mut properties = serde_json::Map::new();
         if kind.accepts_window() {
@@ -314,8 +340,30 @@ fn tool_descriptors() -> Vec<Value> {
         if *kind == QueryKind::Sessions {
             properties.insert("limit".into(), json!({"type":"integer", "minimum":1, "maximum":1000, "default":20}));
         }
+        let (use_when, avoid, interpretation) = tool_guidance(*kind);
+        let example = if kind.accepts_window() { format!("{name}({{\"from\":\"2026-09-01\",\"to\":\"2026-09-07\"}})") } else { format!("{name}({{}})") };
+        let description = format!("{description}\nUse when: {use_when}\nDo not use when: {avoid}\nInterpretation: {interpretation}\nExample requests: {example}");
         json!({"name":name, "description":description, "inputSchema":{"type":"object", "properties":properties, "additionalProperties":false}, "annotations":{"readOnlyHint":true, "destructiveHint":false, "idempotentHint":true, "openWorldHint":false}})
     }).collect()
+}
+
+fn tool_guidance(kind: QueryKind) -> (&'static str, &'static str, &'static str) {
+    match kind {
+        QueryKind::IntegrationStatus => ("Starting an analytics task or uncertain about available data.", "You need actual usage totals; follow the suggested report calls instead.", "Ledger readability does not prove scan completeness. Observation age and coverage are evidence, not live quota authority."),
+        QueryKind::Status => ("Checking legacy ledger availability and rate-card version.", "You need full integration readiness; prefer odometer_status.", "An available ledger can be stale or incomplete."),
+        QueryKind::Diagnostics => ("Investigating missing providers, models, or pricing provenance.", "You need token or cost totals.", "Configured roots and pricing resolution are diagnostics, not proof of a completed scan or current provider service."),
+        QueryKind::Quota => ("Inspecting recorded quota snapshots and their source/staleness.", "You need authoritative live quota without an explicitly consented source.", "Unavailable is not zero. Preserve provenance and age; usage estimates are not provider quota."),
+        QueryKind::Sessions => ("Discovering bounded session keys before referring to a session.", "You need prompts, raw transcripts, or a complete unlimited session export.", "Keys identify sensitive local work. Prices retain provenance; default limit is 20 and maximum is 1000."),
+        QueryKind::Projects => ("Comparing aggregate usage across project cohorts.", "You need filesystem paths or causal conclusions about project productivity.", "Stable project identifiers are redacted; labels can remain sensitive. Cohort differences are observational."),
+        QueryKind::Metrics => ("Comparing workflow ratios and their evidence coverage.", "You intend to claim a speedup or causal effect from cohort correlations.", "Read numerator, denominator, and coverage together. Missing evidence is unavailable."),
+        QueryKind::Findings => ("Finding recurring optimization rules worth investigating.", "You need evidence text or proof that a proposed optimization saved work.", "Counts are observational signals; validate a change independently."),
+        QueryKind::Tools => ("Comparing recorded tool calls, failures and dimensions.", "You need tool arguments, output bodies, or a causal performance claim.", "Dimensions have recorded coverage; absent dimensions do not mean no tool use."),
+        QueryKind::Context => ("Inspecting recorded context-source dimensions.", "You need message text or all context actually seen by an agent.", "Only recorded dimensions are covered; unavailable sources must remain explicit."),
+        QueryKind::Mirrors => ("Inspecting candidate mirrored-session groups.", "You want usage silently deduplicated or proof two transcripts are equivalent.", "Candidate grouping is metadata evidence; totals are not automatically reduced."),
+        QueryKind::Activity => ("Comparing hourly usage in a bounded UTC date window.", "You need local-time hour buckets or provider quota.", "Hourly bins use UTC and observed ledger usage; gaps may reflect missing evidence."),
+        QueryKind::Statusline => ("Rendering a small summary of today's observed usage.", "You need a historical window, scan completeness or live provider balance.", "UTC-day aggregates may be incomplete; pricing and quota provenance still apply."),
+        QueryKind::Report | QueryKind::Models | QueryKind::Categories => ("Comparing observed token usage and priced cohorts over a date window.", "You need a bill, live quota, or causal optimization evidence.", "Keep currencies and cost surfaces separate. Plan credits, API USD estimates and billing scenarios are different quantities; preserve fallback/unavailable provenance."),
+    }
 }
 
 fn prepare_call(params: &Value) -> Result<PreparedCall, ToolError> {
@@ -337,9 +385,9 @@ fn prepare_call(params: &Value) -> Result<PreparedCall, ToolError> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::BadArguments("tools/call needs a string 'name'".into()))?;
-    let kind = tool_specs()
+    let (canonical_name, kind) = tool_specs()
         .iter()
-        .find_map(|(tool, kind, _)| (*tool == name).then_some(*kind))
+        .find_map(|(tool, kind, _)| (*tool == name).then_some((*tool, *kind)))
         .ok_or_else(|| ToolError::UnknownTool(name.into()))?;
     let mut request = Request::default();
     if let Some(arguments) = params.get("arguments") {
@@ -383,6 +431,7 @@ fn prepare_call(params: &Value) -> Result<PreparedCall, ToolError> {
         .validate_for(kind)
         .map_err(|error| ToolError::BadArguments(error.to_string()))?;
     Ok(PreparedCall {
+        name: canonical_name,
         kind,
         request,
         envelope_key: match name {
@@ -474,10 +523,14 @@ fn tool_response(id: Value, result: Result<String, ToolError>) -> String {
             error_response(id, INVALID_PARAMS, &format!("unknown tool '{name}'"))
         }
         Err(ToolError::BadArguments(message)) => error_response(id, INVALID_PARAMS, &message),
-        Err(ToolError::Failed(message)) => success(
-            id,
-            json!({"content":[{"type":"text", "text":message}], "isError":true}),
-        ),
+        Err(ToolError::Failed(message)) => {
+            let diagnostic =
+                crate::integration_status::DiagnosticCode::for_query_failure(&message).diagnostic();
+            success(
+                id,
+                json!({"content":[{"type":"text", "text":json!({"schema_version":1,"diagnostic":diagnostic}).to_string()}], "isError":true}),
+            )
+        }
     }
 }
 
@@ -537,7 +590,12 @@ mod tests {
                 }
             }
             let before = std::fs::read(&path).ok();
-            for name in ["ledger_status", "diagnostics_report", "usage_report"] {
+            for name in [
+                "ledger_status",
+                "odometer_status",
+                "diagnostics_report",
+                "usage_report",
+            ] {
                 let result = execute_at_path(
                     &path,
                     prepare_call(&json!({"name":name})).unwrap(),
