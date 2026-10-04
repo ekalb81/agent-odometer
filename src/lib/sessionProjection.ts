@@ -255,7 +255,7 @@ export function projectSession<T extends SessionSummary>(
     missingModels: useApi ? (api?.missing_models ?? []) : plan.missing_models,
     unpricedModels: useApi ? (api?.unpriced_models ?? []) : plan.unpriced_models,
     timeAwareApiStatus: rates.pricing_catalog.rate_periods.some((period) =>
-      period.surface === (session.harness === 'codex' ? 'openai_api_usd' : 'anthropic_api_usd'))
+      period.surface === (session.harness === 'codex' ? 'openai_api_usd' : session.harness === 'gemini_cli' ? 'gemini_api_usd' : 'anthropic_api_usd'))
       ? 'unavailable_requires_request_history'
       : null,
     pricingCatalogAvailable: rates.pricing_catalog.rate_periods.length > 0,

@@ -135,9 +135,12 @@ pub fn price_turn(
     };
     let resolution = rates.resolve_model_pricing(model, harness, rate_table, now);
     result.basis = resolution.basis;
+    result.unpriced |= resolution.basis == PricingBasis::Unavailable;
     result.fallback_used = resolution.basis == PricingBasis::Fallback;
-    if let Some(rate) = rate_table.get(&resolution.resolved_model) {
-        result.cost = token_cost(tokens, rate, service_tier_multiplier(model, tier, table));
+    if resolution.basis != PricingBasis::Unavailable {
+        if let Some(rate) = rate_table.get(&resolution.resolved_model) {
+            result.cost = token_cost(tokens, rate, service_tier_multiplier(model, tier, table));
+        }
     }
     result
 }
@@ -256,11 +259,15 @@ pub fn time_aware_pricing(session: &Session, rates: &RateCard) -> Option<TimeAwa
     if session.tokens_history.is_empty() || rates.pricing_catalog.rate_periods.is_empty() {
         return None;
     }
-    // Preserve the desktop's current provider-to-scenario mapping.
+    // Billing rules must stay inside the provider's API surface.
     let surface = if session.harness == codex_provider_id() {
         PricingSurface::OpenaiApiUsd
-    } else {
+    } else if session.harness.as_str() == "gemini_cli" {
+        PricingSurface::GeminiApiUsd
+    } else if session.harness.as_str() == "claude_code" {
         PricingSurface::AnthropicApiUsd
+    } else {
+        return None;
     };
     let mut result = TimeAwarePricing {
         pricing: PricedSurface {

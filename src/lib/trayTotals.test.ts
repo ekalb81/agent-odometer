@@ -56,6 +56,19 @@ function session(id: string, harness: TraySessionLike['harness'], unlimited: boo
 }
 
 describe('computeTrayTotals', () => {
+  it('keeps expired-only prices unavailable and mixed totals partial without dropping tokens', () => {
+    const expired = range('expired-promo', 100, 50, 0, 0);
+    expired.pricing = { plan: surface(0, { unpriced_models: ['expired-promo'] }), api: surface(0, { unpriced_models: ['expired-promo'] }) };
+    const only = computeTrayTotals([session('c1', 'codex'), session('a1', 'claude_code')], { c1: expired, a1: expired }, rateCard);
+    expect(only.tokens).toBe('300');
+    expect(only.codex_credits).toBe('unavailable');
+    expect(only.codex_api_usd).toBe('unavailable · unpriced models');
+    expect(only.claude_usd).toBe('unavailable');
+    const mixed = computeTrayTotals([session('c1', 'codex'), session('c2', 'codex')], { c1: expired, c2: range('priced', 3, 2, 17, 29) }, rateCard);
+    expect(mixed.tokens).toBe('155');
+    expect(mixed.codex_credits).toBe('17.00 · excludes unpriced');
+    expect(mixed.codex_api_usd).toBe('$29.00 · excludes unpriced');
+  });
   it('sums tokens and authoritative backend prices for codex + claude sessions', () => {
     const totals = computeTrayTotals(
       [session('c1', 'codex'), session('a1', 'claude_code')],

@@ -522,7 +522,9 @@ pub(crate) fn price_buckets_detailed_controlled(
         let is_unpriced = rates.unpriced_models.contains(&bucket.model);
         let resolution = rates.resolve_model_pricing(&bucket.model, harness, rate_table, now);
 
-        if is_unpriced && resolution.basis == PricingBasis::Unavailable {
+        if resolution.basis == PricingBasis::Unavailable
+            && (is_unpriced || rate_table.contains_key(&resolution.resolved_model))
+        {
             unpriced.insert(bucket.model.clone());
             by_model
                 .entry(bucket.model.clone())
@@ -536,6 +538,9 @@ pub(crate) fn price_buckets_detailed_controlled(
             missing.insert(bucket.model.clone());
         }
 
+        if resolution.basis == PricingBasis::Unavailable {
+            continue;
+        }
         let Some(rate) = rate_table.get(&resolution.resolved_model) else {
             // No rate row. A free/local model is a declared zero worth
             // showing; anything else is already reported through

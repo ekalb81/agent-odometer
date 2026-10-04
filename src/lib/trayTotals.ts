@@ -52,9 +52,9 @@ export function computeTrayTotals(
   const creditText = unlimited > 0 && codexCredits === 0 ? `unlimited (${unlimited})` : `${codexCredits.toFixed(2)}${unlimited ? ` + ${unlimited} unlimited` : ''}${unpricedCredits ? ' · excludes unpriced' : missingCredits ? ' · fallback' : ''}`;
   return {
     tokens: tokens.toLocaleString(),
-    codex_credits: !Number.isFinite(codexCredits) ? 'unavailable' : creditText,
-    codex_api_usd: missingApi ? 'unavailable · missing direct rate' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
-    claude_usd: !Number.isFinite(claudeUsd) ? 'unavailable' : `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}`,
+    codex_credits: !Number.isFinite(codexCredits) || (unpricedCredits && codexCredits === 0 && unlimited === 0) ? 'unavailable' : creditText,
+    codex_api_usd: missingApi ? 'unavailable · missing direct rate' : unpricedApi && codexApi === 0 ? 'unavailable · unpriced models' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
+    claude_usd: !Number.isFinite(claudeUsd) || (unpricedClaude && claudeUsd === 0) ? 'unavailable' : `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}`,
     quota: quotaLabel ?? '',
   };
 }

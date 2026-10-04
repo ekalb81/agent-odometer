@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelRate {
     pub input: f64,
     pub cached_input: f64,
@@ -78,6 +78,7 @@ pub enum PricingSurface {
     CodexPlanCredits,
     OpenaiApiUsd,
     AnthropicApiUsd,
+    GeminiApiUsd,
 }
 
 /// Source information retained with each catalog rule so scenario estimates do
@@ -93,7 +94,7 @@ pub struct PricingProvenance {
 
 /// An effective-dated base rate. `to: None` denotes an open-ended interval;
 /// otherwise periods use the half-open interval `[from, to)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectiveRatePeriod {
     /// Stable catalog identity used to reconcile rate rules across updates.
     /// Missing IDs deserialize for old user overrides but do not validate.
@@ -130,7 +131,7 @@ pub struct RateMultipliers {
 /// An effective-dated conditional pricing rule.  Cache-write token categories
 /// are deliberately not represented by `RateMultipliers`: parsers currently
 /// retain cache reads but do not distinguish cache writes from uncached input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConditionalRateModifier {
     /// Stable catalog identity used to reconcile conditional rules across updates.
     /// Missing IDs deserialize for old user overrides but do not validate.
@@ -680,6 +681,17 @@ pub struct RateCard {
     /// refresh flow. See `RateRefreshState` and `apply_refresh_candidate`.
     #[serde(default)]
     pub refresh: RateRefreshState,
+    /// Evidence belongs to a specific row, never to an entire merged card.
+    /// Keys are models/<id>, api_models/<id>, or floating_model_aliases/<id>.
+    #[serde(default)]
+    pub rate_provenance: HashMap<String, PricingProvenance>,
+    /// Retained edits or old rows whose bundled origin cannot be established.
+    #[serde(default)]
+    pub upgrade_review: Vec<String>,
+    /// Exclusive UTC expiry of a flat reference with a published price change.
+    /// Historical scenarios use pricing_catalog instead of this current estimate.
+    #[serde(default)]
+    pub flat_rate_expires_at: HashMap<String, NaiveDate>,
 }
 
 fn rates_path() -> Option<PathBuf> {
@@ -778,8 +790,15 @@ impl RateCard {
         table: &HashMap<String, ModelRate>,
         now: DateTime<Utc>,
     ) -> PricedModelResolution {
-        let basis = |direct_basis: PricingBasis| -> PricingBasis {
-            if self.refresh.freshness(now) == RateFreshness::Stale {
+        let basis = |resolved: &str, direct_basis: PricingBasis| -> PricingBasis {
+            if self.unpriced_models.iter().any(|model| model == resolved)
+                || self
+                    .flat_rate_expires_at
+                    .get(resolved)
+                    .is_some_and(|end| now.date_naive() >= *end)
+            {
+                PricingBasis::Unavailable
+            } else if self.refresh.freshness(now) == RateFreshness::Stale {
                 PricingBasis::Stale
             } else {
                 direct_basis
@@ -797,10 +816,20 @@ impl RateCard {
                 basis: PricingBasis::Unavailable,
             };
         }
+        if self
+            .flat_rate_expires_at
+            .get(model)
+            .is_some_and(|end| now.date_naive() >= *end)
+        {
+            return PricedModelResolution {
+                resolved_model: model.to_owned(),
+                basis: PricingBasis::Unavailable,
+            };
+        }
         if table.contains_key(model) {
             return PricedModelResolution {
                 resolved_model: model.to_owned(),
-                basis: basis(PricingBasis::Direct),
+                basis: basis(model, PricingBasis::Direct),
             };
         }
         // Checked before `model_aliases`, and only while unexpired: past its
@@ -814,7 +843,7 @@ impl RateCard {
             {
                 return PricedModelResolution {
                     resolved_model: floating.target.clone(),
-                    basis: basis(PricingBasis::FloatingAlias),
+                    basis: basis(&floating.target, PricingBasis::FloatingAlias),
                 };
             }
         }
@@ -822,7 +851,7 @@ impl RateCard {
         if hopped && table.contains_key(resolved) {
             return PricedModelResolution {
                 resolved_model: resolved.to_owned(),
-                basis: basis(PricingBasis::Aliased),
+                basis: basis(resolved, PricingBasis::Aliased),
             };
         }
         let fallback_model = self
@@ -832,7 +861,7 @@ impl RateCard {
         if table.contains_key(fallback_model.as_str()) {
             return PricedModelResolution {
                 resolved_model: fallback_model.clone(),
-                basis: basis(PricingBasis::Fallback),
+                basis: basis(fallback_model, PricingBasis::Fallback),
             };
         }
         PricedModelResolution {
@@ -874,6 +903,67 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     if disk.version >= bundled.version {
         return disk;
     }
+    // Version 11 shipped before per-row evidence. Equality with its exact
+    // archived bundle is the only recoverable default signal; an identical
+    // deliberate user entry is indistinguishable and follows the default.
+    // Unknown versions never authorize replacing an existing value.
+    let previous: Option<RateCard> = (disk.version == 11)
+        .then(|| serde_json::from_str(include_str!("../rate-history/v11.json")).ok())
+        .flatten();
+    merge_default_entries(
+        &mut disk.models,
+        &bundled.models,
+        previous.as_ref().map(|card| &card.models),
+        "models",
+        &mut disk.rate_provenance,
+        &bundled.rate_provenance,
+        &mut disk.upgrade_review,
+    );
+    merge_default_entries(
+        &mut disk.api_models,
+        &bundled.api_models,
+        previous.as_ref().map(|card| &card.api_models),
+        "api_models",
+        &mut disk.rate_provenance,
+        &bundled.rate_provenance,
+        &mut disk.upgrade_review,
+    );
+    // Version 11 had no static Daybreak aliases. A new static mapping is
+    // an explicit user choice; don't shadow it with a bundled floating one.
+    let mut floating_defaults = bundled.floating_model_aliases.clone();
+    for (raw_id, target) in &disk.model_aliases {
+        if !floating_defaults.contains_key(raw_id) {
+            continue;
+        }
+        if disk.version < 11
+            && bundled
+                .floating_model_aliases
+                .get(raw_id)
+                .is_some_and(|floating| &floating.target == target)
+        {
+            continue; // Recognized legacy static default is migrated below.
+        }
+        floating_defaults.remove(raw_id);
+        disk.upgrade_review.push(format!("model_aliases/{raw_id}"));
+        if previous
+            .as_ref()
+            .and_then(|card| card.floating_model_aliases.get(raw_id))
+            == disk.floating_model_aliases.get(raw_id)
+        {
+            disk.floating_model_aliases.remove(raw_id);
+            disk.rate_provenance
+                .remove(&format!("floating_model_aliases/{raw_id}"));
+        }
+    }
+    merge_default_entries(
+        &mut disk.floating_model_aliases,
+        &floating_defaults,
+        previous.as_ref().map(|card| &card.floating_model_aliases),
+        "floating_model_aliases",
+        &mut disk.rate_provenance,
+        &bundled.rate_provenance,
+        &mut disk.upgrade_review,
+    );
     // Backfill the newly split cache-creation dimension onto models the user
     // already customized, before bundled entries below fill in models the
     // user never touched. A disk entry's `cache_creation_input` being
@@ -903,21 +993,31 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
             }
         }
     }
-    for (model, rate) in bundled.models {
-        disk.models.entry(model).or_insert(rate);
-    }
     for (harness, currency) in bundled.currencies {
         disk.currencies.entry(harness).or_insert(currency);
     }
     for (harness, model) in bundled.fallback_models {
         disk.fallback_models.entry(harness).or_insert(model);
     }
-    for (model, rate) in bundled.api_models {
-        disk.api_models.entry(model).or_insert(rate);
-    }
     for model in bundled.unpriced_models {
-        let user_supplied_rate =
-            disk.models.contains_key(&model) || disk.api_models.contains_key(&model);
+        let user_supplied_rate = [
+            (
+                "models",
+                &disk.models,
+                previous.as_ref().map(|card| &card.models),
+            ),
+            (
+                "api_models",
+                &disk.api_models,
+                previous.as_ref().map(|card| &card.api_models),
+            ),
+        ]
+        .into_iter()
+        .any(|(_, table, old)| {
+            table
+                .get(&model)
+                .is_some_and(|value| old.and_then(|table| table.get(&model)) != Some(value))
+        });
         if !user_supplied_rate && !disk.unpriced_models.contains(&model) {
             disk.unpriced_models.push(model);
         }
@@ -940,16 +1040,14 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     // declares is removed, so this discards the copy an earlier bundled card
     // put there and never a mapping the user chose for themselves.
     for (raw_id, floating) in bundled.floating_model_aliases {
-        let superseded_bundled_entry = disk
-            .model_aliases
-            .get(&raw_id)
-            .is_some_and(|existing| *existing == floating.target);
+        let superseded_bundled_entry = disk.version < 11
+            && disk
+                .model_aliases
+                .get(&raw_id)
+                .is_some_and(|existing| *existing == floating.target);
         if superseded_bundled_entry {
             disk.model_aliases.remove(&raw_id);
         }
-        disk.floating_model_aliases
-            .entry(raw_id)
-            .or_insert(floating);
     }
     for (raw_id, canonical) in bundled.model_aliases {
         disk.model_aliases.entry(raw_id).or_insert(canonical);
@@ -965,33 +1063,150 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     // Reconcile managed catalog rules by durable ID. This refreshes corrected
     // bundled periods/modifiers and adds newly published rules while retaining
     // a user's separately identified custom rules and notes.
-    disk.pricing_catalog = merge_older_catalog(disk.pricing_catalog, bundled.pricing_catalog);
+    for period in &disk.pricing_catalog.rate_periods {
+        if !bundled
+            .pricing_catalog
+            .rate_periods
+            .iter()
+            .any(|rule| rule.id == period.id)
+        {
+            disk.upgrade_review
+                .push(format!("pricing_catalog/{}", period.id));
+        }
+    }
+    disk.pricing_catalog = merge_older_catalog(
+        disk.pricing_catalog,
+        bundled.pricing_catalog,
+        previous.as_ref().map(|card| &card.pricing_catalog),
+        &mut disk.upgrade_review,
+    );
     disk.version = bundled.version;
     disk.source_url = bundled.source_url;
-    disk.fetched_at = bundled.fetched_at;
+    if disk.upgrade_review.is_empty() {
+        disk.fetched_at = bundled.fetched_at;
+    }
+    // A published expiry cannot become perpetual through a saved flat row.
+    for (model, end) in bundled.flat_rate_expires_at {
+        if !disk.upgrade_review.contains(&format!("models/{model}")) {
+            disk.flat_rate_expires_at.entry(model).or_insert(end);
+        }
+    }
+    disk.upgrade_review.sort();
+    disk.upgrade_review.dedup();
     // `refresh` and `display_currency` are local/user bookkeeping, not
     // catalog content — a newer bundled card never overwrites them.
     disk
 }
 
-fn merge_older_catalog(mut disk: PricingCatalog, bundled: PricingCatalog) -> PricingCatalog {
+/// Replace only recoverable bundled defaults; preserve all differing entries.
+fn merge_default_entries<T: Clone + PartialEq>(
+    disk: &mut HashMap<String, T>,
+    bundled: &HashMap<String, T>,
+    previous: Option<&HashMap<String, T>>,
+    prefix: &str,
+    evidence: &mut HashMap<String, PricingProvenance>,
+    bundled_evidence: &HashMap<String, PricingProvenance>,
+    review: &mut Vec<String>,
+) {
+    for (id, value) in bundled {
+        let key = format!("{prefix}/{id}");
+        let is_default = disk
+            .get(id)
+            .is_none_or(|existing| previous.and_then(|table| table.get(id)) == Some(existing));
+        if is_default {
+            disk.insert(id.clone(), value.clone());
+            if let Some(source) = bundled_evidence.get(&key) {
+                evidence.insert(key.clone(), source.clone());
+            }
+            review.retain(|entry| entry != &key);
+        } else {
+            // Old card-level dates do not verify retained edits.
+            if !review.contains(&key) {
+                review.push(key);
+            }
+        }
+    }
+    for id in disk.keys().filter(|id| !bundled.contains_key(*id)) {
+        let key = format!("{prefix}/{id}");
+        if !review.contains(&key) {
+            review.push(key);
+        }
+    }
+}
+
+fn merge_older_catalog(
+    mut disk: PricingCatalog,
+    bundled: PricingCatalog,
+    previous: Option<&PricingCatalog>,
+    review: &mut Vec<String>,
+) -> PricingCatalog {
     for bundled_period in bundled.rate_periods {
+        // A separately identified custom rule keeps its interval. Adding an
+        // overlapping default would invalidate the whole saved card and lose
+        // unrelated overrides when loading falls back to the bundled card.
+        if disk.rate_periods.iter().any(|period| {
+            period.id != bundled_period.id
+                && period.surface == bundled_period.surface
+                && period.model == bundled_period.model
+                && intervals_overlap(
+                    period.from,
+                    period.to,
+                    bundled_period.from,
+                    bundled_period.to,
+                )
+        }) {
+            continue;
+        }
         match disk
             .rate_periods
             .iter_mut()
             .find(|period| period.id == bundled_period.id)
         {
-            Some(existing) => *existing = bundled_period,
+            Some(existing)
+                if previous.and_then(|catalog| {
+                    catalog
+                        .rate_periods
+                        .iter()
+                        .find(|period| period.id == existing.id)
+                }) == Some(existing) =>
+            {
+                *existing = bundled_period
+            }
+            Some(existing) => review.push(format!("pricing_catalog/{}", existing.id)),
             None => disk.rate_periods.push(bundled_period),
         }
     }
     for bundled_modifier in bundled.conditional_modifiers {
+        if disk.conditional_modifiers.iter().any(|modifier| {
+            modifier.id != bundled_modifier.id
+                && modifier.surface == bundled_modifier.surface
+                && modifier.model == bundled_modifier.model
+                && modifier.condition == bundled_modifier.condition
+                && intervals_overlap(
+                    modifier.from,
+                    modifier.to,
+                    bundled_modifier.from,
+                    bundled_modifier.to,
+                )
+        }) {
+            continue;
+        }
         match disk
             .conditional_modifiers
             .iter_mut()
             .find(|modifier| modifier.id == bundled_modifier.id)
         {
-            Some(existing) => *existing = bundled_modifier,
+            Some(existing)
+                if previous.and_then(|catalog| {
+                    catalog
+                        .conditional_modifiers
+                        .iter()
+                        .find(|modifier| modifier.id == existing.id)
+                }) == Some(existing) =>
+            {
+                *existing = bundled_modifier
+            }
+            Some(existing) => review.push(format!("pricing_catalog/{}", existing.id)),
             None => disk.conditional_modifiers.push(bundled_modifier),
         }
     }
@@ -1021,6 +1236,203 @@ mod tests {
             output: value,
             reasoning: value,
         }
+    }
+
+    #[test]
+    fn version_eleven_defaults_upgrade_but_edits_and_expiry_decisions_survive() {
+        let bundled = RateCard::load_bundled().unwrap();
+        let mut disk: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v11.json")).unwrap();
+        disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
+        disk.api_models.get_mut("gpt-5.6-sol").unwrap().input = 77.0;
+        disk.models.remove("claude-haiku-4-5");
+        let edited_expiry = instant("2026-09-01T00:00:00Z").date_naive();
+        disk.floating_model_aliases
+            .get_mut("gpt-daybreak-red-latest")
+            .unwrap()
+            .expires_at = edited_expiry;
+        disk.model_aliases
+            .insert("gpt-daybreak-blue-latest".into(), "gpt-6-astra".into());
+        let mut revised = bundled.clone();
+        // Simulate a corrected former default to prove replacement, rather
+        // than only testing newly added keys or aliases.
+        revised.models.get_mut("gpt-5.6-sol").unwrap().input = 80.0;
+        let merged = merge_older_override(disk, revised.clone());
+        assert_eq!(merged.models["gpt-5.6-sol"].input, 80.0);
+        assert_eq!(merged.models["gpt-5.5"].input, 123.0);
+        assert_eq!(merged.api_models["gpt-5.6-sol"].input, 77.0);
+        assert!(merged.models.contains_key("claude-haiku-4-5"));
+        assert_eq!(merged.models["gpt-6-luna"].input, 2.5);
+        assert_eq!(
+            merged.floating_model_aliases["gpt-daybreak-red-latest"].expires_at,
+            edited_expiry
+        );
+        assert!(!merged
+            .floating_model_aliases
+            .contains_key("gpt-daybreak-blue-latest"));
+        let resolved = merged.resolve_model_pricing(
+            "gpt-daybreak-blue-latest",
+            "codex",
+            &merged.models,
+            instant("2026-10-04T00:00:00Z"),
+        );
+        assert_eq!(resolved.resolved_model, "gpt-6-astra");
+        assert_eq!(resolved.basis, PricingBasis::Aliased);
+        assert_eq!(
+            merged.floating_model_aliases["daybreak-blue-latest"]
+                .expires_at
+                .to_string(),
+            "2027-01-02"
+        );
+        assert_eq!(
+            merged.model_aliases["gpt-daybreak-blue-latest"],
+            "gpt-6-astra"
+        );
+        assert!(merged.upgrade_review.contains(&"models/gpt-5.5".into()));
+        assert!(merged
+            .upgrade_review
+            .contains(&"floating_model_aliases/gpt-daybreak-red-latest".into()));
+        assert!(!merged.rate_provenance.contains_key("models/gpt-5.5"));
+        assert_eq!(
+            merged.rate_provenance["models/gpt-6-luna"].verified_at,
+            instant("2026-10-04T00:00:00Z")
+        );
+        assert_eq!(merged.fetched_at.as_deref(), Some("2026-09-10"));
+        assert!(merged.unpriced_models.contains(&"codex-auto-review".into()));
+        let repeated = merge_older_override(merged.clone(), revised);
+        assert_eq!(
+            serde_json::to_value(merged).unwrap(),
+            serde_json::to_value(repeated).unwrap()
+        );
+    }
+
+    #[test]
+    fn pristine_version_eleven_needs_no_review_but_same_id_catalog_edits_survive() {
+        let bundled = RateCard::load_bundled().unwrap();
+        let pristine: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v11.json")).unwrap();
+        let clean = merge_older_override(pristine.clone(), bundled.clone());
+        assert!(
+            clean.upgrade_review.is_empty(),
+            "{:?}",
+            clean.upgrade_review
+        );
+        assert_eq!(clean.fetched_at, bundled.fetched_at);
+        let mut edited = pristine;
+        edited.pricing_catalog.rate_periods[0].rate.input = 77.0;
+        let period = edited.pricing_catalog.rate_periods[0].clone();
+        edited.pricing_catalog.conditional_modifiers[0]
+            .multipliers
+            .input = 9.0;
+        let modifier = edited.pricing_catalog.conditional_modifiers[0].clone();
+        let merged = merge_older_override(edited, bundled);
+        merged.pricing_catalog.validate().unwrap();
+        assert_eq!(
+            merged
+                .pricing_catalog
+                .rate_periods
+                .iter()
+                .find(|p| p.id == period.id),
+            Some(&period)
+        );
+        assert_eq!(
+            merged
+                .pricing_catalog
+                .conditional_modifiers
+                .iter()
+                .find(|m| m.id == modifier.id),
+            Some(&modifier)
+        );
+        assert!(merged
+            .upgrade_review
+            .contains(&format!("pricing_catalog/{}", period.id)));
+        assert!(merged
+            .upgrade_review
+            .contains(&format!("pricing_catalog/{}", modifier.id)));
+    }
+
+    #[test]
+    fn an_unknown_old_bundle_keeps_existing_rows_without_new_evidence() {
+        let bundled = RateCard::load_bundled().unwrap();
+        let mut disk: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v11.json")).unwrap();
+        disk.version = 10;
+        let original_expiry = disk.floating_model_aliases["gpt-daybreak-blue-latest"].expires_at;
+        disk.floating_model_aliases
+            .remove("gpt-daybreak-red-latest");
+        disk.model_aliases
+            .insert("gpt-daybreak-red-latest".into(), "gpt-6-astra".into());
+        let merged = merge_older_override(disk, bundled);
+        assert_eq!(
+            merged.floating_model_aliases["gpt-daybreak-blue-latest"].expires_at,
+            original_expiry
+        );
+        assert!(merged.upgrade_review.contains(&"models/gpt-5.6-sol".into()));
+        assert!(!merged.rate_provenance.contains_key("models/gpt-5.6-sol"));
+        assert_eq!(merged.fetched_at.as_deref(), Some("2026-09-10"));
+        assert_eq!(
+            merged
+                .resolve_model_pricing(
+                    "gpt-daybreak-red-latest",
+                    "codex",
+                    &merged.models,
+                    instant("2026-10-04T00:00:00Z")
+                )
+                .resolved_model,
+            "gpt-6-astra"
+        );
+    }
+
+    #[test]
+    fn static_alias_without_a_floating_entry_and_custom_catalog_survive_upgrade() {
+        let bundled = RateCard::load_bundled().unwrap();
+        let mut disk: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v11.json")).unwrap();
+        disk.floating_model_aliases
+            .remove("gpt-daybreak-blue-latest");
+        disk.model_aliases
+            .insert("gpt-daybreak-blue-latest".into(), "gpt-6-astra".into());
+        disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
+        let mut custom = bundled
+            .pricing_catalog
+            .rate_periods
+            .iter()
+            .find(|period| {
+                period.model == "gpt-6.1-sol" && period.surface == PricingSurface::OpenaiApiUsd
+            })
+            .unwrap()
+            .clone();
+        custom.id = "user/custom-current-rate".into();
+        custom.rate.input = 77.0;
+        disk.pricing_catalog.rate_periods.push(custom);
+        disk.pricing_catalog.validate().unwrap();
+        let merged = merge_older_override(disk, bundled);
+        merged.pricing_catalog.validate().unwrap();
+        assert_eq!(merged.models["gpt-5.5"].input, 123.0);
+        assert!(merged
+            .upgrade_review
+            .contains(&"pricing_catalog/user/custom-current-rate".into()));
+        assert_eq!(
+            merged
+                .pricing_catalog
+                .rate_at(
+                    PricingSurface::OpenaiApiUsd,
+                    "gpt-6.1-sol",
+                    instant("2026-10-04T00:00:00Z")
+                )
+                .unwrap()
+                .rate
+                .input,
+            77.0
+        );
+        let resolved = merged.resolve_model_pricing(
+            "gpt-daybreak-blue-latest",
+            "codex",
+            &merged.models,
+            instant("2026-10-04T00:00:00Z"),
+        );
+        assert_eq!(resolved.resolved_model, "gpt-6-astra");
+        assert_eq!(resolved.basis, PricingBasis::Aliased);
     }
 
     #[test]
@@ -1212,6 +1624,10 @@ mod tests {
             label: "new bundled modifier".into(),
         };
 
+        let previous = PricingCatalog {
+            rate_periods: vec![managed_disk_period.clone()],
+            ..Default::default()
+        };
         let merged = merge_older_catalog(
             PricingCatalog {
                 rate_periods: vec![managed_disk_period, custom_period],
@@ -1223,6 +1639,8 @@ mod tests {
                 conditional_modifiers: vec![bundled_modifier],
                 notes: vec!["bundled note".into()],
             },
+            Some(&previous),
+            &mut Vec::new(),
         );
 
         assert_eq!(merged.rate_periods.len(), 2);
@@ -1412,7 +1830,7 @@ mod tests {
     fn upgrading_replaces_a_superseded_static_alias_with_its_floating_form() {
         let bundled = RateCard::load_bundled().expect("bundled rate card should parse");
         let mut disk = bundled.clone();
-        disk.version = bundled.version - 1;
+        disk.version = 9;
         disk.floating_model_aliases.clear();
         // What v9 actually wrote to disk.
         disk.model_aliases
@@ -1480,7 +1898,7 @@ mod tests {
         disk.model_aliases.remove("claude-opus-4-5");
         disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
         let merged = merge_older_override(disk, bundled);
-        assert_eq!(merged.version, 11);
+        assert_eq!(merged.version, 12);
         assert_eq!(merged.models["gpt-6-astra"].input, 250.0);
         assert_eq!(merged.api_models["gpt-6-astra"].input, 10.0);
         assert_eq!(merged.models["claude-fable-5-1"].cached_input, 0.25);

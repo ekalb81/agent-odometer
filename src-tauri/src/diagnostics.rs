@@ -724,6 +724,7 @@ mod tests {
             subscription_plans: Default::default(),
             display_currency: None,
             refresh: Default::default(),
+            ..Default::default()
         }
     }
 
