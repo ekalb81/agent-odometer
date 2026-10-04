@@ -17,6 +17,7 @@
   import TranscriptExport from './TranscriptExport.svelte';
   import TranscriptSearch from './TranscriptSearch.svelte';
   import SessionProjectEditor from './SessionProjectEditor.svelte';
+  import SessionOrganizationEditor from './SessionOrganizationEditor.svelte';
 
   interface Props {
     session: Session | null;
@@ -322,6 +323,7 @@
     <div class="flex-1 overflow-y-auto min-h-0">
       {#key session.storage_id}
         <SessionProjectEditor {session} />
+        <SessionOrganizationEditor sessionKey={session.storage_id} />
       {/key}
       {#if (session.harness === 'codex' ? sessionApiCost : sessionCredits)?.converted}
         {@const displayedPrice = (session.harness === 'codex' ? sessionApiCost : sessionCredits)!}
