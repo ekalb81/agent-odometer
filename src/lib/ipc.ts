@@ -9,6 +9,7 @@ import type { TranscriptPage, TranscriptRequest } from './types';
 import type { TranscriptSearchRequest, TranscriptSearchPage, TranscriptSearchTarget, RetainedSearchLanding } from './types';
 import type { IntegrationClient, IntegrationScope, IntegrationChange, IntegrationCenterReport, IntegrationPreview, IntegrationApplyResult, IntegrationVerifyReport } from './types';
 import type { SpeedQuery, SpeedReport } from './types';
+import type { WorkflowReport, WorkflowRequest, FindingSuppressionEdit } from './types';
 import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, HistoryRebuildStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert, QuotaBudgetCheck } from './types';
 
 // ---------------------------------------------------------------------------
@@ -17,6 +18,16 @@ import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, H
 
 export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>('list_sessions');
+}
+
+export function getWorkflowReport(request: WorkflowRequest): Promise<WorkflowReport> {
+  return invoke<WorkflowReport>('get_workflow_report', { request });
+}
+export function recordWorkflowMeasurement(request: WorkflowRequest): Promise<WorkflowReport> {
+  return invoke<WorkflowReport>('record_workflow_measurement', { request });
+}
+export function setWorkflowFindingSuppression(edit: FindingSuppressionEdit): Promise<void> {
+  return invoke('set_workflow_finding_suppression', { edit });
 }
 
 /** Explicit private desktop reads; never called by export or MCP flows. */
@@ -332,7 +343,7 @@ export function openTaskInChatGPT(sessionId: string): Promise<void> {
 /** Opens a backend-owned native save dialog and writes only its selected path. */
 export function writeExport(
   defaultName: string,
-  format: 'csv' | 'json' | 'html',
+  format: 'csv' | 'json' | 'html' | 'svg',
   content: string,
 ): Promise<boolean> {
   return invoke<boolean>('write_export', { defaultName, format, content });

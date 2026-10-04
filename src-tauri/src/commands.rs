@@ -110,6 +110,90 @@ pub fn list_external_events(
     state.external_events_snapshot()
 }
 
+/// Explicit, bounded workflow measurement over selected durable sessions.
+#[tauri::command]
+pub async fn get_workflow_report(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    workflow_report(state, request, false).await
+}
+
+/// Explicit local observation metadata write; no configurations or accounting are changed.
+#[tauri::command]
+pub async fn record_workflow_measurement(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    workflow_report(state, request, true).await
+}
+
+#[tauri::command]
+pub async fn set_workflow_finding_suppression(
+    state: State<'_, Arc<AppState>>,
+    edit: crate::workflow::FindingSuppressionEdit,
+) -> Result<(), String> {
+    let history = state
+        .history_ready()
+        .ok_or("Workflow history is unavailable or still preparing.")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history.suppress_workflow_finding(&edit).map_err(|_| {
+            "Finding changed or is unavailable; refresh before editing suppression.".to_owned()
+        })
+    })
+    .await
+    .map_err(|_| "Finding suppression could not finish.".to_owned())?
+}
+
+async fn workflow_report(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+    record: bool,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    let history = state
+        .history_ready()
+        .ok_or_else(|| "Workflow history is unavailable or still preparing.".to_owned())?;
+    let events = state.external_events_snapshot();
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let reader = history
+            .workflow_reader()
+            .map_err(|_| "Workflow history is incomplete or could not be read.".to_owned())?;
+        let rates = get_rates();
+        let mut report = crate::workflow::report(&reader, &rates, request, &events, Utc::now())
+            .map_err(|_| {
+                "Workflow analysis is unavailable: check the selected window and history coverage."
+                    .to_owned()
+            })?;
+        if let Ok(config) = Config::load_read_only() {
+            report.setup_health = Some(crate::workflow::WorkflowSetupHealth::from_diagnostics(
+                crate::diagnostics::generate_report(&app_state, &config, &rates),
+            ));
+        }
+        reader
+            .load_workflow_lifecycle(&mut report)
+            .map_err(|_| "Workflow lifecycle metadata is unavailable.".to_owned())?;
+        drop(reader);
+        if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
+            return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
+        }
+        if record {
+            history
+                .record_workflow_measurement(&mut report)
+                .map_err(|_| {
+                    "Measurement changed or could not be recorded; refresh and try again."
+                        .to_owned()
+                })?;
+        }
+        if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
+            return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|_| "Workflow analysis could not finish.".to_owned())?
+}
+
 #[tauri::command]
 pub async fn list_instruction_files(
     app: AppHandle,
@@ -539,10 +623,14 @@ pub async fn write_export(
         "csv" => "csv",
         "json" => "json",
         "html" => "html",
-        _ => return Err("export format must be csv, json, or html".into()),
+        "svg" => "svg",
+        _ => return Err("export format must be csv, json, html, or svg".into()),
     };
     if extension == "html" && content.len() > 8 * 1024 * 1024 {
         return Err("HTML export exceeds the 8 MiB safety limit".into());
+    }
+    if extension == "svg" && content.len() > 1024 * 1024 {
+        return Err("SVG export exceeds the 1 MiB safety limit".into());
     }
     if content.len() > 128 * 1024 * 1024 {
         return Err("export exceeds the 128 MiB safety limit".into());
@@ -3511,6 +3599,10 @@ mod tests {
         let json = dir.path().join("empty.json");
         write_export_file(&json, "json", "[]\n").unwrap();
         assert_eq!(std::fs::read_to_string(json).unwrap(), "[]\n");
+        let svg = dir.path().join("activity.svg");
+        let preview = "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>Activity Δ</title></svg>";
+        write_export_file(&svg, "svg", preview).unwrap();
+        assert_eq!(std::fs::read_to_string(svg).unwrap(), preview);
         let html = dir.path().join("transcript.html");
         let preview = "<!doctype html><meta charset=\"utf-8\"><p>Reviewed Δ text</p>";
         write_export_file(&html, "html", preview).unwrap();

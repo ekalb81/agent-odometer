@@ -1473,6 +1473,100 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
+export type FindingState = 'new' | 'persistent' | 'improving' | 'resolved' | 'suppressed' | 'not_applicable';
+export interface WorkflowRequest {
+  session_ids: string[];
+  from: string | null;
+  to: string | null;
+}
+export interface WorkflowMetric {
+  id: string;
+  denominator_is: string;
+  value: number | null;
+  numerator: number;
+  denominator: number;
+}
+export interface WorkflowMeasure extends WorkflowMetric {
+  unit: string;
+  coverage_is: string;
+  covered_samples: number;
+  eligible_samples: number;
+  missing_data: string | null;
+}
+export interface WorkflowWindow {
+  from: string;
+  to: string;
+  ledger_metrics: {
+    schema_version: number;
+    from: string | null;
+    to: string | null;
+    sessions: number;
+    metrics: WorkflowMetric[];
+  };
+  additional_metrics: WorkflowMeasure[];
+  analyzed_sessions: number;
+  unavailable_sessions: number;
+  drilldowns: { dimension: 'project' | 'model' | 'category'; value: string;
+    sessions: number; tool_calls: number; classified_turns: number }[];
+}
+export interface FindingObservation {
+  sessions: number;
+  tool_calls: number;
+  findings: number;
+  likely_avoidable_calls: number;
+  analyzer_version: number | null;
+  coverage_complete: boolean;
+  window_duration_ms: number;
+}
+export interface FindingLifecycle {
+  first_observed_at: string; last_observed_at: string; state: FindingState;
+  suppressed: boolean; revision: number; analyzer_changed: boolean;
+}
+export interface FindingSuppressionEdit {
+  provider: string; project_id: string | null; rule_id: string;
+  expected_revision: number; suppressed: boolean;
+}
+export interface WorkflowFinding {
+  lifecycle: FindingLifecycle | null;
+  id: string;
+  provider: string;
+  project_id: string | null;
+  rule_id: string;
+  before: FindingObservation;
+  after: FindingObservation;
+  comparison: {
+    version: number;
+    state: FindingState;
+    comparable: boolean;
+    before_calls_per_100: number | null;
+    after_calls_per_100: number | null;
+    observed_change_per_100_calls: number | null;
+    limitations: string[];
+  };
+  evidence: { session_id: string; turn_id: string | null; timestamp: string | null }[];
+  evidence_truncated: boolean;
+}
+export interface WorkflowReport {
+  historical_findings: { id: string; provider: string; project_id: string | null;
+    rule_id: string; lifecycle: FindingLifecycle }[];
+  version: number;
+  generated_at: string;
+  analyzer_version: number;
+  selected_sessions: number;
+  coverage_complete: boolean;
+  before: WorkflowWindow;
+  after: WorkflowWindow;
+  findings: WorkflowFinding[];
+  setup_health: {
+    source_configuration_valid: boolean;
+    generated_at: string;
+    last_scan_at: string | null;
+    providers: { provider: string; state: ProviderHealthState; configured_roots: number;
+      available_roots: number; parsed_files: number; parse_failures: number;
+      durable_sessions: number; fallback_pricing_used: boolean; reasons: string[] }[];
+  } | null;
+  limitations: string[];
+}
 /** Private desktop organization; never part of SessionSummary or exports. */
 export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
 export interface RecordBookmark { identity: AnnotationIdentity; revision: number; bookmarked: boolean }

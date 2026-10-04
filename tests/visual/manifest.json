@@ -27,6 +27,8 @@
     "tool-dimensions",
     "calendar-activity",
     "calendar-partial-narrow",
+    "activity-summary-preview",
+    "activity-summary-partial-narrow",
     "session-narrow-detail-overlay",
     "instructions-preview",
     "instructions-raw",

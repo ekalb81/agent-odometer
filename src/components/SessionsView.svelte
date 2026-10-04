@@ -38,6 +38,7 @@
   import GitOutcomes from './GitOutcomes.svelte';
   import HumanOutcomes from './HumanOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
+  import WorkflowIntelligence from './WorkflowIntelligence.svelte';
   import SpeedMonitor from './SpeedMonitor.svelte';
   import CalendarActivity from './CalendarActivity.svelte';
   import { calendarFilterValue, type ActivityDay } from '../lib/calendarActivity';
@@ -1904,6 +1905,7 @@
     <div class="mt-2 flex flex-col gap-2">
       <CalendarActivity
         active={active && analyticsOpen}
+        {harness}
         from={fromUtc}
         to={toUtc}
         sessionIds={analyticsSessionIds}
@@ -1968,6 +1970,8 @@
         {dimensionTotals}
         {dimensionAvailability}
       />
+
+      <WorkflowIntelligence active={active && analyticsOpen} sessionIds={analyticsSessionIds} onReview={reviewFindingSession} />
 
       {#if harness === 'codex'}
         <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={speedOpen} data-testid="speed-panel">

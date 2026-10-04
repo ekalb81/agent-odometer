@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/ActivitySummary.svelte',
   'src/components/ConvertedCost.svelte',
   'src/components/DiagnosticsPanel.svelte',
   'src/components/FxSettings.svelte',
@@ -19,6 +20,7 @@ export const COVERAGE_SLICE = [
   'src/lib/stores/organization.svelte.ts',
   'src/components/TranscriptSearch.svelte',
   'src/lib/configTimeline.ts',
+  'src/lib/activitySummary.ts',
   'src/lib/defenderStatus.ts',
   'src/lib/diagnosticsExport.ts',
   'src/lib/flushCadence.ts',
