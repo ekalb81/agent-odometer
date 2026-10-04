@@ -7,7 +7,7 @@ use crate::scanner::ScanReport;
 use crate::watcher::WatcherHandle;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -448,6 +448,10 @@ pub struct AppState {
     instruction_scan_generation: AtomicU64,
     /// Serializes configuration transitions so watcher/scan generations cannot interleave.
     pub config_transition: Mutex<()>,
+    /// Serializes confirmed purge with resident publication. SQL tombstones
+    /// reject ingestion; this gate closes the commit-to-publication race.
+    history_publication: Mutex<()>,
+    pub pending_purge: Mutex<Option<crate::history_store::PurgePreview>>,
     /// Contention measurements for `config_transition` during a bulk scan
     /// (issue #182). See [`ScanWriteLockStats`].
     pub scan_write_lock: ScanWriteLockStats,
@@ -526,6 +530,8 @@ impl AppState {
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),
+            history_publication: Mutex::new(()),
+            pending_purge: Mutex::new(None),
             scan_write_lock: ScanWriteLockStats::default(),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
@@ -883,7 +889,21 @@ impl AppState {
     /// (#116's honesty property) — a load failure is always `Err`.
     pub fn full_session(&self, session_id: &str) -> Result<Option<Session>, String> {
         if !self.sessions.contains_key(session_id) {
-            return Ok(None);
+            let Some(history) = self.history_ready() else {
+                return Ok(None);
+            };
+            if history
+                .is_purged_key(session_id)
+                .map_err(|error| error.to_string())?
+            {
+                return Err("this session's retained history was explicitly purged".into());
+            }
+            if !history
+                .has_session_key(session_id)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(None);
+            }
         }
         Ok(self
             .full_sessions(std::slice::from_ref(&session_id.to_string()))?
@@ -1000,7 +1020,7 @@ impl AppState {
     fn reconcile_session_at_generation(
         &self,
         path: &Path,
-        session: Session,
+        mut session: Session,
         generation: i64,
         bulk: bool,
     ) -> ReconciledSession {
@@ -1014,6 +1034,13 @@ impl AppState {
             match history.observe_bulk(path, &session, generation) {
                 Ok(outcome) => self.apply_bulk_outcome(outcome),
                 Err(error) => {
+                    if error.is::<crate::history_store::PurgedSource>() {
+                        session.lifecycle = crate::model::SessionLifecycle::Purged;
+                        return ReconciledSession {
+                            session,
+                            displaced: None,
+                        };
+                    }
                     tracing::warn!(
                         "could not persist session history for {:?}: {}",
                         path,
@@ -1049,6 +1076,13 @@ impl AppState {
                     }
                 }
                 Err(error) => {
+                    if error.is::<crate::history_store::PurgedSource>() {
+                        session.lifecycle = crate::model::SessionLifecycle::Purged;
+                        return ReconciledSession {
+                            session,
+                            displaced: None,
+                        };
+                    }
                     tracing::warn!(
                         "could not persist session history for {:?}: {}",
                         path,
@@ -1107,6 +1141,10 @@ impl AppState {
     /// there is no "did a scan or watcher already claim this path" race to
     /// resolve the way fresh discovery has to.
     pub fn publish_rebuilt_session(&self, outcome: crate::history_store::BulkObserveOutcome) {
+        let _publication = self.history_publication.lock().unwrap();
+        if !self.may_publish_history(&outcome.stored.session) {
+            return;
+        }
         self.ledger_stale.remove(&outcome.stored.key);
         if outcome.rollups_deferred {
             self.rollup_deferred_stale
@@ -1475,6 +1513,10 @@ impl AppState {
     /// publish and detect changes identically regardless of whether they
     /// loaded the whole corpus or one session.
     fn apply_loaded_session(&self, stored: crate::history_store::StoredSession) -> Option<Session> {
+        let _publication = self.history_publication.lock().unwrap();
+        if !self.may_publish_history(&stored.session) {
+            return None;
+        }
         let session = stored.session;
         let key = stored.key;
         // Scan callbacks already emit fresh present snapshots. Here we only
@@ -1482,6 +1524,7 @@ impl AppState {
         // reconciliation (most notably a missing source).
         let is_changed = self.sessions.get(&key).is_none_or(|existing| {
             existing.summary.source_availability != session.source_availability
+                || existing.summary.lifecycle != session.lifecycle
                 || existing.summary.file_path != session.file_path
         });
         self.quota_points_index.update_session(&key, &session);
@@ -1640,6 +1683,7 @@ impl AppState {
     /// `Session` — every caller only ever needed it to build the
     /// `session-updated` event payload, which is summary-shaped already.
     pub fn mark_source_missing(&self, path: &Path) -> Option<SessionSummary> {
+        let _publication = self.history_publication.lock().unwrap();
         // Write the tombstone before touching SQLite. A bulk worker that has
         // already parsed this path must see it before it can observe/publish
         // stale Present state.
@@ -1704,6 +1748,7 @@ impl AppState {
         let mut resident = self.sessions.get_mut(&storage_id)?;
         let resident = std::sync::Arc::make_mut(resident.value_mut());
         resident.summary.source_availability = SourceAvailability::Missing;
+        resident.summary.lifecycle = crate::model::SessionLifecycle::Retained;
         // A companion full-content fallback entry (kept only when the
         // ledger could not vouch for this session) must stay consistent
         // too, since `Self::full_session`/`full_sessions` hand its
@@ -1747,6 +1792,10 @@ impl AppState {
     /// this path in the same generation. The path entry serializes scan and
     /// watcher publication so an older scan cannot win a last-write race.
     pub fn publish_scanned_session(&self, generation: u64, path: &Path, session: Session) -> bool {
+        let _publication = self.history_publication.lock().unwrap();
+        if !self.may_publish_history(&session) {
+            return false;
+        }
         if self.current_scan_generation() != generation {
             return false;
         }
@@ -1787,7 +1836,11 @@ impl AppState {
         true
     }
 
-    pub fn publish_watched_session(&self, path: &Path, session: Session) {
+    pub fn publish_watched_session(&self, path: &Path, session: Session) -> bool {
+        let _publication = self.history_publication.lock().unwrap();
+        if !self.may_publish_history(&session) {
+            return false;
+        }
         let generation = self.current_scan_generation();
         let key = path_key(path);
         let storage_id = session.effective_storage_id();
@@ -1816,6 +1869,87 @@ impl AppState {
         self.touch_sessions_generation();
         drop(path_state);
         let _ = replaced;
+        true
+    }
+
+    fn may_publish_history(&self, session: &Session) -> bool {
+        if session.lifecycle == crate::model::SessionLifecycle::Purged {
+            return false;
+        }
+        self.history_ready().is_none_or(|history| {
+            // A failed exclusion query is not evidence that erased data may
+            // be republished. Existing readable resident data remains usable.
+            history
+                .is_session_excluded(session)
+                .is_ok_and(|excluded| !excluded)
+        })
+    }
+
+    pub fn session_summaries(&self) -> Result<Vec<SessionSummary>, String> {
+        if matches!(self.history_readiness(), HistoryReadinessKind::Pending) {
+            return Err("durable history is still preparing; retry shortly".into());
+        }
+        let _publication = self.history_publication.lock().unwrap();
+        let mut summaries: HashMap<String, SessionSummary> = match self.history_ready() {
+            Some(history) => history
+                .session_summaries()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .map(|summary| (summary.storage_id.clone(), summary))
+                .collect(),
+            None => HashMap::new(),
+        };
+        for entry in &self.sessions {
+            if !summaries.contains_key(entry.key()) || self.ledger_is_stale(entry.key()) {
+                summaries.insert(entry.key().clone(), entry.summary.clone());
+            }
+        }
+        Ok(summaries.into_values().collect())
+    }
+
+    /// Serialize summary events with purge removal. A parsed result may have
+    /// been superseded or erased between insertion and the event callback.
+    pub fn with_current_summary<T>(
+        &self,
+        summary: &SessionSummary,
+        emit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let _publication = self.history_publication.lock().unwrap();
+        let current = self
+            .sessions
+            .get(&summary.storage_id)
+            .is_some_and(|entry| entry.summary == *summary);
+        current.then(emit)
+    }
+
+    pub fn purge_retained_history(
+        self: &Arc<Self>,
+        preview: &crate::history_store::PurgePreview,
+        mut on_removed: impl FnMut(&str),
+    ) -> anyhow::Result<crate::history_store::PurgeResult> {
+        let _reservation = self.try_begin_rebuild().map_err(anyhow::Error::msg)?;
+        let _publication = self.history_publication.lock().unwrap();
+        let history = self
+            .history_ready()
+            .ok_or_else(|| anyhow::anyhow!("history is unavailable"))?;
+        let result = history.purge_retained(preview, Utc::now())?;
+        let removed: HashSet<&str> = result.removed_keys.iter().map(String::as_str).collect();
+        for key in &result.removed_keys {
+            self.sessions.remove(key);
+            self.full_session_fallback.remove(key);
+            self.ledger_stale.remove(key);
+            self.rollup_deferred_stale.remove(key);
+            self.quota_points_index.remove_session(key);
+        }
+        self.session_paths
+            .retain(|_, value| !removed.contains(value.storage_id.as_str()));
+        self.transcript_observations
+            .retain(|path, _| self.session_paths.contains_key(path));
+        self.touch_sessions_generation();
+        for key in &result.removed_keys {
+            on_removed(key);
+        }
+        Ok(result)
     }
 
     pub fn remove_session_path(&self, path: &Path) -> Option<String> {
@@ -2066,6 +2200,8 @@ mod tests {
             scan_generation: AtomicU64::new(1),
             instruction_scan_generation: AtomicU64::new(0),
             config_transition: Mutex::new(()),
+            history_publication: Mutex::new(()),
+            pending_purge: Mutex::new(None),
             scan_write_lock: ScanWriteLockStats::default(),
             watcher: Mutex::new(None),
             config_watcher: Mutex::new(None),
@@ -2086,6 +2222,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retention_purge_rejects_stale_publication_and_summary_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let history =
+            Arc::new(HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap());
+        let path = directory.path().join("source.jsonl");
+        let mut original = session("purge-publication", 1);
+        original.started_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        original.last_event_at = original.started_at;
+        let key = history.observe(&path, &original, 1).unwrap().key;
+        history.mark_path_missing(&path).unwrap();
+        history
+            .set_retention_policy(&crate::history_store::RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let state = Arc::new(state());
+        state.set_history_ready(Some(history.clone()));
+        let old = state.sessions.get(&key).unwrap().summary.clone();
+        let mut removed = Vec::new();
+        let preview = history.preview_purge(Utc::now()).unwrap();
+        state
+            .purge_retained_history(&preview, |key| removed.push(key.to_owned()))
+            .unwrap();
+        assert_eq!(removed, vec![key.clone()]);
+        assert!(state
+            .with_current_summary(&old, || panic!("erased summary event escaped"))
+            .is_none());
+        assert!(!state.publish_watched_session(&path, original.clone()));
+        assert!(!state.publish_scanned_session(
+            state.current_scan_generation(),
+            &path,
+            original.clone()
+        ));
+        assert!(!state.sessions.contains_key(&key));
+        assert!(state
+            .full_session(&key)
+            .unwrap_err()
+            .contains("explicitly purged"));
+        let mut fresh = original;
+        fresh.started_at += chrono::Duration::days(1);
+        fresh.last_event_at = fresh.started_at;
+        let reconciled = state.reconcile_observed_session(&path, fresh);
+        assert!(state.publish_watched_session(&path, reconciled.session));
+        let summary = state.sessions.get(&key).unwrap().summary.clone();
+        assert_eq!(
+            state.with_current_summary(&summary, || "fresh event"),
+            Some("fresh event")
+        );
+        assert!(state
+            .with_current_summary(&old, || panic!("old identity event replaced fresh history"))
+            .is_none());
+        state.mark_source_missing(&path);
+        let second_preview = history.preview_purge(Utc::now()).unwrap();
+        assert_eq!(second_preview.sessions, 1);
+        state
+            .purge_retained_history(&second_preview, |_| {})
+            .unwrap();
+        assert_eq!(history.retention_status().unwrap().purged_sessions, 2);
+    }
+
     fn session(id: &str, turns: u32) -> Session {
         Session {
             id: id.into(),
@@ -2098,6 +2295,7 @@ mod tests {
             agent_nickname: None,
             file_path: String::new(),
             source_availability: Default::default(),
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: Utc::now(),
             last_event_at: Utc::now(),

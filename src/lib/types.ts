@@ -176,6 +176,7 @@ export interface Session {
   file_path: string;
   /** Whether the recorded transcript is still available at `file_path`. */
   source_availability: 'present' | 'missing';
+  lifecycle?: 'present' | 'retained' | 'superseded' | 'purged';
   archived: boolean;
   started_at: string; // ISO8601
   last_event_at: string; // ISO8601
@@ -393,6 +394,7 @@ export interface SessionSummary {
   file_path: string;
   /** Whether the recorded transcript is still available at `file_path`. */
   source_availability: 'present' | 'missing';
+  lifecycle?: 'present' | 'retained' | 'superseded' | 'purged';
   archived: boolean;
   started_at: string; // ISO8601
   last_event_at: string; // ISO8601
@@ -493,6 +495,26 @@ export interface HistoryStatus {
   items_total: number | null;
   elapsed_ms: number | null;
 }
+
+export interface RetentionPolicy { retained_days: number | null; }
+export interface RetentionStatus {
+  policy: RetentionPolicy;
+  present_sessions: number;
+  retained_sessions: number;
+  superseded_sessions: number;
+  purged_sessions: number;
+  coverage_complete: boolean;
+  recovered_at: string | null;
+}
+export interface PurgePreview {
+  cutoff_utc_day: string;
+  sessions: number;
+  identity_groups: number;
+  snapshot_bytes: number;
+  tokens: TokenTotals;
+  revision: string;
+}
+export interface PurgeResult { removed_keys: string[]; purged_at: string; }
 
 /** Point-in-time evidence from the explicit, elevated Defender action. */
 export interface DefenderExclusionReceipt {

@@ -507,18 +507,21 @@ pub async fn write_export(
 /// this is a cheap clone rather than a `SessionSummary::of` recompute (which
 /// used to re-derive `buckets` from the full `tokens_history` on every call).
 #[tauri::command]
-pub fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<SessionSummary> {
+pub async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<SessionSummary>, String> {
     let started = Instant::now();
-    let result: Vec<_> = state
-        .sessions
-        .iter()
-        .map(|entry| entry.value().summary.clone())
-        .collect();
+    let app_state = state.inner().clone();
+    let result = tauri::async_runtime::spawn_blocking(move || app_state.session_summaries())
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
     state.performance.record_backend(
         "ipc.list_sessions",
         started,
-        true,
-        BTreeMap::from([("sessions".into(), result.len().to_string())]),
+        result.is_ok(),
+        BTreeMap::from([(
+            "sessions".into(),
+            result.as_ref().map_or(0, Vec::len).to_string(),
+        )]),
     );
     result
 }
@@ -600,21 +603,19 @@ pub async fn get_session_pricing(
         let rates = get_rates();
         let now = Utc::now();
         let mut prices = HashMap::new();
-        for id in session_ids {
-            // Pricing categories may take longer than cloning the resident
-            // Arc; release the map shard before doing that work.
-            let resident = blocking_state
-                .sessions
-                .get(&id)
-                .map(|entry| entry.value().clone());
-            if let Some(entry) = resident {
-                prices.insert(id, crate::query::price_summary(&entry.summary, &rates, now));
+        for summary in blocking_state.session_summaries()? {
+            if session_ids.contains(&summary.storage_id) {
+                prices.insert(
+                    summary.storage_id.clone(),
+                    crate::query::price_summary(&summary, &rates, now),
+                );
             }
         }
-        prices
+        Ok::<_, String>(prices)
     })
     .await
-    .map_err(|error| error.to_string());
+    .map_err(|error| error.to_string())
+    .and_then(|result| result);
     app_state.performance.record_backend(
         "ipc.get_session_pricing",
         started,
@@ -744,9 +745,9 @@ pub async fn sessions_in_ranges(
     let keys: Vec<String> = match session_ids {
         Some(ids) => ids,
         None => app_state
-            .sessions
-            .iter()
-            .map(|entry| entry.key().clone())
+            .session_summaries()?
+            .into_iter()
+            .map(|summary| summary.storage_id)
             .collect(),
     };
     let session_count = keys.len();
@@ -1470,12 +1471,13 @@ pub fn spawn_scan(
                 for (path, reconciled) in reconciled {
                     let summary = SessionSummary::of(&reconciled.session);
                     if state.publish_scanned_session(generation, &path, reconciled.session) {
-                        if let Err(e) = app.emit("session-updated", &summary) {
+                        if let Err(e) = emit_session_summary(&app, &state, &summary) {
                             tracing::warn!("emit session-updated failed: {}", e);
                         }
                     }
                     if let Some(displaced) = reconciled.displaced {
-                        if let Err(e) = app.emit("session-updated", &SessionSummary::of(&displaced))
+                        if let Err(e) =
+                            emit_session_summary(&app, &state, &SessionSummary::of(&displaced))
                         {
                             tracing::warn!("emit displaced session-updated failed: {}", e);
                         }
@@ -1589,7 +1591,9 @@ pub fn spawn_scan(
                 let changed = state.finish_history_scan(history_generation);
                 affected_sessions = changed.len();
                 for session in changed {
-                    if let Err(e) = app.emit("session-updated", &SessionSummary::of(&session)) {
+                    if let Err(e) =
+                        emit_session_summary(&app, &state, &SessionSummary::of(&session))
+                    {
                         tracing::warn!("emit session-updated failed: {}", e);
                     }
                 }
@@ -1645,7 +1649,7 @@ pub fn spawn_scan(
         state.persist_thread_name_overlay_batch(&updates);
 
         for (_, summary) in &changed {
-            if let Err(e) = app.emit("session-updated", summary) {
+            if let Err(e) = emit_session_summary(&app, &state, summary) {
                 tracing::warn!("emit session-updated failed: {}", e);
             }
         }
@@ -2061,6 +2065,101 @@ pub fn cancel_history_rebuild(state: State<'_, Arc<AppState>>) {
         .store(true, Ordering::Release);
 }
 
+#[tauri::command]
+pub async fn get_retention_status(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::history_store::RetentionStatus, String> {
+    let history = state
+        .history_ready()
+        .ok_or("durable history is unavailable or still preparing")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .retention_status()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_retention_policy(
+    state: State<'_, Arc<AppState>>,
+    policy: crate::history_store::RetentionPolicy,
+) -> Result<crate::history_store::RetentionStatus, String> {
+    let history = state
+        .history_ready()
+        .ok_or("durable history is unavailable or still preparing")?;
+    *state.pending_purge.lock().unwrap() = None;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .set_retention_policy(&policy)
+            .map_err(|error| error.to_string())?;
+        history
+            .retention_status()
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+pub async fn preview_history_purge(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::history_store::PurgePreview, String> {
+    let app_state = state.inner().clone();
+    let history = state
+        .history_ready()
+        .ok_or("durable history is unavailable or still preparing")?;
+    let preview = tauri::async_runtime::spawn_blocking(move || {
+        history
+            .preview_purge(Utc::now())
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())??;
+    *app_state.pending_purge.lock().unwrap() = Some(preview.clone());
+    Ok(preview)
+}
+
+#[tauri::command]
+pub async fn purge_retained_history(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    revision: String,
+    confirmation: String,
+) -> Result<crate::history_store::PurgeResult, String> {
+    let preview = state
+        .pending_purge
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("review a purge preview before confirming")?;
+    if revision != preview.revision || confirmation != format!("PURGE {}", preview.sessions) {
+        return Err("purge confirmation does not match the reviewed history".into());
+    }
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = app_state
+            .purge_retained_history(&preview, |key| {
+                let _ = app.emit("session-removed", key);
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(result)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+pub(crate) fn emit_session_summary(
+    app: &AppHandle,
+    state: &AppState,
+    summary: &SessionSummary,
+) -> tauri::Result<()> {
+    state
+        .with_current_summary(summary, || app.emit("session-updated", summary))
+        .unwrap_or(Ok(()))
+}
+
 /// Returns the current history-rebuild status. The frontend calls this once
 /// on mount (progress events may have fired before its listeners attached)
 /// and then follows "history-rebuild-progress" events — the same contract
@@ -2171,9 +2270,9 @@ pub fn spawn_history_rebuild(
                     .as_ref()
                     .map(|displaced| SessionSummary::of(&displaced.session));
                 publish_state.publish_rebuilt_session(outcome);
-                let _ = publish_app.emit("session-updated", &summary);
+                let _ = emit_session_summary(&publish_app, &publish_state, &summary);
                 if let Some(displaced_summary) = displaced_summary {
-                    let _ = publish_app.emit("session-updated", &displaced_summary);
+                    let _ = emit_session_summary(&publish_app, &publish_state, &displaced_summary);
                 }
             },
             move || {
@@ -3238,6 +3337,7 @@ mod tests {
             agent_nickname: None,
             file_path: format!("{id}.jsonl"),
             source_availability: SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: timestamp,
             last_event_at: timestamp,

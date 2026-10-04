@@ -513,6 +513,7 @@ mod tests {
             agent_nickname: None,
             file_path: String::new(),
             source_availability: Default::default(),
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: points.first().unwrap().0.parse().unwrap(),
             last_event_at: points.last().unwrap().0.parse().unwrap(),

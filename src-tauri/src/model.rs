@@ -22,6 +22,24 @@ pub enum SourceAvailability {
     Missing,
 }
 
+/// History retention is independent of whether a transcript can be read.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLifecycle {
+    #[default]
+    Present,
+    Retained,
+    Superseded,
+    /// Only minimal exclusion tombstones remain after an explicit purge.
+    Purged,
+}
+
+impl SessionLifecycle {
+    fn is_present(&self) -> bool {
+        *self == Self::Present
+    }
+}
+
 /// Stable identity for a provider session. Unlike `Session::id`, this is
 /// namespaced by harness and is safe to use as a durable storage key.
 pub fn storage_id_for_session(provider: &ProviderId, provider_session_id: &str) -> String {
@@ -620,6 +638,8 @@ pub struct Session {
     /// missing their original source without being deleted from storage.
     #[serde(default)]
     pub source_availability: SourceAvailability,
+    #[serde(default, skip_serializing_if = "SessionLifecycle::is_present")]
+    pub lifecycle: SessionLifecycle,
     pub archived: bool,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub last_event_at: chrono::DateTime<chrono::Utc>,
@@ -731,7 +751,7 @@ pub struct RangeTotals {
 /// events. Excludes `turns` and `tokens_history`, which dominate payload
 /// size (a large session serializes to ~2 MB; its summary to ~1 KB). The
 /// full Session is fetched on demand via `get_session_details`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionSummary {
     pub id: String,
     #[serde(default)]
@@ -745,6 +765,8 @@ pub struct SessionSummary {
     pub file_path: String,
     #[serde(default)]
     pub source_availability: SourceAvailability,
+    #[serde(default, skip_serializing_if = "SessionLifecycle::is_present")]
+    pub lifecycle: SessionLifecycle,
     pub archived: bool,
     pub started_at: DateTime<Utc>,
     pub last_event_at: DateTime<Utc>,
@@ -789,13 +811,17 @@ impl SessionSummary {
             id: s.id.clone(),
             storage_id: s.effective_storage_id(),
             harness: s.harness.clone(),
-            thread_name: s.thread_name.clone(),
+            thread_name: s
+                .thread_name
+                .as_ref()
+                .map(|text| text.chars().take(512).collect()),
             forked_from_id: s.forked_from_id.clone(),
             parent_thread_id: s.parent_thread_id.clone(),
             agent_path: s.agent_path.clone(),
             agent_nickname: s.agent_nickname.clone(),
             file_path: s.file_path.clone(),
             source_availability: s.source_availability,
+            lifecycle: s.lifecycle,
             archived: s.archived,
             started_at: s.started_at,
             last_event_at: s.last_event_at,
@@ -811,7 +837,10 @@ impl SessionSummary {
             credits_balance: s.credits_balance,
             context_window: s.context_window,
             total_turns: s.total_turns,
-            first_user_message: s.first_user_message.clone(),
+            first_user_message: s
+                .first_user_message
+                .as_ref()
+                .map(|text| text.chars().take(1024).collect()),
             tokens_total: s.tokens_total.clone(),
             buckets: s.tier_buckets(),
             tool_metrics: s.tool_metrics.clone(),
@@ -1157,6 +1186,7 @@ pub(crate) mod tests {
             agent_nickname: None,
             file_path: String::new(),
             source_availability: SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             last_event_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -1570,6 +1600,7 @@ pub(crate) mod tests {
             agent_nickname: None,
             file_path: format!("{id}.jsonl"),
             source_availability: SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: base,
             last_event_at: base + chrono::Duration::minutes(turn_count as i64 * 5),

@@ -8,7 +8,7 @@
 //! session or token event during a scan.
 
 use crate::model::{
-    OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session,
+    OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session, SessionLifecycle,
     SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolDimensionMetrics, ToolKind,
     ToolMetrics, ToolObservation, ToolOrigin, ToolOutcome,
 };
@@ -28,7 +28,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 10;
+#[path = "history_lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::{PurgePreview, PurgeResult, PurgedSource, RetentionPolicy, RetentionStatus};
+#[path = "history_recovery.rs"]
+mod recovery;
+pub use recovery::{HistoryFailure, HistoryFailureKind, RecoveryReceipt};
+
+const SCHEMA_VERSION: i64 = 11;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -528,6 +535,8 @@ impl HistoryStore {
         ))?;
         let pragmas = crate::memory::query_sqlite_pragmas(&connection);
         migrate(&mut connection, &mut on_progress)?;
+        recovery::apply_marker(&mut connection, path)?;
+        lifecycle::restore_exclusions(&mut connection, path)?;
         // Crash-safety net for issue #132's deferred-rollup bulk scan: a
         // process that was killed after a bulk `observe_bulk` write
         // committed facts but before the scan's completion rebuilt rollups
@@ -1161,6 +1170,8 @@ impl HistoryStore {
             .collect::<std::result::Result<_, _>>()?;
         keys.sort_unstable();
         keys.dedup();
+        drop(statement);
+        lifecycle::refresh_missing(&connection)?;
         Ok(keys)
     }
 
@@ -1182,6 +1193,7 @@ impl HistoryStore {
             "UPDATE source_locations SET present = 0 WHERE path = ?1",
             [path.as_str()],
         )?;
+        lifecycle::refresh_missing(&connection)?;
         Ok(Some(load_one(&connection, &session_key)?))
     }
 
@@ -2099,7 +2111,7 @@ impl HistoryStore {
 
         let mut snapshot_statement = connection.prepare(
             "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json,
-                    d.thread_name_overlay_set, d.thread_name_overlay
+                    d.thread_name_overlay_set, d.thread_name_overlay, d.lifecycle
              FROM durable_sessions d
              LEFT JOIN session_snapshots s
                ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
@@ -2130,6 +2142,7 @@ impl HistoryStore {
             let locations = locations_by_key.remove(&key).unwrap_or_default();
             let available = locations.iter().any(|location| location.present);
             session.storage_id = key.clone();
+            session.lifecycle = lifecycle::decode_lifecycle(&row.get::<_, String>(7)?)?;
             session.source_availability = if available {
                 SourceAvailability::Present
             } else {
@@ -2868,6 +2881,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 9 {
         steps += 1;
+        version = 10;
+    }
+    if version == 10 {
+        steps += 1;
     }
     steps
 }
@@ -2996,6 +3013,7 @@ fn migrate(
         )?;
         transaction.execute_batch(ROLLUP_SCHEMA_SQL)?;
         transaction.execute_batch(DIMENSION_SCHEMA_SQL)?;
+        lifecycle::install_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -3693,6 +3711,30 @@ fn migrate(
             started.elapsed(),
         ));
     }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 10 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v10_to_v11_retention",
+            step_index,
+            step_total,
+            10,
+            11,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        lifecycle::install_schema(&transaction)?;
+        transaction.execute_batch("INSERT INTO history_meta(key,value) VALUES('schema_version','11') ON CONFLICT(key) DO UPDATE SET value=excluded.value; PRAGMA user_version=11;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v10_to_v11_retention",
+            step_index,
+            step_total,
+            10,
+            11,
+            started.elapsed(),
+        ));
+    }
     Ok(())
 }
 
@@ -4351,6 +4393,9 @@ fn observe_one_in_transaction(
     let lineage = history_lineage(session);
     let fingerprint_is_final = !session.tokens_history.is_empty();
     let now = now_ms();
+    if lifecycle::is_excluded(transaction, session)? {
+        return Err(PurgedSource.into());
+    }
 
     let displaced_key: Option<String> = transaction
         .query_row(
@@ -4371,6 +4416,7 @@ fn observe_one_in_transaction(
     let mut archived_session = session.clone();
     archived_session.storage_id = key.clone();
     archived_session.source_availability = SourceAvailability::Present;
+    archived_session.lifecycle = SessionLifecycle::Present;
     archived_session.file_path = path.clone();
     apply_project_identity(transaction, &key, &mut archived_session)?;
     let raw_snapshot =
@@ -4395,6 +4441,13 @@ fn observe_one_in_transaction(
              seen_generation = MAX(source_locations.seen_generation, excluded.seen_generation)",
         params![path, artifact_key, key, now, generation],
     )?;
+    transaction.execute(
+        "UPDATE durable_sessions SET lifecycle='present' WHERE session_key=?1",
+        [key.as_str()],
+    )?;
+    if let Some(previous) = displaced_key.as_ref().filter(|previous| *previous != &key) {
+        transaction.execute("UPDATE durable_sessions SET lifecycle='superseded' WHERE session_key=?1 AND NOT EXISTS(SELECT 1 FROM source_locations WHERE session_key=?1 AND present=1)",[previous])?;
+    }
     // Most scans see an unchanged, fully parsed snapshot. Its stable hash
     // makes it safe to skip walking/re-inserting the complete history;
     // appends and resumes necessarily change the snapshot and still take
@@ -4844,6 +4897,7 @@ fn store_snapshot(
         "DELETE FROM session_snapshots WHERE session_key = ?1 AND version <> ?2",
         params![key, next_version],
     )?;
+    lifecycle::store_summary(transaction, key, incoming)?;
     Ok(true)
 }
 
@@ -5285,17 +5339,17 @@ fn load_one_controlled(
     if let Some(control) = control {
         control.consume_row()?;
     }
-    let (identity_key, fingerprint, collision, raw, thread_name_overlay_set, thread_name_overlay): (
-        String,
-        String,
-        bool,
-        Vec<u8>,
-        bool,
-        Option<String>,
-    ) = connection
-        .query_row(
+    let (
+        identity_key,
+        fingerprint,
+        collision,
+        raw,
+        thread_name_overlay_set,
+        thread_name_overlay,
+        state,
+    ): (String, String, bool, Vec<u8>, bool, Option<String>, String) = connection.query_row(
         "SELECT d.identity_key, d.first_event_fingerprint, d.collision, s.session_json,
-                d.thread_name_overlay_set, d.thread_name_overlay
+                d.thread_name_overlay_set, d.thread_name_overlay, d.lifecycle
          FROM durable_sessions d JOIN session_snapshots s
            ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
          WHERE d.session_key = ?1",
@@ -5308,6 +5362,7 @@ fn load_one_controlled(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
@@ -5330,6 +5385,7 @@ fn load_one_controlled(
         .collect_bounded(control)?;
     let available = locations.iter().any(|location| location.present);
     session.storage_id = key.to_owned();
+    session.lifecycle = lifecycle::decode_lifecycle(&state)?;
     session.source_availability = if available {
         SourceAvailability::Present
     } else {
@@ -6343,6 +6399,7 @@ mod tests {
             agent_nickname: None,
             file_path: "ignored-by-history-store.jsonl".into(),
             source_availability: SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: timestamp("2026-01-01T00:00:00Z"),
             last_event_at: first.timestamp,
@@ -6383,6 +6440,244 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
         (directory, store)
+    }
+
+    #[test]
+    fn retention_summary_sql_migration_matches_rust_projection_without_full_payload() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        let mut original = session("summary-migration", 160);
+        original.first_user_message = Some("λ".repeat(5000));
+        original.optimization_findings = vec![OptimizationFinding {
+            rule_id: "repeat".into(),
+            severity: "warning".into(),
+            avoidable_calls: 7,
+            ..OptimizationFinding::default()
+        }];
+        original.tokens_history[0].delta.cache_creation_input_tokens = 13;
+        original.tokens_history[0].service_tier = Some("fast".into());
+        let observed = store.observe(&path, &original, 1).unwrap();
+        let expected = serde_json::to_value(&store.session_summaries().unwrap()[0]).unwrap();
+        store.mark_path_missing(&path).unwrap();
+        let database = store.path.clone();
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch("DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; PRAGMA user_version=10;").unwrap();
+        drop(connection);
+        let reopened = HistoryStore::open(&database).unwrap();
+        let summaries = reopened.session_summaries().unwrap();
+        let mut migrated = serde_json::to_value(&summaries[0]).unwrap();
+        migrated.as_object_mut().unwrap().remove("lifecycle");
+        migrated["source_availability"] = serde_json::json!("present");
+        assert_eq!(migrated, expected);
+        assert_eq!(summaries[0].lifecycle, SessionLifecycle::Retained);
+        assert_eq!(
+            summaries[0]
+                .first_user_message
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count(),
+            1024
+        );
+        assert!(!migrated.as_object().unwrap().contains_key("tokens_history"));
+        assert_eq!(
+            reopened
+                .load_one(&observed.key)
+                .unwrap()
+                .session
+                .first_user_message
+                .unwrap()
+                .chars()
+                .count(),
+            5000
+        );
+        assert!(reopened.has_complete_coverage().unwrap());
+    }
+
+    #[test]
+    fn retention_purge_is_atomic_excludes_reimports_and_preserves_source_files() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        std::fs::write(&path, b"synthetic source left intact").unwrap();
+        let original = session("purge", 100);
+        let observed = store.observe(&path, &original, 1).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        assert_eq!(store.preview_purge(now).unwrap().sessions, 0);
+        store.mark_path_missing(&path).unwrap();
+        let preview = store.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        let purged = store.purge_retained(&preview, now).unwrap();
+        assert_eq!(purged.removed_keys, vec![observed.key.clone()]);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"synthetic source left intact"
+        );
+        assert!(store.session_keys().unwrap().is_empty());
+        assert!(store.session_summaries().unwrap().is_empty());
+        assert!(store.load_one(&observed.key).is_err());
+        assert!(store
+            .observe(&directory.path().join("copy.jsonl"), &original, 2)
+            .unwrap_err()
+            .is::<PurgedSource>());
+        assert!(store.purge_retained(&preview, now).is_err());
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 1);
+        let database = store.path.clone();
+        drop(store);
+        let reopened = HistoryStore::open(&database).unwrap();
+        assert!(reopened.is_session_excluded(&original).unwrap());
+        let mut different = original;
+        different.started_at += chrono::Duration::days(1);
+        assert!(reopened.observe(&path, &different, 3).is_ok());
+    }
+
+    #[test]
+    fn retention_purge_preview_rejects_a_resumed_present_source() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        let original = session("resume-before-confirm", 100);
+        store.observe(&path, &original, 1).unwrap();
+        store.mark_path_missing(&path).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        let preview = store.preview_purge(now).unwrap();
+        store.observe(&path, &original, 2).unwrap();
+        assert!(store.purge_retained(&preview, now).is_err());
+        assert_eq!(store.stats().unwrap().sessions, 1);
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 0);
+    }
+
+    #[test]
+    fn retention_recovery_preserves_corrupt_database_and_committed_exclusions() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        let original = session("erased-before-corruption", 100);
+        store.observe(&path, &original, 1).unwrap();
+        store.mark_path_missing(&path).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        store
+            .purge_retained(&store.preview_purge(now).unwrap(), now)
+            .unwrap();
+        let database = store.path.clone();
+        drop(store);
+        std::fs::write(&database, b"synthetic damaged database").unwrap();
+        std::fs::write(
+            database.with_file_name("history.sqlite3-wal"),
+            b"synthetic wal",
+        )
+        .unwrap();
+        std::fs::write(
+            database.with_file_name("history.sqlite3-shm"),
+            b"synthetic shm",
+        )
+        .unwrap();
+        let (replacement, receipt) = HistoryStore::recover_unavailable(&database).unwrap();
+        assert_eq!(
+            std::fs::read(receipt.backup_directory.join("history.sqlite3")).unwrap(),
+            b"synthetic damaged database"
+        );
+        assert_eq!(
+            std::fs::read(receipt.backup_directory.join("history.sqlite3-wal")).unwrap(),
+            b"synthetic wal"
+        );
+        assert_eq!(
+            std::fs::read(receipt.backup_directory.join("history.sqlite3-shm")).unwrap(),
+            b"synthetic shm"
+        );
+        assert!(!replacement.has_complete_coverage().unwrap());
+        assert!(replacement.is_session_excluded(&original).unwrap());
+        assert!(replacement
+            .observe(&path, &original, 2)
+            .unwrap_err()
+            .is::<PurgedSource>());
+        drop(replacement);
+        let reopened = HistoryStore::open(&database).unwrap();
+        assert!(!reopened.has_complete_coverage().unwrap());
+        assert_eq!(reopened.retention_status().unwrap().purged_sessions, 1);
+    }
+
+    #[test]
+    fn retention_confirmed_exclusion_survives_sql_rollback_then_corrupt_recovery() {
+        let (directory, store) = store();
+        let original = session("confirmed-before-commit-failure", 100);
+        let key = store
+            .observe(&directory.path().join("source.jsonl"), &original, 1)
+            .unwrap()
+            .key;
+        // Simulate failure after durable confirmed intent but before SQL commit.
+        let intent = vec![(
+            key.clone(),
+            provider_identity(&original).unwrap(),
+            first_event_fingerprint(&original),
+        )];
+        lifecycle::write_exclusions(&store.path, &intent, now_ms()).unwrap();
+        let database = store.path.clone();
+        drop(store);
+        let reopened = HistoryStore::open(&database).unwrap();
+        assert!(reopened.has_session_key(&key).unwrap());
+        assert!(!reopened.is_session_excluded(&original).unwrap());
+        drop(reopened);
+        std::fs::write(&database, b"synthetic damage after commit failure").unwrap();
+        let (replacement, _) = HistoryStore::recover_unavailable(&database).unwrap();
+        assert!(replacement.is_session_excluded(&original).unwrap());
+        assert!(!replacement.has_complete_coverage().unwrap());
+    }
+
+    #[test]
+    fn retention_recovery_marker_cannot_claim_complete_after_interrupted_replacement() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("history.sqlite3");
+        let receipt = RecoveryReceipt {
+            backup_directory: directory.path().join("preserved"),
+            recovered_at_ms: now_ms(),
+        };
+        let marker = database.with_file_name("history.sqlite3.recovery.json");
+        std::fs::write(marker, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let store = HistoryStore::open(&database).unwrap();
+        assert!(!store.has_complete_coverage().unwrap());
+        assert_eq!(
+            store.recovery_receipt().unwrap().unwrap().backup_directory,
+            receipt.backup_directory
+        );
+    }
+
+    #[test]
+    fn retention_unverified_exclusion_journal_fails_closed_without_erasing_backup() {
+        let (directory, store) = store();
+        let database = store.path.clone();
+        drop(store);
+        std::fs::write(
+            database.with_file_name("history.sqlite3.exclusions.jsonl"),
+            b"invalid complete record\n",
+        )
+        .unwrap();
+        assert!(HistoryStore::open(&database).is_err());
+        assert!(HistoryStore::recover_unavailable(&database).is_err());
+        let preserved = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("history-recovery-")
+            })
+            .unwrap();
+        assert!(preserved.path().join("history.sqlite3").is_file());
     }
 
     fn tool(

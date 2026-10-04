@@ -474,6 +474,7 @@ mod tests {
             agent_nickname: None,
             file_path: format!("{id}.jsonl"),
             source_availability: Default::default(),
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: timestamp,
             last_event_at: timestamp + chrono::Duration::seconds(30),
