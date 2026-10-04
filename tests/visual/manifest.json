@@ -58,6 +58,8 @@
     "transcript-export-preview",
     "transcript-export-narrow",
     "content-search-scopes",
-    "content-search-retained-narrow"
+    "content-search-retained-narrow",
+    "workflow-measurement-desktop",
+    "workflow-lifecycle-narrow"
   ]
 }

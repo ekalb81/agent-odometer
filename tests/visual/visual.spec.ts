@@ -753,6 +753,33 @@ test('content search lands on a source record and Escape returns to the search w
   await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
 });
 
+visualTest('workflow-measurement-desktop', 'workflow measurement shows before and after evidence with unavailable human outcomes', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  const panel = page.getByTestId('workflow-panel').filter({ visible: true });
+  await panel.locator('summary').first().click();
+  await expect(panel.getByText('Tool failure rate')).toBeVisible();
+  await expect(panel.getByText('User correction rate')).toBeVisible();
+  await expect(panel.getByText('Unavailable').first()).toBeVisible();
+  await expect(panel.getByText(/This is a scenario, not measured or causal savings/)).toBeVisible();
+  await panel.getByText('History coverage: complete').scrollIntoViewIfNeeded();
+});
+
+visualTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and comparison limits remain usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { view: 'codex' });
+  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  const panel = page.getByTestId('workflow-panel').filter({ visible: true });
+  await panel.locator('summary').first().click();
+  await expect(panel.getByText('Tool failure rate')).toBeVisible();
+  await panel.getByRole('button', { name: 'Record measurement' }).click();
+  await expect(panel.getByRole('button', { name: 'Suppress finding' })).toBeVisible();
+  await panel.getByRole('button', { name: 'Suppress finding' }).click();
+  await expect(panel.getByRole('button', { name: 'Unsuppress finding' })).toBeVisible();
+  await expect(panel.getByText(/observational comparison/)).toBeVisible();
+  await panel.getByRole('button', { name: 'Unsuppress finding' }).scrollIntoViewIfNeeded();
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {
