@@ -116,7 +116,7 @@ pub fn edit_record_bookmark(
                 session_id: edit.identity.session_key.clone(),
                 record_id: Some(edit.identity.anchor.clone()),
                 max_records: Some(1),
-                max_bytes: Some(MAX_RECORD_BYTES),
+                max_bytes: Some(MAX_PAGE_BYTES),
                 ..Default::default()
             },
         );
@@ -787,6 +787,7 @@ mod tests {
         let sources = root.join("sources");
         std::fs::create_dir_all(&sources).unwrap();
         let mut config = Config::default().normalized();
+        config.config_version = crate::config::CONFIG_VERSION;
         for settings in config.providers.values_mut() {
             settings.live_roots.clear();
             settings.archive_roots.clear();
@@ -801,8 +802,8 @@ mod tests {
         let raw = concat!(
             "{\"type\":\"session_meta\",\"payload\":{\"id\":\"bookmark-synthetic\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n",
             "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"BOOKMARK_PRIVATE_BODY\"}]}}\n"
-        );
-        std::fs::write(&path, raw).unwrap();
+        ).replace("BOOKMARK_PRIVATE_BODY", &format!("BOOKMARK_PRIVATE_BODY{}", "x".repeat(40 * 1024)));
+        std::fs::write(&path, &raw).unwrap();
         let history = std::sync::Arc::new(
             crate::history_store::HistoryStore::open(&root.join("history.sqlite")).unwrap(),
         );
@@ -810,18 +811,37 @@ mod tests {
         let key = history.observe(&path, &session, 1).unwrap().key;
         let state = AppState::new();
         state.set_history_ready(Some(history.clone()));
+        state.publish_watched_session(&path, session.clone());
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
         let request = || TranscriptRequest {
             session_id: key.clone(),
             max_records: Some(1),
+            max_bytes: Some(131_072),
             ..Default::default()
         };
         let first = read_for_session(&state, request());
+        assert!(
+            !first.records.is_empty(),
+            "{:?} {:?}",
+            first.availability,
+            first.issues
+        );
         let second = read_for_session(
             &state,
             TranscriptRequest {
                 cursor: first.next_cursor,
                 ..request()
             },
+        );
+        assert!(
+            !second.records.is_empty(),
+            "{:?} {:?}",
+            second.availability,
+            second.issues
         );
         let anchor = second.records[0].id.clone();
         let list = history.record_bookmarks(&key).unwrap();
@@ -848,6 +868,11 @@ mod tests {
         std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n").unwrap();
         let appended = crate::parser::parse_file(&path, false).unwrap().unwrap();
         history.observe(&path, &appended, 2).unwrap();
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
         let landing = read_for_session(
             &state,
             TranscriptRequest {
@@ -879,6 +904,11 @@ mod tests {
         .unwrap();
         let replaced = crate::parser::parse_file(&path, false).unwrap().unwrap();
         history.observe(&path, &replaced, 3).unwrap();
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
         assert!(edit_record_bookmark(
             &state,
             crate::history_store::RecordBookmark {
