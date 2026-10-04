@@ -49,3 +49,15 @@ claims in 0003 and 0005 lives at
 and runs under the ordinary `cargo test` suite. It is local-only, adds no
 runtime dependency to the shipping app, and never touches the real
 `history-v1.sqlite3` ledger.
+
+## Remote inspection and Git recovery design gates
+
+- [0008-remote-session-inspection-boundary.md](0008-remote-session-inspection-boundary.md)
+  records #261's local-copy-first decision, origin isolation, retention boundary,
+  and the separate review needed before any SSH transport.
+- [0009-git-checkpoint-and-recovery-gates.md](0009-git-checkpoint-and-recovery-gates.md)
+  records #267's observation-only milestone and the backup, confirmation, and
+  concurrent-edit gates before any write-capable recovery feature.
+
+These records enable neither network access nor Git writes. Their proposed
+runtime milestones require separate issues and the reviews specified inside.
