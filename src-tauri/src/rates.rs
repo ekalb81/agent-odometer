@@ -422,6 +422,9 @@ pub enum PricingBasis {
 /// The resolved pricing-table key and provenance for one raw model id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PricedModelResolution {
+    /// Independent of freshness: Stale must not erase fallback identity.
+    #[serde(default)]
+    pub fallback_used: bool,
     /// The table key actually used to find a rate — equal to the requested
     /// model for `Direct`/`FreeLocal`/`Unavailable`, the alias target for
     /// `Aliased`, or the configured fallback model for `Fallback`.
@@ -849,12 +852,14 @@ impl RateCard {
         };
         if self.free_local_models.iter().any(|m| m == model) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: PricingBasis::FreeLocal,
             };
         }
         if self.unpriced_models.iter().any(|m| m == model) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: PricingBasis::Unavailable,
             };
@@ -865,12 +870,14 @@ impl RateCard {
             .is_some_and(|end| now.date_naive() >= *end)
         {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: PricingBasis::Unavailable,
             };
         }
         if table.contains_key(model) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: basis(model, PricingBasis::Direct),
             };
@@ -885,6 +892,7 @@ impl RateCard {
                 && table.contains_key(floating.target.as_str())
             {
                 return PricedModelResolution {
+                    fallback_used: false,
                     resolved_model: floating.target.clone(),
                     basis: basis(&floating.target, PricingBasis::FloatingAlias),
                 };
@@ -893,6 +901,7 @@ impl RateCard {
         let (resolved, hopped) = resolve_alias(model, &self.model_aliases);
         if hopped && table.contains_key(resolved) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: resolved.to_owned(),
                 basis: basis(resolved, PricingBasis::Aliased),
             };
@@ -903,11 +912,13 @@ impl RateCard {
             .unwrap_or(&self.fallback_model);
         if table.contains_key(fallback_model.as_str()) {
             return PricedModelResolution {
+                fallback_used: true,
                 resolved_model: fallback_model.clone(),
                 basis: basis(fallback_model, PricingBasis::Fallback),
             };
         }
         PricedModelResolution {
+            fallback_used: false,
             resolved_model: model.to_owned(),
             basis: PricingBasis::Unavailable,
         }

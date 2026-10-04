@@ -132,7 +132,7 @@ pub fn price_tokens(
                 rates,
                 harness,
                 &resolution.resolved_model,
-                resolution.basis,
+                resolution.fallback_used,
                 service_tier,
                 table,
                 now,
@@ -211,7 +211,7 @@ pub(crate) fn tier_multiplier(
     rates: &RateCard,
     harness: &str,
     resolved: &str,
-    basis: PricingBasis,
+    fallback_used: bool,
     tier: Option<&str>,
     table: RateTable,
     at: DateTime<Utc>,
@@ -220,8 +220,7 @@ pub(crate) fn tier_multiplier(
         return match tier {
             None | Some("default" | "standard") => Some(1.0),
             Some("fast" | "priority")
-                if basis != PricingBasis::Fallback
-                    && matches!(resolved, "gpt-6-astra" | "gpt-5.5" | "gpt-5.4") =>
+                if !fallback_used && matches!(resolved, "gpt-6-astra" | "gpt-5.5" | "gpt-5.4") =>
             {
                 Some(service_tier_multiplier(resolved, tier, table))
             }
@@ -237,7 +236,7 @@ pub(crate) fn tier_multiplier(
         Some("ultrafast") => "ultrafast",
         _ => return None,
     };
-    if basis == PricingBasis::Fallback && tier != "standard" {
+    if fallback_used && tier != "standard" {
         return None;
     }
     let surface = match table {
@@ -638,10 +637,7 @@ pub(crate) fn price_buckets_detailed_controlled(
                 .or_insert((0.0, PricingBasis::Unavailable, true));
             continue;
         }
-        if matches!(
-            resolution.basis,
-            PricingBasis::Fallback | PricingBasis::Unavailable
-        ) {
+        if resolution.fallback_used || resolution.basis == PricingBasis::Unavailable {
             missing.insert(bucket.model.clone());
         }
 

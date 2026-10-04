@@ -344,7 +344,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
       const metric = grouped.get(`${session.harness}\0${model}`)!;
       const priced = surface?.by_model.find((entry) => entry.model === model);
       metric.cost += priced?.cost ?? Number.NaN;
-      metric.fallbackUsed ||= priced?.basis === 'fallback';
+      metric.fallbackUsed ||= priced?.basis === 'fallback' || (priced !== undefined && surface?.missing_models.includes(model) === true);
       metric.unpriced ||= priced?.unpriced ?? false;
       const basis = priced?.basis ?? 'unavailable';
       const key = `${session.harness}\0${model}`;

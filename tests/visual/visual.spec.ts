@@ -234,7 +234,8 @@ visualTest('sessions-subagent-drilldown', 'session subagent drill-down with per-
 
 visualTest('sessions-availability-fallback', 'session availability, fallback, and unpriced indicators', async (page) => {
   await visit(page, { scenario: 'sessions-availability-fallback', view: 'codex' });
-  await expect(page.getByText(/unpriced model excluded/i)).toBeVisible();
+  await expect(page.getByText(/^estimate · 1 unpriced model excluded$/i)).toBeVisible();
+  await expect(page.getByText(/^1 unpriced model excluded · 1 fallback rate used$/i)).toBeVisible();
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
   await page.clock.runFor(500);
   await expect(page.locator('[aria-label="Session details"]:visible')).toContainText('source missing');

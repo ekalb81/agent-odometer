@@ -180,6 +180,14 @@ pub fn price_turn(
     let Some(model) = model.filter(|_| !unpriced) else {
         return result;
     };
+    let rate_table = match table {
+        RateTable::Plan | RateTable::PurchasedCredits | RateTable::IncludedAllowance => {
+            &rates.models
+        }
+        RateTable::Api | RateTable::ApiEstimate => &rates.api_models,
+    };
+    let resolution = rates.resolve_model_pricing(model, harness, rate_table, now);
+    result.fallback_used = resolution.fallback_used;
     if matches!(
         table,
         RateTable::PurchasedCredits | RateTable::IncludedAllowance | RateTable::ApiEstimate
@@ -188,26 +196,18 @@ pub fn price_turn(
         result.cost = value.amount.unwrap_or(0.0);
         result.basis = value.basis;
         result.unpriced = value.amount.is_none();
-        result.fallback_used = value.basis == PricingBasis::Fallback;
         return result;
     }
-    let rate_table = match table {
-        RateTable::Plan | RateTable::PurchasedCredits | RateTable::IncludedAllowance => {
-            &rates.models
-        }
-        RateTable::Api | RateTable::ApiEstimate => &rates.api_models,
-    };
-    let resolution = rates.resolve_model_pricing(model, harness, rate_table, now);
     result.basis = resolution.basis;
     result.unpriced |= resolution.basis == PricingBasis::Unavailable;
-    result.fallback_used = resolution.basis == PricingBasis::Fallback;
+    result.fallback_used = resolution.fallback_used;
     if resolution.basis != PricingBasis::Unavailable {
         if let Some(rate) = rate_table.get(&resolution.resolved_model) {
             if let Some(multiplier) = crate::query::tier_multiplier(
                 rates,
                 harness,
                 &resolution.resolved_model,
-                resolution.basis,
+                resolution.fallback_used,
                 tier,
                 table,
                 now,
@@ -437,10 +437,8 @@ pub fn time_aware_surface(
             rates.resolve_model_pricing(model, session.harness.as_str(), table, event.timestamp);
         // A catalog can directly evidence a model missing from the flat map.
         // A fallback must never borrow the fallback model's historical rules.
-        let canonical = if matches!(
-            resolution.basis,
-            PricingBasis::Fallback | PricingBasis::Unavailable
-        ) {
+        let canonical = if resolution.fallback_used || resolution.basis == PricingBasis::Unavailable
+        {
             model
         } else {
             resolution.resolved_model.as_str()

@@ -843,6 +843,8 @@ export interface FloatingAlias {
 
 /** The resolved pricing-table key and provenance for one raw model id. */
 export interface PricedModelResolution {
+  /** Freshness must not erase the fallback identity. */
+  fallback_used?: boolean;
   resolved_model: string;
   basis: PricingBasis;
 }

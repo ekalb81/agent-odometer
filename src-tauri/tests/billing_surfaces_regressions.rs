@@ -337,3 +337,76 @@ fn ledger_hour_rollups_and_edges_preserve_the_same_current_surface_oracle() {
     .unwrap();
     assert_eq!(expected, priced.purchased_credits);
 }
+
+#[test]
+fn stale_fallback_never_proves_speed_or_borrows_dated_model_evidence() {
+    let mut rates = RateCard::load_bundled().unwrap();
+    let now = at("2026-10-04T12:00:00Z");
+    rates
+        .fallback_models
+        .insert("codex".into(), "gpt-6-astra".into());
+    rates.refresh.last_success_at = Some(at("2026-01-01T00:00:00Z"));
+    let resolution = rates.resolve_model_pricing("unknown", "codex", &rates.models, now);
+    assert_eq!(resolution.basis, PricingBasis::Stale);
+    assert!(resolution.fallback_used);
+    for table in [
+        RateTable::Plan,
+        RateTable::Api,
+        RateTable::PurchasedCredits,
+        RateTable::IncludedAllowance,
+        RateTable::ApiEstimate,
+    ] {
+        assert!(price_tokens(
+            &rates,
+            "codex",
+            "unknown",
+            Some("priority"),
+            &usage(),
+            table,
+            now
+        )
+        .amount
+        .is_none());
+        let normal = price_buckets_detailed(
+            &rates,
+            "codex",
+            &[TierBucket {
+                model: "unknown".into(),
+                service_tier: None,
+                tokens: usage(),
+            }],
+            table,
+            now,
+        )
+        .unwrap();
+        assert_eq!(normal.missing_models, ["unknown"]);
+    }
+    let turn = odometer_lib::query::price_turn(
+        &usage(),
+        Some("unknown"),
+        None,
+        "codex",
+        &rates,
+        RateTable::PurchasedCredits,
+        now,
+    );
+    assert!(turn.fallback_used);
+    assert_eq!(turn.basis, PricingBasis::Stale);
+    let dated = price_session_details(session("unknown", None, Some(100)), &rates, now).pricing;
+    assert!(dated.time_aware_api.is_none());
+    assert!(dated.dated_purchased_credits.is_none());
+    rates
+        .model_aliases
+        .insert("known-alias".into(), "gpt-6-astra".into());
+    assert!(price_tokens(
+        &rates,
+        "codex",
+        "known-alias",
+        Some("priority"),
+        &usage(),
+        RateTable::PurchasedCredits,
+        now
+    )
+    .amount
+    .is_some());
+}
