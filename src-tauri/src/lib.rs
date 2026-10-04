@@ -9,6 +9,7 @@ pub mod claude_parser;
 pub mod commands;
 pub mod config;
 pub mod config_events;
+mod context_evidence;
 pub mod correlation;
 pub mod diagnostics;
 pub mod gemini_parser;
