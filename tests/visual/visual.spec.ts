@@ -510,6 +510,40 @@ test('project reassignment and restore stay usable in the narrow detail drawer',
   await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
 });
 
+async function openQuotaPanel(page: Page, id: string): Promise<ReturnType<Page['locator']>> {
+  const analytics = page.locator('[data-testid="analytics-panel"]:visible');
+  await analytics.locator(':scope > summary').click();
+  const panel = analytics.getByTestId(id);
+  await panel.locator(':scope > summary').click();
+  await panel.scrollIntoViewIfNeeded();
+  return panel;
+}
+
+visualTest('quota-budget-editor-narrow', 'quota project USD editor at narrow width', async (page) => {
+  await page.setViewportSize({ width: 800, height: 800 });
+  await visit(page, { view: 'codex' });
+  const budgets = await openQuotaPanel(page, 'quota-budgets-panel');
+  await budgets.getByRole('button', { name: 'Add budget' }).click();
+  await budgets.getByLabel('Budget type').selectOption('usd');
+  await budgets.getByLabel('Project scope').selectOption({ label: 'demo' });
+  await budgets.getByLabel('Threshold (USD)').fill('10');
+  await expect(budgets.getByRole('button', { name: 'Save budget' })).toBeEnabled();
+  await budgets.getByRole('button', { name: 'Save budget' }).focus();
+  await expect(budgets.getByRole('button', { name: 'Save budget' })).toBeFocused();
+  await budgets.scrollIntoViewIfNeeded();
+});
+
+visualTest('quota-live-off-and-lookup-error', 'quota lookup failure keeps live polling off', async (page) => {
+  await visit(page, { view: 'codex', theme: 'dark' });
+  const live = await openQuotaPanel(page, 'live-quota-accounts');
+  await expect(live).toContainText('No accounts approved. Live polling is off.');
+  await live.getByRole('button', { name: 'Allow one account lookup' }).click();
+  await expect(live.getByRole('alert')).toBeVisible();
+  await expect(live).toContainText('No accounts approved. Live polling is off.');
+  await expect(live.getByRole('button', { name: 'Enable polling for this account' })).toHaveCount(0);
+  await live.scrollIntoViewIfNeeded();
+});
+
 visualTest('transcript-recorded-edit', 'inspector shows recorded tool result and edit in source order', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();

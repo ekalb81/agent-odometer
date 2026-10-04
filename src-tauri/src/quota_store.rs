@@ -12,7 +12,7 @@
 //! own store and migrations independent of `history-v1.sqlite3`, not a
 //! table added to it.
 //!
-//! Stored at `<config_dir>/agent-odometer/quota-v1.json` using the same
+//! Stored at `<config_dir>/agent-odometer/quota-v2.json` using the same
 //! atomic write pattern as `rates.rs::RateCard::save` (temp file + rename).
 
 use crate::provider::ProviderId;
@@ -20,7 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const QUOTA_STORE_VERSION: u32 = 1;
+pub const QUOTA_STORE_VERSION: u32 = 2;
 
 /// Keeps the dedup log bounded regardless of how long the app runs.
 const MAX_LOG_ENTRIES: usize = 500;
@@ -35,10 +35,10 @@ pub enum BudgetUnit {
     /// in `commands.rs::validate_quota_config`).
     PercentOfWindow,
     /// Raw token count, summed over the budget's rolling `period_hours`.
-    /// Monetary project budgets remain deferred. If added, they must use
-    /// the shared Rust query service's pricing and model resolution rather
-    /// than defining a separate calculator here.
     Tokens,
+    /// Current USD API estimate from the shared query service, not a bill
+    /// or subscription allowance. Incomplete pricing is unavailable.
+    Usd,
 }
 
 fn default_true() -> bool {
@@ -51,16 +51,16 @@ pub struct QuotaBudget {
     pub id: String,
     pub provider: ProviderId,
     /// `None` = provider-wide; `Some(project_key)` scopes it to one project
-    /// (#41's `project_key`). Only valid with `unit: Tokens`.
+    /// (#41's `project_key`). Valid with token and USD estimate budgets.
     #[serde(default)]
     pub project_key: Option<String>,
     pub unit: BudgetUnit,
     /// Which window this budget watches, matching
     /// `quota::QuotaWindowKind::as_str()` ("burst", "daily", "weekly",
-    /// "monthly"). Required for `PercentOfWindow`; ignored for `Tokens`.
+    /// "monthly"). Required for `PercentOfWindow`; ignored for token/USD budgets.
     #[serde(default)]
     pub window_kind: Option<String>,
-    /// Rolling period for a `Tokens` budget. Ignored for `PercentOfWindow`,
+    /// Rolling period for a token or USD estimate budget. Ignored for `PercentOfWindow`,
     /// whose period is the provider's own window.
     #[serde(default)]
     pub period_hours: Option<u32>,
@@ -134,7 +134,7 @@ impl Default for QuotaStoreFile {
 }
 
 fn quota_store_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("agent-odometer").join("quota-v1.json"))
+    dirs::config_dir().map(|d| d.join("agent-odometer").join("quota-v2.json"))
 }
 
 impl QuotaStoreFile {
@@ -142,39 +142,55 @@ impl QuotaStoreFile {
     /// or malformed file (logged, never a hard failure — quota bookkeeping
     /// must not block the rest of the app from starting).
     pub fn load() -> Self {
-        let Some(path) = quota_store_path() else {
-            return Self::default();
-        };
-        if !path.exists() {
-            return Self::default();
-        }
-        match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<Self>(&raw) {
-                Ok(mut store) => {
-                    store.version = QUOTA_STORE_VERSION;
-                    store
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        "quota-v1.json at {:?} is malformed ({}); using defaults",
-                        path,
-                        error
-                    );
-                    Self::default()
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    "could not read quota-v1.json at {:?} ({}); using defaults",
-                    path,
-                    error
-                );
-                Self::default()
-            }
-        }
+        Self::load_checked().unwrap_or_else(|_| {
+            tracing::warn!("quota configuration unavailable; automatic quota activity disabled");
+            Self::default()
+        })
     }
 
-    /// Atomic-ish write to `<config_dir>/agent-odometer/quota-v1.json`.
+    /// Preserve the legacy file so older releases cannot overwrite USD
+    /// budgets they do not understand. Reads alone never migrate or write.
+    pub fn load_checked() -> Result<Self, String> {
+        let path = quota_store_path().ok_or("quota configuration location unavailable")?;
+        Self::load_at(&path)
+    }
+
+    fn load_at(path: &std::path::Path) -> Result<Self, String> {
+        use std::io::Read;
+        let legacy = path.with_file_name("quota-v1.json");
+        let path = if path
+            .try_exists()
+            .map_err(|_| "quota configuration unreadable; existing file preserved")?
+        {
+            path
+        } else {
+            &legacy
+        };
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default())
+            }
+            Err(_) => return Err("quota configuration unreadable; existing file preserved".into()),
+        };
+        let mut raw = String::new();
+        file.take(512_001)
+            .read_to_string(&mut raw)
+            .map_err(|_| "quota configuration unreadable; existing file preserved")?;
+        if raw.len() > 512_000 {
+            return Err("quota configuration is too large; existing file preserved".into());
+        }
+        let mut store: Self = serde_json::from_str(&raw)
+            .map_err(|_| "quota configuration invalid; existing file preserved")?;
+        if !(1..=QUOTA_STORE_VERSION).contains(&store.version) {
+            return Err("quota configuration requires a newer Odometer version".into());
+        }
+        validate_quota_config(&QuotaConfigWire::from(&store))?;
+        store.version = QUOTA_STORE_VERSION;
+        Ok(store)
+    }
+
+    /// Atomic-ish write to `<config_dir>/agent-odometer/quota-v2.json`.
     pub fn save(&self) -> anyhow::Result<()> {
         let path =
             quota_store_path().ok_or_else(|| anyhow::anyhow!("could not determine config dir"))?;
@@ -205,14 +221,34 @@ impl QuotaStoreFile {
 /// bookkeeping the frontend never needs to see or round-trip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QuotaConfigWire {
+    /// Optimistic edit revision; excludes automatic notification bookkeeping.
+    #[serde(default)]
+    pub revision: Option<String>,
     pub budgets: Vec<QuotaBudget>,
     pub notifications: NotificationSettings,
     pub max_cache_age_secs: i64,
 }
 
+impl QuotaStoreFile {
+    pub fn config_revision(&self) -> String {
+        let bytes =
+            serde_json::to_vec(&(&self.budgets, &self.notifications, self.max_cache_age_secs))
+                .expect("validated quota settings serialize");
+        format!("{:016x}", crate::stable_hash::fnv1a64(&bytes))
+    }
+
+    pub fn check_revision(&self, revision: Option<&str>) -> Result<(), String> {
+        if revision.is_some_and(|revision| revision != self.config_revision()) {
+            return Err("Quota settings changed. Reload before saving your edits.".into());
+        }
+        Ok(())
+    }
+}
+
 impl From<&QuotaStoreFile> for QuotaConfigWire {
     fn from(store: &QuotaStoreFile) -> Self {
         Self {
+            revision: Some(store.config_revision()),
             budgets: store.budgets.clone(),
             notifications: store.notifications.clone(),
             max_cache_age_secs: store.max_cache_age_secs,
@@ -223,13 +259,34 @@ impl From<&QuotaStoreFile> for QuotaConfigWire {
 /// Validates a candidate config before it is persisted. Fail-closed: the
 /// caller must not write a config that fails this.
 pub fn validate_quota_config(config: &QuotaConfigWire) -> Result<(), String> {
-    if config.max_cache_age_secs <= 0 {
-        return Err("max_cache_age_secs must be positive".to_string());
+    if !(1..=31_536_000).contains(&config.max_cache_age_secs) {
+        return Err("max_cache_age_secs must be between 1 and 31536000".to_string());
+    }
+    if config.budgets.len() > 64 {
+        return Err("at most 64 soft budgets are supported".into());
+    }
+    if config
+        .notifications
+        .quiet_hours
+        .is_some_and(|(start, end)| start > 23 || end > 23)
+    {
+        return Err("quiet hours must be local hours from 0 to 23".into());
     }
     let mut seen_ids = std::collections::HashSet::new();
     for budget in &config.budgets {
-        if budget.id.trim().is_empty() {
-            return Err("budget id must not be empty".to_string());
+        if crate::provider::ProviderRegistry::builtin()
+            .adapter(&budget.provider)
+            .is_none()
+        {
+            return Err("budget provider is not supported".into());
+        }
+        if budget.project_key.as_ref().is_some_and(|key| {
+            key.trim().is_empty() || key.len() > 1024 || key.chars().any(char::is_control)
+        }) {
+            return Err("budget project key is invalid".into());
+        }
+        if budget.id.trim().is_empty() || budget.id.len() > 128 {
+            return Err("budget id must contain 1 to 128 bytes".to_string());
         }
         if !seen_ids.insert(budget.id.as_str()) {
             return Err(format!("duplicate budget id '{}'", budget.id));
@@ -245,7 +302,10 @@ pub fn validate_quota_config(config: &QuotaConfigWire) -> Result<(), String> {
                         budget.id
                     ));
                 }
-                if budget.window_kind.is_none() {
+                if !matches!(
+                    budget.window_kind.as_deref(),
+                    Some("burst" | "daily" | "weekly" | "monthly")
+                ) {
                     return Err(format!(
                         "budget '{}' is percent_of_window and must name a window_kind",
                         budget.id
@@ -258,11 +318,11 @@ pub fn validate_quota_config(config: &QuotaConfigWire) -> Result<(), String> {
                     ));
                 }
             }
-            BudgetUnit::Tokens => {
+            BudgetUnit::Tokens | BudgetUnit::Usd => {
                 if let Some(hours) = budget.period_hours {
-                    if hours == 0 {
+                    if !(1..=8760).contains(&hours) {
                         return Err(format!(
-                            "budget '{}' period_hours must be positive when set",
+                            "budget '{}' period_hours must be between 1 and 8760",
                             budget.id
                         ));
                     }
@@ -280,6 +340,7 @@ mod tests {
 
     fn wire(budgets: Vec<QuotaBudget>) -> QuotaConfigWire {
         QuotaConfigWire {
+            revision: None,
             budgets,
             notifications: NotificationSettings::default(),
             max_cache_age_secs: 3600,
@@ -297,6 +358,39 @@ mod tests {
             threshold: 80.0,
             enabled: true,
         }
+    }
+
+    #[test]
+    fn legacy_migration_is_read_only_and_invalid_newer_file_never_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("quota-v1.json");
+        let current = dir.path().join("quota-v2.json");
+        let legacy = r#"{"version":1,"budgets":[],"notifications":{"enabled":true}}"#;
+        std::fs::write(&old, legacy).unwrap();
+        let loaded = QuotaStoreFile::load_at(&current).unwrap();
+        assert_eq!(loaded.version, 2);
+        assert!(loaded.notifications.enabled);
+        assert!(!current.exists());
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), legacy);
+        for invalid in [r#"{"version":99}"#, "not json"] {
+            std::fs::write(&current, invalid).unwrap();
+            assert!(QuotaStoreFile::load_at(&current).is_err());
+            assert_eq!(std::fs::read_to_string(&current).unwrap(), invalid);
+        }
+    }
+
+    #[test]
+    fn stale_config_edits_fail_without_conflicting_with_alert_bookkeeping() {
+        let mut store = QuotaStoreFile::default();
+        let revision = store.config_revision();
+        store.notification_log.push(NotificationLogEntry {
+            dedup_key: "b1".into(),
+            fired_at: Utc::now(),
+        });
+        assert!(store.check_revision(Some(&revision)).is_ok());
+        store.budgets.push(percent_budget());
+        assert!(store.check_revision(Some(&revision)).is_err());
+        assert!(store.check_revision(Some(&store.config_revision())).is_ok());
     }
 
     #[test]
