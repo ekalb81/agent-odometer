@@ -268,7 +268,7 @@
           <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-(--archived-chip-bg) text-(--archived-chip-fg)">archived</span>
         {/if}
         {#if sourceMissing}
-          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-amber-500/10 text-amber-500 border border-amber-500/20">source missing</span>
+          <span class="text-[10px] font-semibold px-[9px] py-[2px] rounded-full bg-amber-500/10 text-amber-500 border border-amber-500/20">{session.lifecycle === 'superseded' ? 'superseded · source missing' : 'retained · source missing'}</span>
         {/if}
         {#if hasDeepLink}
           <button

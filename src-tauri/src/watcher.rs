@@ -11,7 +11,7 @@ use notify_debouncer_full::{new_debouncer, notify::RecursiveMode, DebounceEventR
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 /// Opaque handle that keeps the debouncer alive. Dropping it stops the watcher.
 pub struct WatcherHandle {
@@ -135,7 +135,9 @@ pub fn start(
                                 id.clone(),
                                 summary.thread_name.clone(),
                             )));
-                            if let Err(e) = app_cb.emit("session-updated", &summary) {
+                            if let Err(e) =
+                                crate::commands::emit_session_summary(&app_cb, &state_cb, &summary)
+                            {
                                 tracing::warn!("emit session-updated failed: {}", e);
                             }
                         }
@@ -160,7 +162,9 @@ pub fn start(
                         // source of truth for removal.
                         let _ = parsers_cb.remove(path);
                         if let Some(summary) = state_cb.mark_source_missing(path) {
-                            if let Err(e) = app_cb.emit("session-updated", &summary) {
+                            if let Err(e) =
+                                crate::commands::emit_session_summary(&app_cb, &state_cb, &summary)
+                            {
                                 tracing::warn!("emit session-updated failed: {}", e);
                             }
                         }
@@ -244,14 +248,20 @@ pub fn start(
                             let reconciled =
                                 state_cb.reconcile_observed_session(path, session.clone());
                             let summary = SessionSummary::of(&reconciled.session);
-                            state_cb.publish_watched_session(path, reconciled.session);
-                            if let Err(e) = app_cb.emit("session-updated", &summary) {
+                            if !state_cb.publish_watched_session(path, reconciled.session) {
+                                continue;
+                            }
+                            if let Err(e) =
+                                crate::commands::emit_session_summary(&app_cb, &state_cb, &summary)
+                            {
                                 tracing::warn!("emit session-updated failed: {}", e);
                             }
                             if let Some(displaced) = reconciled.displaced {
-                                if let Err(e) =
-                                    app_cb.emit("session-updated", &SessionSummary::of(&displaced))
-                                {
+                                if let Err(e) = crate::commands::emit_session_summary(
+                                    &app_cb,
+                                    &state_cb,
+                                    &SessionSummary::of(&displaced),
+                                ) {
                                     tracing::warn!("emit displaced session-updated failed: {}", e);
                                 }
                             }

@@ -5,7 +5,7 @@ export function integrationFixture(scope: IntegrationScope = 'user'): Integratio
     schema_version: 1,
     status: {
       schema_version: 1, server_version: '0.8.21', protocol_version: '2025-06-18', generated_at: '2026-09-01T13:00:00Z',
-      ledger_available: true, scan_status: 'desktop_scan_complete', sessions: 2,
+      ledger_available: true, coverage_complete: true, scan_status: 'desktop_scan_complete', sessions: 2,
       observation: { captured_at: '2026-09-01T12:00:00Z', age_seconds: 3600, generation: 'observation:1788264000000:2', token_event_from: '2026-09-01T12:00:00Z', token_event_to: '2026-09-01T12:30:00Z' },
       providers: [], pricing_models: [], pricing_authority: 'Observed usage, plan credits and API USD estimates are separate quantities.', quota_authority: 'Quota is not queried here. Inspect quota_report provenance.',
       dimensions: ['provider', 'model', 'project', 'session'], filters: ['inclusive UTC dates'], suggested_next_calls: ['usage_report', 'session_report'], diagnostics: [], limitations: ['Browser fixture responses do not prove backend or client behavior.'],
