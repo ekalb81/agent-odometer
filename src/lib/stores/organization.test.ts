@@ -7,6 +7,12 @@ const row: OrganizationSummary = {identity:{session_key:'codex:thread:synthetic'
 beforeEach(() => { vi.resetAllMocks(); organizationStore.invalidate('reset'); mocks.listOrganizationTags.mockResolvedValue([]); mocks.getOrganizationRecoveryState.mockResolvedValue(false); });
 
 describe('private organization metadata requests', () => {
+  it('marks recovery omissions explicitly even when replacement rows contain no pins', async () => {
+    mocks.getOrganizationSummaries.mockResolvedValue([row]);
+    mocks.getOrganizationRecoveryState.mockResolvedValue(true);
+    await organizationStore.load([row.identity.session_key]);
+    expect(organizationStore.recoveryUnrestored).toBe(true);
+  });
   it('rejects a late response after purge/invalidation', async () => {
     let finish!: (rows: OrganizationSummary[]) => void;
     mocks.getOrganizationSummaries.mockReturnValue(new Promise(resolve => { finish = resolve; }));

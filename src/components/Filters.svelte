@@ -180,7 +180,7 @@
           {/each}
         </div>
         <div class="border-t border-edge pt-3 flex flex-col gap-2">
-          {#if filters.utcBounds}<p class="text-[11px] text-ink-faint">Saved UTC bounds preserve exact instants, including seconds and milliseconds. Editing a bound replaces that instant.</p>{/if}
+          {#if filters.utcBounds}<p class="text-[11px] text-ink-faint">UTC bounds preserve exact instants, including seconds and milliseconds. Editing a bound replaces that instant.</p>{/if}
           <label class="flex items-center justify-between gap-2 text-xs text-ink-muted">
             <span>From</span>
             <input

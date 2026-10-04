@@ -16,6 +16,11 @@ async function open() {
   return {onrestore,onchange};
 }
 describe('saved query management', () => {
+  it('discloses preserved but unrestored searches after recovery', async () => {
+    mocks.getOrganizationRecoveryState.mockResolvedValue(true);
+    await open();
+    expect(screen.getByText(/Earlier organization and saved searches were preserved/)).toBeInTheDocument();
+  });
   it('restores provider, exact date bounds and organization choices together', async () => {
     const {onrestore}=await open();
     await userEvent.selectOptions(screen.getByLabelText('Saved search'),'7');

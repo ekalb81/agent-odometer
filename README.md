@@ -256,3 +256,8 @@ Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for 
 [MIT](LICENSE)
 
 Client setup and verification are available in Settings → Integration Center. See [setup, privacy and proof boundaries](docs/INTEGRATION_CENTER.md).
+## Private session organization
+
+Use **Edit organization** in a session’s detail pane to pin it, add tags, or edit a private note. **Organize** in the toolbar filters pins/tags and saves, restores, renames, replaces, or deletes summary searches. Saved searches keep their provider, model, archive/subagent choices, organization filters, and exact UTC date bounds. Summary text search covers the existing summary fields; it does not search private notes or full transcripts. A stored content search reports unavailable until its explicit content-search service can run it.
+
+Organization stays in the local history database and is excluded from ordinary exports, diagnostics, accounting, MCP, and provider files. Missing sources keep it. Confirmed history purge removes the selected sessions’ pins, tag assignments, and notes; global tag definitions and saved searches remain. A corrupt-database recovery preserves the original database backup and rebuilds source history, but does not reconstruct private organization from transcripts. The UI identifies those unrestored records and keeps dependent pin/tag results unavailable.

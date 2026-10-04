@@ -1,5 +1,5 @@
 import type { SessionFilterState, ViewScope } from './sessionProjection';
-import type { AnnotationIdentity, OrganizationSummary, SavedSearchDefinition } from './types';
+import type { OrganizationSummary, SavedSearchDefinition } from './types';
 import { toLocalInputValuePrecise } from './dateRange';
 import { filterBounds } from './sessionProjection';
 
@@ -40,6 +40,3 @@ export function matchesOrganization(
   return !!summary && (!pinnedOnly || summary.pinned) && tags.every(tag => summary.tags.includes(tag));
 }
 
-export function sameAnnotationTarget(a: AnnotationIdentity, b: AnnotationIdentity): boolean {
-  return a.session_key === b.session_key && a.fingerprint === b.fingerprint && a.anchor === b.anchor;
-}

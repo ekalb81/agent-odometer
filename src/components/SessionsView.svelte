@@ -1721,7 +1721,7 @@
   }
 
   function selectCalendarDay(day: ActivityDay): void {
-    const next = { ...filters, dateFrom: calendarFilterValue(day.from), dateTo: calendarFilterValue(day.to) };
+    const next = { ...filters, dateFrom: calendarFilterValue(day.from), dateTo: calendarFilterValue(day.to), utcBounds: { from: day.from, to: day.to } };
     calendarSelection = { scope: `${harness}|${JSON.stringify(next)}`, ids: day.sessionIds };
     focusedParentId = null;
     analyticsOpen = false;

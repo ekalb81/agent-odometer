@@ -17,6 +17,12 @@ async function open() {
   await userEvent.click(await screen.findByRole('button',{name:'Edit organization'}));return view;
 }
 describe('private session editing', () => {
+  it('discloses that a recovered empty note did not restore private backup data', async () => {
+    mocks.getSessionAnnotation.mockResolvedValue({ ...annotation, recovery_backup_unrestored:true });
+    await open();
+    expect(screen.getByText(/Earlier pins, tags, and notes remain/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Private note')).toHaveValue('');
+  });
   it('saves notes only through private IPC and exposes only metadata to the list store', async () => {
     await open();
     await userEvent.type(screen.getByLabelText('Private note'),'PRIVATE_SENTINEL_252');
