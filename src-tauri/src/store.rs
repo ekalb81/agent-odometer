@@ -1966,6 +1966,86 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
+    #[test]
+    fn transcript_ownership_rejects_stale_removed_and_displaced_sources() {
+        let state = state();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("synthetic.jsonl");
+        let mut original = session("original", 0);
+        original.file_path = path.to_string_lossy().into_owned();
+        let id = original.effective_storage_id();
+        state.publish_watched_session(&path, original.clone());
+        assert_eq!(
+            state.registered_transcript_source(&id).unwrap().identity,
+            id
+        );
+        let generation = state.current_scan_generation();
+        state.record_transcript_observation(generation + 1, &path, Some("untrusted".into()));
+        assert!(state.transcript_observation(&id, &path).is_none());
+        state.record_transcript_observation(generation, &path, Some("observed".into()));
+        assert_eq!(
+            state.transcript_observation(&id, &path).as_deref(),
+            Some("observed")
+        );
+        state.advance_scan_generation();
+        assert!(state.registered_transcript_source(&id).is_none());
+        assert!(state.transcript_observation(&id, &path).is_none());
+        state.publish_watched_session(&path, original);
+        assert!(state.transcript_observation(&id, &path).is_none());
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            Some("fresh".into()),
+        );
+        state.mark_source_missing(&path);
+        assert!(state.sessions.contains_key(&id));
+        assert!(state.registered_transcript_source(&id).is_none());
+        assert!(state.transcript_observation(&id, &path).is_none());
+        let mut replacement = session("replacement", 0);
+        replacement.file_path = path.to_string_lossy().into_owned();
+        let replacement_id = replacement.effective_storage_id();
+        state.publish_watched_session(&path, replacement);
+        assert!(state.registered_transcript_source(&id).is_none());
+        assert!(state.transcript_observation(&id, &path).is_none());
+        assert!(state
+            .registered_transcript_source(&replacement_id)
+            .is_some());
+        state.clear_sessions();
+        assert!(state
+            .registered_transcript_source(&replacement_id)
+            .is_none());
+        assert!(state
+            .transcript_observation(&replacement_id, &path)
+            .is_none());
+    }
+
+    #[test]
+    fn registered_claude_subagents_keep_parent_namespaced_identity() {
+        let state = state();
+        let root = tempfile::tempdir().unwrap();
+        for parent in [Some("parent"), None] {
+            let path = root.path().join(if parent.is_some() {
+                "agent-one.jsonl"
+            } else {
+                "agent-two.jsonl"
+            });
+            let mut agent = session("agent", 0);
+            agent.harness = crate::provider::claude_code_provider_id();
+            agent.source = Some("subagent".into());
+            agent.parent_thread_id = parent.map(str::to_owned);
+            agent.storage_id = parent
+                .map(|parent| crate::model::storage_id_for_claude_subagent(parent, &agent.id))
+                .unwrap_or_else(|| crate::model::storage_id_for_session(&agent.harness, &agent.id));
+            agent.file_path = path.to_string_lossy().into_owned();
+            let id = agent.effective_storage_id();
+            state.publish_watched_session(&path, agent);
+            assert_eq!(
+                state.registered_transcript_source(&id).unwrap().identity,
+                id
+            );
+        }
+    }
+
     fn state() -> AppState {
         AppState {
             sessions: DashMap::new(),

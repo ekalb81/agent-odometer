@@ -720,6 +720,285 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Exercise production config loading in a child process. HOME/XDG roots
+    /// are isolated without mutating the environment of parallel tests.
+    #[cfg(unix)]
+    #[test]
+    fn source_selection_and_availability_are_verified_in_isolated_process() {
+        let Some(root) = std::env::var_os("ODOMETER_TRANSCRIPT_TEST_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "transcript::tests::source_selection_and_availability_are_verified_in_isolated_process", "--nocapture"])
+                .env("ODOMETER_TRANSCRIPT_TEST_ROOT", root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("CODEX_HOME", root.path().join("codex"))
+                .env("CLAUDE_CONFIG_DIR", root.path().join("claude"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let sources = root.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        let mut config = Config::default().normalized();
+        config.config_version = crate::config::CONFIG_VERSION;
+        for settings in config.providers.values_mut() {
+            settings.live_roots.clear();
+            settings.archive_roots.clear();
+        }
+        config
+            .providers
+            .get_mut(&crate::provider::codex_provider_id())
+            .unwrap()
+            .live_roots = vec![sources.clone()];
+        config.save().unwrap();
+        let config_path = root.join("config/agent-odometer/config.json");
+        assert!(
+            config_path.is_file(),
+            "config must stay inside the synthetic root"
+        );
+        let path = sources.join("b-observed.jsonl");
+        let header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n";
+        let content = format!("{header}{{\"type\":\"response_item\",\"payload\":{{\"id\":\"tool\",\"output\":\"synthetic transcript-only body\"}}}}\n");
+        std::fs::write(&path, &content).unwrap();
+        let session = crate::parser::parse_file(&path, false).unwrap().unwrap();
+        let id = session.effective_storage_id();
+        let state = AppState::new();
+        assert_eq!(
+            read_for_session(&state, request()).availability,
+            TranscriptAvailability::UnknownSession
+        );
+        assert_eq!(
+            read_for_session(
+                &state,
+                TranscriptRequest {
+                    session_id: "x".repeat(257),
+                    ..Default::default()
+                }
+            )
+            .issues,
+            ["invalid_session_id"]
+        );
+        state.publish_watched_session(&path, session.clone());
+        let unobserved = read_for_session(&state, request());
+        assert_eq!(unobserved.issues, ["source_changed_or_unobserved"]);
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        let available = read_for_session(&state, request());
+        assert_eq!(available.availability, TranscriptAvailability::Available);
+        assert_eq!(available.provider.as_deref(), Some("codex"));
+        assert_eq!(available.records.len(), 2);
+        assert!(available.source_complete);
+        assert!(
+            !serde_json::to_string(&state.sessions.get(&id).unwrap().summary)
+                .unwrap()
+                .contains("transcript-only body")
+        );
+
+        std::fs::write(&path, content.replace("synthetic\"", "other-session\"")).unwrap();
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        assert_eq!(
+            read_for_session(&state, request()).issues,
+            ["source_identity_changed_or_unverified"]
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            read_for_session(&state, request()).availability,
+            TranscriptAvailability::Missing
+        );
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            read_for_session(&state, request()).availability,
+            TranscriptAvailability::Unreadable
+        );
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, &content).unwrap();
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        std::fs::write(&config_path, b"malformed config").unwrap();
+        assert_eq!(
+            read_for_session(&state, request()).issues,
+            ["roots_unavailable"]
+        );
+        config.save().unwrap();
+
+        let outside = root.join("outside.jsonl");
+        std::fs::write(&outside, &content).unwrap();
+        let other_state = AppState::new();
+        let outside_session = crate::parser::parse_file(&outside, false).unwrap().unwrap();
+        other_state.publish_watched_session(&outside, outside_session);
+        assert_eq!(
+            read_for_session(&other_state, request()).issues,
+            ["source_outside_roots"]
+        );
+        let unsupported = sources.join("unsupported.json");
+        std::fs::write(&unsupported, &content).unwrap();
+        let other_state = AppState::new();
+        other_state.publish_watched_session(
+            &unsupported,
+            crate::parser::parse_file(&unsupported, false)
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            read_for_session(&other_state, request()).issues,
+            ["unsupported_format"]
+        );
+        let other_state = AppState::new();
+        let mut wrong_provider = session.clone();
+        wrong_provider.harness = crate::provider::claude_code_provider_id();
+        wrong_provider.storage_id = "claude_code:session:synthetic".into();
+        other_state.publish_watched_session(&path, wrong_provider);
+        assert_eq!(
+            read_for_session(
+                &other_state,
+                TranscriptRequest {
+                    session_id: "claude_code:session:synthetic".into(),
+                    ..Default::default()
+                }
+            )
+            .issues,
+            ["provider_ownership_changed"]
+        );
+        state.mark_source_missing(&path);
+        assert_eq!(
+            read_for_session(&state, request()).availability,
+            TranscriptAvailability::Missing
+        );
+        assert!(
+            state.sessions.contains_key(&id),
+            "missing bodies retain summaries"
+        );
+
+        let history_path = root.join("history.sqlite");
+        let history =
+            std::sync::Arc::new(crate::history_store::HistoryStore::open(&history_path).unwrap());
+        // A live source remains usable before its first durable write when
+        // the otherwise empty archive is Ready.
+        let live_only = AppState::new();
+        live_only.set_history_ready(Some(history.clone()));
+        live_only.publish_watched_session(&path, session.clone());
+        live_only.record_transcript_observation(
+            live_only.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        assert_eq!(
+            read_for_session(&live_only, request()).availability,
+            TranscriptAvailability::Available
+        );
+        live_only.mark_source_missing(&path);
+        assert_eq!(
+            read_for_session(&live_only, request()).availability,
+            TranscriptAvailability::Missing
+        );
+        let first_copy = sources.join("a-unobserved.jsonl");
+        std::fs::write(&first_copy, &content).unwrap();
+        history.observe(&first_copy, &session, 1).unwrap();
+        history.observe(&path, &session, 1).unwrap();
+        let durable_state = AppState::new();
+        durable_state.set_history_ready(Some(history.clone()));
+        durable_state.publish_watched_session(&path, session.clone());
+        durable_state.record_transcript_observation(
+            durable_state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        // A first unobserved durable copy cannot hide a later verified copy.
+        let mut one_record = request();
+        one_record.max_records = Some(1);
+        let first = read_for_session(&durable_state, one_record);
+        assert_eq!(first.availability, TranscriptAvailability::Available);
+        let mut next = request();
+        next.cursor = first.next_cursor;
+        let second = read_for_session(&durable_state, next);
+        assert_eq!(second.records[0].message_id.as_deref(), Some("tool"));
+        assert!(second.source_complete);
+        durable_state.sessions.remove(&id);
+        assert_eq!(
+            read_for_session(&durable_state, request()).issues,
+            ["source_identity_unverified"]
+        );
+        durable_state.publish_watched_session(&path, session.clone());
+        for index in 0..9 {
+            history
+                .observe(&sources.join(format!("z-copy-{index}.jsonl")), &session, 1)
+                .unwrap();
+        }
+        let mut one_record = request();
+        one_record.max_records = Some(1);
+        let limited = read_for_session(&durable_state, one_record);
+        assert_eq!(limited.availability, TranscriptAvailability::Partial);
+        assert!(limited
+            .issues
+            .iter()
+            .any(|issue| issue == "source_location_limit"));
+        assert!(!limited.source_complete);
+        assert!(limited.next_cursor.unwrap().partial);
+        durable_state.clear_sessions();
+        let limited = read_for_session(&durable_state, request());
+        assert_eq!(limited.availability, TranscriptAvailability::Partial);
+        assert!(limited.records.is_empty());
+        let mut invalid = request();
+        invalid.cursor = available.next_cursor.or(Some(TranscriptCursor {
+            session_id: id.clone(),
+            source_id: "displaced-artifact".into(),
+            generation: "old".into(),
+            offset: 0,
+            record_start: 0,
+            partial: false,
+        }));
+        assert_eq!(
+            read_for_session(&state, invalid).availability,
+            TranscriptAvailability::CursorInvalid
+        );
+        // A durable collision fails closed even when this copy's header
+        // matches the requested provider ID and timestamp.
+        let connection = rusqlite::Connection::open(&history_path).unwrap();
+        connection
+            .execute(
+                "UPDATE durable_sessions SET collision = 1 WHERE session_key = ?1",
+                [&id],
+            )
+            .unwrap();
+        let ambiguous = read_for_session(&durable_state, request());
+        assert_eq!(ambiguous.issues, ["ambiguous_source_identity"]);
+        assert!(ambiguous.records.is_empty());
+        connection
+            .execute(
+                "UPDATE durable_sessions SET collision = 0 WHERE session_key = ?1",
+                [&id],
+            )
+            .unwrap();
+        // A corrupt location index cannot fall back to a plausible partial read.
+        rusqlite::Connection::open(history_path)
+            .unwrap()
+            .execute_batch("DROP TABLE source_locations")
+            .unwrap();
+        assert_eq!(
+            read_for_session(&durable_state, request()).issues,
+            ["source_lookup_failed"]
+        );
+    }
+
     fn request() -> TranscriptRequest {
         TranscriptRequest {
             session_id: "codex:thread:synthetic".into(),
