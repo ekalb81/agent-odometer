@@ -537,6 +537,9 @@ visualTest('quota-budget-editor-narrow', 'quota project USD editor at narrow wid
   await budgets.getByRole('button', { name: 'Save budget' }).focus();
   await expect(budgets.getByRole('button', { name: 'Save budget' })).toBeFocused();
   await budgets.scrollIntoViewIfNeeded();
+  // Scrolling can place the save button under the earlier Add budget pointer.
+  // Keep the keyboard focus assertion while capturing a stable non-hover state.
+  await page.mouse.move(0, 0);
 });
 
 visualTest('quota-live-off-and-lookup-error', 'quota lookup failure keeps live polling off', async (page) => {
