@@ -272,12 +272,12 @@ where
     work.par_chunks(write_batch_size).for_each(|chunk| {
         let mut batch: Vec<(PathBuf, crate::model::Session)> = Vec::with_capacity(chunk.len());
         for (path, adapter, kind) in chunk {
-            let transcript_before = crate::transcript::source_generation(path);
+            let mut transcript_before = crate::transcript::source_generation(path);
             let provider_counters = provider_atomics.get(&adapter.descriptor().id);
             let key = path.to_string_lossy().into_owned();
             // The stamp is taken BEFORE parsing so a file that grows mid-parse
             // looks changed on the next launch rather than serving stale data.
-            let stamp = scan_cache::file_stamp(path);
+            let mut stamp = scan_cache::file_stamp(path);
             let cache_started = Instant::now();
             // Captured from every database hit, before `accepts_cached_session`
             // can still turn it into a counted miss below (issue #140): these
@@ -301,9 +301,12 @@ where
                 cache_lookup_deserialize_ns.fetch_add(hit.deserialize_ns, Ordering::Relaxed);
                 cache_hit_bytes_total.fetch_add(hit.raw_bytes as u64, Ordering::Relaxed);
             }
-            let cached = cache_hit
-                .map(|hit| hit.session)
-                .filter(|session| adapter.accepts_cached_session(session, *kind));
+            let cached = stable_cached_session(
+                cache_hit.map(|hit| hit.session),
+                transcript_before.as_deref(),
+                crate::transcript::source_generation(path).as_deref(),
+            )
+            .filter(|session| adapter.accepts_cached_session(session, *kind));
             if cache.as_ref().is_some_and(ScanCache::is_enabled) {
                 cache_lookup_total_ns.fetch_add(elapsed_ns(cache_started), Ordering::Relaxed);
                 if cached.is_some() {
@@ -322,6 +325,10 @@ where
             let session = match cached {
                 Some(session) => Some(session),
                 None => {
+                    // A rejected cache hit may describe an artifact replaced
+                    // during lookup. Retry once through the existing parser.
+                    transcript_before = crate::transcript::source_generation(path);
+                    stamp = scan_cache::file_stamp(path);
                     let parse_started = Instant::now();
                     let result = adapter.parse_file(path, *kind);
                     let parse_ns = elapsed_ns(parse_started);
@@ -369,9 +376,18 @@ where
 
             if let Some(session) = session {
                 let after = crate::transcript::source_generation(path);
-                let stamp = transcript_before.filter(|before| Some(before) == after.as_ref());
-                on_observed(path, stamp);
-                batch.push((path.clone(), session));
+                if transcript_before.is_some() && transcript_before != after {
+                    // Do not publish a cached/parsed Session under a different
+                    // artifact. This request has already used its bounded retry.
+                    parse_failures.fetch_add(1, Ordering::Relaxed);
+                    if let Some(counters) = provider_counters {
+                        counters.parse_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    on_observed(path, None);
+                } else {
+                    on_observed(path, transcript_before);
+                    batch.push((path.clone(), session));
+                }
             }
 
             let mut done = progress_done.lock().unwrap();
@@ -429,6 +445,14 @@ fn elapsed_ns(started: Instant) -> u64 {
     started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
+fn stable_cached_session<T>(
+    cached: Option<T>,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> Option<T> {
+    cached.filter(|_| before.is_some() && before == after)
+}
+
 fn nanos_to_ms(value: u64) -> f64 {
     value as f64 / 1_000_000.0
 }
@@ -436,6 +460,29 @@ fn nanos_to_ms(value: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{parse_write_batch_size_override, SCAN_WRITE_BATCH_SIZE};
+
+    #[test]
+    fn cache_acceptance_rejects_replacement_between_identity_and_lookup() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.jsonl");
+        std::fs::write(&path, b"original\n").unwrap();
+        let before = crate::transcript::source_generation(&path).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut replacement = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        replacement.write_all(b"replaced\n").unwrap();
+        replacement.as_file().set_modified(modified).unwrap();
+        replacement.persist(&path).unwrap();
+        // A size/mtime-only lookup can still return the old artifact here.
+        let old_row = Some("cached Session A");
+        let after = crate::transcript::source_generation(&path).unwrap();
+        assert_ne!(before, after);
+        assert!(super::stable_cached_session(old_row, Some(&before), Some(&after)).is_none());
+        assert_eq!(
+            super::stable_cached_session(Some("B"), Some(&after), Some(&after)),
+            Some("B")
+        );
+    }
 
     /// Issue #182: the batch-size override exists to run a sweep against a
     /// real corpus, so a typo in an experiment's environment must degrade to

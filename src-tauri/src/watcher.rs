@@ -1,6 +1,9 @@
 use crate::model::SessionSummary;
 use crate::paths::strip_verbatim_prefix;
-use crate::provider::{IncrementalProviderParser, ProviderRegistry, ProviderSourceSet};
+use crate::provider::{
+    IncrementalProviderParser, ProviderAdapter, ProviderRegistry, ProviderSourceKind,
+    ProviderSourceSet,
+};
 use crate::store::AppState;
 use dashmap::DashMap;
 use notify::EventKind;
@@ -23,6 +26,23 @@ struct ParserSlot {
     parser: Box<dyn IncrementalProviderParser>,
     last_touch: Instant,
     transcript_identity: Option<String>,
+}
+
+impl ParserSlot {
+    fn ensure_source_identity(
+        &mut self,
+        adapter: &dyn ProviderAdapter,
+        path: &std::path::Path,
+        kind: ProviderSourceKind,
+        generation: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let identity = generation.map(crate::transcript::generation_identity);
+        if self.transcript_identity.as_deref() != identity {
+            self.parser = adapter.incremental_parser(path.to_path_buf(), kind)?;
+            self.transcript_identity = identity.map(str::to_owned);
+        }
+        Ok(())
+    }
 }
 
 /// Idle parsers are dropped after this long without file activity.
@@ -171,6 +191,20 @@ pub fn start(
                                 continue;
                             }
                         };
+                        if let Err(error) = entry.ensure_source_identity(
+                            adapter,
+                            path,
+                            source_kind,
+                            transcript_before.as_deref(),
+                        ) {
+                            state_cb.record_transcript_observation(
+                                state_cb.current_scan_generation(),
+                                path,
+                                None,
+                            );
+                            tracing::warn!("could not reset replaced source parser: {}", error);
+                            continue;
+                        }
                         entry.last_touch = Instant::now();
 
                         let parse_started = Instant::now();
@@ -287,6 +321,71 @@ fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
 mod tests {
     use super::paths_equivalent;
     use std::path::Path;
+
+    #[test]
+    fn replaced_parser_slot_resets_same_size_and_larger_sources_without_remove() {
+        use crate::provider::{codex_provider_id, ProviderRegistry, ProviderSourceKind};
+        use std::io::Write;
+        for larger in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rollout-synthetic.jsonl");
+            let header = "{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n";
+            let user = |message: &str| {
+                format!("{{\"type\":\"event_msg\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"payload\":{{\"type\":\"user_message\",\"message\":\"{message}\"}}}}\n")
+            };
+            std::fs::write(&path, format!("{header}{}", user("alpha"))).unwrap();
+            let adapter = ProviderRegistry::builtin()
+                .adapter(&codex_provider_id())
+                .unwrap();
+            let before = crate::transcript::source_generation(&path).unwrap();
+            let mut slot = super::ParserSlot {
+                parser: adapter
+                    .incremental_parser(path.clone(), ProviderSourceKind::Live)
+                    .unwrap(),
+                last_touch: std::time::Instant::now(),
+                transcript_identity: Some(crate::transcript::generation_identity(&before).into()),
+            };
+            assert!(slot.parser.parse_to_end().unwrap());
+            assert_eq!(
+                slot.parser.session().unwrap().first_user_message.as_deref(),
+                Some("alpha")
+            );
+            let partial = serde_json::json!({"type":"event_msg","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":5,"total_tokens":5},"last_token_usage":{"input_tokens":5,"total_tokens":5}}}}).to_string();
+            let mut replacement = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+            replacement
+                .write_all(format!("{header}{}", user("bravo")).as_bytes())
+                .unwrap();
+            if larger {
+                replacement.write_all(partial.as_bytes()).unwrap();
+            }
+            replacement.persist(&path).unwrap();
+            let after = crate::transcript::source_generation(&path).unwrap();
+            slot.ensure_source_identity(adapter, &path, ProviderSourceKind::Live, Some(&after))
+                .unwrap();
+            assert!(slot.parser.parse_to_end().unwrap());
+            assert_eq!(
+                slot.parser.session().unwrap().first_user_message.as_deref(),
+                Some("bravo")
+            );
+            assert_eq!(slot.parser.session().unwrap().tokens_total.total_tokens, 0);
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            if !larger {
+                file.write_all(partial.as_bytes()).unwrap();
+                assert!(!slot.parser.parse_to_end().unwrap());
+            }
+            file.write_all(b"\n").unwrap();
+            let appended = crate::transcript::source_generation(&path).unwrap();
+            slot.ensure_source_identity(adapter, &path, ProviderSourceKind::Live, Some(&appended))
+                .unwrap();
+            assert!(slot.parser.parse_to_end().unwrap());
+            let session = slot.parser.session().unwrap();
+            assert_eq!(session.first_user_message.as_deref(), Some("bravo"));
+            assert_eq!(session.tokens_total.total_tokens, 5);
+        }
+    }
 
     /// The session-index watcher compares a notify event path against the
     /// configured path. On a UNC root with long-path support active, notify

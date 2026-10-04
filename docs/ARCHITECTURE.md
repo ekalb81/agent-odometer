@@ -367,7 +367,7 @@ timestamp and a registered observation to verify ownership; before hydration or
 observation, access honestly reports unverified. Scanner/watcher observations bind
 size/mtime/OS identity before and after the existing parse (or validated cache read).
 A changed file is unreadable through this API until a stable observation publishes
-it again. A reused incremental parser cannot vouch for a replacement file. Known
+it again. A replacement resets the incremental parser before a fresh parse. Known
 durable collisions report ambiguous identity rather than guessing a lineage.
 The disposable scan cache also binds hits to the OS identity observed before and
 after parsing; legacy entries without that evidence miss once and then warm normally.
