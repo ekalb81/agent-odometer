@@ -1369,3 +1369,21 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
+/** Private desktop organization; never part of SessionSummary or exports. */
+export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
+export interface OrganizationSummary {
+  identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
+}
+export interface SessionAnnotation { summary: OrganizationSummary; note: string }
+export interface AnnotationEdit {
+  identity: AnnotationIdentity; revision: number; pinned: boolean; note: string; tags: string[];
+}
+export interface SavedSearchDefinition {
+  name: string; query: string; scope: string;
+  content_scope: 'summary' | 'session_content';
+  session_key: string | null; fingerprint: string | null;
+  from: string | null; to: string | null; model: string;
+  show_active: boolean; show_archived: boolean; show_subagents: boolean;
+  pinned_only: boolean; tags: string[];
+}
+export interface SavedSearch { id: number; revision: number; definition: SavedSearchDefinition }
