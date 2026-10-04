@@ -228,6 +228,9 @@ impl PricingCatalog {
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut ids = std::collections::HashSet::new();
         for period in &self.rate_periods {
+            if !period.rate.is_usable() {
+                anyhow::bail!("Pricing period rates must be finite and non-negative");
+            }
             validate_rule_id(&period.id, &mut ids)?;
             validate_rule_scope(
                 &period.model,
@@ -238,7 +241,7 @@ impl PricingCatalog {
             )?;
             if period
                 .cache_write_input_multiplier
-                .is_some_and(|multiplier| multiplier <= 0.0)
+                .is_some_and(|multiplier| !multiplier.is_finite() || multiplier <= 0.0)
             {
                 anyhow::bail!("cache-write input multiplier must be greater than zero");
             }
@@ -485,6 +488,10 @@ pub struct SubscriptionPlan {
 /// or with harness credits.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CurrencyConversion {
+    /// Explicit monetary source currency. Legacy cards omit this and only
+    /// inherit a supported monetary card currency, never plan credits.
+    #[serde(default)]
+    pub from_currency: Option<String>,
     /// ISO 4217 code to convert into, e.g. "EUR".
     pub target_currency: String,
     /// Multiply an amount already in the card's original currency by this to
@@ -497,15 +504,53 @@ pub struct CurrencyConversion {
 }
 
 impl CurrencyConversion {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self
+            .from_currency
+            .as_deref()
+            .is_some_and(|value| !is_fx_currency(value))
+            || !is_fx_currency(&self.target_currency)
+            || !self.rate.is_finite()
+            || self.rate <= 0.0
+            || self.source.trim().is_empty()
+            || self.source.len() > 256
+        {
+            anyhow::bail!("FX requires supported monetary currencies, a finite positive rate and a source of at most 256 bytes");
+        }
+        Ok(())
+    }
     /// Converts one original-currency amount. Returns `None` for a
     /// non-finite or non-positive rate rather than producing a nonsensical
     /// total.
     pub fn convert(&self, amount_in_original_currency: f64) -> Option<f64> {
-        if !self.rate.is_finite() || self.rate <= 0.0 {
+        if !self.rate.is_finite()
+            || self.rate <= 0.0
+            || !amount_in_original_currency.is_finite()
+            || amount_in_original_currency < 0.0
+        {
             return None;
         }
-        Some(amount_in_original_currency * self.rate)
+        let amount = amount_in_original_currency * self.rate;
+        amount.is_finite().then_some(amount)
     }
+}
+
+/// The offline editor supports these ISO money units. Entitlement labels
+/// (credits, Standard-credit equivalents, unlimited) are never FX currencies.
+pub fn is_fx_currency(value: &str) -> bool {
+    [
+        "USD", "EUR", "GBP", "CAD", "AUD", "JPY", "CHF", "NZD", "CNY", "INR", "BRL", "MXN", "SGD",
+        "HKD", "KRW", "SEK", "NOK", "DKK", "PLN", "CZK", "ZAR",
+    ]
+    .contains(&value)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RateDelivery {
+    pub source: &'static str,
+    pub app_version: &'static str,
+    pub card_version: u32,
+    pub last_failure_reason: Option<&'static str>,
 }
 
 /// Coarse freshness classification for `RateRefreshState`.
@@ -530,14 +575,12 @@ fn default_max_cache_age_secs() -> i64 {
 /// deliberately separate from `RateCard.fetched_at`, which is
 /// catalog-supplied provenance for the price data itself.
 ///
-/// SEAM (deliberately unimplemented in this PR — see the PR description for
-/// #42's scope): nothing in this codebase currently produces a
-/// `RateRefreshState` from a network or updater-channel fetch. `AGENTS.md`
-/// forbids adding outbound network access without an explicit requirement
-/// and a security review, and no such review has happened yet. A future,
-/// reviewed price source would call `apply_refresh_candidate` after fetching
-/// and deserializing a candidate `RateCard`, exactly as the offline test
-/// coverage in this module exercises.
+/// Cards are embedded in the app and delivered through the existing signed
+/// application updater. There is no independent card fetch. These optional
+/// fields describe explicitly validated candidates, not updater checks or the
+/// catalog's reference date; an app update must not invent a successful fetch
+/// timestamp for a saved custom card. `apply_refresh_candidate` provides the
+/// offline validation/rollback boundary for explicit candidate replacement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RateRefreshState {
     #[serde(default)]
@@ -598,11 +641,16 @@ pub fn apply_refresh_candidate(
 ) -> RateCard {
     let mut refreshed = candidate;
     let structurally_valid = refreshed.pricing_catalog.validate().is_ok();
+    let metadata_valid = refreshed.validate().is_ok();
     // A candidate that "successfully" parses to an empty or truncated price
     // table is not a valid refresh — it would silently zero out coverage the
     // previous card had. Refuse it exactly like a validation failure.
-    let dropped_models = !previous.models.is_empty() && refreshed.models.is_empty();
-    let dropped_api_models = !previous.api_models.is_empty() && refreshed.api_models.is_empty();
+    let dropped_models = previous.models.keys().any(|model| {
+        !refreshed.models.contains_key(model) && !refreshed.unpriced_models.contains(model)
+    });
+    let dropped_api_models = previous.api_models.keys().any(|model| {
+        !refreshed.api_models.contains_key(model) && !refreshed.unpriced_models.contains(model)
+    });
     // Every rate must be a finite, non-negative number (issue #42's
     // "invalid/partial remote price data fails closed"). Parsing is not
     // validation: `-5.0` and `NaN` are both valid JSON numbers, and both
@@ -617,7 +665,12 @@ pub fn apply_refresh_candidate(
         .values()
         .chain(refreshed.api_models.values())
         .any(|rate| !rate.is_usable());
-    if structurally_valid && !dropped_models && !dropped_api_models && !unusable_rate {
+    if structurally_valid
+        && metadata_valid
+        && !dropped_models
+        && !dropped_api_models
+        && !unusable_rate
+    {
         refreshed.refresh.last_success_at = Some(now);
         refreshed.refresh.last_attempt_at = Some(now);
         refreshed.refresh.last_failure_reason = None;
@@ -629,6 +682,8 @@ pub fn apply_refresh_candidate(
             "candidate pricing catalog failed validation".to_owned()
         } else if unusable_rate {
             "candidate contained a negative or non-finite rate".to_owned()
+        } else if !metadata_valid {
+            "candidate FX or cache-age metadata failed validation".to_owned()
         } else {
             "candidate price tables were empty or partial".to_owned()
         });
@@ -723,10 +778,13 @@ pub struct RateCard {
     /// show the original currency; Odometer never invents or fetches a rate.
     #[serde(default)]
     pub display_currency: Option<CurrencyConversion>,
-    /// Bounded-cache-age bookkeeping for the (currently unimplemented)
-    /// refresh flow. See `RateRefreshState` and `apply_refresh_candidate`.
+    /// Informational candidate-validation age, separate from signed app delivery
+    /// and catalog provenance. See `RateRefreshState` and `apply_refresh_candidate`.
     #[serde(default)]
     pub refresh: RateRefreshState,
+    /// Read-time evidence, never trusted from persisted or IPC input.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<RateDelivery>,
     /// Evidence belongs to a specific row, never to an entire merged card.
     /// Keys are models/<id>, api_models/<id>, or floating_model_aliases/<id>.
     #[serde(default)]
@@ -744,75 +802,171 @@ fn rates_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("agent-odometer").join("rates.json"))
 }
 
+const MAX_RATE_BYTES: u64 = 4 * 1024 * 1024;
+fn read_rate_file(path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            anyhow::bail!("Rate file must not be a reparse point");
+        }
+    }
+    if !metadata.is_file() || metadata.len() > MAX_RATE_BYTES {
+        anyhow::bail!("Rate file must be regular and at most 4 MiB");
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_RATE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RATE_BYTES {
+        anyhow::bail!("Rate file exceeds 4 MiB");
+    }
+    Ok(bytes)
+}
+fn atomic_rate_write(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("Rate path has no parent"))?,
+    )?;
+    file.write_all(bytes)?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
+}
+
 impl RateCard {
     /// Loads the bundled rates.json. Unknown fields (e.g. _note) are silently ignored by serde.
     pub fn load_bundled() -> anyhow::Result<Self> {
         let raw = include_str!("../rates.json");
         let card: Self = serde_json::from_str(raw)?;
-        card.pricing_catalog.validate()?;
-        Ok(card)
+        card.validate()?;
+        Ok(card.with_delivery("embedded_app_bundle", None))
     }
 
     /// Loads rates from <config_dir>/agent-odometer/rates.json.
     /// If the file is missing, returns load_bundled (and does NOT seed the disk file —
     /// users can edit the editor to materialize their own copy).
-    /// If the file is present but malformed, logs a warn and returns load_bundled.
+    /// Invalid or unreadable files fall back to a validated adjacent backup,
+    /// then the embedded card. Read-time delivery metadata names this fallback.
+    /// Reads never create, repair or overwrite either file.
     pub fn load_from_disk() -> anyhow::Result<Self> {
         let Some(path) = rates_path() else {
             return Self::load_bundled();
         };
-        if !path.exists() {
-            return Self::load_bundled();
+        Self::load_at(&path, Self::load_bundled()?)
+    }
+
+    /// Validated atomic replacement, followed by a best-effort validated backup.
+    pub fn save(&self) -> anyhow::Result<Self> {
+        let path = rates_path().ok_or_else(|| anyhow::anyhow!("could not determine config dir"))?;
+        self.save_at(&path)
+    }
+
+    fn with_delivery(mut self, source: &'static str, failure: Option<&'static str>) -> Self {
+        self.delivery = Some(RateDelivery {
+            source,
+            app_version: env!("CARGO_PKG_VERSION"),
+            card_version: self.version,
+            last_failure_reason: failure,
+        });
+        self
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        self.pricing_catalog.validate()?;
+        if self
+            .models
+            .values()
+            .chain(self.api_models.values())
+            .any(|rate| !rate.is_usable())
+        {
+            anyhow::bail!("Rate values must be finite and non-negative");
         }
-        match std::fs::read_to_string(&path) {
-            Ok(raw) => match serde_json::from_str::<Self>(&raw) {
-                Ok(card) => {
-                    let bundled = Self::load_bundled()?;
-                    let merged = merge_older_override(card, bundled.clone());
-                    if let Err(e) = merged.pricing_catalog.validate() {
-                        tracing::warn!(
-                            "rates.json at {:?} has an invalid pricing catalog ({}); falling back to bundled",
-                            path,
-                            e
-                        );
-                        Ok(bundled)
-                    } else {
-                        Ok(merged)
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "rates.json at {:?} is malformed ({}); falling back to bundled",
-                        path,
-                        e
-                    );
-                    Self::load_bundled()
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    "could not read rates.json at {:?} ({}); falling back to bundled",
-                    path,
-                    e
-                );
-                Self::load_bundled()
+        if self.refresh.max_cache_age_secs <= 0 {
+            anyhow::bail!("Rate cache age must be positive");
+        }
+        if let Some(conversion) = &self.display_currency {
+            conversion.validate()?;
+        }
+        Ok(())
+    }
+
+    fn load_at(path: &std::path::Path, bundled: Self) -> anyhow::Result<Self> {
+        bundled.validate()?;
+        if std::fs::symlink_metadata(path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return Ok(bundled.with_delivery("embedded_app_bundle", None));
+        }
+        let load = |path| -> anyhow::Result<Self> {
+            let card: Self = serde_json::from_slice(&read_rate_file(path)?)?;
+            card.validate()?;
+            let merged = merge_older_override(card, bundled.clone());
+            merged.validate()?;
+            Ok(merged)
+        };
+        match load(path) {
+            Ok(card) => Ok(card.with_delivery("saved_override", None)),
+            Err(_) => match load(&path.with_file_name("rates.last-valid.json")) {
+                Ok(card) => Ok(card.with_delivery("last_valid_fallback", Some("Saved card is unreadable or invalid; using the last validated backup."))),
+                Err(_) => Ok(bundled.with_delivery("embedded_app_bundle", Some("Saved card and last-valid backup are unavailable or invalid; using the embedded card."))),
             }
         }
     }
 
-    /// Atomic-ish write to <config_dir>/agent-odometer/rates.json.
-    pub fn save(&self) -> anyhow::Result<()> {
-        self.pricing_catalog.validate()?;
-        let path = rates_path().ok_or_else(|| anyhow::anyhow!("could not determine config dir"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    fn save_at(&self, path: &std::path::Path) -> anyhow::Result<Self> {
+        self.validate()?;
+        let mut persisted = self.clone();
+        persisted.delivery = None;
+        let bytes = serde_json::to_vec_pretty(&persisted)?;
+        if bytes.len() > MAX_RATE_BYTES as usize {
+            anyhow::bail!("Rate card exceeds 4 MiB");
         }
-        // Write to a temp file alongside the target, then rename for atomicity.
-        let tmp = path.with_extension("json.tmp");
-        let serialized = serde_json::to_string_pretty(self)?;
-        std::fs::write(&tmp, &serialized)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Rate path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        if std::fs::symlink_metadata(parent)?.file_type().is_symlink() {
+            anyhow::bail!("Rate directory must not be a symbolic link");
+        }
+        for target in [
+            path.to_path_buf(),
+            path.with_file_name("rates.last-valid.json"),
+        ] {
+            if std::fs::symlink_metadata(&target)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+            {
+                anyhow::bail!("Rate files must be regular files");
+            }
+        }
+        atomic_rate_write(path, &bytes)?;
+        // Backup failure cannot invalidate an already committed valid save.
+        // Reads still fail closed to an older valid backup or the embedded card.
+        let backup_failed =
+            atomic_rate_write(&path.with_file_name("rates.last-valid.json"), &bytes).is_err();
+        if backup_failed {
+            tracing::warn!(
+                "The valid rate card was saved, but its recovery backup could not be updated"
+            );
+        }
+        Ok(self.clone().with_delivery(
+            "saved_override",
+            backup_failed.then_some("Valid card saved; its recovery backup could not be updated."),
+        ))
     }
 
     /// Resolves a raw model id against `table` (the legacy plan-credit
@@ -964,6 +1118,7 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     let previous: Option<RateCard> = match disk.version {
         11 => serde_json::from_str(include_str!("../rate-history/v11.json")).ok(),
         12 => serde_json::from_str(include_str!("../rate-history/v12.json")).ok(),
+        13 => serde_json::from_str(include_str!("../rate-history/v13.json")).ok(),
         _ => None,
     };
     merge_default_entries(
@@ -1277,6 +1432,95 @@ fn merge_older_catalog(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_save_recovers_the_last_valid_card_without_writing_during_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rates.json");
+        let bundled = RateCard::load_bundled().unwrap();
+        let mut saved = bundled.clone();
+        saved.models.get_mut("gpt-6-astra").unwrap().input = 77.0;
+        let response = saved.save_at(&path).unwrap();
+        let delivery = response.delivery.unwrap();
+        assert_eq!(delivery.source, "saved_override");
+        assert_eq!(delivery.app_version, env!("CARGO_PKG_VERSION"));
+        assert!(delivery.last_failure_reason.is_none());
+        let backup_path = path.with_file_name("rates.last-valid.json");
+        let backup = std::fs::read(&backup_path).unwrap();
+        let persisted: serde_json::Value = serde_json::from_slice(&backup).unwrap();
+        assert!(
+            persisted.get("delivery").is_none(),
+            "runtime provenance must not become trusted saved input"
+        );
+        std::fs::write(&path, b"{ truncated synthetic rates").unwrap();
+        let recovered = RateCard::load_at(&path, bundled.clone()).unwrap();
+        assert_eq!(recovered.models["gpt-6-astra"].input, 77.0);
+        assert_eq!(recovered.delivery.unwrap().source, "last_valid_fallback");
+        assert_eq!(std::fs::read(&backup_path).unwrap(), backup);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{ truncated synthetic rates"
+        );
+        std::fs::write(&backup_path, b"{} incomplete").unwrap();
+        let fallback = RateCard::load_at(&path, bundled.clone()).unwrap();
+        assert_eq!(
+            fallback.models["gpt-6-astra"],
+            bundled.models["gpt-6-astra"]
+        );
+        assert_eq!(fallback.delivery.unwrap().source, "embedded_app_bundle");
+    }
+
+    #[test]
+    fn invalid_rate_or_fx_save_cannot_replace_either_valid_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rates.json");
+        let mut card = RateCard::load_bundled().unwrap();
+        card.save_at(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let backup = std::fs::read(path.with_file_name("rates.last-valid.json")).unwrap();
+        card.models.get_mut("gpt-6-astra").unwrap().input = -1.0;
+        assert!(card.save_at(&path).is_err());
+        card = RateCard::load_bundled().unwrap();
+        card.display_currency = Some(CurrencyConversion {
+            from_currency: Some("credits".into()),
+            target_currency: "EUR".into(),
+            rate: 0.9,
+            as_of: instant("2026-10-01T00:00:00Z"),
+            source: "synthetic user quote".into(),
+        });
+        assert!(card.save_at(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read(path.with_file_name("rates.last-valid.json")).unwrap(),
+            backup
+        );
+    }
+
+    #[test]
+    fn app_bundle_upgrade_refreshes_known_defaults_and_preserves_real_v13_edits() {
+        let previous: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v13.json")).unwrap();
+        let mut saved = previous.clone();
+        saved.models.get_mut("gpt-6-astra").unwrap().input = 77.0;
+        let mut next = previous.clone();
+        next.version += 1;
+        next.models.get_mut("gpt-6-sol").unwrap().input = 9.0;
+        next.models.get_mut("gpt-6-astra").unwrap().input = 8.0;
+        let merged = merge_older_override(saved, next);
+        assert_eq!(merged.models["gpt-6-sol"].input, 9.0);
+        assert_eq!(merged.models["gpt-6-astra"].input, 77.0);
+        assert!(merged.upgrade_review.contains(&"models/gpt-6-astra".into()));
+        merged.validate().unwrap();
+        let mut partial = previous.clone();
+        partial.models.remove("gpt-6-sol");
+        let rolled_back =
+            apply_refresh_candidate(&previous, partial, instant("2026-10-04T00:00:00Z"));
+        assert_eq!(
+            rolled_back.models["gpt-6-sol"],
+            previous.models["gpt-6-sol"]
+        );
+        assert!(rolled_back.refresh.last_failure_reason.is_some());
+    }
 
     fn instant(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -2710,6 +2954,7 @@ mod tests {
     #[test]
     fn currency_conversion_multiplies_by_the_user_supplied_rate_only() {
         let conversion = CurrencyConversion {
+            from_currency: None,
             target_currency: "EUR".into(),
             rate: 0.9,
             as_of: instant("2026-01-01T00:00:00Z"),

@@ -71,7 +71,7 @@ export function assertFixtureRates(rates: RateCard, original: RateCard): void {
   // These fields affect labels/settings only. Everything else must match the
   // card used by the generator, including future pricing fields by default.
   const presentation = new Set(['version', 'currency', 'currencies', 'source_url', 'fetched_at',
-    'display_currency', 'subscription_plans']);
+      'display_currency', 'subscription_plans', 'delivery']);
   const monetary = (value: RateCard) => {
     const normalized = { ...value,
       api_models: value.api_models ?? {},
@@ -80,6 +80,9 @@ export function assertFixtureRates(rates: RateCard, original: RateCard): void {
       floating_model_aliases: value.floating_model_aliases ?? {},
       free_local_models: value.free_local_models ?? [],
       unpriced_models: value.unpriced_models ?? [],
+      rate_provenance: value.rate_provenance ?? {},
+      upgrade_review: value.upgrade_review ?? [],
+      flat_rate_expires_at: value.flat_rate_expires_at ?? {},
     };
     return Object.fromEntries(Object.entries(normalized).filter(([key]) => !presentation.has(key)));
   };

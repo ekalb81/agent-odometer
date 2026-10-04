@@ -268,6 +268,16 @@ export interface PricedSurface {
   by_model: PricedModel[];
   missing_models: string[];
   unpriced_models: string[];
+  converted?: ConvertedTotal;
+}
+
+export interface ConvertedTotal {
+  from_currency: string;
+  target_currency: string;
+  amount: number;
+  rate: number;
+  as_of: string;
+  source: string;
 }
 
 export interface RangePricing {
@@ -936,6 +946,7 @@ export interface SubscriptionPlan {
  * amount and currency are always retained separately alongside the
  * converted total. */
 export interface CurrencyConversion {
+  from_currency?: string | null;
   target_currency: string;
   rate: number;
   as_of: string;
@@ -989,6 +1000,8 @@ export interface RateCard {
   display_currency: CurrencyConversion | null;
   /** Bounded-cache-age bookkeeping for the refresh flow. */
   refresh: RateRefreshState;
+  /** Read-time evidence; persisted/input metadata is never trusted. */
+  delivery?: { source: 'embedded_app_bundle' | 'saved_override' | 'last_valid_fallback'; app_version: string; card_version: number; last_failure_reason: string | null; };
   /** Per-row source evidence; keys use the Rust table/id convention. */
   rate_provenance?: Record<string, PricingProvenance>;
   /** Retained rates/aliases requiring review; never newly verified by a merge. */

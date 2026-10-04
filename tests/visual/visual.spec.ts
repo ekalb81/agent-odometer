@@ -143,6 +143,25 @@ function assertManifestCasesAreRegistered(): void {
   }
 }
 
+visualTest('calendar-activity', 'calendar heatmap and daily trend', async (page) => {
+  await visit(page, { view: 'codex' });
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toBeVisible();
+  await calendar.scrollIntoViewIfNeeded();
+});
+
+visualTest('calendar-partial-narrow', 'partial recorded history calendar at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { scenario: 'history-partial', view: 'codex' });
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toContainText('partial history');
+  await calendar.scrollIntoViewIfNeeded();
+});
+
 test.beforeEach(async ({ page }) => {
   await page.clock.install({ time: FIXED_TIME });
   page.on('pageerror', (error) => {
@@ -377,6 +396,30 @@ visualTest('integration-narrow-preview', 'integration review remains usable in a
 visualTest('settings-rates', 'settings rates frame', async (page) => {
   await visit(page, { view: 'settings' });
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();
+});
+
+test('offline FX draft survives keyboard input and saves backend delivery evidence', async ({ page }, testInfo) => {
+  await visit(page, { view: 'settings' });
+  await page.getByLabel('Use a user-supplied FX rate').check();
+  await page.getByLabel('Original money currency').selectOption('USD');
+  await page.getByLabel('Display currency').selectOption('EUR');
+  const rate = page.getByLabel('Display units per original unit');
+  await rate.fill('');
+  await rate.pressSequentially('0.');
+  await expect(rate).toHaveValue('0.');
+  await rate.pressSequentially('9');
+  const timestamp = page.getByLabel('Rate timestamp (UTC)');
+  await timestamp.pressSequentially('2026-10-');
+  await expect(timestamp).toHaveValue('2026-10-');
+  await timestamp.pressSequentially('01T12:30:00');
+  await page.getByLabel('User-supplied source').pressSequentially('Synthetic offline quote');
+  const section = page.getByRole('heading', { name: 'Rate card', exact: true }).locator('..');
+  await section.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(section.getByText(/Loaded source: saved override/)).toBeVisible();
+  await expect(rate).toHaveValue('0.9');
+  await expect(timestamp).toHaveValue('2026-10-01T12:30:00');
+  await timestamp.scrollIntoViewIfNeeded();
+  await testInfo.attach('offline-fx-editor', { body: await page.screenshot(), contentType: 'image/png' });
 });
 
 visualTest('settings-rate-validation-error', 'settings rate validation error', async (page) => {
