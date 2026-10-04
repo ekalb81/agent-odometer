@@ -33,6 +33,8 @@ pub mod query_control;
 mod query_desktop;
 mod query_reports;
 pub mod quota;
+pub mod quota_accounts;
+pub mod quota_live;
 pub mod quota_store;
 pub mod rates;
 pub mod report_cli;
@@ -54,18 +56,19 @@ pub mod verify;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, apply_integration_change, cancel_history_rebuild,
-    cancel_instruction_scan, change_organization_tag, check_quota_alerts,
-    clear_session_project_override, compare_tool_impact, correlate_events, delete_saved_search,
-    edit_session_annotation, export_performance_data, get_bundled_rates, get_config,
-    get_history_rebuild_status, get_history_recovery_status, get_history_status,
-    get_integration_status, get_organization_recovery_state, get_organization_summaries,
-    get_performance_live_status, get_performance_status, get_provider_diagnostics,
-    get_quota_config, get_quota_snapshots, get_rates, get_retention_status, get_scan_status,
-    get_session_annotation, get_session_details, get_session_pricing, get_speed_report,
-    get_subscription_usage, get_transcript_page, get_turn_receipt_status, list_external_events,
-    list_instruction_files, list_organization_tags, list_providers, list_saved_searches,
-    list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
+    add_defender_exclusions, apply_integration_change, approve_quota_account,
+    cancel_history_rebuild, cancel_instruction_scan, change_organization_tag, change_quota_account,
+    check_quota_alerts, check_quota_budgets, clear_session_project_override, compare_tool_impact,
+    correlate_events, delete_saved_search, edit_session_annotation, export_performance_data,
+    get_bundled_rates, get_config, get_history_rebuild_status, get_history_recovery_status,
+    get_history_status, get_integration_status, get_live_quota_status,
+    get_organization_recovery_state, get_organization_summaries, get_performance_live_status,
+    get_performance_status, get_provider_diagnostics, get_quota_config, get_quota_snapshots,
+    get_rates, get_retention_status, get_scan_status, get_session_annotation, get_session_details,
+    get_session_pricing, get_speed_report, get_subscription_usage, get_transcript_page,
+    get_turn_receipt_status, identify_quota_account, list_external_events, list_instruction_files,
+    list_organization_tags, list_providers, list_saved_searches, list_sessions,
+    list_tool_impact_targets, merge_projects, open_instruction_file,
     open_integration_configuration, open_task_in_chatgpt, preview_history_purge,
     preview_integration_change, purge_retained_history, read_instruction_file,
     reassign_session_project, rebuild_history, record_frontend_performance, recover_history,
@@ -174,6 +177,11 @@ pub fn run() {
             get_quota_config,
             set_quota_config,
             check_quota_alerts,
+            check_quota_budgets,
+            get_live_quota_status,
+            identify_quota_account,
+            approve_quota_account,
+            change_quota_account,
             get_history_status,
             get_history_recovery_status,
             recover_history,
@@ -188,6 +196,10 @@ pub fn run() {
         ])
         .setup(move |app| {
             let setup_started = Instant::now();
+            quota_accounts::LiveQuotaService::start(
+                &state_for_setup.live_quota,
+                app.handle().clone(),
+            );
             let config_started = Instant::now();
             let config_result = Config::load();
             let config_loaded = config_result.is_ok();

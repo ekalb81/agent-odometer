@@ -468,6 +468,7 @@ For a new backend field, update the Rust model/parser, add parser coverage, upda
 For a new command, implement it in `commands.rs`, register it in `lib.rs`, add a typed wrapper in `ipc.ts`, and expand capabilities only when the API actually requires it.
 
 For watcher changes, test initial files, incremental appends, partial trailing lines, removal, archive roots, session-index updates, and config-triggered restart separately.
+
 ## Private organization
 
 Ledger schema 12 adds `session_annotations`, `annotation_tags`, `organization_tags`, and `saved_searches`. These tables are accessed only by explicit private desktop commands; they never join `SessionSummary`, normalized facts, query reports, MCP, diagnostics, or ordinary exports. Bulk list projections return identity/revision, pin state, tag labels, and a note-presence flag, without note text or full snapshots. Note reads and edits are separate bounded IPC operations.
@@ -479,3 +480,8 @@ Private edits increment an organization revision included in purge previews, so 
 Saved UTC bounds remain authoritative across timezone changes and repeated DST hours. Display inputs preserve seconds and milliseconds; editing one bound replaces only that instant, and calendar selection replaces both. Restoring a content-scope search never silently falls back to summary search.
 
 Ordinary source rebuild/refresh preserves identity-bound organization. Corrupt-database recovery preserves private data only in the original backup; it cannot reconstruct notes, pins, tags, or saved searches from source transcripts. Private editors and search management disclose this limitation, and dependent pin/tag result sets remain unavailable rather than presenting absent annotations as a complete empty result. New private edits apply to the rebuilt database. Backup restoration is a separate future operation.
+
+
+### Account-scoped live quota and soft budgets (#43)
+
+`quota_accounts.rs` owns consent metadata and the desktop polling timer; `quota_live.rs` owns bounded Codex app-server stdio reads. `quota.rs` converts both live buckets and transcript evidence through the shared window service. Live account views never overwrite transcript observations or durable usage. The payload-free `live-quota-updated` event invalidates the tray, and the dashboard reads the same in-memory service. Monetary/token budget values and alert crossings share `check_quota_budgets` and the ledger range/pricing authority. See [QUOTAS.md](QUOTAS.md) for consent, persistence, unsupported-source, and verification boundaries.

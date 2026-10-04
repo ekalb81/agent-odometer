@@ -25,6 +25,7 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { computeTrayTotals } from './lib/trayTotals';
   import { quotaTrayLabel } from './lib/subscriptionUsage';
+  import { getLiveQuotaStatus, liveQuotaTrayLabel, onLiveQuotaUpdated } from './lib/liveQuota';
   import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
   import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
@@ -149,7 +150,8 @@
       // above and defaults to no label on failure.
       let quotaLabel: string | null = null;
       try {
-        quotaLabel = quotaTrayLabel(await getQuotaSnapshots());
+        const [snapshots, live] = await Promise.all([getQuotaSnapshots(), getLiveQuotaStatus()]);
+        quotaLabel = liveQuotaTrayLabel(live) ?? quotaTrayLabel(snapshots);
       } catch (error) {
         if (epoch !== trayEpoch) return;
         console.error('quota tray label refresh failed:', error);
@@ -193,6 +195,15 @@
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);
     const boundary = setTimeout(() => { trayRefreshGeneration += 1; }, next.getTime() - now.getTime());
     return () => { clearTimeout(boundary); if (trayTimer !== null) clearTimeout(trayTimer); };
+  });
+
+  $effect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void onLiveQuotaUpdated(() => { trayRefreshGeneration += 1; }).then((stop) => {
+      if (disposed) stop(); else unlisten = stop;
+    }).catch(() => {});
+    return () => { disposed = true; unlisten?.(); };
   });
 
   // ---------------------------------------------------------------------------
