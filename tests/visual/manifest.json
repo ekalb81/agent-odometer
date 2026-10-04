@@ -38,6 +38,8 @@
     "settings-rates",
     "settings-rate-validation-error",
     "settings-save-error",
+    "history-purge-review",
+    "history-recovery-review",
     "defender-slow-banner",
     "defender-error",
     "updater-available",

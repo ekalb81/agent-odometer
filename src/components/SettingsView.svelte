@@ -6,6 +6,7 @@
   import { themeStore, type ThemePreference } from '../lib/stores/theme.svelte';
   import { setConfig, setRates, getBundledRates, exportPerformanceData, getPerformanceStatus, getTurnReceiptStatus, repairTurnReceiptIntegrations, rebuildHistory, cancelHistoryRebuild, getHistoryRebuildStatus, onHistoryRebuildProgress } from '../lib/ipc';
   import ProjectManagement from './ProjectManagement.svelte';
+  import HistoryManagement from './HistoryManagement.svelte';
   import IntegrationCenter from './IntegrationCenter.svelte';
 
   /**
@@ -1860,6 +1861,8 @@
   <ProjectManagement />
 
   <!-- Issue #162: user-triggered history rebuild -->
+  <HistoryManagement />
+
   <section>
     <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">History archive</h2>
     <p class="text-xs text-ink-faint mb-3 max-w-3xl">

@@ -10,6 +10,13 @@ vi.mock('../lib/ipc', () => ipc);
 beforeEach(() => { vi.resetAllMocks(); ipc.getIntegrationStatus.mockResolvedValue(integrationFixture()); });
 
 describe('Integration Center evidence boundaries', () => {
+  it.each([false, null, undefined])('does not present %s coverage as complete history', async (coverage) => {
+    const fixture = integrationFixture(); fixture.status.coverage_complete = coverage;
+    ipc.getIntegrationStatus.mockResolvedValue(fixture);
+    render(IntegrationCenter);
+    await screen.findByText(coverage === false ? /Partial history — recorded totals/ : /History coverage unavailable — recorded totals/);
+    expect(screen.getByText(/Ledger: 2 recorded sessions/)).toBeTruthy();
+  });
   it('configuration cannot masquerade as successful server or client use', async () => {
     const fixture = integrationFixture(); fixture.cards[0].configured = true;
     ipc.getIntegrationStatus.mockResolvedValue(fixture);

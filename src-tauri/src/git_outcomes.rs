@@ -287,6 +287,7 @@ mod tests {
             agent_nickname: None,
             file_path: String::new(),
             source_availability: Default::default(),
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: started_at.parse().unwrap(),
             last_event_at: last_event_at.parse().unwrap(),

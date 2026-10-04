@@ -343,6 +343,23 @@ visualTest('instructions-content-error', 'instructions content error', async (pa
   await expect(page.getByText(/could not|failed|error/i).last()).toBeVisible();
 });
 
+visualTest('history-purge-review', 'history purge review requires confirmation', async (page) => {
+  await visit(page, { scenario: 'history-purge', view: 'settings' });
+  await page.getByRole('button', { name: 'Review eligible history…' }).click();
+  await expect(page.getByLabel('Purge confirmation')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Purge reviewed history' })).toBeDisabled();
+  await scrollHeadingToTop(page, 'Retention and recovery');
+});
+
+visualTest('history-recovery-review', 'history recovery review stays usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 640, height: 900 });
+  await visit(page, { scenario: 'history-recovery', view: 'settings' });
+  await page.getByRole('button', { name: 'Preserve and rebuild readable history…' }).click();
+  await expect(page.getByLabel('Recovery confirmation')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Preserve and rebuild', exact: true })).toBeDisabled();
+  await scrollHeadingToTop(page, 'Retention and recovery');
+});
+
 visualTest('settings-roots', 'settings roots', async (page) => {
   await visit(page, { view: 'settings' });
   await scrollHeadingToTop(page, 'Watched roots');
