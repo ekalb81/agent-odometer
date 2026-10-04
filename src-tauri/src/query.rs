@@ -1269,6 +1269,8 @@ fn accumulate_tools(into: &mut crate::model::ToolMetrics, from: &crate::model::T
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionUsage {
     pub session_key: String,
+    pub lifecycle: crate::model::SessionLifecycle,
+    pub source_availability: crate::model::SourceAvailability,
     pub harness: String,
     pub tokens: TokenTotals,
     pub cost: Option<f64>,
@@ -1284,7 +1286,8 @@ pub struct SessionReport {
     pub schema_version: u32,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
-    /// Sessions with usage in the window, ordered by total tokens
+    /// All durable sessions for all-time; sessions with usage for a window.
+    /// Ordered by total tokens
     /// descending — the order a person scanning for "what cost the most"
     /// actually wants.
     pub sessions: Vec<SessionUsage>,
@@ -1292,6 +1295,7 @@ pub struct SessionReport {
     /// `None` when everything is shown, so a truncated list can never be
     /// mistaken for a complete one.
     pub truncated_to: Option<usize>,
+    pub coverage_complete: bool,
 }
 
 pub const SESSION_REPORT_SCHEMA_VERSION: u32 = 1;
@@ -1311,6 +1315,7 @@ pub fn session_report(
     now: DateTime<Utc>,
 ) -> Result<SessionReport> {
     let keys = store.session_keys()?;
+    let lifecycle = store.session_lifecycles()?;
     let totals = store
         .range_totals_multi(&keys, &[(from, to)])?
         .into_iter()
@@ -1320,10 +1325,16 @@ pub fn session_report(
     let mut sessions = Vec::new();
     for key in &keys {
         store.check_query()?;
-        let Some(range) = totals.get(key) else {
-            continue;
+        let empty = RangeTotals::default();
+        let range = match totals.get(key) {
+            Some(range) => range,
+            None if from.is_none() && to.is_none() => &empty,
+            None => continue,
         };
-        if range.tokens.total_tokens == 0 && range.buckets.is_empty() {
+        if (from.is_some() || to.is_some())
+            && range.tokens.total_tokens == 0
+            && range.buckets.is_empty()
+        {
             continue;
         }
         let harness = harness_for(key);
@@ -1336,6 +1347,14 @@ pub fn session_report(
             .unwrap_or_else(|| rates.currency.clone());
         sessions.push(SessionUsage {
             session_key: key.clone(),
+            lifecycle: lifecycle
+                .get(key)
+                .ok_or_else(|| anyhow::anyhow!("missing durable lifecycle for {key}"))?
+                .0,
+            source_availability: lifecycle
+                .get(key)
+                .ok_or_else(|| anyhow::anyhow!("missing durable availability for {key}"))?
+                .1,
             harness,
             tokens: range.tokens.clone(),
             cost,
@@ -1364,6 +1383,7 @@ pub fn session_report(
         to,
         sessions,
         truncated_to,
+        coverage_complete: store.has_complete_coverage()?,
     })
 }
 

@@ -176,6 +176,7 @@ export interface Session {
   file_path: string;
   /** Whether the recorded transcript is still available at `file_path`. */
   source_availability: 'present' | 'missing';
+  lifecycle?: 'present' | 'retained' | 'superseded' | 'purged';
   archived: boolean;
   started_at: string; // ISO8601
   last_event_at: string; // ISO8601
@@ -403,6 +404,7 @@ export interface SessionSummary {
   file_path: string;
   /** Whether the recorded transcript is still available at `file_path`. */
   source_availability: 'present' | 'missing';
+  lifecycle?: 'present' | 'retained' | 'superseded' | 'purged';
   archived: boolean;
   started_at: string; // ISO8601
   last_event_at: string; // ISO8601
@@ -502,7 +504,41 @@ export interface HistoryStatus {
   items_done: number | null;
   items_total: number | null;
   elapsed_ms: number | null;
+  coverage_complete?: boolean | null;
+  failure?: HistoryFailure | null;
 }
+
+export interface HistoryFailure { kind: 'corrupt' | 'newer_schema' | 'exclusions_unverified' | 'unavailable'; message: string; }
+export interface RecoveryReceipt { backup_directory: string; recovered_at_ms: number; }
+export interface HistoryRecoveryStatus {
+  status: HistoryReadinessStatus;
+  failure: HistoryFailure | null;
+  coverage_complete: boolean | null;
+  backup_directory: string | null;
+  can_recover: boolean;
+  can_retry: boolean;
+}
+
+export interface RetentionPolicy { retained_days: number | null; }
+export interface RetentionStatus {
+  policy: RetentionPolicy;
+  present_sessions: number;
+  retained_sessions: number;
+  superseded_sessions: number;
+  purged_sessions: number;
+  coverage_complete: boolean;
+  recovered_at: string | null;
+}
+export interface PurgePreview {
+  cutoff_utc_day: string;
+  policy_revision: number;
+  sessions: number;
+  identity_groups: number;
+  snapshot_bytes: number;
+  tokens: TokenTotals;
+  revision: string;
+}
+export interface PurgeResult { removed_keys: string[]; purged_at: string; }
 
 /** Point-in-time evidence from the explicit, elevated Defender action. */
 export interface DefenderExclusionReceipt {
@@ -665,11 +701,12 @@ export interface TurnReceiptIntegrationStatus {
 export type IntegrationClient = 'codex' | 'claude_code';
 export type IntegrationScope = 'user' | 'project';
 export type IntegrationChange = 'install' | 'remove' | 'restore';
-export type IntegrationDiagnosticCode = 'integration_not_configured' | 'server_launch_failed' | 'protocol_version_mismatch' | 'tool_catalog_mismatch' | 'ledger_not_ready' | 'scan_in_progress' | 'session_not_found' | 'pricing_incomplete' | 'query_too_broad' | 'snapshot_expired' | 'query_failed' | 'query_cancelled';
+export type IntegrationDiagnosticCode = 'integration_not_configured' | 'server_launch_failed' | 'protocol_version_mismatch' | 'tool_catalog_mismatch' | 'ledger_not_ready' | 'history_incomplete' | 'history_coverage_unavailable' | 'scan_in_progress' | 'session_not_found' | 'pricing_incomplete' | 'query_too_broad' | 'snapshot_expired' | 'query_failed' | 'query_cancelled';
 export interface IntegrationDiagnostic { code: IntegrationDiagnosticCode; evidence: string; next_action: string; }
 export interface IntegrationStatus {
   schema_version: number; server_version: string; protocol_version: string; generated_at: string;
   ledger_available: boolean; scan_status: string; sessions: number | null;
+  coverage_complete?: boolean | null;
   observation: { captured_at: string | null; age_seconds: number | null; generation: string | null; token_event_from: string | null; token_event_to: string | null; };
   providers: Array<{ provider: string; registered: boolean; roots: Array<{ kind: string; path: string | null; exists: boolean; }>; ledger: { durable_sessions: number; available_sessions: number; collision_sessions: number; } | null; models: Array<{ model: string; basis: PricingBasis; resolved_model: string | null; }>; quota_status: string; }>;
   pricing_authority: string; quota_authority: string; dimensions: string[]; filters: string[];
