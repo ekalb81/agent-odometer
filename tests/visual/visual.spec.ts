@@ -1,4 +1,4 @@
-import { expect, test, type Page, type TestInfo } from '@playwright/test';
+import { expect, test, type Locator, type Page, type TestInfo } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -139,6 +139,34 @@ function visualTest(
   test(title, async ({ page }, testInfo) => {
     await body(page);
     await capture(page, testInfo, id, options);
+  });
+}
+
+function visualPanelTest(id: string, title: string, body: (page: Page) => Promise<Locator>): void {
+  if (!declaredSnapshotIds.has(id) || registeredSnapshotIds.has(id)) {
+    throw new Error(`Visual panel snapshot ID missing or duplicate: ${id}`);
+  }
+  registeredSnapshotIds.add(id);
+  test(title, async ({ page }, testInfo) => {
+    const sourcePanel = await body(page);
+    await expectVisualReady(page);
+    await sourcePanel.evaluate((element, snapshotId) => {
+      const clone = element.cloneNode(true) as HTMLElement;
+      clone.dataset.visualPanelCapture = snapshotId;
+      clone.style.position = 'absolute';
+      clone.style.top = '0';
+      clone.style.left = '0';
+      clone.style.width = `${element.getBoundingClientRect().width}px`;
+      clone.style.zIndex = '2147483647';
+      document.body.appendChild(clone);
+    }, id);
+    const panel = page.locator(`[data-visual-panel-capture="${id}"]`);
+    const currentDir = join(process.cwd(), 'output', 'playwright', 'current');
+    await mkdir(currentDir, { recursive: true });
+    const currentPath = join(currentDir, `${id}.png`);
+    await panel.screenshot({ path: currentPath, animations: 'disabled', caret: 'hide' });
+    await testInfo.attach(`current-${id}`, { path: currentPath, contentType: 'image/png' });
+    await expect(panel).toHaveScreenshot(`${id}.png`, { animations: 'disabled', caret: 'hide' });
   });
 }
 
@@ -753,7 +781,7 @@ test('content search lands on a source record and Escape returns to the search w
   await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
 });
 
-visualTest('workflow-measurement-desktop', 'workflow measurement shows before and after evidence with unavailable human outcomes', async (page) => {
+visualPanelTest('workflow-measurement-desktop', 'workflow measurement shows before and after evidence with unavailable human outcomes', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
   const panel = page.getByTestId('workflow-panel').filter({ visible: true });
@@ -762,10 +790,10 @@ visualTest('workflow-measurement-desktop', 'workflow measurement shows before an
   await expect(panel.getByText('User correction rate')).toBeVisible();
   await expect(panel.getByText('Unavailable').first()).toBeVisible();
   await expect(panel.getByText(/This is a scenario, not measured or causal savings/)).toBeVisible();
-  await panel.getByText('History coverage: complete').scrollIntoViewIfNeeded();
+  return panel;
 });
 
-visualTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and comparison limits remain usable at narrow width', async (page) => {
+visualPanelTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and comparison limits remain usable at narrow width', async (page) => {
   await page.setViewportSize({ width: 520, height: 900 });
   await visit(page, { view: 'codex' });
   await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
@@ -777,7 +805,7 @@ visualTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and comparis
   await panel.getByRole('button', { name: 'Suppress finding' }).click();
   await expect(panel.getByRole('button', { name: 'Unsuppress finding' })).toBeVisible();
   await expect(panel.getByText(/observational comparison/)).toBeVisible();
-  await panel.getByRole('button', { name: 'Unsuppress finding' }).scrollIntoViewIfNeeded();
+  return panel;
 });
 
 assertManifestCasesAreRegistered();
