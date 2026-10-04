@@ -415,7 +415,19 @@ fn purge_candidates(
     let mut rows = statement.query([cutoff])?;
     let mut candidates = Vec::new();
     let mut groups = std::collections::BTreeSet::new();
-    let mut revision = cutoff.to_owned();
+    // Private annotations can change without touching a transcript snapshot.
+    // A preview must be reviewed again before deleting newly edited notes.
+    let organization_revision: Option<String> = connection
+        .query_row(
+            "SELECT value FROM history_meta WHERE key='organization_revision'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let mut revision = format!(
+        "{cutoff}\u{1f}{}",
+        organization_revision.as_deref().unwrap_or("0")
+    );
     let mut tokens = TokenTotals::default();
     let mut bytes = 0;
     while let Some(row) = rows.next()? {

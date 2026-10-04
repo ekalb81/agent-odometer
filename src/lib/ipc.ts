@@ -5,11 +5,12 @@ import { invoke } from '@tauri-apps/api/core';
 import type { AnnotationIdentity, AnnotationEdit, OrganizationSummary, SessionAnnotation, SavedSearch, SavedSearchDefinition } from './types';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { SummaryPricing } from './types';
-import type { WorkflowReport, WorkflowRequest } from './types';
 import type { TranscriptPage, TranscriptRequest } from './types';
+import type { TranscriptSearchRequest, TranscriptSearchPage, TranscriptSearchTarget, RetainedSearchLanding } from './types';
 import type { IntegrationClient, IntegrationScope, IntegrationChange, IntegrationCenterReport, IntegrationPreview, IntegrationApplyResult, IntegrationVerifyReport } from './types';
 import type { SpeedQuery, SpeedReport } from './types';
-import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, HistoryRebuildStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert } from './types';
+import type { WorkflowReport, WorkflowRequest, FindingSuppressionEdit } from './types';
+import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, HistoryRebuildStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert, QuotaBudgetCheck } from './types';
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -25,10 +26,12 @@ export function getWorkflowReport(request: WorkflowRequest): Promise<WorkflowRep
 export function recordWorkflowMeasurement(request: WorkflowRequest): Promise<WorkflowReport> {
   return invoke<WorkflowReport>('record_workflow_measurement', { request });
 }
-export function setWorkflowFindingSuppression(edit: import('./types').FindingSuppressionEdit): Promise<void> {
+export function setWorkflowFindingSuppression(edit: FindingSuppressionEdit): Promise<void> {
   return invoke('set_workflow_finding_suppression', { edit });
 }
+
 /** Explicit private desktop reads; never called by export or MCP flows. */
+export function getOrganizationRecoveryState(): Promise<boolean> { return invoke('get_organization_recovery_state'); }
 export function getOrganizationSummaries(keys: string[]): Promise<OrganizationSummary[]> {
   return invoke('get_organization_summaries', { keys });
 }
@@ -48,7 +51,6 @@ export function saveSearch(id: number | null, revision: number, definition: Save
 }
 export function deleteSavedSearch(id: number, revision: number): Promise<void> {
   return invoke('delete_saved_search', { id, revision });
-
 }
 
 export function getSpeedReport(query: SpeedQuery): Promise<SpeedReport> {
@@ -68,6 +70,16 @@ export function getSessionDetails(sessionId: string): Promise<Session | null> {
 /** Explicit source inspection; never called by list, pricing, diagnostics or MCP flows. */
 export function getTranscriptPage(request: TranscriptRequest): Promise<TranscriptPage> {
   return invoke<TranscriptPage>('get_transcript_page', { request });
+}
+
+/** Opt-in bounded content search; query and snippets remain ephemeral. */
+export function searchSessionContent(request: TranscriptSearchRequest): Promise<TranscriptSearchPage> {
+  return invoke<TranscriptSearchPage>('search_session_content', { request });
+}
+
+/** Resolve a retained field by its lineage and snapshot, never a nearby turn. */
+export function resolveRetainedSearchTarget(target: TranscriptSearchTarget): Promise<RetainedSearchLanding> {
+  return invoke<RetainedSearchLanding>('resolve_retained_search_target', { target });
 }
 
 /** Date-scoped rollups for all sessions, one result map per requested window.
@@ -221,6 +233,11 @@ export function setQuotaConfig(config: QuotaConfigWire): Promise<QuotaConfigWire
  *  server-side — see quota.rs::evaluate_alerts). Safe to poll. */
 export function checkQuotaAlerts(): Promise<QuotaAlert[]> {
   return invoke<QuotaAlert[]>('check_quota_alerts');
+}
+
+/** One backend-owned budget evaluation and its newly crossed alerts. */
+export function checkQuotaBudgets(): Promise<QuotaBudgetCheck> {
+  return invoke<QuotaBudgetCheck>('check_quota_budgets');
 }
 
 /** Every resolved project (#41), after local alias/merge/split overrides —

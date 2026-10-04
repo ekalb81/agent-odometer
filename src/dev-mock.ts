@@ -4,6 +4,9 @@
 
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
+import { mockOrganization } from './dev-mock/organization';
+import { contentSearchFixture, retainedLandingFixture } from './dev-mock/contentSearch';
+import type { TranscriptSearchRequest, TranscriptSearchTarget } from './lib/types';
 import type { TranscriptRequest } from './lib/types';
 import { integrationFixture } from './dev-mock/integration';
 import { mockRangePricing, mockSessionPricing, mockSummaryPricing, assertFixtureRates } from './dev-mock/pricing';
@@ -16,6 +19,7 @@ import type {
   ProviderDiagnostic,
   ProjectInfo,
   QuotaAlert,
+  QuotaBudgetCheck,
   QuotaConfigWire,
   QuotaSnapshot,
   RangeTotals,
@@ -106,6 +110,7 @@ function quotaSnapshots(): QuotaSnapshot[] {
 }
 
 let quotaConfigMock: QuotaConfigWire = {
+  revision: 'dev-mock-revision-1',
   budgets: [],
   notifications: { enabled: false, quiet_hours: null },
   max_cache_age_secs: 21_600,
@@ -113,6 +118,18 @@ let quotaConfigMock: QuotaConfigWire = {
 
 function checkQuotaAlerts(): QuotaAlert[] {
   return [];
+}
+
+function checkQuotaBudgets(): QuotaBudgetCheck {
+  return {
+    as_of: new Date(now).toISOString(),
+    statuses: quotaConfigMock.budgets.map((budget) => ({
+      budget_id: budget.id,
+      current_value: null,
+      unavailable: budget.enabled ? 'no_observation' : 'disabled',
+    })),
+    alerts: [],
+  };
 }
 
 function subscriptionUsage(): SubscriptionUsageEntry[] {
@@ -268,7 +285,7 @@ function historyStatus(): HistoryStatus & { coverage_complete: boolean | null } 
   // normal warm start.
   return {
     status: visualScenario === 'history-unavailable' ? 'unavailable' : 'ready',
-    coverage_complete: visualScenario === 'history-unavailable' ? null : visualScenario !== 'history-partial',
+    coverage_complete: visualScenario === 'history-unavailable' ? null : !['history-partial', 'organization-recovered'].includes(visualScenario),
     step: null,
     step_index: null,
     step_total: null,
@@ -442,6 +459,16 @@ function emitUpdateProgress(channelId: number) {
 
 mockIPC((cmd, payload) => {
   switch (cmd) {
+    case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
+    case 'get_organization_summaries':
+    case 'get_session_annotation':
+    case 'edit_session_annotation':
+    case 'list_organization_tags':
+    case 'change_organization_tag':
+    case 'list_saved_searches':
+    case 'save_search':
+    case 'delete_saved_search':
+      return mockOrganization(cmd, (payload ?? {}) as Record<string, unknown>, visualScenario === 'organization-recovered');
     case 'list_sessions':
       return visibleFixtures().map(summary);
     case 'get_speed_report': {
@@ -473,6 +500,10 @@ mockIPC((cmd, payload) => {
     }
     case 'get_transcript_page':
       return transcriptFixture((payload as { request: TranscriptRequest }).request);
+    case 'search_session_content':
+      return contentSearchFixture((payload as { request: TranscriptSearchRequest }).request, visualScenario === 'content-search-retained');
+    case 'resolve_retained_search_target':
+      return retainedLandingFixture((payload as { target: TranscriptSearchTarget }).target);
     case 'get_session_details': {
       const { sessionId } = payload as { sessionId: string };
       const f = visibleFixtures().find((x) => summary(x).storage_id === sessionId);
@@ -491,6 +522,14 @@ mockIPC((cmd, payload) => {
       return quotaConfigMock;
     case 'check_quota_alerts':
       return checkQuotaAlerts();
+    case 'check_quota_budgets':
+      return checkQuotaBudgets();
+    case 'get_live_quota_status':
+      return { accounts: [], busy: false, configuration_error: null };
+    case 'identify_quota_account':
+    case 'approve_quota_account':
+    case 'change_quota_account':
+      throw new Error('Live account consent is unavailable in browser mock mode.');
     case 'resolve_working_directories':
       // Matches the fixture sessions' working directory, so the grid renders
       // the resolved repository rather than its unresolved path fallback.

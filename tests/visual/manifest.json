@@ -1,5 +1,8 @@
 {
   "snapshots": [
+    "organization-saved-search",
+    "organization-editor-narrow",
+    "organization-recovery-unavailable",
     "primary-all-light-desktop",
     "primary-all-dark-desktop",
     "primary-codex-light-desktop",
@@ -45,7 +48,11 @@
     "updater-available",
     "updater-installing",
     "updater-error",
+    "quota-budget-editor-narrow",
+    "quota-live-off-and-lookup-error",
     "transcript-recorded-edit",
-    "transcript-narrow-anchor"
+    "transcript-narrow-anchor",
+    "content-search-scopes",
+    "content-search-retained-narrow"
   ]
 }

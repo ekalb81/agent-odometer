@@ -14,7 +14,9 @@
   } from '../lib/optimization';
   import Sparkline from './Sparkline.svelte';
   import TranscriptInspector from './TranscriptInspector.svelte';
+  import TranscriptSearch from './TranscriptSearch.svelte';
   import SessionProjectEditor from './SessionProjectEditor.svelte';
+  import SessionOrganizationEditor from './SessionOrganizationEditor.svelte';
 
   interface Props {
     session: Session | null;
@@ -27,6 +29,7 @@
 
   let { session, childCount = 0, onclose, transcriptAnchor = null }: Props = $props();
   let inspectorOpen = $state(false);
+  let contentSearchOpen = $state(false);
 
 
   const numFmt = new Intl.NumberFormat();
@@ -123,6 +126,7 @@
       lastSessionId = id;
       expandedTurn = null;
       inspectorOpen = !!transcriptAnchor;
+      contentSearchOpen = false;
     }
   });
 
@@ -283,7 +287,8 @@
       </div>
     </div>
 
-    <div class="px-5 py-2 border-b border-edge shrink-0"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { inspectorOpen = true; }}>Inspect transcript</button></div>
+    <div class="px-5 py-2 border-b border-edge shrink-0 space-x-4"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { inspectorOpen = true; }}>Inspect transcript</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contentSearchOpen = true; }}>Search content</button></div>
+    {#if contentSearchOpen}<TranscriptSearch sessionId={session.storage_id} onclose={() => { contentSearchOpen = false; }} />{/if}
     {#if inspectorOpen}
       <TranscriptInspector sessionId={session.storage_id} recordId={transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
     {/if}
@@ -312,6 +317,7 @@
     <div class="flex-1 overflow-y-auto min-h-0">
       {#key session.storage_id}
         <SessionProjectEditor {session} />
+        <SessionOrganizationEditor sessionKey={session.storage_id} />
       {/key}
       {#if (session.harness === 'codex' ? sessionApiCost : sessionCredits)?.converted}
         {@const displayedPrice = (session.harness === 'codex' ? sessionApiCost : sessionCredits)!}

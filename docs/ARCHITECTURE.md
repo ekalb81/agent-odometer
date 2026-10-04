@@ -445,6 +445,25 @@ User-owned app data is stored under the platform configuration directory in `age
 
 Session files can contain full prompts, responses, system/developer instructions, local paths, and tool output. Keep processing local, avoid logging message bodies, and use synthetic/redacted test data. Tauri capabilities in `src-tauri/capabilities/default.json` should remain narrowly scoped.
 
+### Explicit session content search (#251)
+
+`search_session_content` / `searchSessionContent` is private desktop IPC using
+the existing bounded transcript reader. Rust matches escaped Unicode literals
+against typed message blocks, with conversation-only defaults and independent
+tool-call/result consent flags. One source page returns at most one bounded
+snippet per matching record and pins continuation to the query, scope, session
+and existing source cursor. Unknown and omitted content remains explicitly
+unsearched.
+
+Incomplete source coverage offers a separate retained phase. `history_search.rs`
+reads at most 25 turns from a snapshot capped at 8 MiB using SQLite JSON field
+projection, without decoding a whole Session or building an index. Prompt and
+final-reply fields retain the parser's 500-character limits; other messages and
+tools are absent. Retained targets bind opaque lineage, current snapshot revision,
+turn and field. `resolve_retained_search_target` fails closed after changes,
+purge or ambiguity. Query/snippet/body data never enters summaries, telemetry,
+accounting, exports or MCP. See [Session content search](TRANSCRIPT_SEARCH.md).
+
 ## Known limitations
 
 Durable enumeration, lifecycle states, confirmed local-history purge and preserved
@@ -468,3 +487,20 @@ For a new backend field, update the Rust model/parser, add parser coverage, upda
 For a new command, implement it in `commands.rs`, register it in `lib.rs`, add a typed wrapper in `ipc.ts`, and expand capabilities only when the API actually requires it.
 
 For watcher changes, test initial files, incremental appends, partial trailing lines, removal, archive roots, session-index updates, and config-triggered restart separately.
+
+## Private organization
+
+Ledger schema 12 adds `session_annotations`, `annotation_tags`, `organization_tags`, and `saved_searches`. These tables are accessed only by explicit private desktop commands; they never join `SessionSummary`, normalized facts, query reports, MCP, diagnostics, or ordinary exports. Bulk list projections return identity/revision, pin state, tag labels, and a note-presence flag, without note text or full snapshots. Note reads and edits are separate bounded IPC operations.
+
+An annotation binds `(session_key, first_event_fingerprint)` and an optional opaque source-record anchor. The composite foreign key cascades fingerprint promotion in place and deletes session-owned rows in the same confirmed purge transaction. Identity and revision checks reject stale editors after promotion, purge/reused keys, or tag changes. Current session edits accept only the empty anchor; record bookmark UI and source-anchor validation belong to #272, which reuses this storage and typed identity seam. No raw source record is duplicated into annotations.
+
+Private edits increment an organization revision included in purge previews, so edits after review require a fresh review. Tag rename/delete invalidates affected editor revisions; saved searches retain their explicit tag choices and report unavailable until reviewed when a tag disappears. Searches store only the explicit user-saved query/filter definition and shared content-class choices. Ordinary conversation-search requests, hits, snippets, and bodies are never saved automatically.
+
+Saved UTC bounds remain authoritative across timezone changes and repeated DST hours. Display inputs preserve seconds and milliseconds; editing one bound replaces only that instant, and calendar selection replaces both. Restoring a content-scope search never silently falls back to summary search.
+
+Ordinary source rebuild/refresh preserves identity-bound organization. Corrupt-database recovery preserves private data only in the original backup; it cannot reconstruct notes, pins, tags, or saved searches from source transcripts. Private editors and search management disclose this limitation, and dependent pin/tag result sets remain unavailable rather than presenting absent annotations as a complete empty result. New private edits apply to the rebuilt database. Backup restoration is a separate future operation.
+
+
+### Account-scoped live quota and soft budgets (#43)
+
+`quota_accounts.rs` owns consent metadata and the desktop polling timer; `quota_live.rs` owns bounded Codex app-server stdio reads. `quota.rs` converts both live buckets and transcript evidence through the shared window service. Live account views never overwrite transcript observations or durable usage. The payload-free `live-quota-updated` event invalidates the tray, and the dashboard reads the same in-memory service. Monetary/token budget values and alert crossings share `check_quota_budgets` and the ledger range/pricing authority. See [QUOTAS.md](QUOTAS.md) for consent, persistence, unsupported-source, and verification boundaries.

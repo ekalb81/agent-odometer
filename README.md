@@ -16,12 +16,13 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 
 - **Every session, across providers** — Codex, Claude Code, Gemini CLI, and an All tab that keeps credits and USD estimates explicitly separated.
 - **Per-project spend** — working directories resolve to a stable project identity (repository root, workspace root, provider project id, or the path itself), so linked worktrees collapse into one project while nested repos and monorepo subfolders stay distinct. Sort, group, and filter by it. Use **Change project** in session details to move one session, make it standalone, or restore detection; manage project names and merges in Settings.
-- **Quota windows and budgets** — subscription and credit windows with reset timing, pace, and projected run-out, plus soft per-provider and per-project budgets with local alerts. Windows with unlike units are never summed together, and a projection is suppressed rather than guessed when the evidence is too thin.
+- **Quota windows and budgets** — transcript observations with reset timing, pace, and projected run-out; editable provider/project token and USD API-estimate budgets; opt-in local alerts. Codex live quota uses a separately approved account through the installed native CLI. Account changes stop readings until separately approved, and unavailable sources never become zero usage. [Quota sources and consent](docs/QUOTAS.md).
 - **Where tool overhead goes** — calls attributed by origin (core, MCP, provider), MCP server, allowlisted shell-command family, language, and context source, with exportable totals.
 - **Tokens where they went** — input, cached, output, and reasoning tokens per session, per model, and per turn.
 - **What it costs** — Codex sessions show plan credits *and* an informational "what would this cost at OpenAI API rates" estimate; Claude Code and Gemini CLI sessions show API-rate estimates in USD. Rates live in an editable rate card, and every priced figure carries its provenance: priced directly, resolved through a model alias, fallback-priced, estimated, or explicitly unpriced.
 - **Turn-by-turn detail** — click any session for its full story: prompts, replies, per-turn tokens and cost, context-window fill, and a tokens-over-time sparkline.
 - **Source inspection** — select a session and choose **Inspect transcript** for bounded source-order pages, explicit tool links, and recorded edits. See [Transcript inspector](docs/TRANSCRIPT_INSPECTOR.md).
+- **Conversation search** — choose **Search content** in a selected session for bounded message search, explicit tool-body scopes, exact source anchors, and separately labeled retained-message fallback. See [Session content search](docs/TRANSCRIPT_SEARCH.md).
 - **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
 - **Live** — sessions update in the list while your agents are still running.
 - **Retained history** — missing or replaced transcripts keep local usage and clearly marked session summaries. Settings offers a reviewed, typed purge and preservation-first corrupt-history recovery; partial recovery remains labeled incomplete. See [history lifecycle](docs/HISTORY_LIFECYCLE.md).
@@ -256,3 +257,8 @@ Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for 
 [MIT](LICENSE)
 
 Client setup and verification are available in Settings → Integration Center. See [setup, privacy and proof boundaries](docs/INTEGRATION_CENTER.md).
+## Private session organization
+
+Use **Edit organization** in a session’s detail pane to pin it, add tags, or edit a private note. **Organize** in the toolbar filters pins/tags and saves, restores, renames, replaces, or deletes summary searches. Saved searches keep their provider, model, archive/subagent choices, organization filters, and exact UTC date bounds. Summary text search covers the existing summary fields; it does not search private notes or full transcripts. A stored content search reports unavailable until its explicit content-search service can run it.
+
+Organization stays in the local history database and is excluded from ordinary exports, diagnostics, accounting, MCP, and provider files. Missing sources keep it. Confirmed history purge removes the selected sessions’ pins, tag assignments, and notes; global tag definitions and saved searches remain. A corrupt-database recovery preserves the original database backup and rebuilds source history, but does not reconstruct private organization from transcripts. The UI identifies those unrestored records and keeps dependent pin/tag results unavailable.

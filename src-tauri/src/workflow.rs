@@ -225,6 +225,7 @@ struct WindowSignals {
     turn_tool_calls: u64,
     tool_turns: BTreeSet<(String, String)>,
     classified_turns: u64,
+    unsupported_classifications: u64,
     planning_turns: u64,
     timestamped_turns: u64,
     first_edit_ms: Vec<u64>,
@@ -244,6 +245,41 @@ impl WindowSignals {
     }
 }
 
+/// Model metadata is provider-supplied and can be a local checkpoint path.
+/// Keep known public-looking IDs readable; all other labels stay opaque.
+fn model_drilldown_label(model: &str) -> String {
+    let safe_chars = model.len() <= 64
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    let public_shape = model.starts_with("gpt-")
+        && model.as_bytes().get(4).is_some_and(u8::is_ascii_digit)
+        || model.starts_with("claude-") && model.contains("-4")
+        || model.starts_with("gemini-") && model.as_bytes().get(7).is_some_and(u8::is_ascii_digit)
+        || matches!(model, "o1" | "o3" | "o3-mini" | "o4-mini");
+    if safe_chars
+        && public_shape
+        && ![
+            ".gguf",
+            ".safetensors",
+            ".onnx",
+            ".bin",
+            ".pt",
+            ".pth",
+            ".ckpt",
+        ]
+        .iter()
+        .any(|suffix| model.ends_with(suffix))
+    {
+        model.to_owned()
+    } else {
+        format!(
+            "opaque-model:{:016x}",
+            crate::stable_hash::fnv1a64(model.as_bytes())
+        )
+    }
+}
+
 fn metric_signals(signals: &mut WindowSignals) -> Vec<WorkflowMeasure> {
     let mut metrics = vec![
         WorkflowMeasure::ratio("tools_per_tool_active_turn", signals.turn_tool_calls,
@@ -255,10 +291,19 @@ fn metric_signals(signals: &mut WindowSignals) -> Vec<WorkflowMeasure> {
             "existing deterministic classifier; unclassified or timestamp-free turns are excluded",
             signals.classified_turns, signals.timestamped_turns),
         WorkflowMeasure::ratio("observed_subagent_session_share", signals.delegated_sessions, signals.sessions,
-            "analyzed sessions with tool observations inside the window",
+            "analyzed sessions with recorded token or tool usage inside the window",
             "explicit parent_thread_id or agent_path metadata; this does not measure all delegation",
             signals.sessions, signals.sessions + signals.unavailable),
     ];
+    if signals.unsupported_classifications > 0 {
+        if let Some(planning) = metrics
+            .iter_mut()
+            .find(|metric| metric.id == "planning_turn_share")
+        {
+            planning.value = None;
+            planning.missing_data = Some("unsupported_classifier_version");
+        }
+    }
     signals.first_edit_ms.sort_unstable();
     let len = signals.first_edit_ms.len();
     let median = if len == 0 {
@@ -414,7 +459,9 @@ pub fn report(
                     project_row.sessions += 1;
                 }
                 for (model, totals) in &range.tool_metrics_by_model {
-                    signals.drilldown("model", model.clone()).tool_calls += totals.calls;
+                    signals
+                        .drilldown("model", model_drilldown_label(model))
+                        .tool_calls += totals.calls;
                 }
                 if range.tool_metrics.calls > 0 || range.tokens.total_tokens > 0 {
                     if index == 0 {
@@ -489,14 +536,19 @@ pub fn report(
                 };
                 signals.timestamped_turns += 1;
                 if let Some(classification) = &turn.classification {
-                    signals.classified_turns += 1;
-                    let category = serde_json::to_value(classification.category)?
-                        .as_str()
-                        .unwrap_or("other")
-                        .to_owned();
-                    signals.drilldown("category", category).classified_turns += 1;
-                    signals.planning_turns +=
-                        u64::from(classification.category == crate::model::TaskCategory::Planning);
+                    if classification.version != crate::telemetry::CLASSIFIER_VERSION {
+                        signals.unsupported_classifications += 1;
+                    } else {
+                        signals.classified_turns += 1;
+                        let category = serde_json::to_value(classification.category)?
+                            .as_str()
+                            .unwrap_or("other")
+                            .to_owned();
+                        signals.drilldown("category", category).classified_turns += 1;
+                        signals.planning_turns += u64::from(
+                            classification.category == crate::model::TaskCategory::Planning,
+                        );
+                    }
                 }
                 let first_edit = observations
                     .iter()
@@ -590,6 +642,9 @@ pub fn report(
     limitations.push("timing_and_tool_success_do_not_establish_accepted_quality".into());
     if confounded {
         limitations.push("recorded_changes_overlap_comparison_windows".into());
+    }
+    if before.unsupported_classifications > 0 || after.unsupported_classifications > 0 {
+        limitations.push("unsupported_classifier_version".into());
     }
     Ok(WorkflowReport {
         version: COMPARISON_VERSION,
@@ -1103,6 +1158,44 @@ mod tests {
             finding_identity("ab", "c", "d")
         );
         assert!(!original.contains("opaque-project"));
+    }
+
+    #[test]
+    fn model_drilldown_never_emits_local_checkpoint_paths_or_filenames() {
+        assert_eq!(model_drilldown_label("gpt-5.4"), "gpt-5.4");
+        for private in [
+            r"C:\private\customer\model.gguf",
+            "/home/customer/model.gguf",
+            "gpt-5.4-private.gguf",
+        ] {
+            let label = model_drilldown_label(private);
+            assert!(label.starts_with("opaque-model:"));
+            assert!(!label.contains("private"));
+            assert!(!label.contains("model.gguf"));
+        }
+    }
+
+    #[test]
+    fn unsupported_classifier_versions_do_not_yield_planning_percentages() {
+        let mut signals = WindowSignals {
+            timestamped_turns: 3,
+            classified_turns: 2,
+            planning_turns: 1,
+            unsupported_classifications: 1,
+            ..Default::default()
+        };
+        let metrics = metric_signals(&mut signals);
+        let planning = metrics
+            .iter()
+            .find(|metric| metric.id == "planning_turn_share")
+            .unwrap();
+        assert_eq!(planning.value, None);
+        assert_eq!(planning.covered_samples, 2);
+        assert_eq!(planning.eligible_samples, 3);
+        assert_eq!(
+            planning.missing_data,
+            Some("unsupported_classifier_version")
+        );
     }
 
     #[test]

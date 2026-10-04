@@ -1274,20 +1274,20 @@ export interface QuotaSnapshot {
   unavailable: QuotaUnavailableReason | null;
 }
 
-export type BudgetUnit = 'percent_of_window' | 'tokens';
+export type BudgetUnit = 'percent_of_window' | 'tokens' | 'usd';
 
 export interface QuotaBudget {
   id: string;
   provider: Harness;
-  /** `null` = provider-wide; only valid combined with `unit: 'tokens'`. */
+  /** `null` = provider-wide; valid with token and USD estimates. */
   project_key: string | null;
   unit: BudgetUnit;
   /** Matches `QuotaWindowKind` ("burst"/"daily"/"weekly"/"monthly").
    *  Required for `percent_of_window`; ignored for `tokens`. */
   window_kind: string | null;
-  /** Rolling period for a `tokens` budget; ignored for `percent_of_window`. */
+  /** Rolling period for token/USD budgets; ignored for `percent_of_window`. */
   period_hours: number | null;
-  /** Percent-used (0-100) for `percent_of_window`, or a raw token count for `tokens`. */
+  /** Percent-used (0-100), raw token count, or USD API estimate threshold. */
   threshold: number;
   enabled: boolean;
 }
@@ -1302,9 +1302,25 @@ export interface NotificationSettings {
 /** get_quota_config / set_quota_config payload. Never includes the backend's
  *  internal notification dedup log. */
 export interface QuotaConfigWire {
+  /** Optimistic edit revision. Preserve it on writes to reject stale edits. */
+  revision?: string | null;
   budgets: QuotaBudget[];
   notifications: NotificationSettings;
   max_cache_age_secs: number;
+}
+
+export interface QuotaBudgetStatus {
+  budget_id: string;
+  /** Null when no trustworthy current value is available. */
+  current_value: number | null;
+  /** Fixed backend reason code; never a provider body or local path. */
+  unavailable: string | null;
+}
+
+export interface QuotaBudgetCheck {
+  as_of: string;
+  statuses: QuotaBudgetStatus[];
+  alerts: QuotaAlert[];
 }
 
 export interface QuotaAlert {
@@ -1365,6 +1381,59 @@ export interface TranscriptRequest {
   max_bytes?: number;
   record_id?: string | null;
 }
+
+/** Explicit search/saved-query content choice. Tool bodies are off by default. */
+export interface TranscriptContentScope {
+  conversation: boolean;
+  tool_calls: boolean;
+  tool_results: boolean;
+}
+
+export type TranscriptSearchTarget =
+  | { kind: 'source_record'; session_id: string; record_id: string; block_index: number }
+  | { kind: 'retained_turn'; session_id: string; session_identity: string; snapshot_revision: string; turn_id: string; field: 'user_message' | 'last_agent_message' };
+export type TranscriptSearchPosition =
+  | { phase: 'source'; cursor: TranscriptCursor; incomplete: boolean }
+  | { phase: 'retained'; session_identity: string; snapshot_revision: string; next_turn: number; incomplete: boolean };
+export interface TranscriptSearchCursor {
+  session_id: string;
+  query: string;
+  scope: TranscriptContentScope;
+  position: TranscriptSearchPosition;
+}
+export interface TranscriptSearchRequest {
+  session_id: string;
+  query: string;
+  scope: TranscriptContentScope;
+  cursor?: TranscriptSearchCursor | null;
+}
+export interface TranscriptSearchSnippet {
+  text: string;
+  match_start: number;
+  match_end: number;
+  truncated_before: boolean;
+  truncated_after: boolean;
+}
+export interface TranscriptSearchHit {
+  target: TranscriptSearchTarget;
+  content_kind: string;
+  snippet: TranscriptSearchSnippet;
+}
+export interface TranscriptSearchPage {
+  phase: 'source' | 'retained';
+  hits: TranscriptSearchHit[];
+  next_cursor: TranscriptSearchCursor | null;
+  issues: string[];
+  source_complete: boolean;
+  retained_complete: boolean;
+  scanned_records: number;
+  scanned_messages: number;
+}
+export interface RetainedSearchLanding {
+  target: TranscriptSearchTarget;
+  text: string;
+  truncated: boolean;
+}
 export interface TranscriptBlock {
   kind: string;
   text: string;
@@ -1395,7 +1464,6 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
-
 export type FindingState = 'new' | 'persistent' | 'improving' | 'resolved' | 'suppressed' | 'not_applicable';
 export interface WorkflowRequest {
   session_ids: string[];
@@ -1495,13 +1563,14 @@ export interface AnnotationIdentity { session_key: string; fingerprint: string; 
 export interface OrganizationSummary {
   identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
 }
-export interface SessionAnnotation { summary: OrganizationSummary; note: string }
+export interface SessionAnnotation { summary: OrganizationSummary; note: string; recovery_backup_unrestored?: boolean }
 export interface AnnotationEdit {
   identity: AnnotationIdentity; revision: number; pinned: boolean; note: string; tags: string[];
 }
 export interface SavedSearchDefinition {
   name: string; query: string; scope: string;
   content_scope: 'summary' | 'session_content';
+  content_classes: TranscriptContentScope;
   session_key: string | null; fingerprint: string | null;
   from: string | null; to: string | null; model: string;
   show_active: boolean; show_archived: boolean; show_subagents: boolean;

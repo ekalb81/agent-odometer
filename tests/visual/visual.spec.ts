@@ -510,6 +510,40 @@ test('project reassignment and restore stay usable in the narrow detail drawer',
   await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
 });
 
+async function openQuotaPanel(page: Page, id: string): Promise<ReturnType<Page['locator']>> {
+  const analytics = page.locator('[data-testid="analytics-panel"]:visible');
+  await analytics.locator(':scope > summary').click();
+  const panel = analytics.getByTestId(id);
+  await panel.locator(':scope > summary').click();
+  await panel.scrollIntoViewIfNeeded();
+  return panel;
+}
+
+visualTest('quota-budget-editor-narrow', 'quota project USD editor at narrow width', async (page) => {
+  await page.setViewportSize({ width: 800, height: 800 });
+  await visit(page, { view: 'codex' });
+  const budgets = await openQuotaPanel(page, 'quota-budgets-panel');
+  await budgets.getByRole('button', { name: 'Add budget' }).click();
+  await budgets.getByLabel('Budget type').selectOption('usd');
+  await budgets.getByLabel('Project scope').selectOption({ label: 'demo' });
+  await budgets.getByLabel('Threshold (USD)').fill('10');
+  await expect(budgets.getByRole('button', { name: 'Save budget' })).toBeEnabled();
+  await budgets.getByRole('button', { name: 'Save budget' }).focus();
+  await expect(budgets.getByRole('button', { name: 'Save budget' })).toBeFocused();
+  await budgets.scrollIntoViewIfNeeded();
+});
+
+visualTest('quota-live-off-and-lookup-error', 'quota lookup failure keeps live polling off', async (page) => {
+  await visit(page, { view: 'codex', theme: 'dark' });
+  const live = await openQuotaPanel(page, 'live-quota-accounts');
+  await expect(live).toContainText('No accounts approved. Live polling is off.');
+  await live.getByRole('button', { name: 'Allow one account lookup' }).click();
+  await expect(live.getByRole('alert')).toBeVisible();
+  await expect(live).toContainText('No accounts approved. Live polling is off.');
+  await expect(live.getByRole('button', { name: 'Enable polling for this account' })).toHaveCount(0);
+  await live.scrollIntoViewIfNeeded();
+});
+
 visualTest('transcript-recorded-edit', 'inspector shows recorded tool result and edit in source order', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
@@ -540,6 +574,102 @@ visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigat
   await expect(inspector).toHaveCount(0);
   await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
   await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
+});
+
+visualTest('organization-saved-search', 'organization saved search and tag management', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByLabel('Pin this session').check();
+  await editor.getByLabel('Tags (comma separated)').fill('review');
+  await editor.getByLabel('Private note').fill('Synthetic local note.');
+  await editor.getByRole('button', { name: 'Save organization' }).click();
+  await expect(editor.getByText(/Pinned.*review.*Private note/)).toBeVisible();
+  await page.getByText('Organize', { exact: true }).click();
+  const toolbar = page.locator('[aria-label="Local session organization"]');
+  await toolbar.getByLabel('Pinned sessions only').check();
+  await toolbar.getByLabel('New search name').fill('Review work');
+  await toolbar.getByRole('button', { name: 'Save current search' }).click();
+  await toolbar.getByRole('combobox', { name: 'Saved search', exact: true }).selectOption({ label: 'Review work · summary · codex' });
+  await expect(toolbar.getByRole('button', { name: 'Run saved search' })).toBeVisible();
+  await expect(toolbar.getByText('Local organization saved.', { exact: true })).toBeVisible();
+});
+
+visualTest('organization-editor-narrow', 'private organization editor and keyboard at narrow width', async (page) => {
+  await page.setViewportSize({ width: 800, height: 900 });
+  await visit(page, { view: 'codex' });
+  await expect(page.getByRole('button', { name: 'Filters', exact: true })).toBeVisible();
+  await page.getByText('Organize', { exact: true }).click();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('details[open] [aria-label="Local session organization"]')).toHaveCount(0);
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByLabel('Pin this session').check();
+  await editor.getByLabel('Tags (comma separated)').fill('review, follow-up');
+  await editor.getByLabel('Private note').fill('Synthetic private note for this session only.');
+  await editor.scrollIntoViewIfNeeded();
+  await expect(editor.getByRole('button', { name: 'Discard changes' })).toBeVisible();
+});
+
+visualTest('organization-recovery-unavailable', 'recovered organization filters fail unavailable', async (page) => {
+  await visit(page, { scenario: 'organization-recovered', view: 'codex' });
+  await page.getByText('Organize', { exact: true }).click();
+  const toolbar = page.locator('[aria-label="Local session organization"]');
+  await expect(toolbar).toContainText('They were not reconstructed from source transcripts.');
+  await toolbar.getByLabel('Pinned sessions only').check();
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('alert').filter({ visible: true })).toContainText('Organization-filtered results are unavailable.');
+});
+
+visualTest('content-search-scopes', 'content search exposes explicit tool scope and exact source landing', async (page) => {
+  await visit(page, { view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await expect(search.getByText(/Matching records on this page: 1/)).toBeVisible();
+  await search.getByLabel('Tool results and errors').check();
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await expect(search.getByText(/Matching records on this page: 2/)).toBeVisible();
+});
+
+visualTest('content-search-retained-narrow', 'missing source search shows separate retained coverage and exact field', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { scenario: 'content-search-retained', view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await search.getByRole('button', { name: 'Search retained messages' }).click();
+  await search.getByRole('button', { name: 'Open retained message · user message' }).click();
+  await expect(search.getByRole('region', { name: 'Selected retained message' })).toBeFocused();
+  await expect(search.getByText(/may overlap them/)).toBeVisible();
+  const bounds = await search.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
+test('content search lands on a source record and Escape returns to the search without deselecting the session', async ({ page }) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Search content', exact: true }).click();
+  const search = page.getByRole('dialog', { name: 'Search session content' });
+  await search.getByLabel('Find text').fill('greeting');
+  await search.getByRole('button', { name: 'Search from start' }).click();
+  await search.getByRole('button', { name: 'Open source record · text' }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await expect(inspector.locator('[id="transcript-synthetic:0-block-0"]')).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await expect(search).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(search).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
 });
 
 assertManifestCasesAreRegistered();

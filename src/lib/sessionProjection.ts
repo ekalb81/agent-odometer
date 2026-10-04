@@ -25,6 +25,8 @@ export interface SessionFilterState {
   showActive: boolean;
   showArchived: boolean;
   showSubagents: boolean;
+  /** Saved absolute instants survive timezone changes and DST repeated hours. */
+  utcBounds?: { from: string | null; to: string | null };
 }
 
 export interface SessionProjection<T extends SessionSummary = SessionSummary> {
@@ -122,6 +124,10 @@ export function toUtcIso(local: string): string | null {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
+export function filterBounds(filters: SessionFilterState): { from: string | null; to: string | null } {
+  return filters.utcBounds ?? { from: toUtcIso(filters.dateFrom), to: toUtcIso(filters.dateTo) };
+}
+
 export function isSubagent(session: SessionSummary): boolean {
   return Boolean(
     session.parent_thread_id || session.agent_path || session.source === 'subagent',
@@ -162,8 +168,8 @@ export function filterSessions<T extends SessionSummary>(
   includeDate = true,
 ): T[] {
   const search = filters.search.toLowerCase();
-  const from = includeDate ? toUtcIso(filters.dateFrom) : null;
-  const to = includeDate ? toUtcIso(filters.dateTo) : null;
+  const from = includeDate ? filterBounds(filters).from : null;
+  const to = includeDate ? filterBounds(filters).to : null;
   const result: T[] = [];
 
   for (const session of sessions) {

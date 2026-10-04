@@ -36,6 +36,9 @@ pub use lifecycle::{
 #[path = "history_recovery.rs"]
 mod recovery;
 pub use recovery::{HistoryFailure, HistoryFailureKind, RecoveryReceipt};
+#[path = "history_search.rs"]
+mod search;
+pub(crate) use search::RetainedSearchMessages;
 #[path = "history_workflow.rs"]
 mod workflow;
 
@@ -6567,7 +6570,7 @@ mod tests {
         let database = store.path.clone();
         drop(store);
         let connection = Connection::open(&database).unwrap();
-        connection.execute_batch("DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; DROP TABLE IF EXISTS workflow_finding_lifecycle; PRAGMA user_version=10;").unwrap();
+        connection.execute_batch("DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; DROP TABLE workflow_finding_lifecycle; PRAGMA user_version=10;").unwrap();
         drop(connection);
         let reopened = HistoryStore::open(&database).unwrap();
         let summaries = reopened.session_summaries().unwrap();
@@ -8886,7 +8889,7 @@ mod tests {
                      ALTER TABLE durable_token_events DROP COLUMN cache_creation_input_tokens;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '2')
                        ON CONFLICT(key) DO UPDATE SET value = '2';
-                     DROP TABLE IF EXISTS workflow_finding_lifecycle; PRAGMA user_version = 2;",
+                     DROP TABLE workflow_finding_lifecycle; PRAGMA user_version = 2;",
                 )
                 .unwrap();
         }
@@ -9062,7 +9065,7 @@ mod tests {
                      DROP TABLE rollup_mutation_chains;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '3')
                        ON CONFLICT(key) DO UPDATE SET value = '3';
-                     DROP TABLE IF EXISTS workflow_finding_lifecycle; PRAGMA user_version = 3;",
+                     DROP TABLE workflow_finding_lifecycle; PRAGMA user_version = 3;",
                 )
                 .unwrap();
         }
@@ -9310,7 +9313,7 @@ mod tests {
                      DROP TABLE IF EXISTS project_session_overrides;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '5')
                        ON CONFLICT(key) DO UPDATE SET value = '5';
-                     DROP TABLE IF EXISTS workflow_finding_lifecycle; PRAGMA user_version = 5;",
+                     DROP TABLE workflow_finding_lifecycle; PRAGMA user_version = 5;",
                 )
                 .unwrap();
         }
@@ -9387,7 +9390,7 @@ mod tests {
                      DROP TABLE IF EXISTS project_session_overrides;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '5')
                        ON CONFLICT(key) DO UPDATE SET value = '5';
-                     DROP TABLE IF EXISTS workflow_finding_lifecycle; PRAGMA user_version = 5;",
+                     DROP TABLE workflow_finding_lifecycle; PRAGMA user_version = 5;",
                 )
                 .unwrap();
         }

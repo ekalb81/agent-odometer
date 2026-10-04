@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
   import InstructionsView from './components/InstructionsView.svelte';
   import Filters from './components/Filters.svelte';
+  import OrganizationToolbar from './components/OrganizationToolbar.svelte';
+  import { organizationStore } from './lib/stores/organization.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
   import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, getHistoryStatus, onHistoryProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
@@ -23,11 +25,12 @@
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { computeTrayTotals } from './lib/trayTotals';
   import { quotaTrayLabel } from './lib/subscriptionUsage';
+  import { getLiveQuotaStatus, liveQuotaTrayLabel, onLiveQuotaUpdated } from './lib/liveQuota';
   import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
   import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
   import { renderedSessionRows } from './lib/paintContext';
-  import { appViews, providerIdForTab, type AppView } from './lib/appViews';
+  import { appViews, providerIdForTab, tabIdForProvider, type AppView } from './lib/appViews';
   import { providersStore } from './lib/stores/providers.svelte';
   import { providerAccent } from './lib/providerAccents';
 
@@ -43,6 +46,16 @@
   // active tab while every sessions view remains mounted. 'all' is always
   // present; a provider's entry is added the first time its descriptor is
   // observed and then persists for the life of the app.
+  let organizationFilters = $state<Record<string, { pinned: boolean; tags: string[] }>>({});
+  $effect(() => {
+    const readiness = historyStore.status.status;
+    const keys = [...sessionsStore.map.values()].map(session => session.storage_id);
+    untrack(() => {
+      if (readiness === 'ready') void organizationStore.load(keys);
+      else organizationStore.invalidate('Private organization requires ready durable history.');
+    });
+  });
+
   let filtersByScope = $state<Record<string, FilterState>>({
     all: defaultFilters(),
   });
@@ -137,7 +150,8 @@
       // above and defaults to no label on failure.
       let quotaLabel: string | null = null;
       try {
-        quotaLabel = quotaTrayLabel(await getQuotaSnapshots());
+        const [snapshots, live] = await Promise.all([getQuotaSnapshots(), getLiveQuotaStatus()]);
+        quotaLabel = liveQuotaTrayLabel(live) ?? quotaTrayLabel(snapshots);
       } catch (error) {
         if (epoch !== trayEpoch) return;
         console.error('quota tray label refresh failed:', error);
@@ -181,6 +195,15 @@
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);
     const boundary = setTimeout(() => { trayRefreshGeneration += 1; }, next.getTime() - now.getTime());
     return () => { clearTimeout(boundary); if (trayTimer !== null) clearTimeout(trayTimer); };
+  });
+
+  $effect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void onLiveQuotaUpdated(() => { trayRefreshGeneration += 1; }).then((stop) => {
+      if (disposed) stop(); else unlisten = stop;
+    }).catch(() => {});
+    return () => { disposed = true; unlisten?.(); };
   });
 
   // ---------------------------------------------------------------------------
@@ -596,7 +619,7 @@
   {/if}
 
   <!-- Toolbar -->
-  <header class="flex items-center gap-5 px-4 h-12 bg-chrome border-b border-edge shrink-0">
+  <header class="flex items-center gap-5 px-4 h-12 bg-chrome border-b border-edge shrink-0 max-[1100px]:flex-wrap max-[1100px]:h-auto max-[1100px]:py-2 max-[1100px]:gap-y-2">
     <!-- Gauge-O wordmark. The ring/hub follow the text color; the needle is
          always brand orange (#e8935a). -->
     <span class="font-bold text-[15px] tracking-[-0.015em] leading-none text-ink whitespace-nowrap">
@@ -610,7 +633,7 @@
       {/if}
     </span>
 
-    <nav class="flex bg-app rounded-lg p-[2px] gap-[2px] border border-edge" aria-label="Views">
+    <nav class="flex shrink-0 max-w-full overflow-x-auto bg-app rounded-lg p-[2px] gap-[2px] border border-edge" aria-label="Views">
       {#each appViews(providersStore.descriptors) as view (view.id)}
         {#if view.id !== 'instructions' || ($config.instructions_enabled && $config.instructions_tab_visible)}
           <button class={tabClass(activeView === view.id, providerAccent(providerIdForTab(view.id)).tabFill)} onclick={() => (activeView = view.id)}>
@@ -621,8 +644,17 @@
     </nav>
 
     {#if activeScope}
-      <div class="ml-auto">
+      <div class="ml-auto flex items-center gap-1 max-[1100px]:basis-full max-[1100px]:justify-end">
         {#key activeScope}
+          <OrganizationToolbar scope={activeScope} filters={filtersByScope[activeScope] ?? defaultFilters()}
+            pinnedOnly={organizationFilters[activeScope]?.pinned ?? false}
+            selectedTags={organizationFilters[activeScope]?.tags ?? []}
+            scopes={['all', ...providersStore.descriptors.map(provider => provider.id)]}
+            onchange={(pinned, tags) => { if (activeScope) organizationFilters[activeScope] = { pinned, tags }; }}
+            onrestore={(scope, filters, pinned, tags) => {
+              filtersByScope[scope] = filters; organizationFilters[scope] = { pinned, tags };
+              activeView = scope === 'all' ? 'all' : tabIdForProvider(scope);
+            }} />
           <Filters
             filters={filtersByScope[activeScope] ?? defaultFilters()}
             sessions={toolbarSessions}
@@ -640,6 +672,8 @@
         harness="all"
         active={activeView === 'all'}
         filters={filtersByScope.all}
+        pinnedOnly={organizationFilters.all?.pinned ?? false}
+        organizationTags={organizationFilters.all?.tags ?? []}
         onfilterschange={(f) => (filtersByScope.all = f)}
       />
     </div>
@@ -649,6 +683,8 @@
           harness={descriptor.id}
           active={activeScope === descriptor.id}
           filters={filtersByScope[descriptor.id] ?? defaultFilters()}
+          pinnedOnly={organizationFilters[descriptor.id]?.pinned ?? false}
+          organizationTags={organizationFilters[descriptor.id]?.tags ?? []}
           onfilterschange={(f) => (filtersByScope[descriptor.id] = f)}
         />
       </div>

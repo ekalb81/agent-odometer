@@ -3,10 +3,11 @@ import { beforeEach, expect, it, vi } from 'vitest';
 import WorkflowIntelligence from './WorkflowIntelligence.svelte';
 import type { WorkflowReport, WorkflowWindow } from '../lib/types';
 import { rates } from '../lib/stores/rates';
+import { projectStore } from '../lib/stores/projects.svelte';
 
-const { getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression } = vi.hoisted(() => ({
-  getWorkflowReport: vi.fn(), recordWorkflowMeasurement: vi.fn(), setWorkflowFindingSuppression: vi.fn() }));
-vi.mock('../lib/ipc', () => ({ getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression }));
+const { getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression, resolveProjects } = vi.hoisted(() => ({
+  getWorkflowReport: vi.fn(), recordWorkflowMeasurement: vi.fn(), setWorkflowFindingSuppression: vi.fn(), resolveProjects: vi.fn() }));
+vi.mock('../lib/ipc', () => ({ getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression, resolveProjects }));
 
 function period(): WorkflowWindow {
   return {
@@ -33,7 +34,7 @@ async function open(): Promise<void> {
   details.open = true;
   await fireEvent(details, new Event('toggle'));
 }
-beforeEach(() => { vi.resetAllMocks(); rates.set(null); getWorkflowReport.mockResolvedValue(report()); });
+beforeEach(() => { vi.resetAllMocks(); rates.set(null); getWorkflowReport.mockResolvedValue(report()); resolveProjects.mockResolvedValue([]); });
 
 it('does not measure while closed, then shows zero and missing data distinctly', async () => {
   render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
@@ -111,4 +112,13 @@ it('labels the call scenario as hypothetical and does not turn it into cost or q
   await open();
   expect(await screen.findByText(/20 observed calls × 10% = 2 hypothetical calls avoided/)).toBeTruthy();
   expect(screen.getByText(/Token, cost, quality and delivery effects are unknown/)).toBeTruthy();
+});
+
+it('refreshes an open report when project scope is re-resolved', async () => {
+  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  await open();
+  await screen.findByText(/3 selected sessions/);
+  expect(getWorkflowReport).toHaveBeenCalledTimes(1);
+  await projectStore.refresh();
+  await waitFor(() => expect(getWorkflowReport).toHaveBeenCalledTimes(2));
 });

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression } from '../lib/ipc';
   import { rates } from '../lib/stores/rates';
+  import { projectStore } from '../lib/stores/projects.svelte';
   import { findingRuleTitle } from '../lib/optimization';
   import type { WorkflowFinding, WorkflowMetric, WorkflowReport } from '../lib/types';
 
@@ -76,6 +77,7 @@
   $effect(() => {
     const token = ++generation;
     if (!active || !opened) return;
+    void projectStore.revision;
     const ids: string[] = JSON.parse(selectionKey);
     const days = Number(period);
     void refresh;
@@ -147,7 +149,7 @@
         <summary class="cursor-pointer text-ink">Project, model and task category evidence</summary>
         <p class="mt-2 text-ink-muted">Current period counts. Project and model calls come from the ledger; categories count turns with the existing classifier. These dimensions have different denominators.</p>
         <ul class="mt-2 text-ink-muted">{#each report.after.drilldowns as row (`${row.dimension}:${row.value}`)}
-          <li>{row.dimension}: {row.value} · {row.sessions} sessions · {row.tool_calls} calls · {row.classified_turns} classified turns</li>
+          <li>{row.dimension}: {row.value}{#if row.dimension === 'project'} · {row.sessions} sessions · {row.tool_calls} calls{:else if row.dimension === 'model'} · {row.tool_calls} calls{:else} · {row.classified_turns} classified turns{/if}</li>
         {/each}</ul>
       </details>
       <div class="rounded-sm border border-edge p-2 text-ink-muted">
