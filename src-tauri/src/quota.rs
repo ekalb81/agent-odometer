@@ -1,25 +1,11 @@
 //! Provider-agnostic live quota windows, pace/forecast math, and soft-budget
 //! alerting (issue #43).
 //!
-//! ## Scope and the network seam
+//! ## Sources
 //!
-//! `AGENTS.md` forbids adding outbound network access, an HTTP client, or a
-//! new Tauri capability without an explicit requirement and a security
-//! review; that review has not happened. This module is therefore built
-//! entirely from data Odometer already has locally: each provider's
-//! transcript-reported `rate_limits_history` / `plan_type` / `credits_*`
-//! fields (see `crate::model::Session`). `QuotaProvenance::TranscriptDerived`
-//! is the only provenance any snapshot carries today.
-//!
-//! `QuotaProvenance::LiveProvider` exists in the type now so a future,
-//! reviewed live-polling source can slot in without changing every
-//! consumer's shape: it would construct a `QuotaSnapshot` the same way this
-//! module does, just from a network response instead of `Session` history,
-//! and set that variant plus the reserved `ProviderOutage` / `AuthExpired` /
-//! `RateLimited` / `Offline` unavailable reasons this module never produces
-//! itself (see the honesty tests at the bottom of this file, which construct
-//! those states synthetically to prove the *type* never collapses them to
-//! zero usage — the actual polling implementation is out of scope here).
+//! Transcript observations remain unattributed local evidence. The separately
+//! consented installed-CLI source in `quota_accounts` supplies account-scoped
+//! live snapshots through the same window builder; it never changes the ledger.
 //!
 //! ## Honesty contract
 //!
@@ -152,13 +138,12 @@ pub enum QuotaUnit {
 
 /// Where a `QuotaSnapshot`'s numbers came from. Never coerced together: a
 /// dashboard/tray surface must always be able to tell a transcript-derived
-/// reading from a (currently unimplemented) live one.
+/// reading from a consented live one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuotaProvenance {
     TranscriptDerived,
-    /// Reserved for a future, reviewed live-polling source. Nothing in this
-    /// build produces this value; see the module doc's network-seam note.
+    /// Consented account-scoped external reading, never a ledger fact.
     LiveProvider,
 }
 
@@ -464,7 +449,7 @@ fn build_percent_window(
     }
 
     let age = now.signed_duration_since(latest_ts);
-    window.stale = age > max_cache_age;
+    window.stale = age > max_cache_age || window.resets_at.is_some_and(|reset| reset <= now);
     if window.stale {
         window.confidence = downgrade(window.confidence, QuotaConfidence::Low);
     }
@@ -529,6 +514,8 @@ fn build_credit_window(
     };
 
     if observed_at > now {
+        window.remaining = None;
+        window.unlimited = false;
         window.unavailable = Some(QuotaUnavailableReason::ClockSkew);
         window.confidence = QuotaConfidence::Low;
         return Some(window);
@@ -540,6 +527,51 @@ fn build_credit_window(
         window.confidence = downgrade(window.confidence, QuotaConfidence::Low);
     }
     Some(window)
+}
+
+/// Converts one independently identified live limit bucket. A single reading
+/// cannot establish a forecast or an observed previous reset.
+pub fn live_bucket_snapshot(
+    bucket: &crate::quota_live::LiveQuotaBucket,
+    observed_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> QuotaSnapshot {
+    let mut windows = Vec::new();
+    for value in [&bucket.primary, &bucket.secondary].into_iter().flatten() {
+        let series = [WindowObservation {
+            timestamp: observed_at,
+            run_started_at: observed_at,
+            observation_count: 1,
+            window: RateLimitWindow {
+                used_percent: value.used_percent,
+                window_minutes: value.window_minutes,
+                resets_at: value.resets_at,
+            },
+        }];
+        if let Some(mut window) = build_percent_window(&series, now, Duration::minutes(10)) {
+            window.window_started_at = None;
+            window.window_started_at_estimated = false;
+            windows.push(window);
+        }
+    }
+    if let Some(credits) = &bucket.credits {
+        let account = QuotaAccountInfo {
+            credits_unlimited: Some(credits.unlimited),
+            credits_balance: credits.balance,
+            observed_at: Some(observed_at),
+        };
+        if let Some(window) = build_credit_window(&account, now, Duration::minutes(10)) {
+            windows.push(window);
+        }
+    }
+    QuotaSnapshot {
+        provider: crate::provider::codex_provider_id(),
+        provenance: QuotaProvenance::LiveProvider,
+        unavailable: windows
+            .is_empty()
+            .then_some(QuotaUnavailableReason::NoObservation),
+        windows,
+    }
 }
 
 /// Builds one provider's quota snapshot from transcript-derived evidence.
@@ -1189,6 +1221,21 @@ pub struct BudgetEvaluation<'a> {
     pub current_value: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct QuotaBudgetStatus {
+    pub budget_id: String,
+    pub current_value: Option<f64>,
+    /// Fixed diagnostic code, never a provider response or local path.
+    pub unavailable: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuotaBudgetCheck {
+    pub as_of: DateTime<Utc>,
+    pub statuses: Vec<QuotaBudgetStatus>,
+    pub alerts: Vec<QuotaAlert>,
+}
+
 fn in_quiet_hours(range: Option<(u8, u8)>, local_hour: u8) -> bool {
     let Some((start, end)) = range else {
         return false;
@@ -1222,6 +1269,10 @@ fn alert_message(budget: &QuotaBudget, value: f64) -> String {
             value,
             budget.period_hours.unwrap_or(24),
             budget.threshold
+        ),
+        BudgetUnit::Usd => format!(
+            "{} recorded an API base estimate of ${:.2} against a {}-hour soft budget of ${:.2}; this is not a bill.",
+            budget.provider, value, budget.period_hours.unwrap_or(24), budget.threshold
         ),
     }
 }
@@ -1688,6 +1739,39 @@ mod tests {
     }
 
     #[test]
+    fn live_quota_clock_skew_and_resume_never_create_current_allowance() {
+        let observed: DateTime<Utc> = "2026-01-01T01:00:00Z".parse().unwrap();
+        let bucket = crate::quota_live::LiveQuotaBucket {
+            limit_id: "synthetic".into(),
+            limit_name: None,
+            spend_control_reached: None,
+            primary: Some(crate::quota_live::LiveQuotaWindow {
+                used_percent: 70.0,
+                window_minutes: Some(300),
+                resets_at: Some(observed + Duration::minutes(5)),
+            }),
+            secondary: None,
+            credits: Some(crate::quota_live::LiveQuotaCredits {
+                has_credits: true,
+                unlimited: false,
+                balance: Some(12.0),
+            }),
+        };
+        let skew = live_bucket_snapshot(&bucket, observed, observed - Duration::seconds(1));
+        assert!(skew.windows.iter().all(|window| window.unavailable
+            == Some(QuotaUnavailableReason::ClockSkew)
+            && window.used.is_none()
+            && window.remaining.is_none()));
+        let after_reset = live_bucket_snapshot(&bucket, observed, observed + Duration::minutes(6));
+        assert!(after_reset.windows[0].stale);
+        assert_eq!(after_reset.windows[0].used, Some(70.0));
+        assert!(after_reset.windows[0].forecast.is_none());
+        assert!(after_reset.windows[0].window_started_at.is_none());
+        let after_sleep = live_bucket_snapshot(&bucket, observed, observed + Duration::hours(2));
+        assert!(after_sleep.windows.iter().all(|window| window.stale));
+    }
+
+    #[test]
     fn projected_exhaustion_is_never_reported_past_the_windows_own_reset() {
         // Pace is slow enough that exhaustion would land after the window
         // resets; the window resets "for free" first, so no projection.
@@ -1698,7 +1782,7 @@ mod tests {
             10.0,
             0.5,
             300,
-            "2026-01-01T00:30:00Z", // resets very soon
+            "2026-01-01T01:30:00Z", // resets after the last observation, before projected exhaustion
         );
         let now = points.last().unwrap().timestamp;
         let snapshot = build_quota_snapshot(

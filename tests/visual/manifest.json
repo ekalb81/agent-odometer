@@ -38,6 +38,8 @@
     "defender-error",
     "updater-available",
     "updater-installing",
-    "updater-error"
+    "updater-error",
+    "quota-budget-editor-narrow",
+    "quota-live-off-and-lookup-error"
   ]
 }

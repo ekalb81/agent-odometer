@@ -13,6 +13,7 @@ import type {
   ProviderDiagnostic,
   ProjectInfo,
   QuotaAlert,
+  QuotaBudgetCheck,
   QuotaConfigWire,
   QuotaSnapshot,
   RangeTotals,
@@ -103,6 +104,7 @@ function quotaSnapshots(): QuotaSnapshot[] {
 }
 
 let quotaConfigMock: QuotaConfigWire = {
+  revision: 'dev-mock-revision-1',
   budgets: [],
   notifications: { enabled: false, quiet_hours: null },
   max_cache_age_secs: 21_600,
@@ -110,6 +112,18 @@ let quotaConfigMock: QuotaConfigWire = {
 
 function checkQuotaAlerts(): QuotaAlert[] {
   return [];
+}
+
+function checkQuotaBudgets(): QuotaBudgetCheck {
+  return {
+    as_of: new Date(now).toISOString(),
+    statuses: quotaConfigMock.budgets.map((budget) => ({
+      budget_id: budget.id,
+      current_value: null,
+      unavailable: budget.enabled ? 'no_observation' : 'disabled',
+    })),
+    alerts: [],
+  };
 }
 
 function subscriptionUsage(): SubscriptionUsageEntry[] {
@@ -485,6 +499,14 @@ mockIPC((cmd, payload) => {
       return quotaConfigMock;
     case 'check_quota_alerts':
       return checkQuotaAlerts();
+    case 'check_quota_budgets':
+      return checkQuotaBudgets();
+    case 'get_live_quota_status':
+      return { accounts: [], busy: false, configuration_error: null };
+    case 'identify_quota_account':
+    case 'approve_quota_account':
+    case 'change_quota_account':
+      throw new Error('Live account consent is unavailable in browser mock mode.');
     case 'resolve_working_directories':
       // Matches the fixture sessions' working directory, so the grid renders
       // the resolved repository rather than its unresolved path fallback.

@@ -1,0 +1,531 @@
+//! Consent and scheduling for the installed CLI's current account. No credentials,
+//! response bodies, or readings are persisted. Transcript history stays unattributed.
+use crate::quota_live::{self, DiscoveredQuotaAccount, LiveQuotaError, LiveQuotaReading};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tauri::Emitter;
+
+const POLL_INTERVAL: Duration = Duration::from_secs(300);
+const MAX_BACKOFF: Duration = Duration::from_secs(3600);
+const CANDIDATE_TTL: Duration = Duration::from_secs(300);
+const MAX_ACCOUNTS: usize = 8;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QuotaAccountConsent {
+    pub account_id: String,
+    pub label: String,
+    pub consented_at: DateTime<Utc>,
+    pub enabled: bool,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ConsentFile {
+    #[serde(default = "version")]
+    version: u32,
+    #[serde(default)]
+    accounts: Vec<QuotaAccountConsent>,
+}
+fn version() -> u32 {
+    1
+}
+
+#[derive(Clone, Serialize)]
+pub struct LiveQuotaAccountView {
+    pub provider: &'static str,
+    pub consent: QuotaAccountConsent,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub ordinary_usage_allowed: Option<bool>,
+    pub buckets: Vec<LiveQuotaBucketView>,
+    pub unavailable: Option<&'static str>,
+}
+#[derive(Clone, Serialize)]
+pub struct LiveQuotaBucketView {
+    pub limit_id: String,
+    pub limit_name: Option<String>,
+    pub spend_control_reached: Option<bool>,
+    pub snapshot: crate::quota::QuotaSnapshot,
+}
+#[derive(Serialize)]
+pub struct LiveQuotaStatus {
+    pub accounts: Vec<LiveQuotaAccountView>,
+    pub busy: bool,
+    pub configuration_error: Option<&'static str>,
+}
+
+struct Runtime {
+    loaded: bool,
+    file: ConsentFile,
+    configuration_error: Option<&'static str>,
+    candidate: Option<(DiscoveredQuotaAccount, Instant)>,
+    generation: u64,
+    busy: bool,
+    next_poll: Instant,
+    backoff: Duration,
+    reading: Option<LiveQuotaReading>,
+    error: Option<LiveQuotaError>,
+}
+impl Default for Runtime {
+    fn default() -> Self {
+        Self {
+            loaded: false,
+            file: ConsentFile {
+                version: 1,
+                accounts: vec![],
+            },
+            configuration_error: None,
+            candidate: None,
+            generation: 0,
+            busy: false,
+            next_poll: Instant::now(),
+            backoff: POLL_INTERVAL,
+            reading: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct LiveQuotaService {
+    runtime: Mutex<Runtime>,
+}
+
+fn consent_path() -> Result<PathBuf, &'static str> {
+    dirs::config_dir()
+        .map(|dir| dir.join("agent-odometer").join("quota-live-v1.json"))
+        .ok_or("Live quota settings location is unavailable.")
+}
+fn validate_file(file: &ConsentFile) -> Result<(), &'static str> {
+    if file.version != 1
+        || file.accounts.len() > MAX_ACCOUNTS
+        || file.accounts.iter().filter(|a| a.enabled).count() > 1
+    {
+        return Err("Live quota settings are unsupported; existing file preserved.");
+    }
+    let mut seen = std::collections::HashSet::new();
+    for account in &file.accounts {
+        if account.account_id.is_empty()
+            || account.account_id.len() > 256
+            || account.account_id.chars().any(char::is_control)
+            || account.label.trim().is_empty()
+            || account.label.len() > 80
+            || account.label.chars().any(char::is_control)
+            || !seen.insert(&account.account_id)
+        {
+            return Err("Live quota settings are invalid; existing file preserved.");
+        }
+    }
+    Ok(())
+}
+fn read_file(path: &Path) -> Result<ConsentFile, &'static str> {
+    use std::io::Read;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ConsentFile {
+                version: 1,
+                accounts: vec![],
+            })
+        }
+        Err(_) => return Err("Live quota settings are unreadable; polling is off."),
+    };
+    let mut bytes = Vec::new();
+    file.take(32_769)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "Live quota settings are unreadable; polling is off.")?;
+    if bytes.len() > 32_768 {
+        return Err("Live quota settings are too large; polling is off.");
+    }
+    let file: ConsentFile = serde_json::from_slice(&bytes)
+        .map_err(|_| "Live quota settings are invalid; polling is off.")?;
+    validate_file(&file)?;
+    Ok(file)
+}
+fn save_file(file: &ConsentFile) -> Result<(), &'static str> {
+    validate_file(file)?;
+    let path = consent_path()?;
+    let parent = path
+        .parent()
+        .ok_or("Live quota settings location is unavailable.")?;
+    std::fs::create_dir_all(parent).map_err(|_| "Live quota settings could not be saved.")?;
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(file).map_err(|_| "Live quota settings could not be saved.")?;
+    std::fs::write(&temporary, bytes)
+        .and_then(|()| std::fs::rename(&temporary, &path))
+        .map_err(|_| "Live quota settings could not be saved.")
+}
+
+impl Runtime {
+    fn load(&mut self) {
+        if self.loaded {
+            return;
+        }
+        self.loaded = true;
+        match consent_path().and_then(|path| read_file(&path)) {
+            Ok(file) => self.file = file,
+            Err(error) => self.configuration_error = Some(error),
+        }
+    }
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.reading = None;
+        self.error = None;
+        self.candidate = None;
+        self.next_poll = Instant::now();
+        self.backoff = POLL_INTERVAL;
+    }
+    fn finish_read(
+        &mut self,
+        generation: u64,
+        result: Result<LiveQuotaReading, LiveQuotaError>,
+        now: Instant,
+    ) {
+        self.busy = false;
+        if generation != self.generation {
+            return;
+        }
+        match result {
+            Ok(reading) => {
+                self.reading = Some(reading);
+                self.error = None;
+                self.backoff = POLL_INTERVAL;
+            }
+            Err(error) => {
+                self.reading = None;
+                self.error = Some(error);
+                self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+            }
+        }
+        self.next_poll = now + self.backoff;
+    }
+}
+
+impl LiveQuotaService {
+    /// Starts a desktop-only timer. With default/no consent this never launches a CLI.
+    pub fn start(service: &Arc<Self>, app: tauri::AppHandle) {
+        let weak = Arc::downgrade(service);
+        std::thread::spawn(move || {
+            while let Some(service) = weak.upgrade() {
+                if service.poll() {
+                    let _ = app.emit("live-quota-updated", ());
+                }
+                drop(service);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+    }
+
+    /// Explicit user action authorizes one identity lookup, not periodic polling.
+    pub fn identify(&self) -> Result<DiscoveredQuotaAccount, &'static str> {
+        let generation = {
+            let mut runtime = self.runtime.lock().unwrap();
+            runtime.load();
+            if let Some(error) = runtime.configuration_error {
+                return Err(error);
+            }
+            if runtime.busy {
+                return Err("A quota request is already running.");
+            }
+            runtime.busy = true;
+            runtime.candidate = None;
+            runtime.generation
+        };
+        let result = codex_executable().and_then(|path| quota_live::discover_codex_account(&path));
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.busy = false;
+        if runtime.generation != generation {
+            return Err("Quota consent changed during this request.");
+        }
+        match result {
+            Ok(account) => {
+                runtime.candidate = Some((account.clone(), Instant::now()));
+                Ok(account)
+            }
+            Err(error) => Err(error.code()),
+        }
+    }
+
+    /// Persist only a recently discovered identity plus a local display label.
+    pub fn approve(&self, account_id: &str, label: &str) -> Result<(), &'static str> {
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.load();
+        if let Some(error) = runtime.configuration_error {
+            return Err(error);
+        }
+        let valid = runtime.candidate.as_ref().is_some_and(|(candidate, at)| {
+            candidate.account_id == account_id && at.elapsed() <= CANDIDATE_TTL
+        });
+        if !valid {
+            return Err("Identify this account again before approving polling.");
+        }
+        let mut accounts = runtime.file.accounts.clone();
+        accounts.retain(|account| account.account_id != account_id);
+        for account in &mut accounts {
+            account.enabled = false;
+        }
+        accounts.push(QuotaAccountConsent {
+            account_id: account_id.into(),
+            label: label.trim().into(),
+            consented_at: Utc::now(),
+            enabled: true,
+        });
+        let file = ConsentFile {
+            version: 1,
+            accounts,
+        };
+        save_file(&file)?;
+        runtime.file = file;
+        runtime.invalidate();
+        Ok(())
+    }
+
+    /// Enable/disable is account-scoped. Revocation removes consent altogether.
+    /// One installed CLI has one current account, so enabling one pauses the others.
+    pub fn change(
+        &self,
+        account_id: &str,
+        enabled: bool,
+        revoke: bool,
+    ) -> Result<(), &'static str> {
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.load();
+        if let Some(error) = runtime.configuration_error {
+            return Err(error);
+        }
+        if !runtime
+            .file
+            .accounts
+            .iter()
+            .any(|account| account.account_id == account_id)
+        {
+            return Err("Account consent was not found.");
+        }
+        let mut accounts = runtime.file.accounts.clone();
+        for account in &mut accounts {
+            if account.account_id == account_id {
+                account.enabled = enabled && !revoke;
+            } else if enabled {
+                account.enabled = false;
+            }
+        }
+        if revoke {
+            accounts.retain(|account| account.account_id != account_id);
+        }
+        let file = ConsentFile {
+            version: 1,
+            accounts,
+        };
+        // Disable in memory even if persistence fails; surface the failure and
+        // retain the previous disk file, never claim durable revocation succeeded.
+        runtime.invalidate();
+        runtime
+            .file
+            .accounts
+            .iter_mut()
+            .for_each(|account| account.enabled = false);
+        save_file(&file)?;
+        runtime.file = file;
+        Ok(())
+    }
+
+    pub fn poll(&self) -> bool {
+        let (generation, account_id) = {
+            let mut runtime = self.runtime.lock().unwrap();
+            runtime.load();
+            if runtime.configuration_error.is_some()
+                || runtime.busy
+                || Instant::now() < runtime.next_poll
+            {
+                return false;
+            }
+            let Some(account) = runtime.file.accounts.iter().find(|account| account.enabled) else {
+                return false;
+            };
+            let account_id = account.account_id.clone();
+            runtime.busy = true;
+            (runtime.generation, account_id)
+        };
+        let result =
+            codex_executable().and_then(|path| quota_live::read_codex_quota(&path, &account_id));
+        self.runtime
+            .lock()
+            .unwrap()
+            .finish_read(generation, result, Instant::now());
+        true
+    }
+
+    pub fn status(&self, now: DateTime<Utc>) -> LiveQuotaStatus {
+        let mut runtime = self.runtime.lock().unwrap();
+        runtime.load();
+        let accounts = runtime
+            .file
+            .accounts
+            .iter()
+            .map(|consent| {
+                let reading = runtime
+                    .reading
+                    .as_ref()
+                    .filter(|reading| consent.enabled && reading.account_id == consent.account_id);
+                let buckets = reading
+                    .map(|reading| {
+                        reading
+                            .limit_buckets
+                            .iter()
+                            .map(|bucket| LiveQuotaBucketView {
+                                limit_id: bucket.limit_id.clone(),
+                                limit_name: bucket.limit_name.clone(),
+                                spend_control_reached: bucket.spend_control_reached,
+                                snapshot: crate::quota::live_bucket_snapshot(
+                                    bucket,
+                                    reading.observed_at,
+                                    now,
+                                ),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let unavailable = if !consent.enabled {
+                    Some("disabled")
+                } else if let Some(error) = runtime.error {
+                    Some(error.code())
+                } else if reading.is_none_or(|reading| reading.limit_buckets.is_empty()) {
+                    Some("no_observation")
+                } else if reading.is_some_and(|reading| reading.observed_at > now) {
+                    Some("clock_skew")
+                } else if reading.is_some_and(|reading| {
+                    now.signed_duration_since(reading.observed_at) > chrono::Duration::minutes(10)
+                }) {
+                    Some("stale_observation")
+                } else {
+                    None
+                };
+                LiveQuotaAccountView {
+                    provider: "codex",
+                    consent: consent.clone(),
+                    observed_at: reading.map(|r| r.observed_at),
+                    ordinary_usage_allowed: reading
+                        .filter(|_| unavailable.is_none())
+                        .and_then(|r| r.ordinary_usage_allowed),
+                    buckets,
+                    unavailable,
+                }
+            })
+            .collect();
+        LiveQuotaStatus {
+            accounts,
+            busy: runtime.busy,
+            configuration_error: runtime.configuration_error,
+        }
+    }
+}
+
+fn codex_executable() -> Result<PathBuf, LiveQuotaError> {
+    // Native executable only: no shell shim, command string, or credential-file discovery.
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+        .ok_or(LiveQuotaError::Offline)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn account_permission_expires_with_the_reading_and_rejects_clock_skew() {
+        let observed_at = Utc::now();
+        let service = LiveQuotaService {
+            runtime: Mutex::new(Runtime {
+                loaded: true,
+                file: ConsentFile {
+                    version: 1,
+                    accounts: vec![QuotaAccountConsent {
+                        account_id: "synthetic-account".into(),
+                        label: "Test".into(),
+                        consented_at: observed_at,
+                        enabled: true,
+                    }],
+                },
+                reading: Some(LiveQuotaReading {
+                    account_id: "synthetic-account".into(),
+                    ordinary_usage_allowed: Some(false),
+                    observed_at,
+                    limit_buckets: vec![crate::quota_live::LiveQuotaBucket {
+                        limit_id: "codex".into(),
+                        limit_name: None,
+                        spend_control_reached: Some(true),
+                        primary: Some(crate::quota_live::LiveQuotaWindow {
+                            used_percent: 80.0,
+                            window_minutes: Some(300),
+                            resets_at: None,
+                        }),
+                        secondary: None,
+                        credits: None,
+                    }],
+                }),
+                ..Default::default()
+            }),
+        };
+        let current = service.status(observed_at + chrono::Duration::minutes(5));
+        assert_eq!(current.accounts[0].ordinary_usage_allowed, Some(false));
+        assert_eq!(current.accounts[0].unavailable, None);
+
+        let stale = service.status(observed_at + chrono::Duration::minutes(11));
+        assert_eq!(stale.accounts[0].ordinary_usage_allowed, None);
+        assert_eq!(stale.accounts[0].unavailable, Some("stale_observation"));
+        assert!(stale.accounts[0].buckets[0].snapshot.windows[0].stale);
+
+        let skewed = service.status(observed_at - chrono::Duration::seconds(1));
+        assert_eq!(skewed.accounts[0].ordinary_usage_allowed, None);
+        assert_eq!(skewed.accounts[0].unavailable, Some("clock_skew"));
+        assert!(skewed.accounts[0].buckets[0].snapshot.windows[0]
+            .unavailable
+            .is_some());
+    }
+    #[test]
+    fn consent_file_fails_closed_and_does_not_create_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        assert!(read_file(&path).unwrap().accounts.is_empty());
+        assert!(!path.exists());
+        std::fs::write(&path, br#"{"version":99,"accounts":[]}"#).unwrap();
+        assert!(read_file(&path).is_err());
+        std::fs::write(&path, vec![b'x'; 32769]).unwrap();
+        assert!(read_file(&path).is_err());
+    }
+    #[test]
+    fn revoked_inflight_results_are_discarded_and_errors_back_off() {
+        let mut runtime = Runtime {
+            busy: true,
+            ..Default::default()
+        };
+        let old_generation = runtime.generation;
+        runtime.invalidate();
+        runtime.finish_read(
+            old_generation,
+            Ok(LiveQuotaReading {
+                account_id: "old".into(),
+                ordinary_usage_allowed: None,
+                observed_at: Utc::now(),
+                limit_buckets: vec![],
+            }),
+            Instant::now(),
+        );
+        assert!(runtime.reading.is_none());
+        assert!(!runtime.busy);
+        let now = Instant::now();
+        for _ in 0..20 {
+            runtime.finish_read(runtime.generation, Err(LiveQuotaError::RateLimited), now);
+        }
+        assert_eq!(runtime.backoff, MAX_BACKOFF);
+        assert_eq!(runtime.next_poll, now + MAX_BACKOFF);
+        assert_eq!(runtime.error, Some(LiveQuotaError::RateLimited));
+    }
+}

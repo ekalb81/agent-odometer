@@ -30,6 +30,8 @@ pub mod query_control;
 mod query_desktop;
 mod query_reports;
 pub mod quota;
+pub mod quota_accounts;
+pub mod quota_live;
 pub mod quota_store;
 pub mod rates;
 pub mod report_cli;
@@ -49,19 +51,20 @@ pub mod verify;
 pub mod watcher;
 
 use commands::{
-    add_defender_exclusions, cancel_history_rebuild, cancel_instruction_scan, check_quota_alerts,
+    add_defender_exclusions, approve_quota_account, cancel_history_rebuild,
+    cancel_instruction_scan, change_quota_account, check_quota_alerts, check_quota_budgets,
     clear_session_project_override, compare_tool_impact, correlate_events, export_performance_data,
     get_bundled_rates, get_config, get_history_rebuild_status, get_history_status,
-    get_performance_live_status, get_performance_status, get_provider_diagnostics,
-    get_quota_config, get_quota_snapshots, get_rates, get_scan_status, get_session_details,
-    get_session_pricing, get_speed_report, get_subscription_usage, get_transcript_page,
-    get_turn_receipt_status, list_external_events, list_instruction_files, list_providers,
-    list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
-    open_task_in_chatgpt, read_instruction_file, reassign_session_project, rebuild_history,
-    record_frontend_performance, repair_turn_receipt_integrations, resolve_projects,
-    resolve_working_directories, reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges,
-    set_config, set_project_alias, set_quota_config, set_rates, set_tray_totals, unmerge_project,
-    write_export,
+    get_live_quota_status, get_performance_live_status, get_performance_status,
+    get_provider_diagnostics, get_quota_config, get_quota_snapshots, get_rates, get_scan_status,
+    get_session_details, get_session_pricing, get_speed_report, get_subscription_usage,
+    get_transcript_page, get_turn_receipt_status, identify_quota_account, list_external_events,
+    list_instruction_files, list_providers, list_sessions, list_tool_impact_targets,
+    merge_projects, open_instruction_file, open_task_in_chatgpt, read_instruction_file,
+    reassign_session_project, rebuild_history, record_frontend_performance,
+    repair_turn_receipt_integrations, resolve_projects, resolve_working_directories,
+    reveal_in_file_manager, scan_git_outcomes, sessions_in_ranges, set_config, set_project_alias,
+    set_quota_config, set_rates, set_tray_totals, unmerge_project, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -149,6 +152,11 @@ pub fn run() {
             get_quota_config,
             set_quota_config,
             check_quota_alerts,
+            check_quota_budgets,
+            get_live_quota_status,
+            identify_quota_account,
+            approve_quota_account,
+            change_quota_account,
             get_history_status,
             rebuild_history,
             cancel_history_rebuild,
@@ -156,6 +164,10 @@ pub fn run() {
         ])
         .setup(move |app| {
             let setup_started = Instant::now();
+            quota_accounts::LiveQuotaService::start(
+                &state_for_setup.live_quota,
+                app.handle().clone(),
+            );
             let config_started = Instant::now();
             let config_result = Config::load();
             let config_loaded = config_result.is_ok();

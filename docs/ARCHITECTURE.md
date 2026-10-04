@@ -439,3 +439,7 @@ For a new backend field, update the Rust model/parser, add parser coverage, upda
 For a new command, implement it in `commands.rs`, register it in `lib.rs`, add a typed wrapper in `ipc.ts`, and expand capabilities only when the API actually requires it.
 
 For watcher changes, test initial files, incremental appends, partial trailing lines, removal, archive roots, session-index updates, and config-triggered restart separately.
+
+### Account-scoped live quota and soft budgets (#43)
+
+`quota_accounts.rs` owns consent metadata and the desktop polling timer; `quota_live.rs` owns bounded Codex app-server stdio reads. `quota.rs` converts both live buckets and transcript evidence through the shared window service. Live account views never overwrite transcript observations or durable usage. The payload-free `live-quota-updated` event invalidates the tray, and the dashboard reads the same in-memory service. Monetary/token budget values and alert crossings share `check_quota_budgets` and the ledger range/pricing authority. See [QUOTAS.md](QUOTAS.md) for consent, persistence, unsupported-source, and verification boundaries.

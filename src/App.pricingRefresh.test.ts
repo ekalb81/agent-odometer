@@ -1,3 +1,4 @@
+vi.mock('./lib/liveQuota', () => ({ getLiveQuotaStatus: async () => ({ accounts: [], busy: false, configuration_error: null }), liveQuotaTrayLabel: () => null, onLiveQuotaUpdated: async () => () => {} }));
 import { cleanup, render } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
