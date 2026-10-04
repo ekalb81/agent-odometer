@@ -94,7 +94,7 @@ pub struct PricingProvenance {
 
 /// An effective-dated base rate. `to: None` denotes an open-ended interval;
 /// otherwise periods use the half-open interval `[from, to)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectiveRatePeriod {
     /// Stable catalog identity used to reconcile rate rules across updates.
     /// Missing IDs deserialize for old user overrides but do not validate.
@@ -131,7 +131,7 @@ pub struct RateMultipliers {
 /// An effective-dated conditional pricing rule.  Cache-write token categories
 /// are deliberately not represented by `RateMultipliers`: parsers currently
 /// retain cache reads but do not distinguish cache writes from uncached input.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConditionalRateModifier {
     /// Stable catalog identity used to reconcile conditional rules across updates.
     /// Missing IDs deserialize for old user overrides but do not validate.
@@ -932,6 +932,9 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     // an explicit user choice; don't shadow it with a bundled floating one.
     let mut floating_defaults = bundled.floating_model_aliases.clone();
     for (raw_id, target) in &disk.model_aliases {
+        if !floating_defaults.contains_key(raw_id) {
+            continue;
+        }
         if disk.version < 11
             && bundled
                 .floating_model_aliases
@@ -1071,7 +1074,12 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
                 .push(format!("pricing_catalog/{}", period.id));
         }
     }
-    disk.pricing_catalog = merge_older_catalog(disk.pricing_catalog, bundled.pricing_catalog);
+    disk.pricing_catalog = merge_older_catalog(
+        disk.pricing_catalog,
+        bundled.pricing_catalog,
+        previous.as_ref().map(|card| &card.pricing_catalog),
+        &mut disk.upgrade_review,
+    );
     disk.version = bundled.version;
     disk.source_url = bundled.source_url;
     if disk.upgrade_review.is_empty() {
@@ -1126,7 +1134,12 @@ fn merge_default_entries<T: Clone + PartialEq>(
     }
 }
 
-fn merge_older_catalog(mut disk: PricingCatalog, bundled: PricingCatalog) -> PricingCatalog {
+fn merge_older_catalog(
+    mut disk: PricingCatalog,
+    bundled: PricingCatalog,
+    previous: Option<&PricingCatalog>,
+    review: &mut Vec<String>,
+) -> PricingCatalog {
     for bundled_period in bundled.rate_periods {
         // A separately identified custom rule keeps its interval. Adding an
         // overlapping default would invalidate the whole saved card and lose
@@ -1149,7 +1162,17 @@ fn merge_older_catalog(mut disk: PricingCatalog, bundled: PricingCatalog) -> Pri
             .iter_mut()
             .find(|period| period.id == bundled_period.id)
         {
-            Some(existing) => *existing = bundled_period,
+            Some(existing)
+                if previous.and_then(|catalog| {
+                    catalog
+                        .rate_periods
+                        .iter()
+                        .find(|period| period.id == existing.id)
+                }) == Some(existing) =>
+            {
+                *existing = bundled_period
+            }
+            Some(existing) => review.push(format!("pricing_catalog/{}", existing.id)),
             None => disk.rate_periods.push(bundled_period),
         }
     }
@@ -1173,7 +1196,17 @@ fn merge_older_catalog(mut disk: PricingCatalog, bundled: PricingCatalog) -> Pri
             .iter_mut()
             .find(|modifier| modifier.id == bundled_modifier.id)
         {
-            Some(existing) => *existing = bundled_modifier,
+            Some(existing)
+                if previous.and_then(|catalog| {
+                    catalog
+                        .conditional_modifiers
+                        .iter()
+                        .find(|modifier| modifier.id == existing.id)
+                }) == Some(existing) =>
+            {
+                *existing = bundled_modifier
+            }
+            Some(existing) => review.push(format!("pricing_catalog/{}", existing.id)),
             None => disk.conditional_modifiers.push(bundled_modifier),
         }
     }
@@ -1271,6 +1304,51 @@ mod tests {
             serde_json::to_value(merged).unwrap(),
             serde_json::to_value(repeated).unwrap()
         );
+    }
+
+    #[test]
+    fn pristine_version_eleven_needs_no_review_but_same_id_catalog_edits_survive() {
+        let bundled = RateCard::load_bundled().unwrap();
+        let pristine: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v11.json")).unwrap();
+        let clean = merge_older_override(pristine.clone(), bundled.clone());
+        assert!(
+            clean.upgrade_review.is_empty(),
+            "{:?}",
+            clean.upgrade_review
+        );
+        assert_eq!(clean.fetched_at, bundled.fetched_at);
+        let mut edited = pristine;
+        edited.pricing_catalog.rate_periods[0].rate.input = 77.0;
+        let period = edited.pricing_catalog.rate_periods[0].clone();
+        edited.pricing_catalog.conditional_modifiers[0]
+            .multipliers
+            .input = 9.0;
+        let modifier = edited.pricing_catalog.conditional_modifiers[0].clone();
+        let merged = merge_older_override(edited, bundled);
+        merged.pricing_catalog.validate().unwrap();
+        assert_eq!(
+            merged
+                .pricing_catalog
+                .rate_periods
+                .iter()
+                .find(|p| p.id == period.id),
+            Some(&period)
+        );
+        assert_eq!(
+            merged
+                .pricing_catalog
+                .conditional_modifiers
+                .iter()
+                .find(|m| m.id == modifier.id),
+            Some(&modifier)
+        );
+        assert!(merged
+            .upgrade_review
+            .contains(&format!("pricing_catalog/{}", period.id)));
+        assert!(merged
+            .upgrade_review
+            .contains(&format!("pricing_catalog/{}", modifier.id)));
     }
 
     #[test]
@@ -1546,6 +1624,10 @@ mod tests {
             label: "new bundled modifier".into(),
         };
 
+        let previous = PricingCatalog {
+            rate_periods: vec![managed_disk_period.clone()],
+            ..Default::default()
+        };
         let merged = merge_older_catalog(
             PricingCatalog {
                 rate_periods: vec![managed_disk_period, custom_period],
@@ -1557,6 +1639,8 @@ mod tests {
                 conditional_modifiers: vec![bundled_modifier],
                 notes: vec!["bundled note".into()],
             },
+            Some(&previous),
+            &mut Vec::new(),
         );
 
         assert_eq!(merged.rate_periods.len(), 2);
