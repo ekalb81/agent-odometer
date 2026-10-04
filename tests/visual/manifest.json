@@ -44,6 +44,8 @@
     "updater-installing",
     "updater-error",
     "quota-budget-editor-narrow",
-    "quota-live-off-and-lookup-error"
+    "quota-live-off-and-lookup-error",
+    "transcript-recorded-edit",
+    "transcript-narrow-anchor"
   ]
 }

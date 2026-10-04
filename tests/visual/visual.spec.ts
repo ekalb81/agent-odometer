@@ -501,6 +501,38 @@ visualTest('quota-live-off-and-lookup-error', 'quota lookup failure keeps live p
   await live.scrollIntoViewIfNeeded();
 });
 
+visualTest('transcript-recorded-edit', 'inspector shows recorded tool result and edit in source order', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector).toBeVisible();
+  await inspector.getByRole('button', { name: 'Next page' }).click();
+  await inspector.getByRole('button', { name: 'Expand tool', exact: true }).click();
+  await inspector.getByRole('button', { name: 'Expand assistant', exact: true }).click();
+  await expect(inspector.getByText('Recorded replacement · demo.ts')).toBeVisible();
+  await expect(inspector.getByRole('button', { name: 'Jump to tool call', exact: true })).toBeVisible();
+});
+
+visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigation and escape', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await inspector.getByLabel('Record anchor').fill('synthetic:2');
+  await inspector.getByRole('button', { name: 'Jump to record', exact: true }).click();
+  await expect(inspector.getByRole('button', { name: 'Collapse tool', exact: true })).toBeVisible();
+  await expect(inspector.getByText(/earlier records not inspected/)).toBeVisible();
+  const bounds = await inspector.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {
