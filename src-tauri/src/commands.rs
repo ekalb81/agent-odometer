@@ -110,6 +110,36 @@ pub fn list_external_events(
     state.external_events_snapshot()
 }
 
+/// Explicit, bounded workflow measurement over selected durable sessions.
+#[tauri::command]
+pub async fn get_workflow_report(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    let history = state
+        .history_ready()
+        .ok_or_else(|| "Workflow history is unavailable or still preparing.".to_owned())?;
+    let events = state.external_events_snapshot();
+    tauri::async_runtime::spawn_blocking(move || {
+        let reader = history
+            .workflow_reader()
+            .map_err(|_| "Workflow history is incomplete or could not be read.".to_owned())?;
+        let report = crate::workflow::report(&reader, &get_rates(), request, &events, Utc::now())
+            .map_err(|_| {
+            "Workflow analysis is unavailable: check the selected window and history coverage."
+                .to_owned()
+        })?;
+        let bytes = serde_json::to_vec(&report)
+            .map_err(|_| "Workflow analysis could not be encoded.".to_owned())?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|_| "Workflow analysis could not finish.".to_owned())?
+}
+
 #[tauri::command]
 pub async fn list_instruction_files(
     app: AppHandle,

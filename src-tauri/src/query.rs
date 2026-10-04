@@ -1116,7 +1116,7 @@ pub struct WorkflowMetrics {
 /// changes the meaning of a series. Bump this when any metric's definition
 /// changes, so a stored comparison can refuse to compare across versions
 /// rather than plot a discontinuity as a trend.
-pub const WORKFLOW_METRICS_VERSION: u32 = 1;
+pub const WORKFLOW_METRICS_VERSION: u32 = 2;
 
 /// Computes workflow metrics from ledger rollups over a window.
 ///
@@ -1138,8 +1138,22 @@ pub fn workflow_metrics(
     now: DateTime<Utc>,
 ) -> Result<WorkflowMetrics> {
     let keys = store.session_keys()?;
+    workflow_metrics_for_keys(store, rates, harness_for, &keys, from, to, now)
+}
+
+/// Shared selected-session projection; desktop workflow views use the same
+/// denominators and pricing-coverage definition as CLI and MCP metrics.
+pub(crate) fn workflow_metrics_for_keys(
+    store: &HistoryStore,
+    rates: &RateCard,
+    harness_for: impl Fn(&str) -> String,
+    keys: &[String],
+    from: Option<DateTime<Utc>>,
+    to: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Result<WorkflowMetrics> {
     let totals = store
-        .range_totals_multi(&keys, &[(from, to)])?
+        .range_totals_multi(keys, &[(from, to)])?
         .into_iter()
         .next()
         .unwrap_or_default();
@@ -1150,12 +1164,15 @@ pub fn workflow_metrics(
     let mut priced_tokens = 0f64;
     let mut total_priceable_tokens = 0f64;
 
-    for key in &keys {
+    for key in keys {
         store.check_query()?;
         let Some(range) = totals.get(key) else {
             continue;
         };
-        if range.tokens.total_tokens == 0 && range.buckets.is_empty() {
+        if range.tokens.total_tokens == 0
+            && range.buckets.is_empty()
+            && range.tool_metrics.calls == 0
+        {
             continue;
         }
         sessions += 1;

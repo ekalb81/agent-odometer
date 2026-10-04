@@ -1369,3 +1369,77 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
+
+export type FindingState = 'new' | 'persistent' | 'improving' | 'resolved' | 'suppressed' | 'not_applicable';
+export interface WorkflowRequest {
+  session_ids: string[];
+  from: string | null;
+  to: string | null;
+}
+export interface WorkflowMetric {
+  id: string;
+  denominator_is: string;
+  value: number | null;
+  numerator: number;
+  denominator: number;
+}
+export interface WorkflowMeasure extends WorkflowMetric {
+  unit: string;
+  coverage_is: string;
+  covered_samples: number;
+  eligible_samples: number;
+  missing_data: string | null;
+}
+export interface WorkflowWindow {
+  from: string;
+  to: string;
+  ledger_metrics: {
+    schema_version: number;
+    from: string | null;
+    to: string | null;
+    sessions: number;
+    metrics: WorkflowMetric[];
+  };
+  additional_metrics: WorkflowMeasure[];
+  analyzed_sessions: number;
+  unavailable_sessions: number;
+}
+export interface FindingObservation {
+  sessions: number;
+  tool_calls: number;
+  findings: number;
+  likely_avoidable_calls: number;
+  analyzer_version: number | null;
+  coverage_complete: boolean;
+  window_duration_ms: number;
+}
+export interface WorkflowFinding {
+  id: string;
+  provider: string;
+  project_id: string | null;
+  rule_id: string;
+  before: FindingObservation;
+  after: FindingObservation;
+  comparison: {
+    version: number;
+    state: FindingState;
+    comparable: boolean;
+    before_calls_per_100: number | null;
+    after_calls_per_100: number | null;
+    observed_change_per_100_calls: number | null;
+    limitations: string[];
+  };
+  evidence: { session_id: string; turn_id: string | null; timestamp: string | null }[];
+  evidence_truncated: boolean;
+}
+export interface WorkflowReport {
+  version: number;
+  generated_at: string;
+  analyzer_version: number;
+  selected_sessions: number;
+  coverage_complete: boolean;
+  before: WorkflowWindow;
+  after: WorkflowWindow;
+  findings: WorkflowFinding[];
+  limitations: string[];
+}

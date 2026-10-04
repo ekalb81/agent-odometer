@@ -50,6 +50,7 @@ pub mod tray;
 pub mod turn_receipts;
 pub mod verify;
 pub mod watcher;
+pub mod workflow;
 
 use commands::{
     add_defender_exclusions, apply_integration_change, cancel_history_rebuild,
@@ -60,8 +61,8 @@ use commands::{
     get_provider_diagnostics, get_quota_config, get_quota_snapshots, get_rates,
     get_retention_status, get_scan_status, get_session_details, get_session_pricing,
     get_speed_report, get_subscription_usage, get_transcript_page, get_turn_receipt_status,
-    list_external_events, list_instruction_files, list_providers, list_sessions,
-    list_tool_impact_targets, merge_projects, open_instruction_file,
+    get_workflow_report, list_external_events, list_instruction_files, list_providers,
+    list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
     open_integration_configuration, open_task_in_chatgpt, preview_history_purge,
     preview_integration_change, purge_retained_history, read_instruction_file,
     reassign_session_project, rebuild_history, record_frontend_performance, recover_history,
@@ -145,6 +146,7 @@ pub fn run() {
             add_defender_exclusions,
             write_export,
             list_external_events,
+            get_workflow_report,
             list_instruction_files,
             cancel_instruction_scan,
             read_instruction_file,

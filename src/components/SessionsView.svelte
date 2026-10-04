@@ -35,6 +35,7 @@
   import ConfigTimeline from './ConfigTimeline.svelte';
   import GitOutcomes from './GitOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
+  import WorkflowIntelligence from './WorkflowIntelligence.svelte';
   import SpeedMonitor from './SpeedMonitor.svelte';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
   import { clearRenderedSessionRows, publishRenderedSessionRows } from '../lib/paintContext';
@@ -1904,6 +1905,8 @@
         {dimensionTotals}
         {dimensionAvailability}
       />
+
+      <WorkflowIntelligence active={active && analyticsOpen} sessionIds={analyticsSessionIds} onReview={reviewFindingSession} />
 
       {#if harness === 'codex'}
         <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={speedOpen} data-testid="speed-panel">
