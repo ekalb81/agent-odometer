@@ -3145,6 +3145,28 @@ mod tests {
 
     #[test]
     fn token_budget_alerts_require_verified_complete_history() {
+        // Notification delivery verifies the persisted config revision. Run in
+        // a subprocess so this fixture never reads/writes a real config, and
+        // avoid mutating process-wide environment during parallel tests.
+        if std::env::var_os("ODOMETER_TOKEN_COVERAGE_TEST_CHILD").is_none() {
+            let config = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::tests::token_budget_alerts_require_verified_complete_history",
+                    "--nocapture",
+                ])
+                .env("ODOMETER_TOKEN_COVERAGE_TEST_CHILD", "1")
+                .env("XDG_CONFIG_HOME", config.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stdout)
+            );
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("history.sqlite3");
         let history = Arc::new(HistoryStore::open(&database).unwrap());
@@ -3197,6 +3219,7 @@ mod tests {
             enabled: true,
         });
         budgets.notifications.enabled = true;
+        budgets.save().unwrap();
         state.set_quota_store(budgets.clone());
         assert_eq!(crate::commands::check_quota_alerts_impl(&state).len(), 1);
         state.set_quota_store(budgets.clone());
