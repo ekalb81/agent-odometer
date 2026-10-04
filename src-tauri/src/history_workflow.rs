@@ -217,7 +217,7 @@ impl HistoryStore {
                     } else {
                         consumed += raw.len();
                         match serde_json::from_slice::<WorkflowSnapshot>(raw) {
-                            Ok(snapshot) => WorkflowSource::Available(snapshot),
+                            Ok(snapshot) => WorkflowSource::Available(Box::new(snapshot)),
                             Err(_) => WorkflowSource::Unavailable("invalid_workflow_snapshot"),
                         }
                     }

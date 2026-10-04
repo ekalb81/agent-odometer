@@ -30,7 +30,7 @@ export function createProjectStore() {
 
   function fetchProjects(): Promise<void> {
     const request = ++epoch;
-    revision += 1;
+    revision = request;
     loaded = false;
     error = null;
     const pending = resolveProjects()

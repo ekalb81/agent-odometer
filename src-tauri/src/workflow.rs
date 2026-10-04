@@ -51,7 +51,7 @@ pub(crate) struct WorkflowTurn {
 }
 
 pub(crate) enum WorkflowSource {
-    Available(WorkflowSnapshot),
+    Available(Box<WorkflowSnapshot>),
     Unavailable(&'static str),
 }
 
