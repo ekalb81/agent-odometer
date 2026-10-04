@@ -61,6 +61,7 @@ struct Runtime {
     loaded: bool,
     file: ConsentFile,
     durable_file: Option<ConsentFile>,
+    locally_paused: bool,
     configuration_error: Option<&'static str>,
     candidate: Option<(DiscoveredQuotaAccount, Instant)>,
     generation: u64,
@@ -79,6 +80,7 @@ impl Default for Runtime {
                 accounts: vec![],
             },
             durable_file: None,
+            locally_paused: false,
             configuration_error: None,
             candidate: None,
             generation: 0,
@@ -186,6 +188,15 @@ fn require_regular(file: &std::fs::File) -> Result<(), &'static str> {
     }
     Ok(())
 }
+// Explicitly release locks even if a concurrently spawned child temporarily
+// retains a duplicated descriptor. Closing only this descriptor is insufficient.
+struct ConsentLock(std::fs::File);
+impl Drop for ConsentLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 fn save_file(path: &Path, expected: &ConsentFile, file: &ConsentFile) -> Result<(), &'static str> {
     use std::io::Write;
     validate_file(file)?;
@@ -204,6 +215,7 @@ fn save_file(path: &Path, expected: &ConsentFile, file: &ConsentFile) -> Result<
     require_regular(&lock)?;
     lock.try_lock()
         .map_err(|_| "Live quota settings are changing in another app; retry the action.")?;
+    let _lock = ConsentLock(lock);
     if &read_file(path)? != expected {
         return Err("Live quota consent changed in another app; review it and retry.");
     }
@@ -247,8 +259,17 @@ impl Runtime {
                 self.configuration_error = Some(error);
             }
         }
+        self.enforce_local_pause();
         self.loaded = true;
         changed
+    }
+    fn enforce_local_pause(&mut self) {
+        if self.locally_paused {
+            self.file
+                .accounts
+                .iter_mut()
+                .for_each(|account| account.enabled = false);
+        }
     }
     fn invalidate(&mut self) {
         self.generation = self.generation.wrapping_add(1);
@@ -379,6 +400,7 @@ impl LiveQuotaService {
         save_file(&self.path()?, expected, &file)?;
         runtime.durable_file = Some(file.clone());
         runtime.file = file;
+        runtime.locally_paused = false;
         runtime.invalidate();
         Ok(())
     }
@@ -431,9 +453,21 @@ impl LiveQuotaService {
             .durable_file
             .as_ref()
             .ok_or("Live quota settings are unavailable.")?;
-        save_file(&self.path()?, expected, &file)?;
+        if let Err(error) = self
+            .path()
+            .and_then(|path| save_file(&path, expected, &file))
+        {
+            // A failed revoke/pause is a local denial. An unrelated change in
+            // another app must not silently resume this instance's polling.
+            runtime.locally_paused = true;
+            return Err(error);
+        }
         runtime.durable_file = Some(file.clone());
         runtime.file = file;
+        if enabled && !revoke {
+            runtime.locally_paused = false;
+        }
+        runtime.enforce_local_pause();
         Ok(())
     }
 
@@ -555,6 +589,7 @@ mod tests {
     fn isolated(path: &Path) -> LiveQuotaService {
         LiveQuotaService {
             settings_path: Some(path.into()),
+            executable: Some(path.with_extension("test-cli-missing")),
             ..Default::default()
         }
     }
@@ -613,6 +648,36 @@ mod tests {
         drop(lock);
         service.change("a", false, true).unwrap();
         assert!(isolated(&path).status(Utc::now()).accounts.is_empty());
+    }
+    #[test]
+    fn failed_revocation_stays_paused_across_unrelated_external_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("consent.json");
+        let first = isolated(&path);
+        first.status(Utc::now());
+        candidate(&first, "b");
+        first.approve("b", "B").unwrap();
+        candidate(&first, "a");
+        first.approve("a", "A").unwrap();
+        let lock = std::fs::File::open(path.with_extension("lock")).unwrap();
+        lock.try_lock().unwrap();
+        assert!(first.change("a", false, true).is_err());
+        drop(lock);
+        let second = isolated(&path);
+        second.change("b", false, true).unwrap();
+        assert!(second.status(Utc::now()).accounts[0].consent.enabled);
+        let local = first.status(Utc::now());
+        assert_eq!(local.accounts[0].consent.account_id, "a");
+        assert!(
+            !local.accounts[0].consent.enabled,
+            "unrelated disk edits cannot cancel a failed local revoke"
+        );
+        assert!(!first.poll());
+        first.change("a", true, false).unwrap();
+        assert!(
+            first.status(Utc::now()).accounts[0].consent.enabled,
+            "an explicit local enable can resume polling"
+        );
     }
     #[test]
     fn another_instances_revoke_invalidates_cached_and_inflight_readings() {
