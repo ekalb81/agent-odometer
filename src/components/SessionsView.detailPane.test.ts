@@ -310,9 +310,9 @@ describe('SessionsView range pricing refresh orchestration', () => {
     sessionsStore.replaceAll([]);
     vi.restoreAllMocks();
   });
-  function mountRangeView() {
+  function mountRangeView(harness: 'codex' | 'all' = 'codex') {
     return render(SessionsView, { props: {
-      harness: 'codex', active: true,
+      harness, active: true,
       filters: { ...defaultFilters(), dateFrom: '2026-07-31T00:00', dateTo: '2026-08-02T00:00' },
       onfilterschange: () => {},
     } });
@@ -324,6 +324,36 @@ describe('SessionsView range pricing refresh orchestration', () => {
     expect(calls.slice(-2).some(([ranges]) => ranges.length > 1)).toBe(true);
     return calls;
   }
+  it.each(['unsupported', 'partial', 'fallback', 'purchased-primary', 'both-unsupported'] as const)('qualifies purchased estimates independently from API availability: %s', async (mode) => {
+    const card = testRateCard();
+    if (mode !== 'purchased-primary') card.api_models = card.models;
+    card.currencies.claude_code = 'USD';
+    rates.set(card);
+    const tokens = { ...zeroTokens, input_tokens: 100, total_tokens: 100 };
+    const base = { ...summary(ids[0], ids[0]), tokens_total: tokens };
+    sessionsStore.replaceAll([base]);
+    const unavailable = mode === 'unsupported' || mode === 'purchased-primary' || mode === 'both-unsupported';
+    const purchased = { total: unavailable ? 0 : 20, by_model: [], missing_models: mode === 'fallback' ? ['synthetic'] : [], unpriced_models: mode === 'fallback' ? [] : ['synthetic'] };
+    const api = { total: mode === 'both-unsupported' ? 0 : 17, by_model: [], missing_models: [], unpriced_models: mode === 'both-unsupported' ? ['synthetic'] : [] };
+    const totals: RangeTotals = { tokens, buckets: [], tool_metrics: base.tool_metrics, tool_metrics_by_model: {}, optimization_findings_count: 0,
+      pricing: { plan: api, api, current: { as_of: '2026-10-04T00:00:00Z', purchased_credits: purchased, included_allowance: api, api_estimate: api } } };
+    ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => Promise.resolve(ranges.map(() => ({ [ids[0]]: totals }))));
+    mountRangeView(mode === 'purchased-primary' ? 'codex' : 'all');
+    await waitFor(() => {
+      const label = screen.getAllByText(/^Purchased-credit estimate/).find(el => el.parentElement?.textContent?.includes(mode === 'fallback' ? 'fallback rate' : 'unpriced model'))!;
+      expect(label).toBeDefined();
+      expect(label.parentElement).toHaveTextContent(unavailable ? 'Unavailable' : '20.00');
+      expect(label.parentElement).toHaveTextContent(mode === 'fallback' ? '1 fallback rate used' : '1 unpriced model excluded');
+    });
+    if (mode === 'purchased-primary') expect(screen.getAllByText('Unavailable').length).toBeGreaterThanOrEqual(2);
+    else {
+      await fireEvent.click(screen.getByText(/^Analytics & exports/));
+      expect(screen.getByText('Codex purchased-credit estimate').parentElement).toHaveTextContent(unavailable ? 'Unavailable' : '20.00');
+      expect(screen.getByText('Codex purchased-credit estimate').parentElement).toHaveTextContent(mode === 'fallback' ? '1 fallback rate used' : '1 unpriced model excluded');
+      expect(screen.getByText('Codex API base USD').parentElement).toHaveTextContent(mode === 'both-unsupported' ? 'Unavailable' : '$17.00');
+    }
+  });
+
   it('refetches both batched consumers on same-version rate replacement and preserves delta refreshes', async () => {
     mountRangeView();
     await expectBothBatches(2);

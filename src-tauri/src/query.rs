@@ -44,6 +44,10 @@ pub enum RateTable {
     Plan,
     /// `RateCard::api_models` — OpenAI API USD rates, Codex only.
     Api,
+    /// Current as-of scenarios; neither identifies an actual billing allocation.
+    PurchasedCredits,
+    IncludedAllowance,
+    ApiEstimate,
 }
 
 /// One priced amount plus the provenance that produced it.
@@ -75,12 +79,14 @@ pub fn price_tokens(
     now: DateTime<Utc>,
 ) -> PricedAmount {
     let rate_table = match table {
-        RateTable::Api => &rates.api_models,
-        RateTable::Plan => &rates.models,
+        RateTable::Api | RateTable::ApiEstimate => &rates.api_models,
+        RateTable::Plan | RateTable::PurchasedCredits | RateTable::IncludedAllowance => {
+            &rates.models
+        }
     };
     // Codex is the only provider with an API table; asking for one anywhere
     // else is unanswerable rather than zero.
-    if table == RateTable::Api
+    if matches!(table, RateTable::Api | RateTable::ApiEstimate)
         && (harness != codex_provider_id().as_str() || rates.api_models.is_empty())
     {
         return PricedAmount {
@@ -90,6 +96,17 @@ pub fn price_tokens(
         };
     }
 
+    if matches!(
+        table,
+        RateTable::PurchasedCredits | RateTable::IncludedAllowance
+    ) && harness != codex_provider_id().as_str()
+    {
+        return PricedAmount {
+            amount: None,
+            basis: PricingBasis::Unavailable,
+            resolved_model: model.to_owned(),
+        };
+    }
     let resolution = rates.resolve_model_pricing(model, harness, rate_table, now);
     match resolution.basis {
         // Explicitly zero by declaration, not "no rate found".
@@ -111,16 +128,35 @@ pub fn price_tokens(
                     resolved_model: resolution.resolved_model,
                 };
             };
-            let amount = token_cost(
-                tokens,
-                rate,
-                service_tier_multiplier(model, service_tier, table),
-            );
+            let Some(multiplier) = tier_multiplier(
+                rates,
+                harness,
+                &resolution.resolved_model,
+                resolution.fallback_used,
+                service_tier,
+                table,
+                now,
+            ) else {
+                return PricedAmount {
+                    amount: None,
+                    basis: PricingBasis::Unavailable,
+                    resolved_model: resolution.resolved_model,
+                };
+            };
+            let mut rate = rate.clone();
+            // Codex never records cache writes. Credit scenarios have no write charge.
+            if matches!(
+                table,
+                RateTable::PurchasedCredits | RateTable::IncludedAllowance
+            ) {
+                rate.cache_creation_input = Some(0.0);
+            }
+            let amount = token_cost(tokens, &rate, multiplier);
             PricedAmount {
                 amount: Some(amount),
                 basis: crate::rates::downgrade_for_cache_creation_fallback(
                     resolution.basis,
-                    rate,
+                    &rate,
                     tokens.cache_creation_input_tokens,
                 ),
                 resolved_model: resolution.resolved_model,
@@ -155,18 +191,68 @@ pub fn token_cost(tokens: &TokenTotals, rate: &ModelRate, multiplier: f64) -> f6
 /// Service-tier price multiplier for a model and pricing surface.
 /// Astra fast mode uses 2.5x Codex credits but 2x OpenAI API USD rates.
 pub fn service_tier_multiplier(model: &str, service_tier: Option<&str>, table: RateTable) -> f64 {
-    if service_tier != Some("fast") {
+    if !matches!(service_tier, Some("fast" | "priority")) {
         return 1.0;
     }
     match model {
         "gpt-6-astra" => match table {
-            RateTable::Plan => 2.5,
-            RateTable::Api => 2.0,
+            RateTable::Plan | RateTable::IncludedAllowance => 2.5,
+            RateTable::Api | RateTable::ApiEstimate | RateTable::PurchasedCredits => 2.0,
         },
         "gpt-5.5" => 2.5,
         "gpt-5.4" => 2.0,
         _ => 1.0,
     }
+}
+
+/// Current scenarios require an explicit dated rule. A fallback rate never proves
+/// that the unknown requested model supports Fast or Ultrafast.
+pub(crate) fn tier_multiplier(
+    rates: &RateCard,
+    harness: &str,
+    resolved: &str,
+    fallback_used: bool,
+    tier: Option<&str>,
+    table: RateTable,
+    at: DateTime<Utc>,
+) -> Option<f64> {
+    if matches!(table, RateTable::Plan | RateTable::Api) {
+        return match tier {
+            None | Some("default" | "standard") => Some(1.0),
+            Some("fast" | "priority")
+                if !fallback_used && matches!(resolved, "gpt-6-astra" | "gpt-5.5" | "gpt-5.4") =>
+            {
+                Some(service_tier_multiplier(resolved, tier, table))
+            }
+            _ => None,
+        };
+    }
+    if harness != codex_provider_id().as_str() {
+        return None;
+    }
+    let tier = match tier {
+        None | Some("default" | "standard") => "standard",
+        Some("priority" | "fast") => "fast",
+        Some("ultrafast") => "ultrafast",
+        _ => return None,
+    };
+    if fallback_used && tier != "standard" {
+        return None;
+    }
+    let surface = match table {
+        RateTable::PurchasedCredits => crate::rates::PricingSurface::CodexPurchasedCredits,
+        RateTable::IncludedAllowance => crate::rates::PricingSurface::CodexIncludedAllowance,
+        RateTable::ApiEstimate => crate::rates::PricingSurface::OpenaiApiUsd,
+        _ => unreachable!(),
+    };
+    let identity = resolved;
+    rates
+        .pricing_catalog
+        .modifier_for_tier(surface, identity, at, tier)
+        .map(|rule| rule.multipliers.input)
+        // A flat ModelRate is already the explicit Standard reference. Speed
+        // tiers require dated evidence; a normal request does not invent one.
+        .or_else(|| (tier == "standard").then_some(1.0))
 }
 
 /// Usage for one model in a reported window.
@@ -190,6 +276,8 @@ pub struct ModelUsage {
 /// (issue #47: "Schemas are versioned").
 #[derive(Debug, Clone, Serialize)]
 pub struct RangeReport {
+    /// Compatibility prices are explicitly separate from current surface scenarios.
+    pub cost_surface: String,
     pub schema_version: u32,
     pub from: Option<DateTime<Utc>>,
     pub to: Option<DateTime<Utc>>,
@@ -356,6 +444,7 @@ pub fn range_report(
 
     let converted = convert_totals(rates, &cost_by_currency);
     Ok(RangeReport {
+        cost_surface: "legacy_reference".into(),
         schema_version: RANGE_REPORT_SCHEMA_VERSION,
         from,
         to,
@@ -429,6 +518,20 @@ pub struct PricedSurface {
 pub struct RangePricing {
     pub plan: PricedSurface,
     pub api: Option<PricedSurface>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<CurrentPricing>,
+}
+
+/// Reprices recorded usage at the rules verified at query time. Not a bill or quota.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CurrentPricing {
+    pub as_of: DateTime<Utc>,
+    /// Included usage is a Standard purchased-credit rate reference, never quota authority.
+    #[serde(default)]
+    pub included_allowance_basis: String,
+    pub purchased_credits: PricedSurface,
+    pub included_allowance: PricedSurface,
+    pub api_estimate: PricedSurface,
 }
 
 /// Enrich final range maps without changing their raw accounting data.
@@ -461,6 +564,7 @@ pub fn enrich_range_pricing(
                 )
                 .map(|plan| RangePricing {
                     plan,
+                    current: current_pricing(&totals.buckets, provider.as_str(), rates, now),
                     api: price_buckets_detailed(
                         rates,
                         provider.as_str(),
@@ -501,15 +605,17 @@ pub(crate) fn price_buckets_detailed_controlled(
     check: impl Fn() -> Result<()>,
 ) -> Result<Option<PricedSurface>> {
     check()?;
-    if table == RateTable::Api
+    if matches!(table, RateTable::Api | RateTable::ApiEstimate)
         && (harness != codex_provider_id().as_str() || rates.api_models.is_empty())
     {
         return Ok(None);
     }
 
     let rate_table = match table {
-        RateTable::Api => &rates.api_models,
-        RateTable::Plan => &rates.models,
+        RateTable::Api | RateTable::ApiEstimate => &rates.api_models,
+        RateTable::Plan | RateTable::PurchasedCredits | RateTable::IncludedAllowance => {
+            &rates.models
+        }
     };
 
     let mut by_model: BTreeMap<String, (f64, PricingBasis, bool)> = BTreeMap::new();
@@ -521,6 +627,9 @@ pub(crate) fn price_buckets_detailed_controlled(
         check()?;
         let is_unpriced = rates.unpriced_models.contains(&bucket.model);
         let resolution = rates.resolve_model_pricing(&bucket.model, harness, rate_table, now);
+        if resolution.fallback_used {
+            missing.insert(bucket.model.clone());
+        }
 
         if resolution.basis == PricingBasis::Unavailable
             && (is_unpriced || rate_table.contains_key(&resolution.resolved_model))
@@ -531,17 +640,14 @@ pub(crate) fn price_buckets_detailed_controlled(
                 .or_insert((0.0, PricingBasis::Unavailable, true));
             continue;
         }
-        if matches!(
-            resolution.basis,
-            PricingBasis::Fallback | PricingBasis::Unavailable
-        ) {
+        if resolution.basis == PricingBasis::Unavailable {
             missing.insert(bucket.model.clone());
         }
 
         if resolution.basis == PricingBasis::Unavailable {
             continue;
         }
-        let Some(rate) = rate_table.get(&resolution.resolved_model) else {
+        let Some(_rate) = rate_table.get(&resolution.resolved_model) else {
             // No rate row. A free/local model is a declared zero worth
             // showing; anything else is already reported through
             // `missing_models`, and a zero row would read as "this was
@@ -556,17 +662,28 @@ pub(crate) fn price_buckets_detailed_controlled(
             continue;
         };
 
-        let cost = token_cost(
+        let priced = price_tokens(
+            rates,
+            harness,
+            &bucket.model,
+            bucket.service_tier.as_deref(),
             &bucket.tokens,
-            rate,
-            service_tier_multiplier(&bucket.model, bucket.service_tier.as_deref(), table),
+            table,
+            now,
         );
+        let Some(cost) = priced.amount else {
+            unpriced.insert(bucket.model.clone());
+            let entry = by_model.entry(bucket.model.clone()).or_insert((
+                0.0,
+                PricingBasis::Unavailable,
+                true,
+            ));
+            entry.1 = PricingBasis::Unavailable;
+            entry.2 = true;
+            continue;
+        };
         total += cost;
-        let basis = crate::rates::downgrade_for_cache_creation_fallback(
-            resolution.basis,
-            rate,
-            bucket.tokens.cache_creation_input_tokens,
-        );
+        let basis = priced.basis;
         let entry = by_model
             .entry(bucket.model.clone())
             .or_insert((0.0, basis, false));
@@ -574,9 +691,7 @@ pub(crate) fn price_buckets_detailed_controlled(
         // A model can appear in several buckets, one per service tier. Once
         // any of them downgrades to `Estimated`, a later cleaner bucket must
         // not paper back over it.
-        if entry.1 != PricingBasis::Estimated {
-            entry.1 = basis;
-        }
+        entry.1 = least_confident_basis(entry.1, basis);
     }
 
     Ok(Some(PricedSurface {

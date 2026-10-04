@@ -76,6 +76,8 @@ impl ModelRate {
 #[serde(rename_all = "snake_case")]
 pub enum PricingSurface {
     CodexPlanCredits,
+    CodexPurchasedCredits,
+    CodexIncludedAllowance,
     OpenaiApiUsd,
     AnthropicApiUsd,
     GeminiApiUsd,
@@ -106,8 +108,8 @@ pub struct EffectiveRatePeriod {
     #[serde(default)]
     pub to: Option<DateTime<Utc>>,
     pub rate: ModelRate,
-    /// Cache-write multiplier over uncached input. Parsers do not currently
-    /// expose cache-write tokens, so this is catalog metadata only.
+    /// Cache-write multiplier over uncached input. Codex does not observe
+    /// cache writes; Claude records them separately through ModelRate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_input_multiplier: Option<f64>,
     pub provenance: PricingProvenance,
@@ -120,6 +122,8 @@ pub struct EffectiveRatePeriod {
 pub enum PricingCondition {
     /// Applies only when the request's complete input exceeds this count.
     RequestInputTokenThreshold { greater_than: u64 },
+    /// Verified harness spelling is normalized by the pricing service.
+    ServiceTier { tier: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -129,8 +133,7 @@ pub struct RateMultipliers {
 }
 
 /// An effective-dated conditional pricing rule.  Cache-write token categories
-/// are deliberately not represented by `RateMultipliers`: parsers currently
-/// retain cache reads but do not distinguish cache writes from uncached input.
+/// follow the input multiplier; ModelRate preserves the separate write rate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConditionalRateModifier {
     /// Stable catalog identity used to reconcile conditional rules across updates.
@@ -149,8 +152,8 @@ pub struct ConditionalRateModifier {
 }
 
 /// Versioned, auditable scenario pricing data.  The legacy `models` maps stay
-/// authoritative for existing views and user overrides; this catalog adds
-/// time/surface-aware alternatives without changing those calculations.
+/// authoritative Standard references for user overrides; this catalog adds
+/// dated surface and speed rules alongside legacy compatibility values.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PricingCatalog {
     #[serde(default)]
@@ -205,6 +208,21 @@ impl PricingCatalog {
             .collect()
     }
 
+    pub fn modifier_for_tier(
+        &self,
+        surface: PricingSurface,
+        model: &str,
+        at: DateTime<Utc>,
+        tier: &str,
+    ) -> Option<&ConditionalRateModifier> {
+        self.conditional_modifiers.iter().find(|modifier| {
+            modifier.surface == surface
+                && modifier.model == model
+                && interval_contains(modifier.from, modifier.to, at)
+                && matches!(&modifier.condition, PricingCondition::ServiceTier { tier: value } if value == tier)
+        })
+    }
+
     /// Ensures catalog intervals are well-formed and that base-rate periods do
     /// not overlap for one `(surface, model)` pair.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -234,14 +252,39 @@ impl PricingCatalog {
                 &modifier.label,
                 &modifier.provenance,
             )?;
-            match modifier.condition {
+            match &modifier.condition {
                 PricingCondition::RequestInputTokenThreshold { greater_than }
-                    if greater_than > 0 => {}
+                    if *greater_than > 0 => {}
+                PricingCondition::ServiceTier { tier }
+                    if matches!(tier.as_str(), "standard" | "fast" | "ultrafast") => {}
+                PricingCondition::ServiceTier { .. } => {
+                    anyhow::bail!("unsupported service-tier rule")
+                }
                 PricingCondition::RequestInputTokenThreshold { .. } => {
                     anyhow::bail!("request input token threshold must be greater than zero")
                 }
             }
-            if modifier.multipliers.input <= 0.0 || modifier.multipliers.output <= 0.0 {
+            if matches!(modifier.condition, PricingCondition::ServiceTier { .. })
+                && modifier.multipliers.input != modifier.multipliers.output
+            {
+                anyhow::bail!("service-tier multipliers must apply equally to input and output");
+            }
+            if matches!(
+                modifier.condition,
+                PricingCondition::RequestInputTokenThreshold { .. }
+            ) && matches!(
+                modifier.surface,
+                PricingSurface::CodexPurchasedCredits | PricingSurface::CodexIncludedAllowance
+            ) {
+                anyhow::bail!(
+                    "API request thresholds cannot apply to Codex allowance or credit surfaces"
+                );
+            }
+            if !modifier.multipliers.input.is_finite()
+                || !modifier.multipliers.output.is_finite()
+                || modifier.multipliers.input <= 0.0
+                || modifier.multipliers.output <= 0.0
+            {
                 anyhow::bail!("pricing modifier multipliers must be greater than zero");
             }
         }
@@ -379,6 +422,9 @@ pub enum PricingBasis {
 /// The resolved pricing-table key and provenance for one raw model id.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PricedModelResolution {
+    /// Independent of freshness: Stale must not erase fallback identity.
+    #[serde(default)]
+    pub fallback_used: bool,
     /// The table key actually used to find a rate — equal to the requested
     /// model for `Direct`/`FreeLocal`/`Unavailable`, the alias target for
     /// `Aliased`, or the configured fallback model for `Fallback`.
@@ -806,12 +852,14 @@ impl RateCard {
         };
         if self.free_local_models.iter().any(|m| m == model) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: PricingBasis::FreeLocal,
             };
         }
         if self.unpriced_models.iter().any(|m| m == model) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: PricingBasis::Unavailable,
             };
@@ -822,12 +870,14 @@ impl RateCard {
             .is_some_and(|end| now.date_naive() >= *end)
         {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: PricingBasis::Unavailable,
             };
         }
         if table.contains_key(model) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: model.to_owned(),
                 basis: basis(model, PricingBasis::Direct),
             };
@@ -842,6 +892,7 @@ impl RateCard {
                 && table.contains_key(floating.target.as_str())
             {
                 return PricedModelResolution {
+                    fallback_used: false,
                     resolved_model: floating.target.clone(),
                     basis: basis(&floating.target, PricingBasis::FloatingAlias),
                 };
@@ -850,6 +901,7 @@ impl RateCard {
         let (resolved, hopped) = resolve_alias(model, &self.model_aliases);
         if hopped && table.contains_key(resolved) {
             return PricedModelResolution {
+                fallback_used: false,
                 resolved_model: resolved.to_owned(),
                 basis: basis(resolved, PricingBasis::Aliased),
             };
@@ -860,11 +912,13 @@ impl RateCard {
             .unwrap_or(&self.fallback_model);
         if table.contains_key(fallback_model.as_str()) {
             return PricedModelResolution {
+                fallback_used: true,
                 resolved_model: fallback_model.clone(),
                 basis: basis(fallback_model, PricingBasis::Fallback),
             };
         }
         PricedModelResolution {
+            fallback_used: false,
             resolved_model: model.to_owned(),
             basis: PricingBasis::Unavailable,
         }
@@ -907,9 +961,11 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
     // archived bundle is the only recoverable default signal; an identical
     // deliberate user entry is indistinguishable and follows the default.
     // Unknown versions never authorize replacing an existing value.
-    let previous: Option<RateCard> = (disk.version == 11)
-        .then(|| serde_json::from_str(include_str!("../rate-history/v11.json")).ok())
-        .flatten();
+    let previous: Option<RateCard> = match disk.version {
+        11 => serde_json::from_str(include_str!("../rate-history/v11.json")).ok(),
+        12 => serde_json::from_str(include_str!("../rate-history/v12.json")).ok(),
+        _ => None,
+    };
     merge_default_entries(
         &mut disk.models,
         &bundled.models,
@@ -1236,6 +1292,43 @@ mod tests {
             output: value,
             reasoning: value,
         }
+    }
+
+    #[test]
+    fn surface_rules_are_uniform_and_v12_edits_survive_upgrade() {
+        let mut bundled = RateCard::load_bundled().unwrap();
+        let rule = bundled
+            .pricing_catalog
+            .conditional_modifiers
+            .iter_mut()
+            .find(|rule| matches!(rule.condition, PricingCondition::ServiceTier { .. }))
+            .unwrap();
+        rule.multipliers.output = 99.0;
+        assert!(bundled.pricing_catalog.validate().is_err());
+        let bundled = RateCard::load_bundled().unwrap();
+        let mut disk: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v12.json")).unwrap();
+        disk.models.get_mut("gpt-6.1-sol").unwrap().input = 123.0;
+        disk.api_models.get_mut("gpt-6-luna").unwrap().output = 9.0;
+        let merged = merge_older_override(disk, bundled.clone());
+        assert_eq!(merged.models["gpt-6.1-sol"].input, 123.0);
+        assert_eq!(merged.api_models["gpt-6-luna"].output, 9.0);
+        assert!(merged.upgrade_review.contains(&"models/gpt-6.1-sol".into()));
+        assert_eq!(
+            merged.pricing_catalog.conditional_modifiers.len(),
+            bundled.pricing_catalog.conditional_modifiers.len()
+        );
+        merged.pricing_catalog.validate().unwrap();
+        let mut duplicate = merged.pricing_catalog.clone();
+        let mut rule = duplicate
+            .conditional_modifiers
+            .iter()
+            .find(|rule| matches!(rule.condition, PricingCondition::ServiceTier { .. }))
+            .unwrap()
+            .clone();
+        rule.id = "synthetic-overlap".into();
+        duplicate.conditional_modifiers.push(rule);
+        assert!(duplicate.validate().is_err());
     }
 
     #[test]
@@ -1898,7 +1991,7 @@ mod tests {
         disk.model_aliases.remove("claude-opus-4-5");
         disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
         let merged = merge_older_override(disk, bundled);
-        assert_eq!(merged.version, 12);
+        assert_eq!(merged.version, 13);
         assert_eq!(merged.models["gpt-6-astra"].input, 250.0);
         assert_eq!(merged.api_models["gpt-6-astra"].input, 10.0);
         assert_eq!(merged.models["claude-fable-5-1"].cached_input, 0.25);

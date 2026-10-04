@@ -29,6 +29,7 @@ fn bundled_new_models_resolve_directly_with_published_dimensions() {
             let row = match table {
                 RateTable::Api => &rates.api_models[model],
                 RateTable::Plan => &rates.models[model],
+                _ => unreachable!(),
             };
             assert_eq!(row.input, input * multiplier, "{model}");
             assert_eq!(row.cached_input, cached * multiplier, "{model}");
@@ -177,7 +178,7 @@ fn fast_multiplier_preserves_existing_models_and_ignores_unsupported_tiers() {
                 expected
             );
         }
-        for tier in [None, Some("default"), Some("priority")] {
+        for tier in [None, Some("default")] {
             assert_eq!(service_tier_multiplier("gpt-6-astra", tier, table), 1.0);
         }
     }

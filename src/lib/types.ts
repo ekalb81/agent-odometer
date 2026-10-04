@@ -270,8 +270,20 @@ export interface PricedSurface {
 }
 
 export interface RangePricing {
+  /** Legacy reference, not a purchased-credit or included-allowance measurement. */
   plan: PricedSurface;
   api: PricedSurface | null;
+  current?: CurrentPricing;
+}
+
+export interface CurrentPricing {
+  as_of: string;
+  /** Standard purchased-credit rates are the reference; this is never quota authority. */
+  included_allowance_basis?: string;
+  purchased_credits: PricedSurface;
+  /** Standard-credit equivalents; does not infer an allowance size or billed allocation. */
+  included_allowance: PricedSurface;
+  api_estimate: PricedSurface;
 }
 
 /** Response-only cumulative pricing; never derived from an unbounded event window. */
@@ -308,8 +320,11 @@ export interface TimeAwarePricing extends PricedSurface {
 export interface SessionPricing {
   plan: PricedSurface;
   flat_api: PricedSurface | null;
-  turn_prices: Record<string, { plan: TurnPrice; api: TurnPrice | null }>;
+  turn_prices: Record<string, { plan: TurnPrice; api: TurnPrice | null; current?: { purchased_credits: TurnPrice; included_allowance: TurnPrice; api_estimate: TurnPrice } }>;
   time_aware_api: TimeAwarePricing | null;
+  current?: CurrentPricing;
+  dated_purchased_credits?: TimeAwarePricing;
+  dated_included_allowance?: TimeAwarePricing;
 }
 
 /** Date-scoped rollup returned by sessions_in_ranges. */
@@ -739,7 +754,7 @@ export interface ModelRate {
 }
 
 /** Billing surface for a catalog rule.  Rules never cross billing surfaces. */
-export type PricingSurface = 'codex_plan_credits' | 'openai_api_usd' | 'anthropic_api_usd' | 'gemini_api_usd';
+export type PricingSurface = 'codex_plan_credits' | 'codex_purchased_credits' | 'codex_included_allowance' | 'openai_api_usd' | 'anthropic_api_usd' | 'gemini_api_usd';
 
 /** Source evidence retained with a dated or conditional pricing rule. */
 export interface PricingProvenance {
@@ -769,7 +784,7 @@ export interface RequestInputTokenThresholdCondition {
   greater_than: number;
 }
 
-export type PricingCondition = RequestInputTokenThresholdCondition;
+export type PricingCondition = RequestInputTokenThresholdCondition | { kind: 'service_tier'; tier: 'standard' | 'fast' | 'ultrafast' };
 
 export interface RateMultipliers {
   input: number;
@@ -828,6 +843,8 @@ export interface FloatingAlias {
 
 /** The resolved pricing-table key and provenance for one raw model id. */
 export interface PricedModelResolution {
+  /** Freshness must not erase the fallback identity. */
+  fallback_used?: boolean;
   resolved_model: string;
   basis: PricingBasis;
 }

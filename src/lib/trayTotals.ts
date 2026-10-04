@@ -3,6 +3,7 @@
 // using backend pricing refreshed whenever the saved rate card changes.
 
 import { formatCredits } from './currency';
+import { primarySurfaces } from './sessionProjection';
 import type { Harness, RangeTotals, RateCard } from './types';
 
 export interface TrayTotals {
@@ -36,12 +37,11 @@ export function computeTrayTotals(
   for (const session of sessions) {
     const range = ranges[session.storage_id]; if (!range) continue;
     tokens += range.tokens.total_tokens;
-    const plan = range.pricing?.plan;
+    const { plan, api } = primarySurfaces(range.pricing);
     if (session.harness === 'codex') {
-      if (session.credits_unlimited) unlimited++; else codexCredits += (plan?.total ?? Number.NaN);
+      if (session.credits_unlimited && !range.pricing?.current) unlimited++; else codexCredits += (plan?.total ?? Number.NaN);
       missingCredits ||= (plan?.missing_models.length ?? 0) > 0;
       unpricedCredits ||= (plan?.unpriced_models.length ?? 0) > 0;
-      const api = range.pricing?.api;
       codexApi += api?.total ?? 0; missingApi ||= !api || api.missing_models.length > 0;
       unpricedApi ||= (api?.unpriced_models.length ?? 0) > 0;
     } else {

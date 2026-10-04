@@ -56,6 +56,14 @@ function session(id: string, harness: TraySessionLike['harness'], unlimited: boo
 }
 
 describe('computeTrayTotals', () => {
+  it('uses current server credit and API estimates, including unlimited comparison usage', () => {
+    const value = range('synthetic', 1, 1, 99, 88);
+    value.pricing!.current = { as_of: '2026-10-04T00:00:00Z', purchased_credits: surface(20), included_allowance: surface(25), api_estimate: surface(4) };
+    const totals = computeTrayTotals([session('c1', 'codex', true)], { c1: value }, rateCard);
+    expect(totals.codex_credits).toBe('20.00');
+    expect(totals.codex_api_usd).toBe('$4.00');
+  });
+
   it('keeps expired-only prices unavailable and mixed totals partial without dropping tokens', () => {
     const expired = range('expired-promo', 100, 50, 0, 0);
     expired.pricing = { plan: surface(0, { unpriced_models: ['expired-promo'] }), api: surface(0, { unpriced_models: ['expired-promo'] }) };

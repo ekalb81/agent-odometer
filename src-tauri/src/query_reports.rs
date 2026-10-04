@@ -67,6 +67,7 @@ fn controlled_surfaces(
     now: DateTime<Utc>,
 ) -> Result<RangePricing> {
     Ok(RangePricing {
+        current: crate::query::current_pricing(buckets, harness, rates, now),
         plan: price_buckets_detailed_controlled(
             rates,
             harness,
@@ -634,6 +635,7 @@ pub struct StatuslineProvider {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatuslineReport {
+    pub cost_surface: String,
     pub schema_version: u32,
     pub from: DateTime<Utc>,
     pub to: DateTime<Utc>,
@@ -740,6 +742,7 @@ pub fn statusline_report(
     }
     let pricing_complete = providers.iter().all(|row| row.pricing_complete);
     Ok(StatuslineReport {
+        cost_surface: "legacy_reference".into(),
         schema_version: HEADLESS_REPORT_SCHEMA_VERSION,
         from,
         to: now,

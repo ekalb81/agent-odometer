@@ -32,6 +32,12 @@ export function mockRangePricing(key: string, fraction: number): RangePricing {
   }
   const value = fixturePricing(key).range;
   return {
+    ...value,
+    ...(value.current ? { current: { ...value.current,
+      purchased_credits: scaleSurface(value.current.purchased_credits, fraction),
+      included_allowance: scaleSurface(value.current.included_allowance, fraction),
+      api_estimate: scaleSurface(value.current.api_estimate, fraction),
+    } } : {}),
     plan: scaleSurface(value.plan, fraction),
     api: value.api ? scaleSurface(value.api, fraction) : null,
   };

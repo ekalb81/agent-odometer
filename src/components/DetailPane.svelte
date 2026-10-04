@@ -157,21 +157,23 @@
   // What the same usage would cost à la carte at OpenAI API rates —
   // informational for subscription users; codex sessions only.
   const flatApiReference = $derived(session?.pricing?.flat_api ?? null);
-  const sessionApiCost = $derived(session?.harness === 'codex' ? flatApiReference : null);
+  const sessionApiCost = $derived(session?.harness === 'codex' ? session.pricing?.current?.api_estimate ?? flatApiReference : null);
   const timeAwareApiScenario = $derived(session?.pricing?.time_aware_api ?? null);
   const timeAwarePricingRules = $derived(timeAwareApiScenario?.rules ?? []);
 
   // The headline money figure: Codex shows the API-rate estimate, Claude the
   // Anthropic-rate cost.
-  function surfaceMoney(surface: PricedSurface, api = false): string {
+  function surfaceMoney(surface: PricedSurface, api = false, unit?: string): string {
     if (costIsUnmeasured(surface.unpriced_models, surface.total)) return 'Unavailable';
-    const amount = api ? formatCredits(surface.total, 'USD') : fmtCredit(surface.total);
-    return amount + (surface.unpriced_models.length > 0 ? ' · excludes unpriced' : '');
+    const amount = unit ? formatCredits(surface.total, unit) : api ? formatCredits(surface.total, 'USD') : fmtCredit(surface.total);
+    return amount
+      + (surface.unpriced_models.length > 0 ? ` · excludes unpriced: ${surface.unpriced_models.join(', ')}` : '')
+      + (surface.missing_models.length > 0 ? ` · fallback rate used: ${surface.missing_models.join(', ')}` : '');
   }
   const heroCost = $derived(
     session?.harness === 'codex'
-      ? (sessionApiCost ? { label: 'Est. API', text: surfaceMoney(sessionApiCost, true) } :
-         sessionCredits ? { label: 'Credits', text: surfaceMoney(sessionCredits) } : null)
+      ? (sessionApiCost ? { label: 'API base estimate', text: surfaceMoney(sessionApiCost, true) } :
+         sessionCredits ? { label: 'Legacy credits', text: surfaceMoney(sessionCredits) } : null)
       : (sessionCredits ? { label: 'Cost', text: surfaceMoney(sessionCredits) } : null),
   );
 
@@ -183,7 +185,7 @@
     if (!session?.pricing) return m;
     for (const t of session.turns) {
       const prices = session.pricing.turn_prices[t.turn_id];
-      const price = session.harness === 'codex' && sessionApiCost ? prices?.api : prices?.plan;
+      const price = session.harness === 'codex' && sessionApiCost ? prices?.current?.api_estimate ?? prices?.api : prices?.current?.purchased_credits ?? prices?.plan;
       if (price) m.set(t.turn_id, { ...price, fallbackUsed: price.fallback_used });
     }
     return m;
@@ -279,7 +281,7 @@
         <div class="font-mono font-semibold mt-0.5 text-ink">{fmt(session.tokens_total.total_tokens)}</div>
       </div>
       <div class="bg-panel px-5 py-2.5">
-        <div class="section-label">{heroCost?.label ?? 'Cost'}</div>
+        <div class="section-label" title={session.harness === 'codex' ? 'Current rate reference; excludes request-specific long-context premiums. Dated API scenarios appear in More details.' : undefined}>{heroCost?.label ?? 'Cost'}</div>
         <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroCost?.text ?? 'Unavailable'}</div>
       </div>
       <div class="bg-panel px-5 py-2.5">
@@ -572,6 +574,31 @@
               <p class="mt-1.5 text-[11px] text-ink-faint">
                 Reference: {surfaceMoney(sessionCredits)} à-la-carte equivalent
               </p>
+            {/if}
+            {#if session.harness === 'codex'}
+              <div class="mt-3 space-y-1" aria-label="Billing surface scenarios">
+                <p class="text-ink-muted">Billing scenarios · not a bill or observed allowance usage</p>
+                {#if session.pricing?.current}
+                  {@const current = session.pricing.current}
+                  <p class="text-ink-faint">Current rules as of {current.as_of.slice(0, 10)} UTC applied to this usage:</p>
+                  {#each [
+                    { label: 'Purchased credits', value: current.purchased_credits, unit: 'purchased credits' },
+                    { label: 'Included allowance', value: current.included_allowance, unit: 'Standard-credit equivalents' },
+                    { label: 'API base estimate', value: current.api_estimate, unit: 'USD' },
+                  ] as scenario}
+                    <p>{scenario.label}: <span class="font-mono">{surfaceMoney(scenario.value, scenario.unit === 'USD', scenario.unit)}</span></p>
+                  {/each}
+                {:else}
+                  <p>Current purchased-credit and included-allowance estimates: Unavailable</p>
+                {/if}
+                {#each [
+                  { label: 'Dated purchased credits', value: session.pricing?.dated_purchased_credits, unit: 'purchased credits' },
+                  { label: 'Dated included allowance', value: session.pricing?.dated_included_allowance, unit: 'Standard-credit equivalents' },
+                ] as scenario}
+                  <p>{scenario.label}: <span class="font-mono">{scenario.value ? surfaceMoney(scenario.value, false, scenario.unit) : 'Unavailable'}</span></p>
+                {/each}
+                <p class="text-ink-faint">Included allowance uses Standard-credit equivalents, not a quota percentage or inferred plan size. Dated estimates require covered event dates. API request-size premiums never apply to Codex allowances.</p>
+              </div>
             {/if}
             {#if flatApiReference}
               <p class="mt-1.5 text-[11px] text-ink-faint">

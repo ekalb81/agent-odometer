@@ -40,14 +40,14 @@ pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()>
     let codex_credits = MenuItem::with_id(
         app,
         "codex_credits",
-        "Codex credits · —",
+        "Codex purchased-credit estimate · —",
         false,
         None::<&str>,
     )?;
     let codex_api = MenuItem::with_id(
         app,
         "codex_api",
-        "Codex API estimate · —",
+        "Codex API base estimate · —",
         false,
         None::<&str>,
     )?;
@@ -124,10 +124,16 @@ pub fn update(state: &Arc<AppState>, totals: TrayTotals) -> Result<(), String> {
         .set_text(format!("Today · {} tokens", totals.tokens))
         .map_err(|error| error.to_string())?;
     tray.codex_credits
-        .set_text(format!("Codex credits · {}", totals.codex_credits))
+        .set_text(format!(
+            "Codex purchased-credit estimate · {}",
+            totals.codex_credits
+        ))
         .map_err(|error| error.to_string())?;
     tray.codex_api
-        .set_text(format!("Codex API estimate · {}", totals.codex_api_usd))
+        .set_text(format!(
+            "Codex API base estimate · {}",
+            totals.codex_api_usd
+        ))
         .map_err(|error| error.to_string())?;
     tray.claude_usd
         .set_text(format!("Claude estimate · {}", totals.claude_usd))

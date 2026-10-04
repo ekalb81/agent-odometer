@@ -54,6 +54,31 @@ beforeEach(() => { rates.set({
 afterEach(() => { cleanup(); rates.set(null); });
 
 describe('DetailPane server pricing', () => {
+  it('renders distinct server billing scenarios and keeps unsupported surfaces unavailable', () => {
+    const value = session();
+    value.pricing!.current = { as_of: '2026-10-04T00:00:00Z', purchased_credits: surface(20), included_allowance: surface(25), api_estimate: surface(0) };
+    value.pricing!.current.api_estimate.unpriced_models = ['unsupported-tier'];
+    render(DetailPane, { session: value, onclose: () => {} });
+    expect(screen.getByText('20.00 purchased credits')).toBeInTheDocument();
+    expect(screen.getByText('25.00 Standard-credit equivalents')).toBeInTheDocument();
+    expect(screen.queryByText('$4.00')).not.toBeInTheDocument();
+    expect(screen.getByText(/Current rules as of 2026-10-04/)).toBeInTheDocument();
+    expect(screen.getByText(/not a bill or observed allowance usage/)).toBeInTheDocument();
+    expect(screen.getByText(/API request-size premiums never apply/)).toBeInTheDocument();
+  });
+  it('keeps valid current and dated subtotals while identifying excluded and fallback models', () => {
+    const value = session();
+    const partial = { ...surface(20), unpriced_models: ['unsupported-speed'], missing_models: ['fallback-model'] };
+    value.pricing!.current = { as_of: '2026-10-04T00:00:00Z', purchased_credits: partial, included_allowance: { ...partial, total: 25 }, api_estimate: { ...partial, total: 4 } };
+    const dated = { ...partial, surface: 'codex_purchased_credits' as const, applied_rate_periods: [], applied_modifiers: [], conditional_evidence_missing: [], cache_write_pricing_unmodeled: false, unobserved_cache_write_input_multipliers: [], rules: [] };
+    value.pricing!.dated_purchased_credits = dated;
+    value.pricing!.dated_included_allowance = { ...dated, surface: 'codex_included_allowance', total: 0 };
+    render(DetailPane, { session: value, onclose: () => {} });
+    expect(screen.getAllByText('20.00 purchased credits · excludes unpriced: unsupported-speed · fallback rate used: fallback-model')).toHaveLength(2);
+    expect(screen.getByText('25.00 Standard-credit equivalents · excludes unpriced: unsupported-speed · fallback rate used: fallback-model')).toBeInTheDocument();
+    expect(screen.getAllByText('$4.00 · excludes unpriced: unsupported-speed · fallback rate used: fallback-model').length).toBeGreaterThan(0);
+    expect(screen.getByText('Dated included allowance:').textContent).toContain('Unavailable');
+  });
   it('renders expired-only usage as unavailable and mixed prices as partial, retaining raw tokens', () => {
     const value = session();
     value.harness = 'gemini_cli';
@@ -74,15 +99,15 @@ describe('DetailPane server pricing', () => {
     render(DetailPane, { session: session(), onclose: () => {} });
     expect(screen.getAllByText('$42.50').length).toBeGreaterThan(0);
     expect(screen.getByTitle('#1 · $42.50')).toBeInTheDocument();
-    expect(screen.getByText('17.25 credits')).toBeInTheDocument();
-    expect(screen.getByText(/Reference: 17.25 credits à-la-carte equivalent/)).toBeInTheDocument();
+    expect(screen.getByText('17.25 legacy credits')).toBeInTheDocument();
+    expect(screen.getByText(/Reference: 17.25 legacy credits à-la-carte equivalent/)).toBeInTheDocument();
   });
 
   it('does not reconstruct absent server pricing from tokens or the local card', () => {
     const value = session();
     delete value.pricing;
     render(DetailPane, { session: value, onclose: () => {} });
-    expect(screen.getByText('Unavailable')).toBeInTheDocument();
+    expect(screen.getAllByText('Unavailable').length).toBeGreaterThan(0);
     expect(screen.queryByText('Cost per turn')).not.toBeInTheDocument();
     expect(screen.queryByText(/Flat OpenAI API reference/)).not.toBeInTheDocument();
   });
@@ -92,7 +117,7 @@ describe('DetailPane server pricing', () => {
     value.pricing!.flat_api = null;
     value.pricing!.turn_prices.one.api = null;
     render(DetailPane, { session: value, onclose: () => {} });
-    expect(screen.getByTitle('#1 · 17.25 credits')).toBeInTheDocument();
+    expect(screen.getByTitle('#1 · 17.25 legacy credits')).toBeInTheDocument();
     expect(screen.queryByText('$42.50')).not.toBeInTheDocument();
   });
 
