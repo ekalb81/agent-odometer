@@ -1991,6 +1991,7 @@ mod tests {
             config_watcher: Mutex::new(None),
             instruction_paths: Mutex::new(HashSet::new()),
             session_paths: DashMap::new(),
+            transcript_observations: DashMap::new(),
             ledger_stale: DashMap::new(),
             rollup_deferred_stale: DashMap::new(),
             external_events: Mutex::new(ExternalEventStore::new(Vec::new())),

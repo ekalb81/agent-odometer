@@ -60,7 +60,7 @@ fn scan_reports_progress_and_writes_cache() {
 }
 
 #[test]
-fn matching_cache_entry_is_served_without_parsing() {
+fn legacy_cache_entry_is_reparsed_once_then_warms_normally() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("projects");
     std::fs::create_dir_all(&root).unwrap();
@@ -68,8 +68,8 @@ fn matching_cache_entry_is_served_without_parsing() {
     std::fs::copy(fixture(), &file).unwrap();
     let cache_path = dir.path().join("cache.sqlite3");
 
-    // Fabricate a cache entry with a marker id and the file's real stamp; a
-    // hit must return the cached session, proving no re-parse happened.
+    // Legacy entries have size/mtime but no evidence of the parsed OS artifact.
+    // They must miss once, rather than vouch for a replacement with that stamp.
     let (size, mtime_ms) = scan_cache::file_stamp(&file).unwrap();
     let (real_ids, _, _) = scan_ids(&root, None);
     let cache = ScanCache::load(&cache_path); // empty, path unused yet
@@ -81,9 +81,15 @@ fn matching_cache_entry_is_served_without_parsing() {
     cache.store(&file.to_string_lossy(), size, mtime_ms, &marker);
     cache.finish_scan();
 
-    let (ids, _, _) = scan_ids(&root, Some(&cache_path));
-    assert_eq!(ids, vec!["from-the-cache"]);
-    assert_ne!(ids, real_ids);
+    let (ids, _, report) = scan_ids(&root, Some(&cache_path));
+    assert_eq!(ids, real_ids);
+    assert_eq!(report.cache_hits, 0);
+    assert_eq!(report.parsed_files, 1);
+
+    let (ids, _, report) = scan_ids(&root, Some(&cache_path));
+    assert_eq!(ids, real_ids);
+    assert_eq!(report.cache_hits, 1);
+    assert_eq!(report.parsed_files, 0);
 
     // Change the file: the stamp no longer matches, so it re-parses.
     let mut contents = std::fs::read_to_string(&file).unwrap();

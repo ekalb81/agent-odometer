@@ -1011,6 +1011,7 @@ impl HistoryStore {
                 } else {
                     ProviderSourceKind::Live
                 };
+                let observed_before = crate::transcript::source_generation(&item.path);
                 match adapter.parse_file(&item.path, kind) {
                     Ok(Some(session)) => {
                         // Issue #174: fold this pass's own re-parse straight
@@ -1023,6 +1024,7 @@ impl HistoryStore {
                                 cache,
                                 &item.path,
                                 &session,
+                                observed_before.as_deref(),
                                 &mut scan_cache_touched,
                             );
                         }
@@ -4185,15 +4187,24 @@ fn record_scan_cache_refresh(
     cache: &ScanCache,
     path: &Path,
     session: &Session,
+    observed_before: Option<&str>,
     touched: &mut HashMap<String, Option<String>>,
 ) {
     let normalized = source_path_key(path);
-    match resolve_scan_cache_key_and_stamp(path) {
-        Some((key, size, mtime_ms)) => {
-            cache.store(&key, size, mtime_ms, session);
+    match (resolve_scan_cache_key_and_stamp(path), observed_before) {
+        (Some((key, size, mtime_ms)), Some(before))
+            if crate::transcript::source_generation(path).as_deref() == Some(before) =>
+        {
+            cache.store_observed(
+                &key,
+                size,
+                mtime_ms,
+                session,
+                Some(crate::transcript::generation_identity(before)),
+            );
             touched.insert(normalized, Some(key));
         }
-        None => {
+        _ => {
             touched.insert(normalized, None);
         }
     }
