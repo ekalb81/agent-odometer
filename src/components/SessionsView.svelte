@@ -1116,6 +1116,8 @@
     codexCredits: number;
     codexApiUsd: number;
     claudeUsd: number;
+    codexApiFallbackModels: string[];
+    codexApiUnpricedModels: string[];
     fallbackModels: string[];
     unpricedModels: string[];
   };
@@ -1164,6 +1166,8 @@
       codexCredits: 0,
       codexApiUsd: 0,
       claudeUsd: 0,
+      codexApiFallbackModels: [],
+      codexApiUnpricedModels: [],
       fallbackModels: [],
       unpricedModels: [],
     };
@@ -1179,8 +1183,10 @@
       if (s.harness === 'codex') {
         out.codexCredits += priced.planCost;
         out.codexApiUsd += priced.apiCost ?? Number.NaN;
-        out.fallbackModels.push(...priced.apiFallbackModels);
-        out.unpricedModels.push(...priced.apiUnpricedModels);
+        out.codexApiFallbackModels.push(...priced.apiFallbackModels);
+        out.codexApiUnpricedModels.push(...priced.apiUnpricedModels);
+        out.fallbackModels.push(...(harness === 'codex' && !showApiCost ? priced.planFallbackModels : priced.apiFallbackModels));
+        out.unpricedModels.push(...(harness === 'codex' && !showApiCost ? priced.planUnpricedModels : priced.apiUnpricedModels));
       } else {
         out.claudeUsd += priced.planCost;
         out.fallbackModels.push(...priced.planFallbackModels);
@@ -1194,6 +1200,8 @@
         : allUsdAvailable
           ? out.codexApiUsd + out.claudeUsd
           : 0;
+    out.codexApiFallbackModels = [...new Set(out.codexApiFallbackModels)].sort();
+    out.codexApiUnpricedModels = [...new Set(out.codexApiUnpricedModels)].sort();
     out.fallbackModels = [...new Set(out.fallbackModels)].sort();
     out.unpricedModels = [...new Set(out.unpricedModels)].sort();
     return out;
@@ -1217,7 +1225,7 @@
     const out = {
       sessionCount: 0,
       byModel: [] as ReturnType<typeof aggregateModelMetrics>,
-      credits: { billedTotal: 0, unlimitedCount: 0 },
+      credits: { billedTotal: 0, unlimitedCount: 0, fallbackModels: [] as string[], unpricedModels: [] as string[] },
       subagents: { count: 0, cost: 0 },
       allUnlimited: false,
     };
@@ -1230,7 +1238,11 @@
       out.sessionCount++;
       if (s.harness === 'codex') {
         if (s.credits_unlimited === true && !rt.pricing?.current) out.credits.unlimitedCount++;
-        else out.credits.billedTotal += priced.planCost;
+        else {
+          out.credits.billedTotal += priced.planCost;
+          out.credits.fallbackModels.push(...priced.planFallbackModels);
+          out.credits.unpricedModels.push(...priced.planUnpricedModels);
+        }
       }
       if (isSubagent(s)) {
         out.subagents.count++;
@@ -1241,6 +1253,8 @@
         }
       }
     }
+    out.credits.fallbackModels = [...new Set(out.credits.fallbackModels)].sort();
+    out.credits.unpricedModels = [...new Set(out.credits.unpricedModels)].sort();
     out.byModel = allUsdAvailable && analyticsReady ? aggregateModelMetrics(filteredNoDate, data, r) : [];
     const codexCount = filteredNoDate.filter((session) => data[session.storage_id]?.tokens.total_tokens && session.harness === 'codex').length;
     out.allUnlimited = codexCount > 0 && out.credits.unlimitedCount === codexCount;
@@ -1360,6 +1374,17 @@
     return moneyIsUsd ? fmtUsd(n) : fmtAmount(n);
   }
 
+  // Both Codex cards retain their own surface's provenance, including in All.
+  function estimateSummary(total: number, fallback: string[], unpriced: string[], usd: boolean, available = analyticsReady) {
+    return {
+      value: !available || !Number.isFinite(total) || costIsUnmeasured(unpriced, total) ? 'Unavailable' : usd ? fmtUsd(total) : total > 0 ? fmtAmount(total) : '—',
+      note: [unpriced.length ? `${unpriced.length} unpriced model${unpriced.length === 1 ? '' : 's'} excluded` : '', fallback.length ? `${fallback.length} fallback rate${fallback.length === 1 ? '' : 's'} used` : ''].filter(Boolean).join(' · '),
+      title: [...unpriced, ...fallback].join(', '),
+    };
+  }
+  const purchasedCreditSummary = $derived(estimateSummary(windowStats.credits.billedTotal, windowStats.credits.fallbackModels, windowStats.credits.unpricedModels, false));
+  const codexApiSummary = $derived(estimateSummary(windowTotals.codexApiUsd, windowTotals.codexApiFallbackModels, windowTotals.codexApiUnpricedModels, true, analyticsReady && allUsdAvailable));
+
   const spendCardLabel = $derived(
     harness === 'all'
       ? `Combined API estimate · ${windowLabel}`
@@ -1382,7 +1407,7 @@
           : windowTotals.fallbackModels.length > 0
             ? `estimate · ${windowTotals.fallbackModels.length} fallback rate${windowTotals.fallbackModels.length === 1 ? '' : 's'} used`
             : windowStats.allUnlimited ? 'à la carte · all sessions unlimited'
-            : ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0 ? 'flat OpenAI API reference' : 'OpenAI API rates')
+            : showApiCost ? 'current API base rate reference' : 'current purchased-credit reference')
       : windowTotals.unpricedModels.length > 0
         ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
         : windowTotals.fallbackModels.length > 0
@@ -1796,23 +1821,9 @@
       {#if harness === 'codex' || harness === 'all'}
         <div>
           <div class="text-[11px] text-ink-muted font-medium">Purchased-credit estimate · {windowLabel}</div>
-          {#if !analyticsReady || !Number.isFinite(windowStats.credits.billedTotal)}
-            <div class="text-xl font-bold font-mono mt-0.5 text-ink">unavailable</div>
-          {:else if windowStats.credits.billedTotal > 0}
-            <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-              {fmtAmount(analyticsReady ? windowStats.credits.billedTotal : Number.NaN)}
-              {#if windowStats.credits.unlimitedCount > 0}
-                <span class="text-[11px] text-ink-faint font-normal">{windowStats.credits.unlimitedCount} unlimited excluded</span>
-              {/if}
-            </div>
-          {:else if windowStats.credits.unlimitedCount > 0}
-            <!-- Never print 0.00 next to an unlimited count. -->
-            <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-              — <span class="text-[11px] text-ink-faint font-normal">all sessions unlimited</span>
-            </div>
-          {:else}
-            <div class="text-xl font-bold font-mono mt-0.5 text-ink">—</div>
-          {/if}
+          <div class="text-xl font-bold font-mono mt-0.5 text-ink">{purchasedCreditSummary.value}</div>
+          {#if analyticsReady && purchasedCreditSummary.note}<p class="text-[11px] text-ink-faint" title={purchasedCreditSummary.title}>{purchasedCreditSummary.note}</p>{/if}
+          {#if windowStats.credits.unlimitedCount > 0}<p class="text-[11px] text-ink-faint">{windowStats.allUnlimited ? 'all sessions unlimited' : `${windowStats.credits.unlimitedCount} unlimited excluded`}</p>{/if}
         </div>
       {:else}
         <div>
@@ -1844,8 +1855,8 @@
       />
       {#if harness === 'all'}
       <div class="grid grid-cols-3 gap-2 text-xs">
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex purchased-credit estimate</span><div class="font-mono font-semibold">{fmtAmount(analyticsReady ? windowTotals.codexCredits : Number.NaN)}</div></div>
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex API base USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.codexApiUsd) ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex purchased-credit estimate</span><div class="font-mono font-semibold">{purchasedCreditSummary.value}</div>{#if purchasedCreditSummary.note}<p title={purchasedCreditSummary.title}>{purchasedCreditSummary.note}</p>{/if}</div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex API base USD</span><div class="font-mono font-semibold">{codexApiSummary.value}</div>{#if codexApiSummary.note}<p title={codexApiSummary.title}>{codexApiSummary.note}</p>{/if}</div>
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.claudeUsd) ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
       </div>
       {/if}

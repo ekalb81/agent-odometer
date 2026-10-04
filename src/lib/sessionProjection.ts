@@ -198,8 +198,8 @@ export function usesApiPricing(session: SessionSummary, rates: RateCard): boolea
   return session.harness === 'codex' && Object.keys(rates.api_models ?? {}).length > 0;
 }
 
-export function displayCurrency(session: SessionSummary, rates: RateCard): string {
-  return usesApiPricing(session, rates) ? 'USD' : harnessCurrency(rates, session.harness);
+export function displayCurrency(session: SessionSummary, rates: RateCard, pricing?: RangePricing): string {
+  return usesApiPricing(session, rates) ? 'USD' : session.harness === 'codex' && pricing?.current ? 'purchased credits' : harnessCurrency(rates, session.harness);
 }
 
 export function projectSession<T extends SessionSummary>(
@@ -326,7 +326,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
           model: bucket.model,
           tokens: zeroTotals(),
           cost: 0,
-          currency: displayCurrency(session, rates),
+          currency: displayCurrency(session, rates, range.pricing),
           fallbackUsed: false,
           unpriced: false,
           basis: 'unavailable',
@@ -357,7 +357,7 @@ export function aggregateModelMetrics<T extends SessionSummary>(
       let metric = grouped.get(key);
       if (!metric) {
         metric = { harness: session.harness, model, tokens: zeroTotals(), cost: 0,
-          currency: displayCurrency(session, rates), fallbackUsed: false, unpriced: false,
+          currency: displayCurrency(session, rates, range.pricing), fallbackUsed: false, unpriced: false,
           basis: 'unavailable', tools: zeroToolMetrics() };
         grouped.set(key, metric);
       }
