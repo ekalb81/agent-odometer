@@ -118,6 +118,15 @@ export function validateUpdaterManifest(manifest, release, expectedVersion, expe
     if (typeof entry.signature !== 'string' || entry.signature.trim() === '') {
       throw new Error(`${platform}.signature must be a non-empty string`);
     }
+    // Match the updater's version field parser. Cryptographic verification of
+    // the trusted comment belongs to the updater; this is a release metadata gate.
+    const comment = Buffer.from(entry.signature, 'base64').toString('utf8').split(/\r?\n/)[2];
+    const signedVersion = comment?.startsWith('trusted comment: ')
+      ? comment.slice('trusted comment: '.length).split('\t').find((field) => field.startsWith('version:'))?.slice('version:'.length)
+      : undefined;
+    if (signedVersion !== expectedVersion) {
+      throw new Error(`${platform}.signature must contain signed version ${expectedVersion}`);
+    }
     if (typeof entry.url !== 'string') {
       throw new Error(`${platform}.url must be a string`);
     }

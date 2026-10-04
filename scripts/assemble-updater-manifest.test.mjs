@@ -13,11 +13,16 @@ const TAG = `v${VERSION}`;
 const REPOSITORY = 'example/odometer';
 const SHA = '0123456789abcdef0123456789abcdef01234567';
 
+// Synthetic signature text: these tests validate metadata, not cryptography.
+function signatureFixture() {
+  return Buffer.from(`untrusted comment: fixture\nZmFrZQ==\ntrusted comment: timestamp:1\tversion:${VERSION}\nZmFrZQ==\n`).toString('base64');
+}
+
 function withArtifactDirectory(callback) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'odometer-updater-manifest-'));
   try {
     for (const name of releaseBundleAssetNames(VERSION)) {
-      fs.writeFileSync(path.join(directory, name), name.endsWith('.sig') ? `signature:${name}` : 'bundle');
+      fs.writeFileSync(path.join(directory, name), name.endsWith('.sig') ? signatureFixture() : 'bundle');
     }
     return callback(directory);
   } finally {
@@ -55,7 +60,7 @@ test('assembles a complete public updater manifest after all platform bundles ex
 
     assert.doesNotThrow(() => validateUpdaterManifest(manifest, release(), VERSION, SHA));
     assert.equal(manifest.platforms['darwin-aarch64'].url, `https://github.com/${REPOSITORY}/releases/download/${TAG}/Odometer.app.tar.gz`);
-    assert.equal(manifest.platforms['windows-x86_64-nsis'].signature, `signature:Odometer_${VERSION}_x64-setup.exe.sig`);
+    assert.equal(manifest.platforms['windows-x86_64-nsis'].signature, signatureFixture());
     assert.equal(manifest.platforms['linux-x86_64'].url, `https://github.com/${REPOSITORY}/releases/download/${TAG}/Odometer_${VERSION}_amd64.AppImage`);
   });
 });

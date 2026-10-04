@@ -232,6 +232,8 @@ Bump the version first, on a normal PR, with `npm run version:bump -- <major|min
 
 All three checked version fields must already equal `X.Y.Z`; the release workflow rejects a mismatched `vX.Y.Z` tag before any platform builds start. The tagged commit must also have a successful CI run.
 
+Use Tauri CLI 2.12 or newer so updater signatures include the app version. Odometer requires that signed version to match the update manifest; the release validator rejects missing or mismatched versions. Existing installations can still update to these bundles through the same endpoint and public key.
+
 A repository ruleset forbids updating **or deleting** tag refs. A tag pushed at the wrong commit is permanently unusable and its version number is burned, so never tag before the bump commit is on `main` with green CI.
 
 GitHub generates draft release notes from merged pull requests. Work that lands directly on `main` is invisible to that generator, so read the draft's notes and rewrite them from the actual commit range before publishing. Notes are only editable while the release is a draft. `git tag -s` creates an annotated, cryptographically signed Git tag; this Git signature is separate from the updater artifact signature.

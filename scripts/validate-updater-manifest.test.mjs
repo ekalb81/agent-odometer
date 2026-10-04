@@ -6,6 +6,11 @@ import { rewriteUpdaterManifestUrls, validateUpdaterManifest } from './validate-
 const VERSION = '0.6.4';
 const SHA = '0123456789abcdef0123456789abcdef01234567';
 
+// Synthetic signature text: these tests validate metadata, not cryptography.
+function signatureFixture(trustedComment = `timestamp:1\tversion:${VERSION}`) {
+  return Buffer.from(`untrusted comment: fixture\nZmFrZQ==\ntrusted comment: ${trustedComment}\nZmFrZQ==\n`).toString('base64');
+}
+
 function fixture() {
   const names = [
     'latest.json',
@@ -42,7 +47,7 @@ function fixture() {
     'windows-x86_64-nsis',
   ];
   const platforms = Object.fromEntries(platformNames.map((name, index) => [name, {
-    signature: 'signed',
+    signature: signatureFixture(),
     url: assets[(index % (assets.length - 1)) + 1].browser_download_url,
   }]));
   return {
@@ -54,6 +59,33 @@ function fixture() {
 test('accepts a complete Tauri updater manifest', () => {
   const { manifest, release } = fixture();
   assert.doesNotThrow(() => validateUpdaterManifest(manifest, release, VERSION, SHA));
+});
+
+test('rejects legacy signatures without a signed version', () => {
+  const { manifest, release } = fixture();
+  manifest.platforms['windows-x86_64'].signature = signatureFixture('timestamp:1');
+  assert.throws(
+    () => validateUpdaterManifest(manifest, release, VERSION, SHA),
+    /signature must contain signed version 0\.6\.4/,
+  );
+});
+
+test('rejects an artifact signed for a different version', () => {
+  const { manifest, release } = fixture();
+  manifest.platforms['windows-x86_64'].signature = signatureFixture('timestamp:1\tversion:0.6.3');
+  assert.throws(
+    () => validateUpdaterManifest(manifest, release, VERSION, SHA),
+    /signature must contain signed version 0\.6\.4/,
+  );
+});
+
+test('rejects malformed signature text', () => {
+  const { manifest, release } = fixture();
+  manifest.platforms['windows-x86_64'].signature = 'signed';
+  assert.throws(
+    () => validateUpdaterManifest(manifest, release, VERSION, SHA),
+    /signature must contain signed version 0\.6\.4/,
+  );
 });
 
 test('rewrites API asset URLs to public release downloads for every platform', () => {
