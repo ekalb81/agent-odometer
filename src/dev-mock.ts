@@ -1,5 +1,5 @@
 // Fixture IPC for `npm run dev` in a plain browser (no native backend).
-// Loaded only when import.meta.env.DEV is set and Tauri isn't present â€” see
+// Loaded only when import.meta.env.DEV is set and Tauri isn't present — see
 // main.ts. Production builds tree-shake this module away entirely.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
@@ -156,14 +156,14 @@ function subscriptionUsage(): SubscriptionUsageEntry[] {
 
 // Issue #44: only populated for the 'tool-dimensions' visual scenario, so
 // every other baseline is byte-for-byte unaffected. Codex and Claude Code
-// both get real mcp_server/shell_family/language/context_source data â€” both
+// both get real mcp_server/shell_family/language/context_source data — both
 // providers are genuinely capable of every dimension (provider.rs). Gemini
 // CLI deliberately omits mcp_server/shell_family here: it genuinely lacks
 // those two capabilities (mcp_dimension/shell_dimension: false in the
 // 'tool-dimensions' branch of the 'list_providers' case below, matching
 // provider.rs's real GEMINI_CLI_DESCRIPTOR), so the panel must render
 // "Unavailable" from that capability flag, not from an absent-vs-zero guess
-// at missing keys here â€” there is no override anywhere in this file.
+// at missing keys here — there is no override anywhere in this file.
 function dimensionTotalsFor(f: Fixture): RangeTotals['tool_dimensions'] {
   if (visualScenario !== 'tool-dimensions') return undefined;
   const dim = (calls: number, failures: number, outputBytes: number, durationMs: number) =>
@@ -209,7 +209,7 @@ function dimensionTotalsFor(f: Fixture): RangeTotals['tool_dimensions'] {
     };
   }
   // Gemini CLI: mcp_server/shell_family keys are omitted entirely (not
-  // zeroed) â€” the capability is genuinely absent, not merely unused this
+  // zeroed) — the capability is genuinely absent, not merely unused this
   // session. language/context_source stay real: those two dimensions are
   // generic, provider-agnostic signals (see provider.rs's
   // language_dimension/context_dimension, both true for Gemini CLI).
@@ -296,7 +296,7 @@ function historyStatus(): HistoryStatus & { coverage_complete: boolean | null } 
 }
 
 function historyRebuildStatus(): HistoryRebuildStatus {
-  // No visual scenario models an in-progress or completed rebuild â€” browser
+  // No visual scenario models an in-progress or completed rebuild — browser
   // dev mode has no Rust backend to actually run one, and `rebuild_history`/
   // `cancel_history_rebuild` are unhandled below (they fall through to
   // mockIPC's default, an error), so a click in dev mode surfaces as an
@@ -544,7 +544,7 @@ mockIPC((cmd, payload) => {
           directory: '/home/dev/Documents/Codex/2026-08-04/ser',
           repository_name: null,
           relative_path: null,
-          display_path: 'â€¦/Codex/2026-08-04/ser',
+          display_path: '…/Codex/2026-08-04/ser',
         },
       ];
     case 'resolve_projects': {
@@ -594,7 +594,7 @@ mockIPC((cmd, payload) => {
         { id: 'claude_code', display_name: 'Claude Code', archived_sources: false, session_index: false, currency: 'USD', deep_link: false, quota_source: false, mcp_dimension: true, shell_dimension: true, language_dimension: true, context_dimension: true },
       ];
       // Issue #44: the 'tool-dimensions' scenario adds Gemini CLI so the
-      // panel can show a real, uncontrived "Unavailable" state â€” no
+      // panel can show a real, uncontrived "Unavailable" state — no
       // capability-flag override on any provider anywhere in this file.
       // These flags match provider.rs's real GEMINI_CLI_DESCRIPTOR exactly:
       // mcp_dimension/shell_dimension false (not corroborated against a
@@ -639,7 +639,7 @@ mockIPC((cmd, payload) => {
         total_ttft_ms: 0,
         // Synthetic cohort data, not tied to a specific session/model
         // (buckets stays empty below), so cache-creation harness-awareness
-        // doesn't matter for pricing here â€” 'claude_code' is an arbitrary
+        // doesn't matter for pricing here — 'claude_code' is an arbitrary
         // but harmless choice.
         tokens: tok(tokens * turns, 'claude_code'),
         buckets: [],
@@ -852,7 +852,7 @@ mockIPC((cmd, payload) => {
     case 'plugin:event|unlisten':
       return 0;
     default:
-      // e.g. plugin:updater|check â€” callers handle rejection gracefully.
+      // e.g. plugin:updater|check — callers handle rejection gracefully.
       return Promise.reject(new Error(`dev-mock: unhandled command ${cmd}`));
   }
 });

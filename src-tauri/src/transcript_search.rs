@@ -485,8 +485,8 @@ mod tests {
 
     #[test]
     fn literal_unicode_search_produces_javascript_safe_highlight_offsets() {
-        let literal = matcher("[cafÃ©]").unwrap();
-        let result = snippet("ðŸ¦€ [CAFÃ‰] literal", &literal).unwrap();
+        let literal = matcher("[café]").unwrap();
+        let result = snippet("🦀 [CAFÉ] literal", &literal).unwrap();
         assert_eq!((result.match_start, result.match_end), (3, 9));
         assert!(snippet("CAFE", &literal).is_none());
         assert!(matcher(" ").is_err());
