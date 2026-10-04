@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte';
   import type { SessionSummary } from '../lib/types';
   import { RANGE_PRESETS, rangeLabelFor, toLocalInputValue, type RangePreset } from '../lib/dateRange';
-  import { defaultFilters, type SessionFilterState } from '../lib/sessionProjection';
+  import { defaultFilters, toUtcIso, type SessionFilterState } from '../lib/sessionProjection';
 
   export type FilterState = SessionFilterState;
 
@@ -43,7 +43,15 @@
   }
 
   function emit(patch: Partial<FilterState>) {
-    onchange({ ...filters, ...patch });
+    const next = { ...filters, ...patch };
+    if ('dateFrom' in patch && 'dateTo' in patch) delete next.utcBounds;
+    else if (filters.utcBounds && ('dateFrom' in patch || 'dateTo' in patch)) {
+      next.utcBounds = {
+        from: 'dateFrom' in patch ? toUtcIso(next.dateFrom) : filters.utcBounds.from,
+        to: 'dateTo' in patch ? toUtcIso(next.dateTo) : filters.utcBounds.to,
+      };
+    }
+    onchange(next);
   }
 
   function clearAll() {
@@ -172,6 +180,7 @@
           {/each}
         </div>
         <div class="border-t border-edge pt-3 flex flex-col gap-2">
+          {#if filters.utcBounds}<p class="text-[11px] text-ink-faint">UTC bounds preserve exact instants, including seconds and milliseconds. Editing a bound replaces that instant.</p>{/if}
           <label class="flex items-center justify-between gap-2 text-xs text-ink-muted">
             <span>From</span>
             <input

@@ -128,7 +128,7 @@
     {#if preview}
       <div class="border border-amber-500/40 rounded-sm p-3 space-y-2" aria-label="Purge preview">
         <p class="text-xs text-ink-muted">{count(preview.sessions)} retained {preview.sessions === 1 ? 'session' : 'sessions'} in {count(preview.identity_groups)} identity {preview.identity_groups === 1 ? 'group' : 'groups'} with activity before {preview.cutoff_utc_day} UTC. Selected snapshots contain {formatBytes(preview.snapshot_bytes)}.</p>
-        <p class="text-xs text-amber-500">This removes their local snapshots, usage facts, rollups, and session-specific project assignments. Historical coverage becomes incomplete, so token and money budgets become unavailable. Provider files and earlier recovery backups remain. Minimal fingerprint exclusions prevent copied, moved, or resumed erased history from reimporting. New fingerprints can be imported.</p>
+        <p class="text-xs text-amber-500">This removes their local snapshots, usage facts, rollups, session-specific project assignments, pins, tags, and private notes. Saved searches and tag definitions remain. Historical coverage becomes incomplete, so token and money budgets become unavailable. Provider files and earlier recovery backups remain. Minimal fingerprint exclusions prevent copied, moved, or resumed erased history from reimporting. New fingerprints can be imported.</p>
         {#if preview.sessions > 0}
           <label class="block text-xs text-ink-muted">Type PURGE {preview.sessions} to confirm
             <input aria-label="Purge confirmation" class="block w-full mt-1 px-2 py-1.5 bg-card border border-edge rounded-sm" bind:value={confirmation} disabled={busy} autocomplete="off" />
