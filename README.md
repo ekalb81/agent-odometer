@@ -66,7 +66,7 @@ If Codex or Claude Code is installed with default paths, there is nothing to con
 
 Custom locations can be added under **Settings → Watched roots**.
 
-Cursor, GitHub Copilot, and OpenCode are **not** supported. Each was evaluated and rejected on evidence rather than effort: Cursor reports no real token counts in recent versions, Copilot's only source with an input/output split is an internal trace database that is not always present, and OpenCode spreads a session across many files in a shape the incremental parser cannot follow. Odometer would have to estimate, and an estimate presented as a measurement is worse than no support.
+Cursor, GitHub Copilot CLI, OpenCode, Cline, Kilo Code, and Goose are **not** currently supported. A source-format review found promising local data for some providers, but it has not yet established stable schemas and accounting semantics that meet Odometer's event-level contracts. In particular, Cursor's published token API is for its SDK rather than desktop history; Copilot's opt-in local OpenTelemetry export needs a verified project/session join; and OpenCode's current SQLite store is internal and versioned with the app. See [additional adapter evidence](docs/ADAPTER_COMPATIBILITY.md) for the reviewed versions, source links, and bounded candidate recommendation. Odometer does not estimate missing usage.
 
 On first launch after an upgrade that changes the history schema, the window opens immediately and analytics report that history is still preparing while the database migrates in the background. A large history can take a while; the app stays usable and never reports partial totals as if they were complete.
 
