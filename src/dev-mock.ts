@@ -3,6 +3,8 @@
 // main.ts. Production builds tree-shake this module away entirely.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
+import { transcriptFixture } from './dev-mock/transcript';
+import type { TranscriptRequest } from './lib/types';
 import { mockRangePricing, mockSessionPricing, mockSummaryPricing, assertFixtureRates } from './dev-mock/pricing';
 import { createFixtureData, tok, scaleTok, toolMetrics, type Fixture } from './dev-mock/fixtures';
 import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } from './dev-mock/visualScenario';
@@ -467,6 +469,8 @@ mockIPC((cmd, payload) => {
       return Object.fromEntries(visibleFixtures().filter(f => ids.has(summary(f).storage_id))
         .map(f => [summary(f).storage_id, mockSummaryPricing(pricingKey(f))]));
     }
+    case 'get_transcript_page':
+      return transcriptFixture((payload as { request: TranscriptRequest }).request);
     case 'get_session_details': {
       const { sessionId } = payload as { sessionId: string };
       const f = visibleFixtures().find((x) => summary(x).storage_id === sessionId);

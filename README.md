@@ -21,6 +21,7 @@ Everything happens on your machine. Odometer never uploads, phones home, or send
 - **Tokens where they went** — input, cached, output, and reasoning tokens per session, per model, and per turn.
 - **What it costs** — Codex sessions show plan credits *and* an informational "what would this cost at OpenAI API rates" estimate; Claude Code and Gemini CLI sessions show API-rate estimates in USD. Rates live in an editable rate card, and every priced figure carries its provenance: priced directly, resolved through a model alias, fallback-priced, estimated, or explicitly unpriced.
 - **Turn-by-turn detail** — click any session for its full story: prompts, replies, per-turn tokens and cost, context-window fill, and a tokens-over-time sparkline.
+- **Source inspection** — select a session and choose **Inspect transcript** for bounded source-order pages, explicit tool links, and recorded edits. See [Transcript inspector](docs/TRANSCRIPT_INSPECTOR.md).
 - **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
 - **Live** — sessions update in the list while your agents are still running.
 - **Codex speed** — open **Codex → Analytics & exports → Codex speed** for Today, 7-day, and 14-day reports, Fast/Standard comparisons, model and reasoning filters, and CSV export. The default turn throughput uses session-log tokens and recorded turn durations, including tools, reasoning, and waiting; recorded time to first token is shown when available. An optional response view uses retained local SQLite telemetry. The two measurements stay separate, and neither measures pure decoding or accepted-task delivery. Missing timing or mode evidence is labeled unavailable or unknown. See [measurement details](docs/CODEX_SPEED.md).
@@ -247,3 +248,4 @@ Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for 
 ## License
 
 [MIT](LICENSE)
+
