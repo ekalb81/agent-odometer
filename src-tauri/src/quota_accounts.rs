@@ -637,6 +637,10 @@ mod tests {
         service.approve("a", "A").unwrap();
         let before = std::fs::read(&path).unwrap();
         let lock = std::fs::File::open(path.with_extension("lock")).unwrap();
+        // Model a Unix child retaining the open-file description after fork.
+        // Explicit unlock must permit retry even while that descriptor lives.
+        #[cfg(unix)]
+        let _inherited_descriptor = lock.try_clone().unwrap();
         lock.try_lock().unwrap();
         assert!(service.change("a", false, true).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -645,6 +649,7 @@ mod tests {
             Some("disabled")
         );
         assert!(!service.poll());
+        lock.unlock().unwrap();
         drop(lock);
         service.change("a", false, true).unwrap();
         assert!(isolated(&path).status(Utc::now()).accounts.is_empty());
@@ -662,6 +667,7 @@ mod tests {
         let lock = std::fs::File::open(path.with_extension("lock")).unwrap();
         lock.try_lock().unwrap();
         assert!(first.change("a", false, true).is_err());
+        lock.unlock().unwrap();
         drop(lock);
         let second = isolated(&path);
         second.change("b", false, true).unwrap();
