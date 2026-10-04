@@ -247,6 +247,7 @@ pub struct ProviderLedgerStats {
 /// failed archive must not quietly behave like a disposable cache.
 pub struct HistoryStore {
     connection: Mutex<Connection>,
+    exclusion_cache: Mutex<ExclusionCache>,
     query_control: Option<QueryControl>,
     /// Retained so aggregation can open dedicated read connections instead
     /// of serializing behind the writer mutex (WAL permits concurrent reads).
@@ -317,6 +318,7 @@ impl HistoryStore {
         let pragmas = crate::memory::query_sqlite_pragmas(&connection);
         Ok(Self {
             connection: Mutex::new(connection),
+            exclusion_cache: Mutex::new(ExclusionCache::at(path.to_path_buf())),
             query_control: Some(control),
             path: path.to_path_buf(),
             pragmas,
@@ -565,6 +567,7 @@ impl HistoryStore {
         }
         Ok(Self {
             connection: Mutex::new(connection),
+            exclusion_cache: Mutex::new(ExclusionCache::at(path.to_path_buf())),
             query_control: None,
             path: path.to_path_buf(),
             pragmas,
@@ -5783,7 +5786,7 @@ mod tests {
         writer
             .connection()
             .unwrap()
-            .execute_batch("PRAGMA user_version = 11")
+            .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
             .unwrap();
         let error = HistoryStore::open_read_only(&path, QueryControl::default())
             .err()
@@ -5795,7 +5798,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            11
+            SCHEMA_VERSION + 1
         );
     }
 
@@ -6559,6 +6562,39 @@ mod tests {
     }
 
     #[test]
+    fn retention_policy_changes_invalidate_preview_even_when_original_policy_is_restored() {
+        let (directory, store) = store();
+        let path = directory.path().join("policy.jsonl");
+        store
+            .observe(&path, &session("stale-policy", 100), 1)
+            .unwrap();
+        store.mark_path_missing(&path).unwrap();
+        let days30 = RetentionPolicy {
+            retained_days: Some(30),
+        };
+        store.set_retention_policy(&days30).unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        let preview = store.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        store
+            .set_retention_policy(&RetentionPolicy::default())
+            .unwrap();
+        assert!(store
+            .purge_retained(&preview, now)
+            .unwrap_err()
+            .to_string()
+            .contains("policy changed"));
+        assert_eq!(store.retention_status().unwrap().retained_sessions, 1);
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 0);
+        store.set_retention_policy(&days30).unwrap();
+        assert!(store.purge_retained(&preview, now).is_err());
+        let fresh = store.preview_purge(now).unwrap();
+        assert!(fresh.policy_revision > preview.policy_revision);
+        store.purge_retained(&fresh, now).unwrap();
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 1);
+    }
+
+    #[test]
     fn retention_recovery_preserves_corrupt_database_and_committed_exclusions() {
         let (directory, store) = store();
         let path = directory.path().join("source.jsonl");
@@ -6712,6 +6748,19 @@ mod tests {
         assert!(cache.is_excluded(&fresh).is_err());
         std::fs::remove_file(&journal).unwrap();
         assert!(cache.is_excluded(&copy).is_err());
+    }
+
+    #[test]
+    fn retention_complete_coverage_rejects_unverified_exclusions_after_open() {
+        let (directory, store) = store();
+        assert!(store.has_complete_coverage().unwrap());
+        let journal = directory.path().join("history.sqlite3.exclusions.jsonl");
+        std::fs::write(&journal, b"invalid complete erasure record\n").unwrap();
+        assert!(store.has_complete_coverage().is_err());
+        assert!(store.retention_status().is_err());
+        std::fs::remove_file(journal).unwrap();
+        // Removing previously observed evidence does not make it verified.
+        assert!(store.has_complete_coverage().is_err());
     }
 
     #[test]
@@ -8903,50 +8952,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("history.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO history_meta(key, value) VALUES('schema_version', '1');
-                 CREATE TABLE durable_token_events (
-                   session_key TEXT NOT NULL,
-                   event_key TEXT NOT NULL,
-                   event_index INTEGER NOT NULL,
-                   timestamp_ms INTEGER NOT NULL,
-                   model TEXT,
-                   service_tier TEXT,
-                   cumulative_total_tokens INTEGER NOT NULL,
-                   input_tokens INTEGER NOT NULL,
-                   cached_input_tokens INTEGER NOT NULL,
-                   output_tokens INTEGER NOT NULL,
-                   reasoning_output_tokens INTEGER NOT NULL,
-                   total_tokens INTEGER NOT NULL,
-                   PRIMARY KEY(session_key, event_key)
-                 );
-                 -- Present in every real v1 store; the v3 fact backfill reads
-                 -- current snapshots through these tables.
-                 CREATE TABLE durable_sessions (
-                   session_key TEXT PRIMARY KEY,
-                   identity_key TEXT NOT NULL,
-                   first_event_fingerprint TEXT NOT NULL,
-                   fingerprint_is_final INTEGER NOT NULL,
-                   collision INTEGER NOT NULL DEFAULT 0,
-                   current_snapshot_version INTEGER NOT NULL DEFAULT 0,
-                   current_snapshot_hash TEXT,
-                   created_at_ms INTEGER NOT NULL,
-                   last_seen_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE session_snapshots (
-                   session_key TEXT NOT NULL,
-                   version INTEGER NOT NULL,
-                   format_version INTEGER NOT NULL,
-                   snapshot_hash TEXT NOT NULL,
-                   captured_at_ms INTEGER NOT NULL,
-                   session_json BLOB NOT NULL,
-                   PRIMARY KEY(session_key, version)
-                 );
-                 PRAGMA user_version = 1;",
-            )
-            .unwrap();
+        connection.execute_batch(V1_MINIMAL_SCHEMA_SQL).unwrap();
         drop(connection);
 
         let store = HistoryStore::open(&path).unwrap();
@@ -10033,7 +10039,7 @@ mod tests {
     /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
     /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
     /// `HistoryStore::open` and pasting the result below.
-    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT, thread_name_overlay TEXT, thread_name_overlay_set INTEGER NOT NULL DEFAULT 0 )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:purged_sessions_identity_idx:CREATE INDEX purged_sessions_identity_idx ON purged_sessions(identity_key, first_event_fingerprint)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT, thread_name_overlay TEXT, thread_name_overlay_set INTEGER NOT NULL DEFAULT 0 , lifecycle TEXT NOT NULL DEFAULT 'present' CHECK(lifecycle IN ('present','retained','superseded')))\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:purged_sessions:CREATE TABLE purged_sessions ( session_key TEXT NOT NULL, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, purged_at_ms INTEGER NOT NULL, PRIMARY KEY(session_key,first_event_fingerprint) )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:session_summaries:CREATE TABLE session_summaries ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), summary_json BLOB NOT NULL )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
 
     #[test]
     fn schema_fingerprint_matches_committed_expected_value() {
@@ -10268,6 +10274,7 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                11 => "DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; DELETE FROM history_meta WHERE key IN ('coverage_complete','retention_policy');",
                 10 => {
                     "ALTER TABLE durable_sessions DROP COLUMN thread_name_overlay;
                      ALTER TABLE durable_sessions DROP COLUMN thread_name_overlay_set;"
@@ -10497,6 +10504,7 @@ mod tests {
                 "v7_to_v8_tool_dimensions_backfill",
                 "v8_to_v9_last_seen_index",
                 "v9_to_v10_thread_name_overlay",
+                "v10_to_v11_retention",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );

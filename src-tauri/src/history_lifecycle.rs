@@ -139,6 +139,9 @@ pub struct RetentionStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PurgePreview {
     pub cutoff_utc_day: String,
+    /// Monotonic policy revision, read in the same snapshot as candidates.
+    #[serde(default)]
+    pub policy_revision: u64,
     pub sessions: u64,
     pub identity_groups: u64,
     pub snapshot_bytes: u64,
@@ -334,12 +337,12 @@ impl ExclusionCache {
             *self = Self::at(path);
         }
     }
-    pub fn is_excluded(&mut self, session: &Session) -> Result<bool> {
+    pub fn verify(&mut self) -> Result<()> {
         let Some(path) = &self.path else {
             if self.invalid {
                 bail!("independent purge exclusions are unavailable");
             }
-            return Ok(false);
+            return Ok(());
         };
         let stamp = match std::fs::metadata(exclusion_path(path)) {
             Ok(metadata) => Some((metadata.len(), metadata.modified()?)),
@@ -377,6 +380,10 @@ impl ExclusionCache {
         if self.invalid {
             bail!("independent purge exclusions could not be verified; source history cannot be republished");
         }
+        Ok(())
+    }
+    pub fn is_excluded(&mut self, session: &Session) -> Result<bool> {
+        self.verify()?;
         Ok(self.identities.contains(&(
             provider_identity(session)?,
             first_event_fingerprint(session),
@@ -431,6 +438,7 @@ fn purge_candidates(
     Ok((
         PurgePreview {
             cutoff_utc_day: cutoff.to_owned(),
+            policy_revision: 0,
             sessions: candidates.len() as u64,
             identity_groups: groups.len() as u64,
             snapshot_bytes: bytes,
@@ -438,6 +446,28 @@ fn purge_candidates(
             revision: stable_hash(&revision),
         },
         candidates,
+    ))
+}
+
+fn read_retention_policy(connection: &Connection) -> Result<(RetentionPolicy, u64)> {
+    let read = |key| -> Result<Option<String>> {
+        Ok(connection
+            .query_row(
+                "SELECT value FROM history_meta WHERE key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    };
+    Ok((
+        read("retention_policy")?
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?
+            .unwrap_or_default(),
+        read("retention_policy_revision")?
+            .map(|raw| raw.parse::<u64>())
+            .transpose()?
+            .unwrap_or(0),
     ))
 }
 
@@ -495,14 +525,16 @@ impl HistoryStore {
     }
 
     pub fn preview_purge(&self, now: DateTime<Utc>) -> Result<PurgePreview> {
-        let status = self.retention_status()?;
-        let days = status
-            .policy
+        let connection = self.open_reader()?;
+        // open_reader already holds one validated read transaction.
+        let (policy, revision) = read_retention_policy(&connection)?;
+        let days = policy
             .retained_days
             .ok_or_else(|| anyhow!("choose a retention duration before reviewing purge"))?;
         let cutoff = (now.date_naive() - chrono::Duration::days(i64::from(days))).to_string();
-        let connection = self.open_reader()?;
-        Ok(purge_candidates(&connection, &cutoff)?.0)
+        let mut preview = purge_candidates(&connection, &cutoff)?.0;
+        preview.policy_revision = revision;
+        Ok(preview)
     }
 
     /// Confirmed removal of local derived history only. Tombstones and every
@@ -514,7 +546,12 @@ impl HistoryStore {
     ) -> Result<PurgeResult> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (current, candidates) = purge_candidates(&transaction, &preview.cutoff_utc_day)?;
+        let (policy, revision) = read_retention_policy(&transaction)?;
+        if policy.retained_days.is_none() || revision != preview.policy_revision {
+            bail!("retention policy changed after the purge preview; review a fresh preview");
+        }
+        let (mut current, candidates) = purge_candidates(&transaction, &preview.cutoff_utc_day)?;
+        current.policy_revision = revision;
         if &current != preview {
             bail!("history changed after the purge preview; review a fresh preview");
         }
@@ -555,6 +592,7 @@ impl HistoryStore {
 
     /// Recovery of readable sources cannot claim that missing historical sources were recovered.
     pub fn has_complete_coverage(&self) -> Result<bool> {
+        self.exclusion_cache.lock().unwrap().verify()?;
         let connection = self.open_reader()?;
         Ok(connection.query_row(
             "SELECT value='1' FROM history_meta WHERE key='coverage_complete'",
@@ -564,6 +602,7 @@ impl HistoryStore {
     }
 
     pub fn retention_status(&self) -> Result<RetentionStatus> {
+        self.exclusion_cache.lock().unwrap().verify()?;
         let connection = self.open_reader()?;
         let policy: Option<String> = connection
             .query_row(
@@ -615,7 +654,15 @@ impl HistoryStore {
         {
             bail!("retention duration must be between 1 and 36500 days");
         }
-        self.connection()?.execute("INSERT INTO history_meta(key,value) VALUES('retention_policy',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(policy)?])?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (_, revision) = read_retention_policy(&transaction)?;
+        let next = revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("retention policy revision exhausted"))?;
+        transaction.execute("INSERT INTO history_meta(key,value) VALUES('retention_policy',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(policy)?])?;
+        transaction.execute("INSERT INTO history_meta(key,value) VALUES('retention_policy_revision',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[next.to_string()])?;
+        transaction.commit()?;
         Ok(())
     }
 

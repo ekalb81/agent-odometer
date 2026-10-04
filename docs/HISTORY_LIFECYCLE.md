@@ -12,7 +12,8 @@ purge preview. It does not schedule deletion. Present sessions and unreconciled
 usage are ineligible. Sessions sharing a provider identity and first-event
 fingerprint form one exclusion group; any present or newer sibling excludes the
 whole group from the preview. Confirmation rechecks the exact candidate set in
-an immediate SQLite transaction. A resumed source invalidates the preview.
+an immediate SQLite transaction. A resumed source or any saved policy change
+invalidates the preview, even if the former policy is later restored.
 
 Purge deletes local snapshots, bounded summaries, source metadata, normalized
 facts, rollups, and session-specific project assignments together. Project-wide

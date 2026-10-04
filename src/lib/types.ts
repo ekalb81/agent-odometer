@@ -521,6 +521,7 @@ export interface RetentionStatus {
 }
 export interface PurgePreview {
   cutoff_utc_day: string;
+  policy_revision: number;
   sessions: number;
   identity_groups: number;
   snapshot_bytes: number;

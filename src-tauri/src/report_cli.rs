@@ -38,6 +38,8 @@ pub enum Format {
 struct StatusReport {
     schema_version: u32,
     ledger_available: bool,
+    coverage_complete: Option<bool>,
+    retention: Option<crate::history_store::RetentionStatus>,
     /// Absent rather than 0 when the ledger could not be opened — the two
     /// mean opposite things to anything acting on this.
     sessions: Option<usize>,
@@ -451,6 +453,8 @@ pub fn render_status(
     let status = StatusReport {
         schema_version: STATUS_SCHEMA_VERSION,
         ledger_available: store.is_some(),
+        coverage_complete: store.map(HistoryStore::has_complete_coverage).transpose()?,
+        retention: store.map(HistoryStore::retention_status).transpose()?,
         sessions,
         ledger_bytes,
         rate_card_version: rates.version,
@@ -462,6 +466,7 @@ pub fn render_status(
         Format::Csv => {
             let mut out = String::from("key,value\n");
             out.push_str(&format!("ledger_available,{}\n", status.ledger_available));
+            out.push_str(&format!("coverage_complete,{}\n", render_opt(status.coverage_complete)));
             out.push_str(&format!("sessions,{}\n", render_opt(status.sessions)));
             out.push_str(&format!(
                 "ledger_bytes,{}\n",
@@ -475,12 +480,13 @@ pub fn render_status(
             out
         }
         Format::Text => format!(
-            "ledger: {}\nsessions: {}\nledger bytes: {}\nrate card: v{} ({})",
+            "ledger: {}\nhistorical coverage complete: {}\nsessions: {}\nledger bytes: {}\nrate card: v{} ({})",
             if status.ledger_available {
                 "available"
             } else {
                 "unavailable"
             },
+            render_opt(status.coverage_complete),
             render_opt(status.sessions),
             render_opt(status.ledger_bytes),
             status.rate_card_version,
