@@ -7,7 +7,7 @@ let error = $state<string | null>(null);
 let tagLabels = $state<string[]>([]);
 let recoveryUnrestored = $state(false);
 let generation = 0;
-let epoch = 0;
+let epoch = $state(0);
 let editSequence = 0;
 const edits = new Map<string, number>();
 

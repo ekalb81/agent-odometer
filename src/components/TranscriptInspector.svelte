@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { getTranscriptPage } from '../lib/ipc';
-  import type { TranscriptCursor, TranscriptPage, TranscriptRecord } from '../lib/types';
+  import { getTranscriptPage, getRecordBookmarks, editRecordBookmark } from '../lib/ipc';
+  import { organizationStore } from '../lib/stores/organization.svelte';
+  import type { TranscriptCursor, TranscriptPage, TranscriptRecord, RecordBookmark, RecordBookmarkList } from '../lib/types';
   let { sessionId, recordId = null, blockIndex = null, onclose }: { sessionId: string; recordId?: string | null; blockIndex?: number | null; onclose: () => void } = $props();
   let dialog: HTMLDialogElement;
   let page = $state<TranscriptPage | null>(null);
@@ -14,6 +15,12 @@
   let currentLocation: Location = { cursor: null, recordId: null };
   let previous = $state<Location[]>([]);
   let generation = 0;
+  let bookmarks = $state<RecordBookmarkList | null>(null);
+  let bookmarkLoading = $state(false);
+  let bookmarkBusy = $state(false);
+  let bookmarkError = $state<string | null>(null);
+  let bookmarkGeneration = 0;
+  const savedBookmarks = $derived(bookmarks?.bookmarks.filter(row => row.bookmarked) ?? []);
   // Only anchor metadata crosses pages. Raw bodies remain bounded to this page.
   let toolAnchors = $state(new Map<string, { calls: string[]; results: string[] }>());
   const unavailable = $derived(page && !['available', 'partial'].includes(page.availability));
@@ -49,7 +56,40 @@
     } catch { if (request === generation) { error = 'The transcript could not be read. Retry or reopen it.'; page = null; } }
     finally { if (request === generation) loading = false; }
   }
-  onMount(() => { dialog.showModal(); return () => { generation++; }; });
+  onMount(() => { dialog.showModal(); return () => { generation++; bookmarkGeneration++; }; });
+  $effect(() => {
+    const key = sessionId;
+    const epoch = organizationStore.epoch;
+    void epoch;
+    bookmarks = null; bookmarkBusy = false;
+    void loadBookmarks(key);
+    return () => { bookmarkGeneration++; };
+  });
+
+  async function loadBookmarks(key = sessionId): Promise<void> {
+    const request = ++bookmarkGeneration;
+    bookmarkLoading = true; bookmarkError = null;
+    try {
+      const result = await getRecordBookmarks(key);
+      if (request === bookmarkGeneration) bookmarks = result;
+    } catch { if (request === bookmarkGeneration) bookmarkError = 'Private bookmarks are unavailable. Reload bookmarks after history is ready.'; }
+    finally { if (request === bookmarkGeneration) bookmarkLoading = false; }
+  }
+  async function setBookmark(id: string, bookmarked: boolean): Promise<void> {
+    if (!bookmarks || bookmarkBusy || bookmarkLoading) return;
+    const request = bookmarkGeneration;
+    const epoch = organizationStore.epoch;
+    const existing = bookmarks.bookmarks.find(row => row.identity.anchor === id);
+    const edit: RecordBookmark = { identity: { ...bookmarks.identity, anchor: id }, revision: existing?.revision ?? 0, bookmarked };
+    bookmarkBusy = true; bookmarkError = null;
+    try {
+      const result = await editRecordBookmark(edit);
+      if (request === bookmarkGeneration && epoch === organizationStore.epoch && bookmarks) {
+        bookmarks = { ...bookmarks, bookmarks: [...bookmarks.bookmarks.filter(row => row.identity.anchor !== id), result] };
+      }
+    } catch (cause) { if (request === bookmarkGeneration && epoch === organizationStore.epoch) bookmarkError = String(cause); }
+    finally { if (request === bookmarkGeneration) bookmarkBusy = false; }
+  }
   $effect(() => {
     const key = sessionId;
     const target = recordId;
@@ -101,6 +141,25 @@
       <button type="button" disabled={loading} onclick={() => { previous = []; toolAnchors = new Map(); void read(null); }}>Reload from start</button>
       {#if selected && !page?.records.some(record => record.id === selected)}<button type="button" disabled={loading} onclick={() => selected && jump(selected)}>Return to selected record</button>{/if}
     </div>
+    <details class="bookmarks" aria-label="Local record bookmarks">
+      <summary>Record bookmarks ({bookmarkLoading ? 'loading' : bookmarks ? savedBookmarks.length : 'unavailable'})</summary>
+      <p>Private and local. Bookmarks retain anchors only. Missing or changed sources stay unavailable; confirmed history purge removes their bookmarks.</p>
+      {#if bookmarks?.recovery_backup_unrestored}<p role="status">Earlier bookmarks remain in the preserved database backup and were not restored.</p>{/if}
+      {#if bookmarkLoading}<p role="status">Loading bookmarks…</p>{/if}
+      {#if bookmarkBusy}<p role="status">Saving bookmark…</p>{/if}
+      {#if bookmarkError}<p role="alert">{bookmarkError}</p>{/if}
+      <button type="button" disabled={bookmarkLoading || bookmarkBusy} onclick={() => void loadBookmarks()}>Reload bookmarks</button>
+      {#if bookmarks && savedBookmarks.length === 0}<p>No bookmarked records.</p>{/if}
+      <ul>
+        {#each savedBookmarks as bookmark, index (bookmark.identity.anchor)}
+          <li>
+            <button type="button" disabled={loading} onclick={() => jump(bookmark.identity.anchor)}>Open bookmarked record {index + 1}</button>
+            <button type="button" disabled={bookmarkBusy || bookmarkLoading} onclick={() => void setBookmark(bookmark.identity.anchor, false)}>Remove bookmark {index + 1}</button>
+            <code>{bookmark.identity.anchor}</code>
+          </li>
+        {/each}
+      </ul>
+    </details>
     <div class="records" aria-busy={loading}>
       {#if loading}<p role="status">Loading transcript page…</p>{/if}
       {#if error}<p role="alert">{error}</p>{/if}
@@ -115,6 +174,7 @@
             <span>{record.presentation?.timestamp ?? 'Timestamp not recorded'}</span>
           </div>
           <p class="anchor"><button type="button" onclick={() => { selected = record.id; anchor = record.id; }}>Select anchor</button> <code>{record.id}</code></p>
+          <button type="button" disabled={!bookmarks || bookmarkLoading || bookmarkBusy || loading || !record.raw_json} onclick={() => void setBookmark(record.id, !savedBookmarks.some(row => row.identity.anchor === record.id))}>{savedBookmarks.some(row => row.identity.anchor === record.id) ? 'Remove record bookmark' : 'Bookmark record'}</button>
           {#if record.issue}<p role="status">{issueLabel(record.issue)} · payload unavailable</p>{/if}
           {#if expanded.has(record.id)}
             {#each record.presentation?.blocks ?? [] as block, index (index)}
@@ -156,6 +216,9 @@
   button { color: var(--accent); border: 1px solid var(--border); background: var(--card); border-radius: 4px; padding: 4px 8px; } button:disabled { opacity: .45; }
   button:focus-visible, input:focus-visible, article:focus-visible, .block:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .records { overflow: auto; padding: 12px; min-height: 0; }
+  .bookmarks { flex-shrink: 0; padding: 8px 14px; border-bottom: 1px solid var(--border); max-height: 220px; overflow: auto; }
+  .bookmarks li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+  .bookmarks code { min-width: 0; font-size: 10px; }
   article { padding: 10px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 8px; background: var(--card); }
   article.selected { border-color: var(--accent); }
   .record-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }

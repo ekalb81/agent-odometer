@@ -9,6 +9,7 @@ pub mod claude_parser;
 pub mod commands;
 pub mod config;
 pub mod config_events;
+mod context_evidence;
 pub mod correlation;
 pub mod diagnostics;
 pub mod gemini_parser;
@@ -60,14 +61,15 @@ use commands::{
     add_defender_exclusions, apply_integration_change, approve_quota_account,
     cancel_history_rebuild, cancel_instruction_scan, change_organization_tag, change_quota_account,
     check_quota_alerts, check_quota_budgets, clear_session_project_override, compare_tool_impact,
-    correlate_events, delete_saved_search, edit_session_annotation, export_performance_data,
-    get_bundled_rates, get_config, get_history_rebuild_status, get_history_recovery_status,
-    get_history_status, get_integration_status, get_live_quota_status,
+    correlate_events, delete_saved_search, edit_record_bookmark, edit_session_annotation,
+    export_performance_data, get_bundled_rates, get_config, get_history_rebuild_status,
+    get_history_recovery_status, get_history_status, get_integration_status, get_live_quota_status,
     get_organization_recovery_state, get_organization_summaries, get_performance_live_status,
     get_performance_status, get_provider_diagnostics, get_quota_config, get_quota_snapshots,
-    get_rates, get_retention_status, get_scan_status, get_session_annotation, get_session_details,
-    get_session_pricing, get_speed_report, get_subscription_usage, get_transcript_page,
-    get_turn_receipt_status, get_workflow_report, identify_quota_account, list_external_events,
+    get_rates, get_record_bookmarks, get_retention_status, get_scan_status, get_session_annotation,
+    get_session_details, get_session_pricing, get_speed_report, get_subscription_usage,
+    get_transcript_page, get_turn_receipt_status, get_workflow_report, identify_quota_account,
+    list_external_events,
     list_instruction_files, list_organization_tags, list_providers, list_saved_searches,
     list_sessions, list_tool_impact_targets, merge_projects, open_instruction_file,
     open_integration_configuration, open_task_in_chatgpt, preview_history_purge,
@@ -124,6 +126,8 @@ pub fn run() {
             get_organization_summaries,
             get_session_annotation,
             edit_session_annotation,
+            get_record_bookmarks,
+            edit_record_bookmark,
             list_organization_tags,
             change_organization_tag,
             list_saved_searches,
