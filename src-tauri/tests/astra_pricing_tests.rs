@@ -82,7 +82,7 @@ fn bundled_daybreak_red_alias_expires_instead_of_silently_retaining_old_target()
             "gpt-daybreak-red-latest",
             "codex",
             table,
-            "2026-12-09T23:59:59Z".parse().unwrap(),
+            "2027-01-02T23:59:59Z".parse().unwrap(),
         );
         assert_eq!(active.resolved_model, "gpt-5.6-cyber");
         assert_eq!(active.basis, PricingBasis::FloatingAlias);
@@ -90,7 +90,7 @@ fn bundled_daybreak_red_alias_expires_instead_of_silently_retaining_old_target()
             "gpt-daybreak-red-latest",
             "codex",
             table,
-            "2026-12-10T00:00:00Z".parse().unwrap(),
+            "2027-01-03T00:00:00Z".parse().unwrap(),
         );
         assert_eq!(expired.resolved_model, rates.fallback_models["codex"]);
         assert_eq!(expired.basis, PricingBasis::Fallback);

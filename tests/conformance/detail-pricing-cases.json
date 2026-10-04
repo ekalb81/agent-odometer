@@ -1664,6 +1664,8 @@
     },
     {
       "name": "Gemini retains legacy Anthropic scenario mapping",
+      "backend_expected_overrides": { "time_aware_api": null },
+      "divergence_reason": "Issue #247 adds the Gemini API USD catalog surface. Gemini usage must not select an Anthropic API billing rule. The original frozen desktop payload is retained below; corrected Rust behavior is unavailable without a matching Gemini period.",
       "session": {
         "harness": "gemini_cli",
         "tokens_history": [

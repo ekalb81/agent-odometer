@@ -644,6 +644,10 @@
   // editor yet (#42 ships the data model and offline plumbing first); carry
   // them through unchanged so saving the rate table never silently drops them.
   let ratesModelAliases = $state<RateCard['model_aliases']>({});
+  let ratesFloatingAliases = $state<RateCard['floating_model_aliases']>({});
+  let rateProvenance = $state<NonNullable<RateCard['rate_provenance']>>({});
+  let upgradeReview = $state<string[]>([]);
+  let flatRateExpiresAt = $state<NonNullable<RateCard['flat_rate_expires_at']>>({});
   let ratesFreeLocalModels = $state<string[]>([]);
   let ratesSubscriptionPlans = $state<RateCard['subscription_plans']>({});
   let ratesDisplayCurrency = $state<RateCard['display_currency']>(null);
@@ -695,6 +699,10 @@
     ratesUnpricedModels = [...(r.unpriced_models ?? [])];
     pricingCatalog = r.pricing_catalog;
     ratesModelAliases = { ...(r.model_aliases ?? {}) };
+    ratesFloatingAliases = { ...(r.floating_model_aliases ?? {}) };
+    rateProvenance = { ...(r.rate_provenance ?? {}) };
+    upgradeReview = [...(r.upgrade_review ?? [])];
+    flatRateExpiresAt = { ...(r.flat_rate_expires_at ?? {}) };
     ratesFreeLocalModels = [...(r.free_local_models ?? [])];
     ratesSubscriptionPlans = { ...(r.subscription_plans ?? {}) };
     ratesDisplayCurrency = r.display_currency ?? null;
@@ -744,6 +752,7 @@
   function fmtPricingSurface(surface: PricingCatalog['rate_periods'][number]['surface']): string {
     if (surface === 'codex_plan_credits') return 'Codex plan credits';
     if (surface === 'openai_api_usd') return 'OpenAI API USD';
+    if (surface === 'gemini_api_usd') return 'Gemini API USD';
     return 'Anthropic API USD';
   }
 
@@ -785,6 +794,18 @@
       validationError = `Fallback model "${fallbackModel}" is not in the model list.`;
       return null;
     }
+    // User edits do not inherit the bundled row's verification evidence.
+    const evidence = { ...rateProvenance };
+    const review = new Set(upgradeReview);
+    for (const [model, rate] of Object.entries(models)) {
+      const previous = $rates?.models[model];
+      if (!previous || rate.input !== previous.input || rate.cached_input !== previous.cached_input
+        || (rate.cache_creation_input ?? null) !== (previous.cache_creation_input ?? null)
+        || rate.output !== previous.output || rate.reasoning !== previous.reasoning) {
+        delete evidence[`models/${model}`];
+        review.add(`models/${model}`);
+      }
+    }
     validationError = null;
     return {
       version: ratesVersion,
@@ -800,6 +821,10 @@
       unpriced_models: ratesUnpricedModels,
       pricing_catalog: pricingCatalog,
       model_aliases: ratesModelAliases,
+      floating_model_aliases: ratesFloatingAliases,
+      rate_provenance: evidence,
+      upgrade_review: [...review].sort(),
+      flat_rate_expires_at: flatRateExpiresAt,
       free_local_models: ratesFreeLocalModels,
       subscription_plans: ratesSubscriptionPlans,
       display_currency: ratesDisplayCurrency,
@@ -1534,7 +1559,7 @@
       <div class="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 text-xs text-ink-faint">
         <span>v{ratesVersion} · {ratesCurrency} · {ratesUnit}</span>
         {#if fetchedAt}
-          <span>fetched {fetchedAt}</span>
+          <span>card reference {fetchedAt}</span>
         {/if}
         {#if sourceUrl}
           <a
@@ -1573,6 +1598,25 @@
         {/if}
       </div>
 
+      {#if upgradeReview.length > 0}
+        <p class="mb-3 text-xs text-amber-600" role="status">
+          Retained custom or unverified entries: {upgradeReview.join(', ')}.
+          Review these values; the card reference date does not verify them.
+          Reset to shipped defaults replaces the entire card, including custom rates and aliases.
+        </p>
+      {/if}
+      <p class="mb-3 text-xs text-ink-faint">Flat rates estimate Standard paid text at the current reference price. Dated scenarios use event dates. Other tiers, modalities, storage and tool charges may be unavailable or estimated.</p>
+      {#each Object.entries(flatRateExpiresAt) as [model, end]}
+        <p class="mb-3 text-xs text-ink-faint">{model}: flat reference expires {end} UTC. Published doubled rates are in the dated catalog; review the flat reference after that date.</p>
+      {/each}
+      {#each Object.entries(ratesFloatingAliases ?? {}) as [alias, mapping]}
+        <p class="mb-1 text-xs text-ink-faint">{alias} → {mapping.target}; trusted through {mapping.expires_at} UTC.
+          {#if rateProvenance[`floating_model_aliases/${alias}`] && !upgradeReview.includes(`floating_model_aliases/${alias}`)}
+            Verified {rateProvenance[`floating_model_aliases/${alias}`].verified_at.slice(0, 10)}.
+          {/if}
+        </p>
+      {/each}
+
       <!-- Fallback model selector -->
       <div class="flex items-center gap-3 mb-4">
         <label for="fallback-model" class="text-xs text-ink-muted whitespace-nowrap">Fallback model</label>
@@ -1606,7 +1650,13 @@
           <tbody>
             {#each rows as row, i (row.name + i)}
               <tr class="border-b border-edgerow">
-                <td class="px-3 py-1.5 font-mono text-ink-2">{row.name}</td>
+                <td class="px-3 py-1.5 font-mono text-ink-2">{row.name}
+                  {#if upgradeReview.includes(`models/${row.name}`)}
+                    <span class="block text-xs font-sans text-amber-600">Retained · review needed</span>
+                  {:else if rateProvenance[`models/${row.name}`]}
+                    <a class="block text-xs font-sans text-ink-faint underline" href={rateProvenance[`models/${row.name}`].source_url} target="_blank" rel="noopener noreferrer" title={rateProvenance[`models/${row.name}`].evidence}>Evidence {rateProvenance[`models/${row.name}`].verified_at.slice(0, 10)}</a>
+                  {/if}
+                </td>
                 <td class="px-3 py-1.5">
                   <input
                     type="number"

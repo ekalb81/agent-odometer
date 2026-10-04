@@ -71,7 +71,14 @@ fn serialized_detail_pricing_matches_legacy_desktop_for_every_case() {
             "{}: flattened session changed",
             case["name"]
         );
-        let mut expected = case["expected"].clone();
+        // Retain the captured desktop oracle while naming intentional
+        // correctness fixes; overrides are explicit, never regenerated.
+        if case.get("backend_expected_overrides").is_some() {
+            assert!(case["divergence_reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()));
+        }
+        let mut expected = merge(&case["expected"], &case["backend_expected_overrides"]);
         normalize(&mut actual);
         normalize(&mut expected);
         assert_eq!(actual, expected, "{}", case["name"]);

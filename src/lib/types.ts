@@ -739,7 +739,7 @@ export interface ModelRate {
 }
 
 /** Billing surface for a catalog rule.  Rules never cross billing surfaces. */
-export type PricingSurface = 'codex_plan_credits' | 'openai_api_usd' | 'anthropic_api_usd';
+export type PricingSurface = 'codex_plan_credits' | 'openai_api_usd' | 'anthropic_api_usd' | 'gemini_api_usd';
 
 /** Source evidence retained with a dated or conditional pricing rule. */
 export interface PricingProvenance {
@@ -903,6 +903,12 @@ export interface RateCard {
   display_currency: CurrencyConversion | null;
   /** Bounded-cache-age bookkeeping for the refresh flow. */
   refresh: RateRefreshState;
+  /** Per-row source evidence; keys use the Rust table/id convention. */
+  rate_provenance?: Record<string, PricingProvenance>;
+  /** Retained rates/aliases requiring review; never newly verified by a merge. */
+  upgrade_review?: string[];
+  /** Exclusive UTC expiry of a temporary current flat reference. */
+  flat_rate_expires_at?: Record<string, string>;
 }
 
 export interface ExternalEvent {

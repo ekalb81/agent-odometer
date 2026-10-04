@@ -130,7 +130,7 @@ Costs are computed from token counts against a bundled, editable rate card (per 
 - A model with no published rate for a dimension prices that dimension at the ordinary input rate and marks the result estimated. It is never silently priced at zero, which would understate the total while still looking like a number.
 - Unknown models fall back to a configurable per-provider fallback rate and are flagged in the UI. Models explicitly listed as unpriced are excluded and named instead of being assigned an unrelated fallback price.
 
-Edit any rate under **Settings → Rate card**; your overrides persist and automatically inherit newly bundled models on upgrades.
+Edit any rate under **Settings → Rate card**. Upgrades refresh values matching the archived version-11 defaults and preserve differing rates and alias expiries. Retained or unverified entries are named for review; row evidence dates stay separate from the card reference date. **Reset to shipped defaults** replaces the entire card after confirmation. Gemini 3.8 Flash’s temporary flat reference expires January 1, 2027; its dated scenario records the published doubled rates. Flat estimates use current Standard paid-text reference prices, including for historical totals; other billing scenarios may remain estimated or unavailable.
 
 ---
 
