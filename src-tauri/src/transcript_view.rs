@@ -158,7 +158,16 @@ pub fn present(value: &Value) -> TranscriptPresentation {
                 string(&item["call_id"]),
                 &item["output"],
             )),
-            "reasoning" => content(&item["summary"], &mut result.blocks),
+            "reasoning" => {
+                content(&item["summary"], &mut result.blocks);
+                // The envelope is authoritative even when a provider spells a
+                // summary part as generic text or supplies an assistant role.
+                for block in &mut result.blocks {
+                    if block.kind == "text" {
+                        block.kind = "reasoning";
+                    }
+                }
+            }
             _ => (),
         }
     } else if record_type == "user" || record_type == "assistant" {
@@ -186,6 +195,17 @@ pub fn present(value: &Value) -> TranscriptPresentation {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn reasoning_summary_text_never_becomes_conversation_text() {
+        for role in [serde_json::Value::Null, json!("assistant")] {
+            let view = present(
+                &json!({"type":"response_item","payload":{"type":"reasoning","role":role,"summary":[{"type":"text","text":"private reasoning"}]}}),
+            );
+            assert_eq!(view.blocks.len(), 1);
+            assert_eq!(view.blocks[0].kind, "reasoning");
+            assert_eq!(view.blocks[0].text, "private reasoning");
+        }
+    }
     #[test]
     fn interleaved_claude_blocks_preserve_order_identity_and_recorded_edit() {
         let view = present(
