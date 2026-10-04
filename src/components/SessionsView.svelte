@@ -37,6 +37,8 @@
   import ToolImpact from './ToolImpact.svelte';
   import WorkflowIntelligence from './WorkflowIntelligence.svelte';
   import SpeedMonitor from './SpeedMonitor.svelte';
+  import CalendarActivity from './CalendarActivity.svelte';
+  import { calendarFilterValue, type ActivityDay } from '../lib/calendarActivity';
   import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
   import { clearRenderedSessionRows, publishRenderedSessionRows } from '../lib/paintContext';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
@@ -197,15 +199,21 @@
   // Drill-down: when set, the table shows one parent and its descendants only.
   // Storage id, so it survives the provider-id indirection in parentStorageId.
   let focusedParentId = $state<string | null>(null);
+  let calendarSelection = $state<{ scope: string; ids: string[] } | null>(null);
+  const calendarScope = $derived(`${harness}|${JSON.stringify(filters)}`);
+  const calendarSelected = $derived(calendarSelection?.scope === calendarScope);
+  const calendarSessions = $derived(calendarSelected
+    ? dateFiltered.filter((session) => calendarSelection!.ids.includes(session.storage_id))
+    : dateFiltered);
   const focusedParent = $derived(
     focusedParentId ? (dateFiltered.find((s) => s.storage_id === focusedParentId) ?? null) : null,
   );
   // Descendants at any depth: a subagent can itself spawn subagents, and
   // scoping to direct children only would silently drop the deeper runs.
   const filtered = $derived((() => {
-    if (!focusedParentId) return dateFiltered;
+    if (!focusedParentId) return calendarSessions;
     const childrenOf = new Map<string, TrackedSession[]>();
-    for (const session of dateFiltered) {
+    for (const session of calendarSessions) {
       const parentId = parentStorageId(session);
       if (!parentId) continue;
       const arr = childrenOf.get(parentId);
@@ -222,7 +230,7 @@
         walk(child.storage_id);
       }
     };
-    const root = dateFiltered.find((s) => s.storage_id === focusedParentId);
+    const root = calendarSessions.find((s) => s.storage_id === focusedParentId);
     if (root) out.unshift(root);
     walk(focusedParentId);
     return out;
@@ -244,6 +252,18 @@
     if (unchanged) return lastAnalyticsSessionIds;
     lastAnalyticsSessionIds = next;
     return next;
+  })());
+  const calendarProjects = $derived((() => {
+    const groups = new Map<string, { key: string; label: string; sessionIds: string[] }>();
+    for (const session of filteredNoDate) {
+      const resolved = projectStore.forSession(session);
+      const key = resolved?.project_key ?? session.project_key;
+      if (!key) continue;
+      const group = groups.get(key) ?? { key, label: resolved?.label ?? session.project_label ?? key, sessionIds: [] };
+      group.sessionIds.push(session.storage_id);
+      groups.set(key, group);
+    }
+    return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label));
   })());
 
   // True when the user has narrowed by date — drives whether per-session
@@ -1689,6 +1709,14 @@
     analyticsOpen = false;
   }
 
+  function selectCalendarDay(day: ActivityDay): void {
+    const next = { ...filters, dateFrom: calendarFilterValue(day.from), dateTo: calendarFilterValue(day.to) };
+    calendarSelection = { scope: `${harness}|${JSON.stringify(next)}`, ids: day.sessionIds };
+    focusedParentId = null;
+    analyticsOpen = false;
+    onfilterschange(next);
+  }
+
   function deselect() {
     selectedSessionId = null;
     selectedSession = null;
@@ -1719,6 +1747,12 @@
 </script>
 
 <div class="flex flex-col h-full overflow-hidden">
+  {#if calendarSelected}
+    <div class="mx-4 mt-2 flex items-center gap-2 text-[11px] text-ink-muted" role="status">
+      Calendar drill-down · {filtered.length} sessions with recorded events
+      <button type="button" class="text-accent underline" onclick={() => calendarSelection = null}>Show all overlapping sessions</button>
+    </div>
+  {/if}
   <!-- Analytics band -->
   <div class="grid gap-3.5 p-4 shrink-0" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
     <!-- Spend card -->
@@ -1849,6 +1883,16 @@
       Analytics &amp; exports · {windowLabel}
     </summary>
     <div class="mt-2 flex flex-col gap-2">
+      <CalendarActivity
+        active={active && analyticsOpen}
+        from={fromUtc}
+        to={toUtc}
+        sessionIds={analyticsSessionIds}
+        projects={calendarProjects}
+        projectLoaded={projectStore.loaded}
+        projectError={projectStore.error}
+        onbucket={selectCalendarDay}
+      />
       <SubscriptionUsage
         active={active && analyticsOpen}
         {harness}

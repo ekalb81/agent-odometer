@@ -3,6 +3,7 @@
   import { costIsUnmeasured } from '../lib/sessionProjection';
   import { rates } from '../lib/stores/rates';
   import { formatCredits, harnessCurrency } from '../lib/currency';
+  import ConvertedCost from './ConvertedCost.svelte';
   import { openTaskInChatGPT, revealInFileManager } from '../lib/ipc';
   import { providersStore } from '../lib/stores/providers.svelte';
   import {
@@ -12,6 +13,7 @@
     summarizeOptimizationFindings,
   } from '../lib/optimization';
   import Sparkline from './Sparkline.svelte';
+  import TranscriptInspector from './TranscriptInspector.svelte';
   import SessionProjectEditor from './SessionProjectEditor.svelte';
 
   interface Props {
@@ -19,9 +21,13 @@
     /** Subagent sessions spawned by this one (for the "N subagents" pill). */
     childCount?: number;
     onclose: () => void;
+    /** Stable source record target for search/bookmark navigation. */
+    transcriptAnchor?: string | null;
   }
 
-  let { session, childCount = 0, onclose }: Props = $props();
+  let { session, childCount = 0, onclose, transcriptAnchor = null }: Props = $props();
+  let inspectorOpen = $state(false);
+
 
   const numFmt = new Intl.NumberFormat();
   const pctFmt = new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 });
@@ -116,8 +122,11 @@
     if (id !== lastSessionId) {
       lastSessionId = id;
       expandedTurn = null;
+      inspectorOpen = !!transcriptAnchor;
     }
   });
+
+  $effect(() => { if (transcriptAnchor) inspectorOpen = true; });
 
   let copied = $state(false);
   function copyId() {
@@ -274,6 +283,11 @@
       </div>
     </div>
 
+    <div class="px-5 py-2 border-b border-edge shrink-0"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { inspectorOpen = true; }}>Inspect transcript</button></div>
+    {#if inspectorOpen}
+      <TranscriptInspector sessionId={session.storage_id} recordId={transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
+    {/if}
+
     <!-- 2×2 stat grid -->
     <div class="grid grid-cols-2 gap-px bg-edge border-b border-edge shrink-0">
       <div class="bg-panel px-5 py-2.5">
@@ -299,6 +313,10 @@
       {#key session.storage_id}
         <SessionProjectEditor {session} />
       {/key}
+      {#if (session.harness === 'codex' ? sessionApiCost : sessionCredits)?.converted}
+        {@const displayedPrice = (session.harness === 'codex' ? sessionApiCost : sessionCredits)!}
+        <div class="px-5 py-3 border-b border-edge"><ConvertedCost value={displayedPrice.converted} incomplete={displayedPrice.unpriced_models.length > 0} /></div>
+      {/if}
       <!-- Context bar -->
       {#if ctxPercent !== null}
         <div class="px-5 py-3 border-b border-edge">
@@ -587,6 +605,7 @@
                     { label: 'API base estimate', value: current.api_estimate, unit: 'USD' },
                   ] as scenario}
                     <p>{scenario.label}: <span class="font-mono">{surfaceMoney(scenario.value, scenario.unit === 'USD', scenario.unit)}</span></p>
+                    <ConvertedCost value={scenario.value.converted} incomplete={scenario.value.unpriced_models.length > 0} />
                   {/each}
                 {:else}
                   <p>Current purchased-credit and included-allowance estimates: Unavailable</p>

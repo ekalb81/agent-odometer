@@ -143,6 +143,25 @@ function assertManifestCasesAreRegistered(): void {
   }
 }
 
+visualTest('calendar-activity', 'calendar heatmap and daily trend', async (page) => {
+  await visit(page, { view: 'codex' });
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toBeVisible();
+  await calendar.scrollIntoViewIfNeeded();
+});
+
+visualTest('calendar-partial-narrow', 'partial recorded history calendar at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { scenario: 'history-partial', view: 'codex' });
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toContainText('partial history');
+  await calendar.scrollIntoViewIfNeeded();
+});
+
 test.beforeEach(async ({ page }) => {
   await page.clock.install({ time: FIXED_TIME });
   page.on('pageerror', (error) => {
@@ -379,6 +398,30 @@ visualTest('settings-rates', 'settings rates frame', async (page) => {
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();
 });
 
+test('offline FX draft survives keyboard input and saves backend delivery evidence', async ({ page }, testInfo) => {
+  await visit(page, { view: 'settings' });
+  await page.getByLabel('Use a user-supplied FX rate').check();
+  await page.getByLabel('Original money currency').selectOption('USD');
+  await page.getByLabel('Display currency').selectOption('EUR');
+  const rate = page.getByLabel('Display units per original unit');
+  await rate.fill('');
+  await rate.pressSequentially('0.');
+  await expect(rate).toHaveValue('0.');
+  await rate.pressSequentially('9');
+  const timestamp = page.getByLabel('Rate timestamp (UTC)');
+  await timestamp.pressSequentially('2026-10-');
+  await expect(timestamp).toHaveValue('2026-10-');
+  await timestamp.pressSequentially('01T12:30:00');
+  await page.getByLabel('User-supplied source').pressSequentially('Synthetic offline quote');
+  const section = page.getByRole('heading', { name: 'Rate card', exact: true }).locator('..');
+  await section.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(section.getByText(/Loaded source: saved override/)).toBeVisible();
+  await expect(rate).toHaveValue('0.9');
+  await expect(timestamp).toHaveValue('2026-10-01T12:30:00');
+  await timestamp.scrollIntoViewIfNeeded();
+  await testInfo.attach('offline-fx-editor', { body: await page.screenshot(), contentType: 'image/png' });
+});
+
 visualTest('settings-rate-validation-error', 'settings rate validation error', async (page) => {
   await visit(page, { view: 'settings' });
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();
@@ -465,6 +508,38 @@ test('project reassignment and restore stay usable in the narrow detail drawer',
   await editor.getByRole('button', { name: 'Change project' }).click();
   await expect(editor.getByRole('button', { name: 'Restore detected project' })).toHaveCount(0);
   await editor.getByRole('button', { name: 'Cancel', exact: true }).click();
+});
+
+visualTest('transcript-recorded-edit', 'inspector shows recorded tool result and edit in source order', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector).toBeVisible();
+  await inspector.getByRole('button', { name: 'Next page' }).click();
+  await inspector.getByRole('button', { name: 'Expand tool', exact: true }).click();
+  await inspector.getByRole('button', { name: 'Expand assistant', exact: true }).click();
+  await expect(inspector.getByText('Recorded replacement · demo.ts')).toBeVisible();
+  await expect(inspector.getByRole('button', { name: 'Jump to tool call', exact: true })).toBeVisible();
+});
+
+visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigation and escape', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await inspector.getByLabel('Record anchor').fill('synthetic:2');
+  await inspector.getByRole('button', { name: 'Jump to record', exact: true }).click();
+  await expect(inspector.getByRole('button', { name: 'Collapse tool', exact: true })).toBeVisible();
+  await expect(inspector.getByText(/earlier records not inspected/)).toBeVisible();
+  const bounds = await inspector.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
 });
 
 assertManifestCasesAreRegistered();

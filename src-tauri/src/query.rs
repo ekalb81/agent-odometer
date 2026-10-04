@@ -511,6 +511,9 @@ pub struct PricedSurface {
     /// different and quieter state.
     pub missing_models: Vec<String>,
     pub unpriced_models: Vec<String>,
+    /// Display-only monetary restatement. Original totals remain authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converted: Option<ConvertedTotal>,
 }
 
 /// Derived pricing attached only at the range-query response boundary.
@@ -694,6 +697,8 @@ pub(crate) fn price_buckets_detailed_controlled(
         entry.1 = least_confident_basis(entry.1, basis);
     }
 
+    let conversion_available =
+        unpriced.is_empty() || by_model.values().any(|(_, _, unpriced)| !unpriced);
     Ok(Some(PricedSurface {
         total,
         by_model: by_model
@@ -707,6 +712,23 @@ pub(crate) fn price_buckets_detailed_controlled(
             .collect(),
         missing_models: missing.into_iter().collect(),
         unpriced_models: unpriced.into_iter().collect(),
+        converted: conversion_available
+            .then(|| {
+                convert_total(
+                    rates,
+                    match table {
+                        RateTable::Api | RateTable::ApiEstimate => "USD",
+                        RateTable::PurchasedCredits | RateTable::IncludedAllowance => "credits",
+                        RateTable::Plan => rates
+                            .currencies
+                            .get(harness)
+                            .map(String::as_str)
+                            .unwrap_or(&rates.currency),
+                    },
+                    total,
+                )
+            })
+            .flatten(),
     }))
 }
 
@@ -1469,7 +1491,7 @@ pub fn activity_heatmap(
 /// converted figure without those is not a number anyone can check — and
 /// Odometer never fetches a rate, so `source` is always the user's own
 /// account of it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConvertedTotal {
     /// The original currency this was converted *from*. Kept so the
     /// original total stays the authoritative one and the conversion reads
@@ -1487,10 +1509,9 @@ pub struct ConvertedTotal {
 /// #42: "Currency conversion never combines credits with money or different
 /// original currencies." Two rules follow, and both are refusals:
 ///
-/// - Only totals already in the card's own `currency` are converted. The
-///   card carries a single rate, defined as multiplying "an amount already
-///   in the card's original currency", so applying it to anything else
-///   would be arithmetic on unrelated units.
+/// - Only totals matching the conversion's explicit monetary source are
+///   converted. Legacy settings may infer a monetary card currency, but
+///   never infer a monetary source from a card denominated in credits.
 /// - Plan credits are never converted. Credits are an entitlement, not
 ///   money at an exchange rate, and turning them into euros would invent a
 ///   price the provider never charged.
@@ -1498,27 +1519,33 @@ pub struct ConvertedTotal {
 /// Each converted amount stays keyed to the currency it came from, so
 /// nothing is ever summed across originals.
 pub fn convert_totals(rates: &RateCard, totals: &BTreeMap<String, f64>) -> Vec<ConvertedTotal> {
-    let Some(conversion) = rates.display_currency.as_ref() else {
-        return Vec::new();
-    };
     totals
         .iter()
-        .filter(|(currency, _)| {
-            // Same currency in and out is not a conversion, it is noise.
-            currency.as_str() == rates.currency
-                && !currency.eq_ignore_ascii_case(&conversion.target_currency)
-        })
-        .filter_map(|(currency, amount)| {
-            conversion.convert(*amount).map(|converted| ConvertedTotal {
-                from_currency: currency.clone(),
-                target_currency: conversion.target_currency.clone(),
-                amount: converted,
-                rate: conversion.rate,
-                as_of: conversion.as_of,
-                source: conversion.source.clone(),
-            })
-        })
+        .filter_map(|(currency, amount)| convert_total(rates, currency, *amount))
         .collect()
+}
+
+pub fn convert_total(rates: &RateCard, currency: &str, amount: f64) -> Option<ConvertedTotal> {
+    let conversion = rates.display_currency.as_ref()?;
+    if conversion.validate().is_err()
+        || !crate::rates::is_fx_currency(currency)
+        || currency
+            != conversion
+                .from_currency
+                .as_deref()
+                .unwrap_or(&rates.currency)
+        || currency == conversion.target_currency
+    {
+        return None;
+    }
+    Some(ConvertedTotal {
+        from_currency: currency.to_owned(),
+        target_currency: conversion.target_currency.clone(),
+        amount: conversion.convert(amount)?,
+        rate: conversion.rate,
+        as_of: conversion.as_of,
+        source: conversion.source.clone(),
+    })
 }
 
 #[cfg(test)]
