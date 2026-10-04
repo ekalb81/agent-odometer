@@ -603,6 +603,11 @@ impl HistoryStore {
     /// Recovery of readable sources cannot claim that missing historical sources were recovered.
     pub fn has_complete_coverage(&self) -> Result<bool> {
         self.exclusion_cache.lock().unwrap().verify()?;
+        // A read-only query may arrive after a replacement schema was created
+        // but before desktop startup applies its recovery marker to SQL metadata.
+        if self.recovery_receipt()?.is_some() {
+            return Ok(false);
+        }
         let connection = self.open_reader()?;
         Ok(connection.query_row(
             "SELECT value='1' FROM history_meta WHERE key='coverage_complete'",
@@ -612,7 +617,7 @@ impl HistoryStore {
     }
 
     pub fn retention_status(&self) -> Result<RetentionStatus> {
-        self.exclusion_cache.lock().unwrap().verify()?;
+        let coverage_complete = self.has_complete_coverage()?;
         let connection = self.open_reader()?;
         let policy: Option<String> = connection
             .query_row(
@@ -648,11 +653,7 @@ impl HistoryStore {
                 [],
                 |r| r.get::<_, i64>(0),
             )?)?,
-            coverage_complete: connection.query_row(
-                "SELECT value='1' FROM history_meta WHERE key='coverage_complete'",
-                [],
-                |r| r.get(0),
-            )?,
+            coverage_complete,
             recovered_at: recovered.and_then(DateTime::from_timestamp_millis),
         })
     }

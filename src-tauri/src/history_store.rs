@@ -6748,12 +6748,30 @@ mod tests {
     fn retention_recovery_marker_cannot_claim_complete_after_interrupted_replacement() {
         let directory = tempdir().unwrap();
         let database = directory.path().join("history.sqlite3");
+        drop(HistoryStore::open(&database).unwrap());
         let receipt = RecoveryReceipt {
             backup_directory: directory.path().join("preserved"),
             recovered_at_ms: now_ms(),
         };
         let marker = database.with_file_name("history.sqlite3.recovery.json");
-        std::fs::write(marker, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        std::fs::write(&marker, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let read_only = HistoryStore::open_read_only(&database, QueryControl::default()).unwrap();
+        assert!(!read_only.has_complete_coverage().unwrap());
+        assert!(!read_only.retention_status().unwrap().coverage_complete);
+        // Read-only queries must not repair SQL or remove the evidence.
+        assert!(marker.exists());
+        assert_eq!(
+            Connection::open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT value FROM history_meta WHERE key='coverage_complete'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "1"
+        );
+        drop(read_only);
         let store = HistoryStore::open(&database).unwrap();
         assert!(!store.has_complete_coverage().unwrap());
         assert_eq!(
