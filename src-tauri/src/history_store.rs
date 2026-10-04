@@ -234,6 +234,14 @@ pub struct ProviderLedgerStats {
     pub models: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct IntegrationObservation {
+    pub captured_at_ms: Option<i64>,
+    pub snapshot_count: u64,
+    pub token_from_ms: Option<i64>,
+    pub token_to_ms: Option<i64>,
+}
+
 /// Durable archive database. Errors are deliberately surfaced to callers: a
 /// failed archive must not quietly behave like a disposable cache.
 pub struct HistoryStore {
@@ -397,6 +405,31 @@ impl HistoryStore {
             })?;
         }
         Ok(())
+    }
+
+    /// Integration freshness and event coverage from ledger columns only.
+    /// The observation marker is diagnostic metadata, not a resumable cursor
+    /// or proof that the desktop scan has completed.
+    pub fn integration_observation(&self) -> Result<IntegrationObservation> {
+        let connection = self.open_reader()?;
+        self.check_session_count(&connection)?;
+        self.check_query()?;
+        let (captured, snapshots): (Option<i64>, i64) = connection.query_row(
+            "SELECT MAX(captured_at_ms), COUNT(*) FROM session_snapshots WHERE version IN (SELECT current_snapshot_version FROM durable_sessions WHERE durable_sessions.session_key = session_snapshots.session_key)",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (first, last) = connection.query_row(
+            "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM durable_token_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        self.check_query()?;
+        Ok(IntegrationObservation {
+            captured_at_ms: captured,
+            snapshot_count: snapshots.try_into()?,
+            token_from_ms: first,
+            token_to_ms: last,
+        })
     }
 
     /// Provider diagnostics from ledger columns only, never snapshot JSON.

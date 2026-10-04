@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
   'src/components/DiagnosticsPanel.svelte',
+  'src/components/IntegrationCenter.svelte',
   'src/components/SessionContextMenu.svelte',
   'src/components/SessionGridControls.svelte',
   'src/components/SessionProjectEditor.svelte',

@@ -338,6 +338,43 @@ fn apply_plans(plans: Vec<PlannedWrite>) -> anyhow::Result<IntegrationTransactio
     })
 }
 
+/// Shared compare-before-write transaction for the explicitly selected MCP
+/// entry. Hook setup keeps its existing cleanup policy; MCP changes retain
+/// a private, timestamped original so the user can undo the configuration.
+pub(crate) fn apply_mcp_config(
+    path: &Path,
+    original: Option<Vec<u8>>,
+    updated: Vec<u8>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let mut transaction = apply_plans(vec![PlannedWrite {
+        path: path.to_path_buf(),
+        original,
+        updated,
+    }])?;
+    let write = &transaction.applied[0];
+    let retained = if let Some(backup) = &write.backup {
+        let parent = backup
+            .parent()
+            .context("configuration backup has no parent")?;
+        let name = format!(
+            ".odometer-mcp-backup-{}-{}.bak",
+            chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
+            backup
+                .file_name()
+                .context("configuration backup has no name")?
+                .to_string_lossy()
+        );
+        let retained = parent.join(name);
+        atomic_install_new(&retained, backup)?;
+        transaction.applied[0].backup = Some(retained.clone());
+        Some(retained)
+    } else {
+        None
+    };
+    transaction.committed = true;
+    Ok(retained)
+}
+
 fn ensure_unchanged(plan: &PlannedWrite) -> anyhow::Result<()> {
     let current = read_optional_config(&plan.path)?;
     if current == plan.original {
@@ -455,7 +492,7 @@ pub fn status(config: &Config) -> TurnReceiptIntegrationStatus {
     }
 }
 
-fn integration_executable() -> anyhow::Result<PathBuf> {
+pub(crate) fn integration_executable() -> anyhow::Result<PathBuf> {
     let current = std::env::current_exe().context("could not locate the Odometer executable")?;
     Ok(resolve_stable_launcher(
         &current,
@@ -1315,7 +1352,7 @@ fn is_current_toml_handler(table: &Table, expected_command: &str) -> bool {
             .is_none_or(|item| item.as_bool() == Some(false))
 }
 
-fn read_optional_config(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
+pub(crate) fn read_optional_config(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1340,7 +1377,7 @@ fn read_optional_config(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
             MAX_CONFIG_BYTES / 1024 / 1024
         ));
     }
-    let bytes = std::fs::read(path)?;
+    let bytes = read_regular_file(path)?;
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err(anyhow!(
             "{} exceeds the {} MiB integration safety limit",
@@ -1701,14 +1738,47 @@ fn undo_restore_swap(path: &Path, displaced: &Path, backup: &Path) -> anyhow::Re
 }
 
 fn read_regular_file(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes()
+            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+            != 0
+        {
+            return Err(anyhow!(
+                "configuration is a reparse point; use manual setup"
+            ));
+        }
+    }
+    if !metadata.file_type().is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err(anyhow!(
-            "receipt-hook recovery path {} is not a regular file",
+            "configuration path {} is not a bounded regular file",
             path.display()
         ));
     }
-    Ok(std::fs::read(path)?)
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(anyhow!(
+            "configuration exceeded its safety limit while reading"
+        ));
+    }
+    Ok(bytes)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2151,6 +2221,29 @@ fn configuration_changed(path: &Path) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_config_reader_refuses_oversized_files_without_reading_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
+        assert!(read_regular_file(&path).is_err());
+        assert!(read_optional_config(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_config_handle_rejects_a_fifo_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert!(read_regular_file(&path).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
     use tempfile::tempdir;
 
     const COMMAND: &str = "odometer hook codex --integration-id odometer-turn-receipts-v1";

@@ -249,3 +249,4 @@ Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for 
 
 [MIT](LICENSE)
 
+Client setup and verification are available in Settings → Integration Center. See [setup, privacy and proof boundaries](docs/INTEGRATION_CENTER.md).
