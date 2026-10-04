@@ -108,8 +108,8 @@ pub struct EffectiveRatePeriod {
     #[serde(default)]
     pub to: Option<DateTime<Utc>>,
     pub rate: ModelRate,
-    /// Cache-write multiplier over uncached input. Parsers do not currently
-    /// expose cache-write tokens, so this is catalog metadata only.
+    /// Cache-write multiplier over uncached input. Codex does not observe
+    /// cache writes; Claude records them separately through ModelRate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_input_multiplier: Option<f64>,
     pub provenance: PricingProvenance,
@@ -133,8 +133,7 @@ pub struct RateMultipliers {
 }
 
 /// An effective-dated conditional pricing rule.  Cache-write token categories
-/// are deliberately not represented by `RateMultipliers`: parsers currently
-/// retain cache reads but do not distinguish cache writes from uncached input.
+/// follow the input multiplier; ModelRate preserves the separate write rate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConditionalRateModifier {
     /// Stable catalog identity used to reconcile conditional rules across updates.
@@ -153,8 +152,8 @@ pub struct ConditionalRateModifier {
 }
 
 /// Versioned, auditable scenario pricing data.  The legacy `models` maps stay
-/// authoritative for existing views and user overrides; this catalog adds
-/// time/surface-aware alternatives without changing those calculations.
+/// authoritative Standard references for user overrides; this catalog adds
+/// dated surface and speed rules alongside legacy compatibility values.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PricingCatalog {
     #[serde(default)]
@@ -1981,7 +1980,7 @@ mod tests {
         disk.model_aliases.remove("claude-opus-4-5");
         disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
         let merged = merge_older_override(disk, bundled);
-        assert_eq!(merged.version, 12);
+        assert_eq!(merged.version, 13);
         assert_eq!(merged.models["gpt-6-astra"].input, 250.0);
         assert_eq!(merged.api_models["gpt-6-astra"].input, 10.0);
         assert_eq!(merged.models["claude-fable-5-1"].cached_input, 0.25);

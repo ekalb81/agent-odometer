@@ -1061,6 +1061,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0001": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 11.729151375,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 11.729151375,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 10.321653210000001,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 10.321653210000001,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 10.321653210000001,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 10.321653210000001,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -1096,6 +1139,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.138751875,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.0021016500000002,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.0021016500000002,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.0021016500000002,
@@ -1109,6 +1172,26 @@
               "cost": 2.528031875,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 2.528031875,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 2.2246680500000005,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 2.2246680500000005,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1124,6 +1207,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.63980725,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.4430303800000002,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.4430303800000002,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.4430303800000002,
@@ -1137,6 +1240,26 @@
               "cost": 3.029077375,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 3.029077375,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 2.6655880900000004,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 2.6655880900000004,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1152,6 +1275,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 2.140853875,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.88395141,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.88395141,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.88395141,
@@ -1165,6 +1308,26 @@
               "cost": 1.252629125,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.252629125,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.10231363,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.10231363,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1188,6 +1351,49 @@
           "missing_models": [],
           "total": 13.66503425,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 13.66503425,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 13.66503425,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 12.025230140000001,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 12.025230140000001,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 12.025230140000001,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 12.025230140000001,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -1219,6 +1425,49 @@
               "total": 13.66503425,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 13.66503425,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 13.66503425,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 12.025230140000001,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 12.025230140000001,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 12.025230140000001,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 12.025230140000001,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -1248,6 +1497,49 @@
             "total": 13.66503425,
             "unpriced_models": []
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 13.66503425,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 13.66503425,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 12.025230140000001,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 12.025230140000001,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 12.025230140000001,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 12.025230140000001,
+              "unpriced_models": []
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -1266,6 +1558,55 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0001/gpt-5.7-visual-preview": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "fallback",
+                "cost": 11.729151375,
+                "model": "gpt-5.7-visual-preview",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [
+              "gpt-5.7-visual-preview"
+            ],
+            "total": 11.729151375,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "fallback",
+                "cost": 10.321653210000001,
+                "model": "gpt-5.7-visual-preview",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [
+              "gpt-5.7-visual-preview"
+            ],
+            "total": 10.321653210000001,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "fallback",
+                "cost": 10.321653210000001,
+                "model": "gpt-5.7-visual-preview",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [
+              "gpt-5.7-visual-preview"
+            ],
+            "total": 10.321653210000001,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -1305,6 +1646,26 @@
               "fallback_used": true,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "fallback",
+                "cost": 1.138751875,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "fallback",
+                "cost": 1.0021016500000002,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "fallback",
+                "cost": 1.0021016500000002,
+                "fallback_used": true,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "fallback",
               "cost": 1.0021016500000002,
@@ -1318,6 +1679,26 @@
               "cost": 2.528031875,
               "fallback_used": true,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "fallback",
+                "cost": 2.528031875,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "fallback",
+                "cost": 2.2246680500000005,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "fallback",
+                "cost": 2.2246680500000005,
+                "fallback_used": true,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "fallback",
@@ -1333,6 +1714,26 @@
               "fallback_used": true,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "fallback",
+                "cost": 1.63980725,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "fallback",
+                "cost": 1.4430303800000002,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "fallback",
+                "cost": 1.4430303800000002,
+                "fallback_used": true,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "fallback",
               "cost": 1.4430303800000002,
@@ -1346,6 +1747,26 @@
               "cost": 3.029077375,
               "fallback_used": true,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "fallback",
+                "cost": 3.029077375,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "fallback",
+                "cost": 2.6655880900000004,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "fallback",
+                "cost": 2.6655880900000004,
+                "fallback_used": true,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "fallback",
@@ -1361,6 +1782,26 @@
               "fallback_used": true,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "fallback",
+                "cost": 2.140853875,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "fallback",
+                "cost": 1.88395141,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "fallback",
+                "cost": 1.88395141,
+                "fallback_used": true,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "fallback",
               "cost": 1.88395141,
@@ -1374,6 +1815,26 @@
               "cost": 1.252629125,
               "fallback_used": true,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "fallback",
+                "cost": 1.252629125,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "fallback",
+                "cost": 1.10231363,
+                "fallback_used": true,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "fallback",
+                "cost": 1.10231363,
+                "fallback_used": true,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "fallback",
@@ -1399,6 +1860,55 @@
           ],
           "total": 13.66503425,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "fallback",
+                "cost": 13.66503425,
+                "model": "gpt-5.7-visual-preview",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [
+              "gpt-5.7-visual-preview"
+            ],
+            "total": 13.66503425,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "fallback",
+                "cost": 12.025230140000001,
+                "model": "gpt-5.7-visual-preview",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [
+              "gpt-5.7-visual-preview"
+            ],
+            "total": 12.025230140000001,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "fallback",
+                "cost": 12.025230140000001,
+                "model": "gpt-5.7-visual-preview",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [
+              "gpt-5.7-visual-preview"
+            ],
+            "total": 12.025230140000001,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -1433,6 +1943,55 @@
               ],
               "total": 13.66503425,
               "unpriced_models": []
+            },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "fallback",
+                    "cost": 13.66503425,
+                    "model": "gpt-5.7-visual-preview",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [
+                  "gpt-5.7-visual-preview"
+                ],
+                "total": 13.66503425,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "fallback",
+                    "cost": 12.025230140000001,
+                    "model": "gpt-5.7-visual-preview",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [
+                  "gpt-5.7-visual-preview"
+                ],
+                "total": 12.025230140000001,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "fallback",
+                    "cost": 12.025230140000001,
+                    "model": "gpt-5.7-visual-preview",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [
+                  "gpt-5.7-visual-preview"
+                ],
+                "total": 12.025230140000001,
+                "unpriced_models": []
+              }
             },
             "plan": {
               "by_model": [
@@ -1466,6 +2025,55 @@
             ],
             "total": 13.66503425,
             "unpriced_models": []
+          },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "fallback",
+                  "cost": 13.66503425,
+                  "model": "gpt-5.7-visual-preview",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [
+                "gpt-5.7-visual-preview"
+              ],
+              "total": 13.66503425,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "fallback",
+                  "cost": 12.025230140000001,
+                  "model": "gpt-5.7-visual-preview",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [
+                "gpt-5.7-visual-preview"
+              ],
+              "total": 12.025230140000001,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "fallback",
+                  "cost": 12.025230140000001,
+                  "model": "gpt-5.7-visual-preview",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [
+                "gpt-5.7-visual-preview"
+              ],
+              "total": 12.025230140000001,
+              "unpriced_models": []
+            }
           },
           "plan": {
             "by_model": [
@@ -1487,6 +2095,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0002": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.066634704,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.066634704,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.055528919999999996,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.055528919999999996,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.055528919999999996,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.055528919999999996,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -1522,6 +2173,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.020693915999999996,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.01724493,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.01724493,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.01724493,
@@ -1535,6 +2206,26 @@
               "cost": 0.045940788,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.045940788,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.03828399,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.03828399,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1558,6 +2249,49 @@
           "missing_models": [],
           "total": 0.08277580799999999,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.08277580799999999,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.08277580799999999,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.06897984,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.06897984,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.06897984,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.06897984,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -1589,6 +2323,49 @@
               "total": 0.08277580799999999,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.08277580799999999,
+                    "model": "gpt-5.6-luna",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.08277580799999999,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.06897984,
+                    "model": "gpt-5.6-luna",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.06897984,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.06897984,
+                    "model": "gpt-5.6-luna",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.06897984,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -1618,6 +2395,49 @@
             "total": 0.08277580799999999,
             "unpriced_models": []
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.08277580799999999,
+                  "model": "gpt-5.6-luna",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.08277580799999999,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.06897984,
+                  "model": "gpt-5.6-luna",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.06897984,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.06897984,
+                  "model": "gpt-5.6-luna",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.06897984,
+              "unpriced_models": []
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -1636,6 +2456,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0003": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 24.36634775,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 24.36634775,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 21.442386020000004,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 21.442386020000004,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 21.442386020000004,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 21.442386020000004,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -1671,6 +2534,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.4400905,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.2672796400000002,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.2672796400000002,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.2672796400000002,
@@ -1684,6 +2567,26 @@
               "cost": 3.19700625,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 3.19700625,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 2.8133655000000006,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 2.8133655000000006,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1699,6 +2602,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 2.073729875,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.8248822900000001,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.8248822900000001,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.8248822900000001,
@@ -1712,6 +2635,26 @@
               "cost": 3.830645625,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 3.830645625,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 3.3709681500000004,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 3.3709681500000004,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1727,6 +2670,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 2.70736925,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 2.3824849400000003,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 2.3824849400000003,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 2.3824849400000003,
@@ -1740,6 +2703,26 @@
               "cost": 1.584104,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.584104,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.39401152,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.39401152,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1755,6 +2738,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 3.34100975,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 2.9400885800000003,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 2.9400885800000003,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 2.9400885800000003,
@@ -1769,6 +2772,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 2.217743375,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.9516141699999998,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.9516141699999998,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.9516141699999998,
@@ -1782,6 +2805,26 @@
               "cost": 3.974649125,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 3.974649125,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 3.4976912300000005,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 3.4976912300000005,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1805,6 +2848,49 @@
           "missing_models": [],
           "total": 25.92165125,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 25.92165125,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 25.92165125,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 22.811053100000002,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 22.811053100000002,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 22.811053100000002,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 22.811053100000002,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -1836,6 +2922,49 @@
               "total": 25.92165125,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 25.92165125,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 25.92165125,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 22.811053100000002,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 22.811053100000002,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 22.811053100000002,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 22.811053100000002,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -1865,6 +2994,49 @@
             "total": 25.92165125,
             "unpriced_models": []
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 25.92165125,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 25.92165125,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 22.811053100000002,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 22.811053100000002,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 22.811053100000002,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 22.811053100000002,
+              "unpriced_models": []
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -1883,6 +3055,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0004": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.9423111000000001,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.9423111000000001,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.78525925,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.78525925,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.78525925,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.78525925,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -1918,6 +3133,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.12873132,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.1072761,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.1072761,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.1072761,
@@ -1931,6 +3166,26 @@
               "cost": 0.28578312,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.28578312,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.2381526,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.2381526,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1946,6 +3201,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.1853724,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.154477,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.154477,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.154477,
@@ -1959,6 +3234,26 @@
               "cost": 0.34242426000000004,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.34242426000000004,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.28535355,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.28535355,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -1982,6 +3277,49 @@
           "missing_models": [],
           "total": 1.02986052,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 1.02986052,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 1.02986052,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.8582171,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.8582171,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.8582171,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.8582171,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -2013,6 +3351,49 @@
               "total": 1.02986052,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 1.02986052,
+                    "model": "gpt-5.6-terra",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 1.02986052,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.8582171,
+                    "model": "gpt-5.6-terra",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.8582171,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.8582171,
+                    "model": "gpt-5.6-terra",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.8582171,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -2042,6 +3423,49 @@
             "total": 1.02986052,
             "unpriced_models": []
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 1.02986052,
+                  "model": "gpt-5.6-terra",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 1.02986052,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.8582171,
+                  "model": "gpt-5.6-terra",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.8582171,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.8582171,
+                  "model": "gpt-5.6-terra",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.8582171,
+              "unpriced_models": []
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -2060,6 +3484,55 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0004/gpt-5.3-codex-spark": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "unavailable",
+                "cost": 0,
+                "model": "gpt-5.3-codex-spark",
+                "unpriced": true
+              }
+            ],
+            "missing_models": [],
+            "total": 0,
+            "unpriced_models": [
+              "gpt-5.3-codex-spark"
+            ]
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "unavailable",
+                "cost": 0,
+                "model": "gpt-5.3-codex-spark",
+                "unpriced": true
+              }
+            ],
+            "missing_models": [],
+            "total": 0,
+            "unpriced_models": [
+              "gpt-5.3-codex-spark"
+            ]
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "unavailable",
+                "cost": 0,
+                "model": "gpt-5.3-codex-spark",
+                "unpriced": true
+              }
+            ],
+            "missing_models": [],
+            "total": 0,
+            "unpriced_models": [
+              "gpt-5.3-codex-spark"
+            ]
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -2099,6 +3572,26 @@
               "fallback_used": false,
               "unpriced": true
             },
+            "current": {
+              "api_estimate": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "included_allowance": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "purchased_credits": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              }
+            },
             "plan": {
               "basis": "unavailable",
               "cost": 0,
@@ -2112,6 +3605,26 @@
               "cost": 0,
               "fallback_used": false,
               "unpriced": true
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "included_allowance": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "purchased_credits": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              }
             },
             "plan": {
               "basis": "unavailable",
@@ -2127,6 +3640,26 @@
               "fallback_used": false,
               "unpriced": true
             },
+            "current": {
+              "api_estimate": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "included_allowance": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "purchased_credits": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              }
+            },
             "plan": {
               "basis": "unavailable",
               "cost": 0,
@@ -2140,6 +3673,26 @@
               "cost": 0,
               "fallback_used": false,
               "unpriced": true
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "included_allowance": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              },
+              "purchased_credits": {
+                "basis": "unavailable",
+                "cost": 0,
+                "fallback_used": false,
+                "unpriced": true
+              }
             },
             "plan": {
               "basis": "unavailable",
@@ -2165,6 +3718,55 @@
           "unpriced_models": [
             "gpt-5.3-codex-spark"
           ]
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "unavailable",
+                "cost": 0,
+                "model": "gpt-5.3-codex-spark",
+                "unpriced": true
+              }
+            ],
+            "missing_models": [],
+            "total": 0,
+            "unpriced_models": [
+              "gpt-5.3-codex-spark"
+            ]
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "unavailable",
+                "cost": 0,
+                "model": "gpt-5.3-codex-spark",
+                "unpriced": true
+              }
+            ],
+            "missing_models": [],
+            "total": 0,
+            "unpriced_models": [
+              "gpt-5.3-codex-spark"
+            ]
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "unavailable",
+                "cost": 0,
+                "model": "gpt-5.3-codex-spark",
+                "unpriced": true
+              }
+            ],
+            "missing_models": [],
+            "total": 0,
+            "unpriced_models": [
+              "gpt-5.3-codex-spark"
+            ]
+          }
         },
         "plan": {
           "by_model": [
@@ -2200,6 +3802,55 @@
                 "gpt-5.3-codex-spark"
               ]
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "unavailable",
+                    "cost": 0,
+                    "model": "gpt-5.3-codex-spark",
+                    "unpriced": true
+                  }
+                ],
+                "missing_models": [],
+                "total": 0,
+                "unpriced_models": [
+                  "gpt-5.3-codex-spark"
+                ]
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "unavailable",
+                    "cost": 0,
+                    "model": "gpt-5.3-codex-spark",
+                    "unpriced": true
+                  }
+                ],
+                "missing_models": [],
+                "total": 0,
+                "unpriced_models": [
+                  "gpt-5.3-codex-spark"
+                ]
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "unavailable",
+                    "cost": 0,
+                    "model": "gpt-5.3-codex-spark",
+                    "unpriced": true
+                  }
+                ],
+                "missing_models": [],
+                "total": 0,
+                "unpriced_models": [
+                  "gpt-5.3-codex-spark"
+                ]
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -2233,6 +3884,55 @@
               "gpt-5.3-codex-spark"
             ]
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "unavailable",
+                  "cost": 0,
+                  "model": "gpt-5.3-codex-spark",
+                  "unpriced": true
+                }
+              ],
+              "missing_models": [],
+              "total": 0,
+              "unpriced_models": [
+                "gpt-5.3-codex-spark"
+              ]
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "unavailable",
+                  "cost": 0,
+                  "model": "gpt-5.3-codex-spark",
+                  "unpriced": true
+                }
+              ],
+              "missing_models": [],
+              "total": 0,
+              "unpriced_models": [
+                "gpt-5.3-codex-spark"
+              ]
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "unavailable",
+                  "cost": 0,
+                  "model": "gpt-5.3-codex-spark",
+                  "unpriced": true
+                }
+              ],
+              "missing_models": [],
+              "total": 0,
+              "unpriced_models": [
+                "gpt-5.3-codex-spark"
+              ]
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -2253,6 +3953,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0005": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 2.1194364,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 2.1194364,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 1.7661969999999998,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 1.7661969999999998,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 1.7661969999999998,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 1.7661969999999998,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -2288,6 +4031,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.23037582,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.19197985,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.19197985,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.19197985,
@@ -2301,6 +4064,26 @@
               "cost": 0.5114286,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.5114286,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.4261905,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.4261905,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2316,6 +4099,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.33173874,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.27644895,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.27644895,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.27644895,
@@ -2330,6 +4133,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.61279152,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.5106596,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.5106596,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.5106596,
@@ -2343,6 +4166,26 @@
               "cost": 0.43310172,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.43310172,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.36091809999999996,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.36091809999999996,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2366,6 +4209,49 @@
           "missing_models": [],
           "total": 2.3037375,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 2.3037375,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 2.3037375,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 1.91978125,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 1.91978125,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 1.91978125,
+                "model": "gpt-5.6-terra",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 1.91978125,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -2397,6 +4283,49 @@
               "total": 2.3037375,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 2.3037375,
+                    "model": "gpt-5.6-terra",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 2.3037375,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 1.91978125,
+                    "model": "gpt-5.6-terra",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 1.91978125,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 1.91978125,
+                    "model": "gpt-5.6-terra",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 1.91978125,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -2426,6 +4355,49 @@
             "total": 2.3037375,
             "unpriced_models": []
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 2.3037375,
+                  "model": "gpt-5.6-terra",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 2.3037375,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 1.91978125,
+                  "model": "gpt-5.6-terra",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 1.91978125,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 1.91978125,
+                  "model": "gpt-5.6-terra",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 1.91978125,
+              "unpriced_models": []
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -2444,6 +4416,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0006": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 17.173609499999998,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 17.173609499999998,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 15.112776360000002,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 15.112776360000002,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 15.112776360000002,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 15.112776360000002,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -2479,6 +4494,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.854406625,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.7518778300000001,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.7518778300000001,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.7518778300000001,
@@ -2492,6 +4527,26 @@
               "cost": 1.691729125,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.691729125,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.4887216300000004,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.4887216300000004,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2507,6 +4562,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.025292375,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.9022572900000001,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.9022572900000001,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.9022572900000001,
@@ -2520,6 +4595,26 @@
               "cost": 1.89678425,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.89678425,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.66917014,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.66917014,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2535,6 +4630,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.230346375,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.08270481,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.08270481,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.08270481,
@@ -2548,6 +4663,26 @@
               "cost": 2.272732875,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 2.272732875,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 2.0000049300000002,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 2.0000049300000002,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2563,6 +4698,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.606287375,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.4135328900000002,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.4135328900000002,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.4135328900000002,
@@ -2576,6 +4731,26 @@
               "cost": 0.9398495,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.9398495,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.82706756,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.82706756,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2591,6 +4766,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.982226,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.7443588800000003,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.7443588800000003,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.7443588800000003,
@@ -2605,6 +4800,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.31578925,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 1.15789454,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 1.15789454,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 1.15789454,
@@ -2618,6 +4833,26 @@
               "cost": 2.35816575,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 2.35816575,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 2.07518586,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 2.07518586,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2641,6 +4876,49 @@
           "missing_models": [],
           "total": 18.79700075,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 18.79700075,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 18.79700075,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 16.54136066,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 16.54136066,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 16.54136066,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 16.54136066,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -2672,6 +4950,49 @@
               "total": 18.79700075,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 18.79700075,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 18.79700075,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 16.54136066,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 16.54136066,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 16.54136066,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 16.54136066,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -2701,6 +5022,49 @@
             "total": 18.79700075,
             "unpriced_models": []
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 18.79700075,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 18.79700075,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 16.54136066,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 16.54136066,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 16.54136066,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 16.54136066,
+              "unpriced_models": []
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -2719,6 +5083,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0007": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 5.3554565,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 5.3554565,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 4.712801720000001,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 4.712801720000001,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 4.712801720000001,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 4.712801720000001,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -2754,6 +5161,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.424361,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.37343768000000005,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.37343768000000005,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.37343768000000005,
@@ -2767,6 +5194,26 @@
               "cost": 0.9420825,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.9420825,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.8290326,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.8290326,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2782,6 +5229,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.611083375,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.53775337,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.53775337,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.53775337,
@@ -2795,6 +5262,26 @@
               "cost": 1.128805,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 1.128805,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.9933484000000001,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.9933484000000001,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2810,6 +5297,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.797805875,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.70206917,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.70206917,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.70206917,
@@ -2824,6 +5331,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.466798,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.41078223999999997,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.41078223999999997,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.41078223999999997,
@@ -2837,6 +5364,26 @@
               "cost": 0.98452075,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.98452075,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.8663782600000002,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.8663782600000002,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -2860,6 +5407,49 @@
           "missing_models": [],
           "total": 5.941114,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 5.941114,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 5.941114,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 5.22818032,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 5.22818032,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 5.22818032,
+                "model": "gpt-5.6-sol",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 5.22818032,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -2891,6 +5481,49 @@
               "total": 5.941114,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 5.941114,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 5.941114,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 5.22818032,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 5.22818032,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 5.22818032,
+                    "model": "gpt-5.6-sol",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 5.22818032,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -2920,6 +5553,49 @@
             "total": 5.941114,
             "unpriced_models": []
           },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 5.941114,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 5.941114,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 5.22818032,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 5.22818032,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 5.22818032,
+                  "model": "gpt-5.6-sol",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 5.22818032,
+              "unpriced_models": []
+            }
+          },
           "plan": {
             "by_model": [
               {
@@ -2938,6 +5614,49 @@
     },
     "caba26c9-41d2-4e08-9c1a-0000c0de0008": {
       "detail": {
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.23725643399999996,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.23725643399999996,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.19771369499999997,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.19771369499999997,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.19771369499999997,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.19771369499999997,
+            "unpriced_models": []
+          }
+        },
         "flat_api": {
           "by_model": [
             {
@@ -2973,6 +5692,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.050913377999999995,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.042427815,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.042427815,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.042427815,
@@ -2987,6 +5726,26 @@
               "fallback_used": false,
               "unpriced": false
             },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.11302772399999998,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.09418976999999999,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.09418976999999999,
+                "fallback_used": false,
+                "unpriced": false
+              }
+            },
             "plan": {
               "basis": "direct",
               "cost": 0.09418976999999999,
@@ -3000,6 +5759,26 @@
               "cost": 0.073315332,
               "fallback_used": false,
               "unpriced": false
+            },
+            "current": {
+              "api_estimate": {
+                "basis": "direct",
+                "cost": 0.073315332,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "included_allowance": {
+                "basis": "direct",
+                "cost": 0.061096109999999995,
+                "fallback_used": false,
+                "unpriced": false
+              },
+              "purchased_credits": {
+                "basis": "direct",
+                "cost": 0.061096109999999995,
+                "fallback_used": false,
+                "unpriced": false
+              }
             },
             "plan": {
               "basis": "direct",
@@ -3023,6 +5802,49 @@
           "missing_models": [],
           "total": 0.305481888,
           "unpriced_models": []
+        },
+        "current": {
+          "api_estimate": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.305481888,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.305481888,
+            "unpriced_models": []
+          },
+          "as_of": "2026-07-29T15:30:00Z",
+          "included_allowance": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.25456824,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.25456824,
+            "unpriced_models": []
+          },
+          "included_allowance_basis": "standard_purchased_credit_rate_reference",
+          "purchased_credits": {
+            "by_model": [
+              {
+                "basis": "direct",
+                "cost": 0.25456824,
+                "model": "gpt-5.6-luna",
+                "unpriced": false
+              }
+            ],
+            "missing_models": [],
+            "total": 0.25456824,
+            "unpriced_models": []
+          }
         },
         "plan": {
           "by_model": [
@@ -3054,6 +5876,49 @@
               "total": 0.305481888,
               "unpriced_models": []
             },
+            "current": {
+              "api_estimate": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.305481888,
+                    "model": "gpt-5.6-luna",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.305481888,
+                "unpriced_models": []
+              },
+              "as_of": "2026-07-29T15:30:00Z",
+              "included_allowance": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.25456824,
+                    "model": "gpt-5.6-luna",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.25456824,
+                "unpriced_models": []
+              },
+              "included_allowance_basis": "standard_purchased_credit_rate_reference",
+              "purchased_credits": {
+                "by_model": [
+                  {
+                    "basis": "direct",
+                    "cost": 0.25456824,
+                    "model": "gpt-5.6-luna",
+                    "unpriced": false
+                  }
+                ],
+                "missing_models": [],
+                "total": 0.25456824,
+                "unpriced_models": []
+              }
+            },
             "plan": {
               "by_model": [
                 {
@@ -3082,6 +5947,49 @@
             "missing_models": [],
             "total": 0.305481888,
             "unpriced_models": []
+          },
+          "current": {
+            "api_estimate": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.305481888,
+                  "model": "gpt-5.6-luna",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.305481888,
+              "unpriced_models": []
+            },
+            "as_of": "2026-07-29T15:30:00Z",
+            "included_allowance": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.25456824,
+                  "model": "gpt-5.6-luna",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.25456824,
+              "unpriced_models": []
+            },
+            "included_allowance_basis": "standard_purchased_credit_rate_reference",
+            "purchased_credits": {
+              "by_model": [
+                {
+                  "basis": "direct",
+                  "cost": 0.25456824,
+                  "model": "gpt-5.6-luna",
+                  "unpriced": false
+                }
+              ],
+              "missing_models": [],
+              "total": 0.25456824,
+              "unpriced_models": []
+            }
           },
           "plan": {
             "by_model": [

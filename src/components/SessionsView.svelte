@@ -1364,7 +1364,7 @@
     harness === 'all'
       ? `Combined API estimate · ${windowLabel}`
       : harness === 'codex'
-      ? (showApiCost ? `Est. API cost · ${windowLabel}` : `Purchased-credit estimate · ${windowLabel}`)
+      ? (showApiCost ? `API base estimate · ${windowLabel}` : `Purchased-credit estimate · ${windowLabel}`)
       : `Est. spend · ${windowLabel}`,
   );
   const spendCardNote = $derived(
@@ -1845,7 +1845,7 @@
       {#if harness === 'all'}
       <div class="grid grid-cols-3 gap-2 text-xs">
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex purchased-credit estimate</span><div class="font-mono font-semibold">{fmtAmount(analyticsReady ? windowTotals.codexCredits : Number.NaN)}</div></div>
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex est. API USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.codexApiUsd) ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex API base USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.codexApiUsd) ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.claudeUsd) ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
       </div>
       {/if}
@@ -2030,7 +2030,7 @@
           >
             {#each visibleColumns as column (column.id)}
               <span role="columnheader" aria-sort={ariaSortAttr(column.id)} class={column.align === 'right' ? 'text-right' : 'text-left'}>
-                <button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" onclick={() => toggleSort(column.id)}>{column.id === 'cost' ? (harness === 'all' ? 'Est. USD' : showApiCost ? 'Est. $' : 'Cost') : column.label}{caretFor(column.id)}</button>
+                <button class="uppercase tracking-[0.07em] hover:text-ink transition-colors" title={column.id === 'cost' && showApiCost ? 'Current API base rate reference; excludes request-specific long-context premiums' : undefined} onclick={() => toggleSort(column.id)}>{column.id === 'cost' ? (harness === 'all' ? 'Est. USD' : showApiCost ? 'Est. $' : 'Cost') : column.label}{caretFor(column.id)}</button>
               </span>
             {/each}
           </div>

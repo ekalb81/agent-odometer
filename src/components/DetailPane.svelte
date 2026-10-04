@@ -170,7 +170,7 @@
   }
   const heroCost = $derived(
     session?.harness === 'codex'
-      ? (sessionApiCost ? { label: 'Est. API', text: surfaceMoney(sessionApiCost, true) } :
+      ? (sessionApiCost ? { label: 'API base estimate', text: surfaceMoney(sessionApiCost, true) } :
          sessionCredits ? { label: 'Legacy credits', text: surfaceMoney(sessionCredits) } : null)
       : (sessionCredits ? { label: 'Cost', text: surfaceMoney(sessionCredits) } : null),
   );
@@ -279,7 +279,7 @@
         <div class="font-mono font-semibold mt-0.5 text-ink">{fmt(session.tokens_total.total_tokens)}</div>
       </div>
       <div class="bg-panel px-5 py-2.5">
-        <div class="section-label">{heroCost?.label ?? 'Cost'}</div>
+        <div class="section-label" title={session.harness === 'codex' ? 'Current rate reference; excludes request-specific long-context premiums. Dated API scenarios appear in More details.' : undefined}>{heroCost?.label ?? 'Cost'}</div>
         <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroCost?.text ?? 'Unavailable'}</div>
       </div>
       <div class="bg-panel px-5 py-2.5">
@@ -582,7 +582,7 @@
                   {#each [
                     { label: 'Purchased credits', value: current.purchased_credits, unit: 'purchased credits' },
                     { label: 'Included allowance', value: current.included_allowance, unit: 'Standard-credit equivalents' },
-                    { label: 'API estimate', value: current.api_estimate, unit: 'USD' },
+                    { label: 'API base estimate', value: current.api_estimate, unit: 'USD' },
                   ] as scenario}
                     <p>{scenario.label}: <span class="font-mono">{scenario.value.unpriced_models.length > 0 || scenario.value.missing_models.length > 0 ? 'Unavailable' : formatCredits(scenario.value.total, scenario.unit)}</span></p>
                   {/each}

@@ -1440,7 +1440,7 @@ mod tests {
             }}}]
         }));
         assert!(rendered.contains("1200 tokens today"));
-        assert!(rendered.contains("2.0000 credits"));
+        assert!(rendered.contains("2.0000 legacy credits"));
         assert!(rendered.contains("0.2500 USD"));
         assert!(rendered.contains("incomplete pricing"));
         assert!(rendered.contains("estimated"));

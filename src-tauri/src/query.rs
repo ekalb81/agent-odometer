@@ -251,6 +251,9 @@ pub(crate) fn tier_multiplier(
         .pricing_catalog
         .modifier_for_tier(surface, identity, at, tier)
         .map(|rule| rule.multipliers.input)
+        // A flat ModelRate is already the explicit Standard reference. Speed
+        // tiers require dated evidence; a normal request does not invent one.
+        .or_else(|| (tier == "standard").then_some(1.0))
 }
 
 /// Usage for one model in a reported window.

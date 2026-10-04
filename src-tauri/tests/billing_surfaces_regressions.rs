@@ -109,6 +109,20 @@ fn frozen_current_surfaces_are_distinct_and_canonical_aliases_keep_tiers() {
     );
     assert_eq!(fallback.basis, PricingBasis::Fallback);
     close(fallback.amount.unwrap(), 165.5);
+    for tier in [None, Some("default")] {
+        for (table, expected) in [
+            (RateTable::PurchasedCredits, 332.0),
+            (RateTable::IncludedAllowance, 332.0),
+            (RateTable::ApiEstimate, 13.28),
+        ] {
+            close(
+                price_tokens(&rates, "codex", "gpt-5.6-sol", tier, &usage(), table, now)
+                    .amount
+                    .unwrap(),
+                expected,
+            );
+        }
+    }
     for (model, tier) in [
         ("unknown", "priority"),
         ("gpt-6-sol", "ultrafast"),
