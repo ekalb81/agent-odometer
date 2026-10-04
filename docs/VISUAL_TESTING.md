@@ -71,10 +71,10 @@ Each Playwright invocation clears `output/playwright/current` once during global
 When a visual change is deliberate, review the diff and update references explicitly. Use the same pinned Playwright container as CI; its tag must match the `@playwright/test` version in `package-lock.json`:
 
 ```powershell
-docker run --rm --ipc=host --volume "${PWD}:/work" --mount type=volume,target=/work/node_modules --env ODOMETER_VISUAL_BASELINE_ENV=playwright-v1.62.0-jammy -w /work mcr.microsoft.com/playwright:v1.62.0-jammy@sha256:b012874f829d298730411256666afcaeaeebaf505a0cf4c2f668d6dedb3d1e80 bash -lc "npm ci && npm run visual:update"
+docker run --rm --ipc=host --volume "${PWD}:/work" --mount type=volume,target=/work/node_modules --env ODOMETER_VISUAL_BASELINE_ENV=playwright-v1.63.0-jammy -w /work mcr.microsoft.com/playwright:v1.63.0-jammy@sha256:957bb6b7cba151ced0b5bb841703e282c45df1d934af88933b1b655411ecba3a bash -lc "npm ci && npm run visual:update"
 ```
 
-The `v1.62.0-jammy` tag and digest above match CI's Ubuntu 22.04 image and the currently pinned package version; update all three together whenever any changes. The separate container volume keeps Linux dependencies out of the host `node_modules`. `npm run visual:update` is accepted only inside this explicitly marked container; ordinary `npm run visual:test` runs remain available locally for iteration.
+The `v1.63.0-jammy` tag and digest above match CI's Ubuntu 22.04 image and the pinned `@playwright/test` package version; update all three together whenever any changes. The separate container volume keeps Linux dependencies out of the host `node_modules`. `npm run visual:update` is accepted only inside this explicitly marked container; ordinary `npm run visual:test` runs remain available locally for iteration.
 
 Commit updated snapshots together with the UI change and describe the visual consequence in the pull request. Never use a blanket snapshot update to hide unrelated differences.
 
