@@ -13,6 +13,7 @@ export default defineConfig({
       reporter: ['json'],
       reportsDirectory: './coverage/frontend',
       include: [
+        'src/components/ActivitySummary.svelte',
         'src/components/ConvertedCost.svelte',
         'src/components/DiagnosticsPanel.svelte',
         'src/components/FxSettings.svelte',
@@ -28,6 +29,7 @@ export default defineConfig({
         'src/lib/stores/organization.svelte.ts',
         'src/components/TranscriptSearch.svelte',
         'src/lib/configTimeline.ts',
+        'src/lib/activitySummary.ts',
         'src/lib/defenderStatus.ts',
         'src/lib/diagnosticsExport.ts',
         'src/lib/flushCadence.ts',

@@ -168,6 +168,32 @@ visualTest('calendar-partial-narrow', 'partial recorded history calendar at narr
   await calendar.scrollIntoViewIfNeeded();
 });
 
+visualTest('activity-summary-preview', 'local activity SVG and Markdown preview', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.clock.setFixedTime(FIXED_TIME);
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toBeVisible();
+  await calendar.getByRole('button', { name: 'Preview summary card' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByAltText('Exact local SVG activity summary preview')).toBeVisible();
+});
+
+visualTest('activity-summary-partial-narrow', 'partial activity summary keeps coverage at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { scenario: 'history-partial', view: 'codex' });
+  await page.clock.setFixedTime(FIXED_TIME);
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toContainText('partial history');
+  await calendar.getByLabel('Activity metric').selectOption('tool_calls');
+  await calendar.getByRole('button', { name: 'Preview summary card' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByLabel('Companion Markdown')).toHaveValue(/Partial recorded history/);
+});
+
 test.beforeEach(async ({ page }) => {
   await page.clock.install({ time: FIXED_TIME });
   page.on('pageerror', (error) => {
@@ -580,6 +606,26 @@ visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigat
   await expect(inspector).toHaveCount(0);
   await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
   await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
+});
+
+visualTest('transcript-bookmarks-narrow', 'private record bookmarks preserve exact keyboard navigation at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await inspector.getByRole('button', { name: 'Bookmark record', exact: true }).first().click();
+  await expect(inspector.getByText('Record bookmarks (1)', { exact: true })).toBeVisible();
+  await inspector.getByText('Record bookmarks (1)', { exact: true }).click();
+  await inspector.getByRole('button', { name: 'Next page', exact: true }).click();
+  const bookmark = inspector.getByRole('button', { name: 'Open bookmarked record 1', exact: true });
+  await bookmark.focus();
+  await page.keyboard.press('Enter');
+  await expect(inspector.locator('[id="transcript-synthetic:0"]')).toBeFocused();
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  const bounds = await inspector.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
 });
 
 visualTest('transcript-export-preview', 'export previews conversation text before local save', async (page) => {

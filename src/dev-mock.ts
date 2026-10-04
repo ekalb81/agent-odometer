@@ -461,6 +461,8 @@ mockIPC((cmd, payload) => {
   switch (cmd) {
     case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
     case 'get_organization_summaries':
+    case 'get_record_bookmarks':
+    case 'edit_record_bookmark':
     case 'get_session_annotation':
     case 'edit_session_annotation':
     case 'list_organization_tags':

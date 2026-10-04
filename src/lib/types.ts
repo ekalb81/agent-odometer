@@ -1447,6 +1447,15 @@ export interface TranscriptPresentation {
   blocks: TranscriptBlock[];
 }
 export interface TranscriptRecord {
+  context_evidence?: {
+    contributors: string[];
+    compaction: boolean;
+    pre_compaction_tokens: number | null;
+    input_tokens: number | null;
+    output_tokens: number | null;
+    context_window: number | null;
+    unsupported: boolean;
+  } | null;
   id: string;
   byte_offset: number;
   byte_length: number;
@@ -1466,6 +1475,8 @@ export interface TranscriptPage {
 }
 /** Private desktop organization; never part of SessionSummary or exports. */
 export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
+export interface RecordBookmark { identity: AnnotationIdentity; revision: number; bookmarked: boolean }
+export interface RecordBookmarkList { identity: AnnotationIdentity; bookmarks: RecordBookmark[]; recovery_backup_unrestored: boolean }
 export interface OrganizationSummary {
   identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
 }

@@ -59,6 +59,21 @@ pub struct AnnotationEdit {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordBookmark {
+    pub identity: AnnotationIdentity,
+    pub revision: i64,
+    pub bookmarked: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecordBookmarkList {
+    pub identity: AnnotationIdentity,
+    pub bookmarks: Vec<RecordBookmark>,
+    pub recovery_backup_unrestored: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SavedSearchDefinition {
@@ -204,6 +219,81 @@ fn read_annotation(conn: &Connection, identity: &AnnotationIdentity) -> Result<S
 }
 
 impl HistoryStore {
+    pub fn record_bookmarks(&self, key: &str) -> Result<RecordBookmarkList> {
+        if key.is_empty() || key.len() > 1024 {
+            bail!("Invalid bookmark session");
+        }
+        let recovery_backup_unrestored = self.organization_recovery_pending()?;
+        let conn = self.open_reader()?;
+        let fingerprint = conn.query_row(
+            "SELECT first_event_fingerprint FROM durable_sessions WHERE session_key=?1",
+            [key],
+            |r| r.get(0),
+        )?;
+        let identity = AnnotationIdentity {
+            session_key: key.into(),
+            fingerprint,
+            anchor: String::new(),
+        };
+        let mut statement = conn.prepare("SELECT anchor,revision,pinned FROM session_annotations WHERE session_key=?1 AND anchor<>'' ORDER BY anchor LIMIT 501")?;
+        let bookmarks = statement
+            .query_map([key], |r| {
+                Ok(RecordBookmark {
+                    identity: AnnotationIdentity {
+                        anchor: r.get(0)?,
+                        ..identity.clone()
+                    },
+                    revision: r.get(1)?,
+                    bookmarked: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if bookmarks.len() > 500 {
+            bail!("At most 500 record bookmarks are supported per session");
+        }
+        Ok(RecordBookmarkList {
+            identity,
+            bookmarks,
+            recovery_backup_unrestored,
+        })
+    }
+
+    /// Only the desktop source-validation boundary may add a record bookmark.
+    pub(crate) fn edit_record_bookmark(&self, edit: &RecordBookmark) -> Result<RecordBookmark> {
+        validate_identity(&edit.identity)?;
+        if edit.identity.anchor.is_empty() || edit.revision < 0 {
+            bail!("Invalid record bookmark");
+        }
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = read_annotation(&tx, &edit.identity)?;
+        if current.summary.revision != edit.revision {
+            bail!("Bookmark changed; reload before saving");
+        }
+        if !edit.bookmarked && current.summary.revision == 0 {
+            bail!("Bookmark no longer exists; reload bookmarks");
+        }
+        let revision = edit
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Bookmark revision exhausted"))?;
+        tx.execute("INSERT INTO session_annotations(session_key,first_event_fingerprint,anchor,revision,pinned) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(session_key,anchor) DO UPDATE SET revision=excluded.revision,pinned=excluded.pinned", params![edit.identity.session_key,edit.identity.fingerprint,edit.identity.anchor,revision,edit.bookmarked])?;
+        let active: i64 = tx.query_row(
+            "SELECT count(*) FROM session_annotations WHERE session_key=?1 AND anchor<>''",
+            [&edit.identity.session_key],
+            |r| r.get(0),
+        )?;
+        if active > 500 {
+            bail!("At most 500 record bookmarks are supported per session");
+        }
+        changed_annotations(&tx)?;
+        tx.commit()?;
+        Ok(RecordBookmark {
+            revision,
+            ..edit.clone()
+        })
+    }
+
     pub fn organization_recovery_pending(&self) -> Result<bool> {
         let marker = self.recovery_receipt()?.is_some();
         let recorded: bool = self.open_reader()?.query_row(
@@ -561,6 +651,16 @@ mod tests {
             .unwrap()
             .remove(0);
         store.edit_annotation(&edit(&initial)).unwrap();
+        store
+            .edit_record_bookmark(&RecordBookmark {
+                identity: AnnotationIdentity {
+                    anchor: "synthetic-record-anchor".into(),
+                    ..initial.identity.clone()
+                },
+                revision: 0,
+                bookmarked: true,
+            })
+            .unwrap();
         let saved_search = store.save_search(None, 0, &search()).unwrap();
         store.mark_path_missing(&path).unwrap();
         store
@@ -601,6 +701,108 @@ mod tests {
         assert!(!new_summary.has_note && !new_summary.pinned && new_summary.tags.is_empty());
         assert!(store.edit_annotation(&edit(&initial)).is_err());
         assert_eq!(store.saved_searches().unwrap()[0].id, saved_search.id);
+    }
+
+    #[test]
+    fn record_bookmarks_are_private_revisioned_and_persist_without_content() {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("bookmarks.sqlite");
+        let store = HistoryStore::open(&db).unwrap();
+        let key = store
+            .observe(
+                &root.path().join("synthetic.jsonl"),
+                &fixture("bookmarks"),
+                1,
+            )
+            .unwrap()
+            .key;
+        let list = store.record_bookmarks(&key).unwrap();
+        let bookmark = RecordBookmark {
+            identity: AnnotationIdentity {
+                anchor: "opaque-source:0:hash".into(),
+                ..list.identity
+            },
+            revision: 0,
+            bookmarked: true,
+        };
+        let saved = store.edit_record_bookmark(&bookmark).unwrap();
+        assert!(store.edit_record_bookmark(&bookmark).is_err());
+        assert!(
+            !store
+                .organization_summaries(std::slice::from_ref(&key))
+                .unwrap()[0]
+                .pinned
+        );
+        let summary = serde_json::to_string(&store.session_summaries().unwrap()).unwrap();
+        assert!(!summary.contains("opaque-source"));
+        assert!(store
+            .edit_annotation(&AnnotationEdit {
+                identity: saved.identity.clone(),
+                revision: 1,
+                pinned: true,
+                note: "No record bodies".into(),
+                tags: vec![]
+            })
+            .is_err());
+        drop(store);
+        let store = HistoryStore::open(&db).unwrap();
+        let restored = store.record_bookmarks(&key).unwrap().bookmarks.remove(0);
+        assert_eq!(restored.identity, saved.identity);
+        assert_eq!(restored.revision, 1);
+        assert!(restored.bookmarked);
+        let removed = store
+            .edit_record_bookmark(&RecordBookmark {
+                bookmarked: false,
+                ..restored
+            })
+            .unwrap();
+        assert!(!store.record_bookmarks(&key).unwrap().bookmarks[0].bookmarked);
+        assert!(store.edit_record_bookmark(&saved).is_err());
+        assert!(
+            store
+                .edit_record_bookmark(&RecordBookmark {
+                    bookmarked: true,
+                    ..removed
+                })
+                .unwrap()
+                .bookmarked
+        );
+        let retained: (String,i64) = store.connection().unwrap().query_row("SELECT note,(SELECT count(*) FROM annotation_tags) FROM session_annotations WHERE anchor<>''", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+        assert_eq!(retained, (String::new(), 0));
+    }
+
+    #[test]
+    fn record_bookmark_limit_is_transactional_and_removals_cannot_fabricate_anchors() {
+        let root = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(&root.path().join("bookmarks.sqlite")).unwrap();
+        let key = store
+            .observe(
+                &root.path().join("synthetic.jsonl"),
+                &fixture("bookmark-limit"),
+                1,
+            )
+            .unwrap()
+            .key;
+        let identity = store.record_bookmarks(&key).unwrap().identity;
+        let extra = RecordBookmark {
+            identity: AnnotationIdentity {
+                anchor: "extra-anchor".into(),
+                ..identity.clone()
+            },
+            revision: 0,
+            bookmarked: false,
+        };
+        assert!(store.edit_record_bookmark(&extra).is_err());
+        assert!(store.record_bookmarks(&key).unwrap().bookmarks.is_empty());
+        store.connection().unwrap().execute("WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<500) INSERT INTO session_annotations(session_key,first_event_fingerprint,anchor,revision,pinned) SELECT ?1,?2,'synthetic-'||v,1,0 FROM n", params![key,identity.fingerprint]).unwrap();
+        let error = store
+            .edit_record_bookmark(&RecordBookmark {
+                bookmarked: true,
+                ..extra
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("500"));
+        assert_eq!(store.record_bookmarks(&key).unwrap().bookmarks.len(), 500);
     }
 
     #[test]

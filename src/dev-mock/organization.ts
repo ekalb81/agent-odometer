@@ -1,8 +1,9 @@
 /** Synthetic private organization; browser state is not durable native proof. */
-import type { AnnotationEdit, AnnotationIdentity, OrganizationSummary, SavedSearch, SavedSearchDefinition, SessionAnnotation } from '../lib/types';
+import type { AnnotationEdit, AnnotationIdentity, OrganizationSummary, SavedSearch, SavedSearchDefinition, SessionAnnotation, RecordBookmark } from '../lib/types';
 const annotations = new Map<string, SessionAnnotation>();
 const searches = new Map<number, SavedSearch>();
 const tags = new Set<string>();
+const bookmarks = new Map<string, Map<string, RecordBookmark>>();
 let nextId = 1;
 export function organizationIdentity(key: string): AnnotationIdentity {
   return { session_key: key, fingerprint: `synthetic:${key}`, anchor: '' };
@@ -12,6 +13,17 @@ export function organizationSummary(key: string): OrganizationSummary {
 }
 export function mockOrganization(command: string, payload: Record<string, unknown>, recoveryUnrestored = false): unknown {
   switch (command) {
+    case 'get_record_bookmarks': {
+      const key = payload.sessionKey as string;
+      return { identity: organizationIdentity(key), bookmarks: [...(bookmarks.get(key)?.values() ?? [])], recovery_backup_unrestored: recoveryUnrestored };
+    }
+    case 'edit_record_bookmark': {
+      const edit = payload.edit as RecordBookmark;
+      const rows = bookmarks.get(edit.identity.session_key) ?? new Map<string, RecordBookmark>();
+      if ((rows.get(edit.identity.anchor)?.revision ?? 0) !== edit.revision) throw new Error('Bookmark changed; reload before saving');
+      const next = { ...edit, revision: edit.revision + 1 };
+      rows.set(edit.identity.anchor, next); bookmarks.set(edit.identity.session_key, rows); return next;
+    }
     case 'get_organization_summaries': return (payload.keys as string[]).map(organizationSummary);
     case 'get_session_annotation': {
       const identity = payload.identity as AnnotationIdentity;
