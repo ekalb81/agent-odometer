@@ -296,7 +296,7 @@ fn statusline_text(value: &serde_json::Value) -> String {
             if let Some(amount) = amount.as_f64() {
                 output.push_str(&format!(
                     " · {amount:.4} {}",
-                    currency.replace(['\r', '\n', '\u{1b}'], " ")
+                    display_cost_currency(currency).replace(['\r', '\n', '\u{1b}'], " ")
                 ));
             }
         }
@@ -410,9 +410,14 @@ fn parse_window(args: &[String]) -> Result<Window> {
     Ok((from, to))
 }
 
-/// The user's rate card, falling back to the bundled one and then to an
-/// empty card. A report must still render usage when pricing is
-/// unavailable — every cost then reports as unpriced rather than as zero.
+fn display_cost_currency(currency: &str) -> &str {
+    if currency == "credits" {
+        "legacy credits"
+    } else {
+        currency
+    }
+}
+
 fn load_rates() -> RateCard {
     RateCard::load_from_disk()
         .or_else(|_| RateCard::load_bundled())
@@ -559,7 +564,10 @@ fn render_report(report: &RangeReport, format: Format) -> Result<String> {
                     usage.tokens.total_tokens,
                     usage
                         .cost
-                        .map(|cost| format!("  {cost:.4} {}", usage.currency))
+                        .map(|cost| format!(
+                            "  {cost:.4} {}",
+                            display_cost_currency(&usage.currency)
+                        ))
                         .unwrap_or_else(|| "  (unpriced)".to_string())
                 ));
             }
@@ -787,7 +795,10 @@ pub fn sessions_from(
                     session.session_key, session.tokens.total_tokens
                 ));
                 match session.cost {
-                    Some(cost) => out.push_str(&format!("  {cost:.4} {}", session.currency)),
+                    Some(cost) => out.push_str(&format!(
+                        "  {cost:.4} {}",
+                        display_cost_currency(&session.currency)
+                    )),
                     None => out.push_str("  (unpriced)"),
                 }
                 if !session.unpriced_models.is_empty() {
@@ -1242,6 +1253,7 @@ mod tests {
 
     fn sample_report() -> RangeReport {
         RangeReport {
+            cost_surface: "legacy_reference".into(),
             schema_version: crate::query::RANGE_REPORT_SCHEMA_VERSION,
             from: None,
             to: None,

@@ -14,10 +14,10 @@ describe('currency presentation', () => {
     [0, 'USD', '$0.00'],
     [1234.567, 'USD', '$1,234.57'],
     [12.5, 'EUR', '€12.50'],
-    [1234.567, 'credits', '1,234.57 credits'],
-    [0, 'credits', '0.00 credits'],
+    [1234.567, 'credits', '1,234.57 legacy credits'],
+    [0, 'credits', '0.00 legacy credits'],
     [0.0012, 'USD', '$0.0012'],
-    [0.0012, 'credits', '0.0012 credits'],
+    [0.0012, 'credits', '0.0012 legacy credits'],
     [-0.0012, 'USD', '-$0.0012'],
     [0.005, 'USD', '$0.01'],
   ])('formats %s %s as %s without recalculating a price', (amount, currency, expected) => {

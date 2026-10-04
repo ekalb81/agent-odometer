@@ -23,5 +23,5 @@ export function formatCredits(amount: number, currency: string): string {
     minimumFractionDigits: 2,
     maximumFractionDigits: subCent ? 4 : 2,
   }).format(amount);
-  return `${num} ${currency}`;
+  return `${num} ${currency === 'credits' ? 'legacy credits' : currency}`;
 }

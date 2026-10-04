@@ -750,7 +750,9 @@
   }
 
   function fmtPricingSurface(surface: PricingCatalog['rate_periods'][number]['surface']): string {
-    if (surface === 'codex_plan_credits') return 'Codex plan credits';
+    if (surface === 'codex_plan_credits') return 'Codex legacy plan reference';
+    if (surface === 'codex_purchased_credits') return 'Codex purchased credits';
+    if (surface === 'codex_included_allowance') return 'Codex included allowance (Standard-credit equivalents)';
     if (surface === 'openai_api_usd') return 'OpenAI API USD';
     if (surface === 'gemini_api_usd') return 'Gemini API USD';
     return 'Anthropic API USD';
@@ -1830,7 +1832,7 @@
                 <div class="font-medium text-ink">Conditional rule · {modifier.model} · {fmtPricingSurface(modifier.surface)}</div>
                 <div class="mt-0.5 font-mono text-ink-faint break-all">{modifier.id}</div>
                 <div class="mt-0.5 text-ink-faint">Applies {fmtPricingWindow(modifier.from, modifier.to)} · verified {modifier.provenance.verified_at.slice(0, 10)} UTC</div>
-                <div class="mt-0.5 text-ink-faint">When request input exceeds {modifier.condition.greater_than.toLocaleString()} tokens · input {modifier.multipliers.input}× · output {modifier.multipliers.output}×</div>
+                <div class="mt-0.5 text-ink-faint">{#if modifier.condition.kind === 'request_input_token_threshold'}When request input exceeds {modifier.condition.greater_than.toLocaleString()} tokens{:else}Service tier: {modifier.condition.tier}{/if} · input {modifier.multipliers.input}× · output {modifier.multipliers.output}×</div>
                 <div class="mt-0.5"><a class="text-accent hover:underline" href={modifier.provenance.source_url} target="_blank" rel="noreferrer">{modifier.label} · source</a></div>
               </div>
             {/each}

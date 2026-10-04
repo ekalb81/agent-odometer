@@ -54,6 +54,18 @@ beforeEach(() => { rates.set({
 afterEach(() => { cleanup(); rates.set(null); });
 
 describe('DetailPane server pricing', () => {
+  it('renders distinct server billing scenarios and keeps unsupported surfaces unavailable', () => {
+    const value = session();
+    value.pricing!.current = { as_of: '2026-10-04T00:00:00Z', purchased_credits: surface(20), included_allowance: surface(25), api_estimate: surface(4) };
+    value.pricing!.current.api_estimate.unpriced_models = ['unsupported-tier'];
+    render(DetailPane, { session: value, onclose: () => {} });
+    expect(screen.getByText('20.00 purchased credits')).toBeInTheDocument();
+    expect(screen.getByText('25.00 Standard-credit equivalents')).toBeInTheDocument();
+    expect(screen.queryByText('$4.00')).not.toBeInTheDocument();
+    expect(screen.getByText(/Current rules as of 2026-10-04/)).toBeInTheDocument();
+    expect(screen.getByText(/not a bill or observed allowance usage/)).toBeInTheDocument();
+    expect(screen.getByText(/API request-size premiums never apply/)).toBeInTheDocument();
+  });
   it('renders expired-only usage as unavailable and mixed prices as partial, retaining raw tokens', () => {
     const value = session();
     value.harness = 'gemini_cli';
@@ -74,15 +86,15 @@ describe('DetailPane server pricing', () => {
     render(DetailPane, { session: session(), onclose: () => {} });
     expect(screen.getAllByText('$42.50').length).toBeGreaterThan(0);
     expect(screen.getByTitle('#1 · $42.50')).toBeInTheDocument();
-    expect(screen.getByText('17.25 credits')).toBeInTheDocument();
-    expect(screen.getByText(/Reference: 17.25 credits à-la-carte equivalent/)).toBeInTheDocument();
+    expect(screen.getByText('17.25 legacy credits')).toBeInTheDocument();
+    expect(screen.getByText(/Reference: 17.25 legacy credits à-la-carte equivalent/)).toBeInTheDocument();
   });
 
   it('does not reconstruct absent server pricing from tokens or the local card', () => {
     const value = session();
     delete value.pricing;
     render(DetailPane, { session: value, onclose: () => {} });
-    expect(screen.getByText('Unavailable')).toBeInTheDocument();
+    expect(screen.getAllByText('Unavailable').length).toBeGreaterThan(0);
     expect(screen.queryByText('Cost per turn')).not.toBeInTheDocument();
     expect(screen.queryByText(/Flat OpenAI API reference/)).not.toBeInTheDocument();
   });
@@ -92,7 +104,7 @@ describe('DetailPane server pricing', () => {
     value.pricing!.flat_api = null;
     value.pricing!.turn_prices.one.api = null;
     render(DetailPane, { session: value, onclose: () => {} });
-    expect(screen.getByTitle('#1 · 17.25 credits')).toBeInTheDocument();
+    expect(screen.getByTitle('#1 · 17.25 legacy credits')).toBeInTheDocument();
     expect(screen.queryByText('$42.50')).not.toBeInTheDocument();
   });
 

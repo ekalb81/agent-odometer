@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::model::{Session, SessionSummary, TierBucket, TokenTotals};
 use crate::provider::{codex_provider_id, ProviderRegistry};
 use crate::query::{
-    price_buckets_detailed, service_tier_multiplier, token_cost, PricedModel, PricedSurface,
-    RangePricing, RateTable,
+    price_buckets_detailed, service_tier_multiplier, token_cost, CurrentPricing, PricedModel,
+    PricedSurface, RangePricing, RateTable,
 };
 use crate::rates::{PricingBasis, PricingProvenance, PricingSurface, RateCard};
 
@@ -31,12 +31,27 @@ pub struct SessionPricing {
     pub flat_api: Option<PricedSurface>,
     pub turn_prices: BTreeMap<String, TurnPrices>,
     pub time_aware_api: Option<TimeAwarePricing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<CurrentPricing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dated_purchased_credits: Option<TimeAwarePricing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dated_included_allowance: Option<TimeAwarePricing>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TurnPrices {
     pub plan: TurnPrice,
     pub api: Option<TurnPrice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<CurrentTurnPrices>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CurrentTurnPrices {
+    pub purchased_credits: TurnPrice,
+    pub included_allowance: TurnPrice,
+    pub api_estimate: TurnPrice,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -76,10 +91,46 @@ pub fn price_surfaces(
     now: DateTime<Utc>,
 ) -> RangePricing {
     RangePricing {
+        current: current_pricing(buckets, harness, rates, now),
         plan: price_buckets_detailed(rates, harness, buckets, RateTable::Plan, now)
             .expect("plan table always applies"),
         api: price_buckets_detailed(rates, harness, buckets, RateTable::Api, now),
     }
+}
+
+pub fn current_pricing(
+    buckets: &[TierBucket],
+    harness: &str,
+    rates: &RateCard,
+    now: DateTime<Utc>,
+) -> Option<CurrentPricing> {
+    (harness == codex_provider_id().as_str()).then(|| CurrentPricing {
+        as_of: now,
+        included_allowance_basis: "standard_purchased_credit_rate_reference".to_owned(),
+        purchased_credits: price_buckets_detailed(
+            rates,
+            harness,
+            buckets,
+            RateTable::PurchasedCredits,
+            now,
+        )
+        .expect("credit table applies"),
+        included_allowance: price_buckets_detailed(
+            rates,
+            harness,
+            buckets,
+            RateTable::IncludedAllowance,
+            now,
+        )
+        .expect("allowance table applies"),
+        api_estimate: price_buckets_detailed(rates, harness, buckets, RateTable::ApiEstimate, now)
+            .unwrap_or(PricedSurface {
+                total: 0.0,
+                by_model: Vec::new(),
+                missing_models: buckets.iter().map(|b| b.model.clone()).collect(),
+                unpriced_models: buckets.iter().map(|b| b.model.clone()).collect(),
+            }),
+    })
 }
 
 pub fn price_summary(
@@ -129,9 +180,22 @@ pub fn price_turn(
     let Some(model) = model.filter(|_| !unpriced) else {
         return result;
     };
+    if matches!(
+        table,
+        RateTable::PurchasedCredits | RateTable::IncludedAllowance | RateTable::ApiEstimate
+    ) {
+        let value = crate::query::price_tokens(rates, harness, model, tier, tokens, table, now);
+        result.cost = value.amount.unwrap_or(0.0);
+        result.basis = value.basis;
+        result.unpriced = value.amount.is_none();
+        result.fallback_used = value.basis == PricingBasis::Fallback;
+        return result;
+    }
     let rate_table = match table {
-        RateTable::Plan => &rates.models,
-        RateTable::Api => &rates.api_models,
+        RateTable::Plan | RateTable::PurchasedCredits | RateTable::IncludedAllowance => {
+            &rates.models
+        }
+        RateTable::Api | RateTable::ApiEstimate => &rates.api_models,
     };
     let resolution = rates.resolve_model_pricing(model, harness, rate_table, now);
     result.basis = resolution.basis;
@@ -139,7 +203,20 @@ pub fn price_turn(
     result.fallback_used = resolution.basis == PricingBasis::Fallback;
     if resolution.basis != PricingBasis::Unavailable {
         if let Some(rate) = rate_table.get(&resolution.resolved_model) {
-            result.cost = token_cost(tokens, rate, service_tier_multiplier(model, tier, table));
+            if let Some(multiplier) = crate::query::tier_multiplier(
+                rates,
+                harness,
+                &resolution.resolved_model,
+                resolution.basis,
+                tier,
+                table,
+                now,
+            ) {
+                result.cost = token_cost(tokens, rate, multiplier);
+            } else {
+                result.basis = PricingBasis::Unavailable;
+                result.unpriced = true;
+            }
         }
     }
     result
@@ -213,6 +290,35 @@ pub fn price_session_details(
             (
                 turn.turn_id.clone(),
                 TurnPrices {
+                    current: is_codex.then(|| CurrentTurnPrices {
+                        purchased_credits: price_turn(
+                            &turn.tokens,
+                            turn.model.as_deref(),
+                            turn.service_tier.as_deref(),
+                            harness,
+                            rates,
+                            RateTable::PurchasedCredits,
+                            now,
+                        ),
+                        included_allowance: price_turn(
+                            &turn.tokens,
+                            turn.model.as_deref(),
+                            turn.service_tier.as_deref(),
+                            harness,
+                            rates,
+                            RateTable::IncludedAllowance,
+                            now,
+                        ),
+                        api_estimate: price_turn(
+                            &turn.tokens,
+                            turn.model.as_deref(),
+                            turn.service_tier.as_deref(),
+                            harness,
+                            rates,
+                            RateTable::ApiEstimate,
+                            now,
+                        ),
+                    }),
                     plan: price_turn(
                         &turn.tokens,
                         turn.model.as_deref(),
@@ -238,6 +344,18 @@ pub fn price_session_details(
         })
         .collect();
     let time_aware_api = time_aware_pricing(&session, rates);
+    let current = current_pricing(
+        fallback_buckets.as_deref().unwrap_or(&history),
+        harness,
+        rates,
+        now,
+    );
+    let dated_purchased_credits = is_codex
+        .then(|| time_aware_surface(&session, rates, PricingSurface::CodexPurchasedCredits))
+        .flatten();
+    let dated_included_allowance = is_codex
+        .then(|| time_aware_surface(&session, rates, PricingSurface::CodexIncludedAllowance))
+        .flatten();
     SessionDetails {
         session,
         pricing: SessionPricing {
@@ -245,6 +363,9 @@ pub fn price_session_details(
             flat_api,
             turn_prices,
             time_aware_api,
+            current,
+            dated_purchased_credits,
+            dated_included_allowance,
         },
     }
 }
@@ -269,6 +390,17 @@ pub fn time_aware_pricing(session: &Session, rates: &RateCard) -> Option<TimeAwa
     } else {
         return None;
     };
+    time_aware_surface(session, rates, surface)
+}
+
+pub fn time_aware_surface(
+    session: &Session,
+    rates: &RateCard,
+    surface: PricingSurface,
+) -> Option<TimeAwarePricing> {
+    if session.tokens_history.is_empty() {
+        return None;
+    }
     let mut result = TimeAwarePricing {
         pricing: PricedSurface {
             total: 0.0,
@@ -296,15 +428,53 @@ pub fn time_aware_pricing(session: &Session, rates: &RateCard) -> Option<TimeAwa
             return None;
         }
         let catalog = &rates.pricing_catalog;
-        let period = catalog.rate_at(surface, model, event.timestamp)?;
-        let modifiers = event
+        let table = if surface == PricingSurface::OpenaiApiUsd {
+            &rates.api_models
+        } else {
+            &rates.models
+        };
+        let resolution =
+            rates.resolve_model_pricing(model, session.harness.as_str(), table, event.timestamp);
+        // A catalog can directly evidence a model missing from the flat map.
+        // A fallback must never borrow the fallback model's historical rules.
+        let canonical = if matches!(
+            resolution.basis,
+            PricingBasis::Fallback | PricingBasis::Unavailable
+        ) {
+            model
+        } else {
+            resolution.resolved_model.as_str()
+        };
+        let period = catalog.rate_at(surface, canonical, event.timestamp)?;
+        let mut modifiers = event
             .request_input_tokens
-            .map(|input| catalog.modifiers_for_request(surface, model, event.timestamp, input))
+            .map(|input| catalog.modifiers_for_request(surface, canonical, event.timestamp, input))
             .unwrap_or_default();
+        let tier = match event.service_tier.as_deref() {
+            None | Some("default" | "standard") => "standard",
+            Some("fast" | "priority") => "fast",
+            Some("ultrafast") => "ultrafast",
+            _ => return None,
+        };
+        if let Some(rule) = catalog.modifier_for_tier(surface, canonical, event.timestamp, tier) {
+            modifiers.push(rule);
+        } else if tier != "standard" {
+            // Preserve only the explicitly evidenced historical API exceptions.
+            if surface != PricingSurface::OpenaiApiUsd
+                || !matches!(canonical, "gpt-5.5" | "gpt-5.4")
+                || tier != "fast"
+            {
+                return None;
+            }
+        }
         if event.request_input_tokens.is_none() {
             for modifier in &catalog.conditional_modifiers {
                 if modifier.surface == surface
-                    && modifier.model == model
+                    && modifier.model == canonical
+                    && matches!(
+                        modifier.condition,
+                        crate::rates::PricingCondition::RequestInputTokenThreshold { .. }
+                    )
                     && event.timestamp >= modifier.from
                     && modifier.to.is_none_or(|end| event.timestamp < end)
                 {
@@ -330,7 +500,16 @@ pub fn time_aware_pricing(session: &Session, rates: &RateCard) -> Option<TimeAwa
         let cost = token_cost(
             &event.delta,
             &rate,
-            service_tier_multiplier(model, event.service_tier.as_deref(), RateTable::Api),
+            if tier == "fast"
+                && surface == PricingSurface::OpenaiApiUsd
+                && catalog
+                    .modifier_for_tier(surface, canonical, event.timestamp, tier)
+                    .is_none()
+            {
+                service_tier_multiplier(canonical, Some("fast"), RateTable::Api)
+            } else {
+                1.0
+            },
         );
         result.pricing.total += cost;
         let basis = if period.rate.cache_creation_rate_is_fallback()

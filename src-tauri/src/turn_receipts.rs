@@ -271,7 +271,7 @@ pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> St
         format_tokens(turn.tokens.total_tokens)
     );
     if session.harness == codex_provider_id() {
-        first.push_str(&format_optional_amount(turn_plan, "credits", false));
+        first.push_str(&format_optional_amount(turn_plan, "legacy credits", false));
         first.push_str(&format_optional_amount(turn_api, "API", true));
     } else if session.harness == claude_code_provider_id() {
         first.push_str(&format_optional_amount(turn_plan, "API", true));
@@ -287,7 +287,7 @@ pub fn build_receipt(session: &Session, turn: &TurnInfo, rates: &RateCard) -> St
     let session_line = if session.harness == codex_provider_id() {
         format!(
             "Session{}{}",
-            format_session_amount(&session_plan, "credits", false),
+            format_session_amount(&session_plan, "legacy credits", false),
             format_session_amount(&session_api, "API", true)
         )
     } else if session.harness == claude_code_provider_id() {

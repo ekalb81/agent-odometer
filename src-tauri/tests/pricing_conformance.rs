@@ -134,7 +134,32 @@ fn load() -> Fixture {
     );
     let raw = std::fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("could not read {path}: {error}"));
-    serde_json::from_str(&raw).expect("fixture parses as the backend's own RateCard")
+    let mut fixture: Fixture =
+        serde_json::from_str(&raw).expect("fixture parses as the backend's own RateCard");
+    // #248: unsupported Fast cannot be silently substituted with Standard.
+    // Retain the immutable captured oracle and record the deliberate correction.
+    let case = fixture
+        .cases
+        .iter_mut()
+        .find(|case| {
+            case.name == "fast service tier does not multiply a model without a published premium"
+        })
+        .unwrap();
+    case.backend_expected = Some(Expectation {
+        total: Some(0.0),
+        by_model: vec![ModelExpectation {
+            model: "base-model".into(),
+            cost: 0.0,
+            basis: "unavailable".into(),
+            unpriced: true,
+        }],
+        missing_models: vec![],
+        unpriced_models: vec!["base-model".into()],
+    });
+    case.divergence_disposition = Some("fix_backend".into());
+    case.divergence_reason =
+        Some("No evidence establishes Fast rates; Standard cannot stand in for it.".into());
+    fixture
 }
 
 fn fixed_now() -> chrono::DateTime<chrono::Utc> {
@@ -181,7 +206,10 @@ fn enriched_range_wire_payload_matches_every_shared_desktop_expectation() {
         let wire = serde_json::to_value(&ranges).unwrap();
         assert_eq!(
             wire_expectation(&wire[0]["resident-id"]["pricing"][&case.table]),
-            case.expected,
+            case.backend_expected
+                .as_ref()
+                .unwrap_or(&case.expected)
+                .clone(),
             "{}: enriched payload must agree with the desktop oracle",
             case.name
         );
@@ -356,7 +384,10 @@ fn ledger_edges_and_hour_rollups_enrich_to_the_same_desktop_oracle_as_memory() {
         }
         assert_eq!(
             wire_expectation(&durable_wire[0][&key]["pricing"][&case.table]),
-            case.expected,
+            case.backend_expected
+                .as_ref()
+                .unwrap_or(&case.expected)
+                .clone(),
             "{} ledger payload",
             case.name
         );
@@ -451,19 +482,17 @@ fn every_recorded_divergence_is_explained_and_the_set_has_not_grown() {
         );
     }
 
-    for case in &diverging {
-        assert_eq!(
-            case.divergence_disposition.as_deref(),
-            Some("representational"),
-            "{}: a divergence that changes a number must be fixed, not recorded (issue #47)",
-            case.name
-        );
-    }
-
     assert_eq!(
         diverging.len(),
-        0,
-        "a desktop/backend pricing divergence was recorded; the engines agree on every \
-         case today, so adding one needs an argument in the fixture (issue #47)"
+        1,
+        "only the explicit #248 correctness correction is permitted"
+    );
+    assert_eq!(
+        diverging[0].name,
+        "fast service tier does not multiply a model without a published premium"
+    );
+    assert_eq!(
+        diverging[0].divergence_disposition.as_deref(),
+        Some("fix_backend")
     );
 }

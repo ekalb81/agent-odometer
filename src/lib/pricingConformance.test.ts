@@ -66,6 +66,22 @@ function syntheticSession(buckets: TierBucket[]): SessionSummary {
 }
 
 describe('pricing conformance fixture (issue #47)', () => {
+  it('selects current server surfaces for primary totals and retains the legacy export with its label', () => {
+    const session = syntheticSession([]);
+    const surface = (total: number): PricedSurface => ({ total, by_model: [], missing_models: [], unpriced_models: [] });
+    const pricing: RangePricing = { plan: surface(99), api: surface(88), current: { as_of: '2026-10-04T00:00:00Z', purchased_credits: surface(20), included_allowance: surface(25), api_estimate: surface(4) } };
+    const projected = projectSession(session, projectionRates, undefined, false, pricing);
+    expect(projected.planCost).toBe(20);
+    expect(projected.displayCost).toBe(4);
+    const row = exportRows([projected])[0];
+    expect(row.codex_credits).toBe(99);
+    expect(row.codex_plan_surface).toBe('legacy_reference');
+    expect(row.codex_purchased_credit_estimate).toBe(20);
+    expect(row.codex_included_allowance_credit_equivalent_estimate).toBe(25);
+    expect(row.codex_api_base_estimate).toBe(4);
+    expect(row.codex_current_as_of).toBe('2026-10-04T00:00:00Z');
+  });
+
   it('keeps the complete corpus of backend pricing paths', () => {
     // A fixture that silently lost cases would still pass every assertion
     // below, so the shape of the corpus is pinned too.

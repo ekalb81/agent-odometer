@@ -65,6 +65,16 @@ fn serialized_detail_pricing_matches_legacy_desktop_for_every_case() {
         let details = price_session_details(session, &rates, now);
         let mut wire = serde_json::to_value(details).unwrap();
         let mut actual = wire.as_object_mut().unwrap().remove("pricing").unwrap();
+        for field in [
+            "current",
+            "dated_purchased_credits",
+            "dated_included_allowance",
+        ] {
+            actual.as_object_mut().unwrap().remove(field);
+        }
+        for prices in actual["turn_prices"].as_object_mut().unwrap().values_mut() {
+            prices.as_object_mut().unwrap().remove("current");
+        }
         // Price attachment must not alter raw details or persist derived data.
         assert_eq!(
             wire, original,
@@ -79,6 +89,12 @@ fn serialized_detail_pricing_matches_legacy_desktop_for_every_case() {
                 .is_some_and(|reason| !reason.is_empty()));
         }
         let mut expected = merge(&case["expected"], &case["backend_expected_overrides"]);
+        // #248: fallback model identity does not establish speed support.
+        // Keep the captured oracle immutable and state the intentional change.
+        if case["name"] == "fast session and turn costs preserve tier multiplier" {
+            expected["flat_api"] = serde_json::json!({ "total": 0, "by_model": [{"model":"gpt-5.5","cost":0,"basis":"unavailable","unpriced":true}], "missing_models":["gpt-5.5"],"unpriced_models":["gpt-5.5"] });
+            expected["turn_prices"]["fast"]["api"] = serde_json::json!({"cost":0,"fallback_used":true,"unpriced":true,"basis":"unavailable"});
+        }
         normalize(&mut actual);
         normalize(&mut expected);
         assert_eq!(actual, expected, "{}", case["name"]);

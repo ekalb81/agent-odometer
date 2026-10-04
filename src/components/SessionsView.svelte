@@ -6,6 +6,7 @@
   import { projectStore } from '../lib/stores/projects.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
+  import { primarySurfaces } from '../lib/sessionProjection';
   import { formatCredits, harnessCurrency } from '../lib/currency';
   import { formatCompactTokens } from '../lib/format';
   import { getSessionPricing, getSessionDetails, listExternalEvents, onConfigEvent, sessionsInRanges, writeExport } from '../lib/ipc';
@@ -1141,8 +1142,7 @@
     if (!totals || totals.tokens.total_tokens === 0) return null;
     const cached = rangePriceCache.get(totals);
     if (analyticsReady && cached && cached.rates === rateCard) return cached.value;
-    const plan = analyticsReady ? totals.pricing?.plan : undefined;
-    const api = analyticsReady ? totals.pricing?.api : undefined;
+    const { plan, api } = primarySurfaces(analyticsReady ? totals.pricing : undefined);
     const value: RangeSessionPrice = {
       tokens: totals.tokens.total_tokens,
       planCost: plan?.total ?? Number.NaN,
@@ -1229,7 +1229,7 @@
       if (!priced) continue;
       out.sessionCount++;
       if (s.harness === 'codex') {
-        if (s.credits_unlimited === true) out.credits.unlimitedCount++;
+        if (s.credits_unlimited === true && !rt.pricing?.current) out.credits.unlimitedCount++;
         else out.credits.billedTotal += priced.planCost;
       }
       if (isSubagent(s)) {
@@ -1364,7 +1364,7 @@
     harness === 'all'
       ? `Combined API estimate · ${windowLabel}`
       : harness === 'codex'
-      ? (showApiCost ? `Est. API cost · ${windowLabel}` : `Credits · ${windowLabel}`)
+      ? (showApiCost ? `Est. API cost · ${windowLabel}` : `Purchased-credit estimate · ${windowLabel}`)
       : `Est. spend · ${windowLabel}`,
   );
   const spendCardNote = $derived(
@@ -1795,7 +1795,7 @@
       </div>
       {#if harness === 'codex' || harness === 'all'}
         <div>
-          <div class="text-[11px] text-ink-muted font-medium">Credits · {windowLabel}</div>
+          <div class="text-[11px] text-ink-muted font-medium">Purchased-credit estimate · {windowLabel}</div>
           {#if !analyticsReady || !Number.isFinite(windowStats.credits.billedTotal)}
             <div class="text-xl font-bold font-mono mt-0.5 text-ink">unavailable</div>
           {:else if windowStats.credits.billedTotal > 0}
@@ -1844,7 +1844,7 @@
       />
       {#if harness === 'all'}
       <div class="grid grid-cols-3 gap-2 text-xs">
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex credits</span><div class="font-mono font-semibold">{fmtAmount(analyticsReady ? windowTotals.codexCredits : Number.NaN)}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex purchased-credit estimate</span><div class="font-mono font-semibold">{fmtAmount(analyticsReady ? windowTotals.codexCredits : Number.NaN)}</div></div>
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex est. API USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.codexApiUsd) ? fmtUsd(windowTotals.codexApiUsd) : 'Unavailable'}</div></div>
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.claudeUsd) ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
       </div>
