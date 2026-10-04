@@ -154,7 +154,7 @@ jobs:
             --volume "$GITHUB_WORKSPACE:/work" \
             --mount type=volume,target=/work/node_modules \
             --workdir /work \
-            mcr.microsoft.com/playwright:v1.62.0-jammy@sha256:b012874f829d298730411256666afcaeaeebaf505a0cf4c2f668d6dedb3d1e80 \
+            mcr.microsoft.com/playwright:v1.63.0-jammy@sha256:957bb6b7cba151ced0b5bb841703e282c45df1d934af88933b1b655411ecba3a \
             bash -lc '
               set -e
               npm ci
