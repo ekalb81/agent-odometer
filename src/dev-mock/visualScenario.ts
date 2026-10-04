@@ -14,6 +14,8 @@ export const VISUAL_SCENARIOS = [
   'instructions-error',
   'instructions-content-error',
   'settings-save-error',
+  'history-purge',
+  'history-recovery',
   'defender-slow',
   'defender-error',
   'updater-available',

@@ -8,7 +8,7 @@
 //! session or token event during a scan.
 
 use crate::model::{
-    OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session,
+    OptimizationFinding, OptimizationSummary, RangeTotals, RangeWindow, Session, SessionLifecycle,
     SourceAvailability, TierBucket, TokenHistoryPoint, TokenTotals, ToolDimensionMetrics, ToolKind,
     ToolMetrics, ToolObservation, ToolOrigin, ToolOutcome,
 };
@@ -28,7 +28,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 10;
+#[path = "history_lifecycle.rs"]
+mod lifecycle;
+pub use lifecycle::{
+    ExclusionCache, PurgePreview, PurgeResult, PurgedSource, RetentionPolicy, RetentionStatus,
+};
+#[path = "history_recovery.rs"]
+mod recovery;
+pub use recovery::{HistoryFailure, HistoryFailureKind, RecoveryReceipt};
+
+const SCHEMA_VERSION: i64 = 11;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -246,6 +255,7 @@ pub struct IntegrationObservation {
 /// failed archive must not quietly behave like a disposable cache.
 pub struct HistoryStore {
     connection: Mutex<Connection>,
+    exclusion_cache: Mutex<ExclusionCache>,
     query_control: Option<QueryControl>,
     /// Retained so aggregation can open dedicated read connections instead
     /// of serializing behind the writer mutex (WAL permits concurrent reads).
@@ -316,6 +326,7 @@ impl HistoryStore {
         let pragmas = crate::memory::query_sqlite_pragmas(&connection);
         Ok(Self {
             connection: Mutex::new(connection),
+            exclusion_cache: Mutex::new(ExclusionCache::at(path.to_path_buf())),
             query_control: Some(control),
             path: path.to_path_buf(),
             pragmas,
@@ -561,6 +572,8 @@ impl HistoryStore {
         ))?;
         let pragmas = crate::memory::query_sqlite_pragmas(&connection);
         migrate(&mut connection, &mut on_progress)?;
+        recovery::apply_marker(&mut connection, path)?;
+        lifecycle::restore_exclusions(&mut connection, path)?;
         // Crash-safety net for issue #132's deferred-rollup bulk scan: a
         // process that was killed after a bulk `observe_bulk` write
         // committed facts but before the scan's completion rebuilt rollups
@@ -587,6 +600,7 @@ impl HistoryStore {
         }
         Ok(Self {
             connection: Mutex::new(connection),
+            exclusion_cache: Mutex::new(ExclusionCache::at(path.to_path_buf())),
             query_control: None,
             path: path.to_path_buf(),
             pragmas,
@@ -1194,6 +1208,8 @@ impl HistoryStore {
             .collect::<std::result::Result<_, _>>()?;
         keys.sort_unstable();
         keys.dedup();
+        drop(statement);
+        lifecycle::refresh_missing(&connection)?;
         Ok(keys)
     }
 
@@ -1215,6 +1231,7 @@ impl HistoryStore {
             "UPDATE source_locations SET present = 0 WHERE path = ?1",
             [path.as_str()],
         )?;
+        lifecycle::refresh_missing(&connection)?;
         Ok(Some(load_one(&connection, &session_key)?))
     }
 
@@ -2132,7 +2149,7 @@ impl HistoryStore {
 
         let mut snapshot_statement = connection.prepare(
             "SELECT d.session_key, d.identity_key, d.first_event_fingerprint, d.collision, s.session_json,
-                    d.thread_name_overlay_set, d.thread_name_overlay
+                    d.thread_name_overlay_set, d.thread_name_overlay, d.lifecycle
              FROM durable_sessions d
              LEFT JOIN session_snapshots s
                ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
@@ -2163,6 +2180,7 @@ impl HistoryStore {
             let locations = locations_by_key.remove(&key).unwrap_or_default();
             let available = locations.iter().any(|location| location.present);
             session.storage_id = key.clone();
+            session.lifecycle = lifecycle::decode_lifecycle(&row.get::<_, String>(7)?)?;
             session.source_availability = if available {
                 SourceAvailability::Present
             } else {
@@ -2901,6 +2919,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 9 {
         steps += 1;
+        version = 10;
+    }
+    if version == 10 {
+        steps += 1;
     }
     steps
 }
@@ -3029,6 +3051,7 @@ fn migrate(
         )?;
         transaction.execute_batch(ROLLUP_SCHEMA_SQL)?;
         transaction.execute_batch(DIMENSION_SCHEMA_SQL)?;
+        lifecycle::install_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -3726,6 +3749,30 @@ fn migrate(
             started.elapsed(),
         ));
     }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 10 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v10_to_v11_retention",
+            step_index,
+            step_total,
+            10,
+            11,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        lifecycle::install_schema(&transaction)?;
+        transaction.execute_batch("INSERT INTO history_meta(key,value) VALUES('schema_version','11') ON CONFLICT(key) DO UPDATE SET value=excluded.value; PRAGMA user_version=11;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v10_to_v11_retention",
+            step_index,
+            step_total,
+            10,
+            11,
+            started.elapsed(),
+        ));
+    }
     Ok(())
 }
 
@@ -4384,6 +4431,9 @@ fn observe_one_in_transaction(
     let lineage = history_lineage(session);
     let fingerprint_is_final = !session.tokens_history.is_empty();
     let now = now_ms();
+    if lifecycle::is_excluded(transaction, session)? {
+        return Err(PurgedSource.into());
+    }
 
     let displaced_key: Option<String> = transaction
         .query_row(
@@ -4404,6 +4454,7 @@ fn observe_one_in_transaction(
     let mut archived_session = session.clone();
     archived_session.storage_id = key.clone();
     archived_session.source_availability = SourceAvailability::Present;
+    archived_session.lifecycle = SessionLifecycle::Present;
     archived_session.file_path = path.clone();
     apply_project_identity(transaction, &key, &mut archived_session)?;
     let raw_snapshot =
@@ -4428,6 +4479,13 @@ fn observe_one_in_transaction(
              seen_generation = MAX(source_locations.seen_generation, excluded.seen_generation)",
         params![path, artifact_key, key, now, generation],
     )?;
+    transaction.execute(
+        "UPDATE durable_sessions SET lifecycle='present' WHERE session_key=?1",
+        [key.as_str()],
+    )?;
+    if let Some(previous) = displaced_key.as_ref().filter(|previous| *previous != &key) {
+        transaction.execute("UPDATE durable_sessions SET lifecycle='superseded' WHERE session_key=?1 AND NOT EXISTS(SELECT 1 FROM source_locations WHERE session_key=?1 AND present=1)",[previous])?;
+    }
     // Most scans see an unchanged, fully parsed snapshot. Its stable hash
     // makes it safe to skip walking/re-inserting the complete history;
     // appends and resumes necessarily change the snapshot and still take
@@ -4877,6 +4935,7 @@ fn store_snapshot(
         "DELETE FROM session_snapshots WHERE session_key = ?1 AND version <> ?2",
         params![key, next_version],
     )?;
+    lifecycle::store_summary(transaction, key, incoming)?;
     Ok(true)
 }
 
@@ -5318,17 +5377,17 @@ fn load_one_controlled(
     if let Some(control) = control {
         control.consume_row()?;
     }
-    let (identity_key, fingerprint, collision, raw, thread_name_overlay_set, thread_name_overlay): (
-        String,
-        String,
-        bool,
-        Vec<u8>,
-        bool,
-        Option<String>,
-    ) = connection
-        .query_row(
+    let (
+        identity_key,
+        fingerprint,
+        collision,
+        raw,
+        thread_name_overlay_set,
+        thread_name_overlay,
+        state,
+    ): (String, String, bool, Vec<u8>, bool, Option<String>, String) = connection.query_row(
         "SELECT d.identity_key, d.first_event_fingerprint, d.collision, s.session_json,
-                d.thread_name_overlay_set, d.thread_name_overlay
+                d.thread_name_overlay_set, d.thread_name_overlay, d.lifecycle
          FROM durable_sessions d JOIN session_snapshots s
            ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
          WHERE d.session_key = ?1",
@@ -5341,6 +5400,7 @@ fn load_one_controlled(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
@@ -5363,6 +5423,7 @@ fn load_one_controlled(
         .collect_bounded(control)?;
     let available = locations.iter().any(|location| location.present);
     session.storage_id = key.to_owned();
+    session.lifecycle = lifecycle::decode_lifecycle(&state)?;
     session.source_availability = if available {
         SourceAvailability::Present
     } else {
@@ -5758,7 +5819,7 @@ mod tests {
         writer
             .connection()
             .unwrap()
-            .execute_batch("PRAGMA user_version = 11")
+            .execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
             .unwrap();
         let error = HistoryStore::open_read_only(&path, QueryControl::default())
             .err()
@@ -5770,7 +5831,7 @@ mod tests {
                 .unwrap()
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            11
+            SCHEMA_VERSION + 1
         );
     }
 
@@ -6376,6 +6437,7 @@ mod tests {
             agent_nickname: None,
             file_path: "ignored-by-history-store.jsonl".into(),
             source_availability: SourceAvailability::Present,
+            lifecycle: crate::model::SessionLifecycle::Present,
             archived: false,
             started_at: timestamp("2026-01-01T00:00:00Z"),
             last_event_at: first.timestamp,
@@ -6416,6 +6478,479 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap();
         (directory, store)
+    }
+
+    #[test]
+    fn retention_summary_sql_migration_matches_rust_projection_without_full_payload() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        let mut original = session("summary-migration", 160);
+        original.first_user_message = Some("λ".repeat(5000));
+        original.optimization_findings = vec![OptimizationFinding {
+            rule_id: "repeat".into(),
+            severity: "warning".into(),
+            avoidable_calls: 7,
+            ..OptimizationFinding::default()
+        }];
+        original.tokens_history[0].delta.cache_creation_input_tokens = 13;
+        original.tokens_history[0].service_tier = Some("fast".into());
+        let observed = store.observe(&path, &original, 1).unwrap();
+        let expected = serde_json::to_value(&store.session_summaries().unwrap()[0]).unwrap();
+        store.mark_path_missing(&path).unwrap();
+        let database = store.path.clone();
+        drop(store);
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch("DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; PRAGMA user_version=10;").unwrap();
+        drop(connection);
+        let reopened = HistoryStore::open(&database).unwrap();
+        let summaries = reopened.session_summaries().unwrap();
+        let mut migrated = serde_json::to_value(&summaries[0]).unwrap();
+        migrated.as_object_mut().unwrap().remove("lifecycle");
+        migrated["source_availability"] = serde_json::json!("present");
+        assert_eq!(migrated, expected);
+        assert_eq!(summaries[0].lifecycle, SessionLifecycle::Retained);
+        assert_eq!(
+            summaries[0]
+                .first_user_message
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count(),
+            1024
+        );
+        assert!(!migrated.as_object().unwrap().contains_key("tokens_history"));
+        assert_eq!(
+            reopened
+                .load_one(&observed.key)
+                .unwrap()
+                .session
+                .first_user_message
+                .unwrap()
+                .chars()
+                .count(),
+            5000
+        );
+        assert!(reopened.has_complete_coverage().unwrap());
+    }
+
+    #[test]
+    fn retention_purge_is_atomic_excludes_reimports_and_preserves_source_files() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        std::fs::write(&path, b"synthetic source left intact").unwrap();
+        let original = session("purge", 100);
+        let observed = store.observe(&path, &original, 1).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        assert_eq!(store.preview_purge(now).unwrap().sessions, 0);
+        store
+            .purge_retained(&store.preview_purge(now).unwrap(), now)
+            .unwrap();
+        assert!(store.has_complete_coverage().unwrap());
+        store.mark_path_missing(&path).unwrap();
+        let preview = store.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        let purged = store.purge_retained(&preview, now).unwrap();
+        assert_eq!(purged.removed_keys, vec![observed.key.clone()]);
+        assert!(!store.has_complete_coverage().unwrap());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"synthetic source left intact"
+        );
+        assert!(store.session_keys().unwrap().is_empty());
+        assert!(store.session_summaries().unwrap().is_empty());
+        assert!(store.load_one(&observed.key).is_err());
+        assert!(store
+            .observe(&directory.path().join("copy.jsonl"), &original, 2)
+            .unwrap_err()
+            .is::<PurgedSource>());
+        assert!(store.purge_retained(&preview, now).is_err());
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 1);
+        let database = store.path.clone();
+        drop(store);
+        let reopened = HistoryStore::open(&database).unwrap();
+        assert!(reopened.is_session_excluded(&original).unwrap());
+        assert!(!reopened.has_complete_coverage().unwrap());
+        let mut different = original;
+        different.started_at += chrono::Duration::days(1);
+        assert!(reopened.observe(&path, &different, 3).is_ok());
+    }
+
+    #[test]
+    fn retention_purge_preview_rejects_a_resumed_present_source() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        let original = session("resume-before-confirm", 100);
+        store.observe(&path, &original, 1).unwrap();
+        store.mark_path_missing(&path).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        let preview = store.preview_purge(now).unwrap();
+        store.observe(&path, &original, 2).unwrap();
+        assert!(store.purge_retained(&preview, now).is_err());
+        assert_eq!(store.stats().unwrap().sessions, 1);
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 0);
+    }
+
+    #[test]
+    fn retention_purge_rejects_a_cutoff_newer_than_active_policy() {
+        let (directory, store) = store();
+        let path = directory.path().join("tampered-cutoff.jsonl");
+        store
+            .observe(&path, &session("tampered-cutoff", 100), 1)
+            .unwrap();
+        store.mark_path_missing(&path).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        let mut preview = store.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        // All candidates are unchanged, so the candidate hash alone cannot
+        // validate the policy boundary supplied by an IPC caller.
+        preview.cutoff_utc_day = "2026-10-05".into();
+        assert!(store
+            .purge_retained(&preview, now)
+            .unwrap_err()
+            .to_string()
+            .contains("cutoff exceeds"));
+        assert_eq!(store.retention_status().unwrap().retained_sessions, 1);
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 0);
+        assert!(!directory
+            .path()
+            .join("history.sqlite3.exclusions.jsonl")
+            .exists());
+        preview.cutoff_utc_day = "2026-9-01".into();
+        assert!(store
+            .purge_retained(&preview, now)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid purge cutoff"));
+        assert_eq!(store.retention_status().unwrap().retained_sessions, 1);
+        store
+            .purge_retained(&store.preview_purge(now).unwrap(), now)
+            .unwrap();
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 1);
+    }
+
+    #[test]
+    fn retention_policy_changes_invalidate_preview_even_when_original_policy_is_restored() {
+        let (directory, store) = store();
+        let path = directory.path().join("policy.jsonl");
+        store
+            .observe(&path, &session("stale-policy", 100), 1)
+            .unwrap();
+        store.mark_path_missing(&path).unwrap();
+        let days30 = RetentionPolicy {
+            retained_days: Some(30),
+        };
+        store.set_retention_policy(&days30).unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        let preview = store.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        store
+            .set_retention_policy(&RetentionPolicy::default())
+            .unwrap();
+        assert!(store
+            .purge_retained(&preview, now)
+            .unwrap_err()
+            .to_string()
+            .contains("policy changed"));
+        assert_eq!(store.retention_status().unwrap().retained_sessions, 1);
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 0);
+        store.set_retention_policy(&days30).unwrap();
+        assert!(store.purge_retained(&preview, now).is_err());
+        let fresh = store.preview_purge(now).unwrap();
+        assert!(fresh.policy_revision > preview.policy_revision);
+        store.purge_retained(&fresh, now).unwrap();
+        assert_eq!(store.retention_status().unwrap().purged_sessions, 1);
+    }
+
+    #[test]
+    fn retention_recovery_preserves_corrupt_database_and_committed_exclusions() {
+        let (directory, store) = store();
+        let path = directory.path().join("source.jsonl");
+        let original = session("erased-before-corruption", 100);
+        store.observe(&path, &original, 1).unwrap();
+        store.mark_path_missing(&path).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        store
+            .purge_retained(&store.preview_purge(now).unwrap(), now)
+            .unwrap();
+        let database = store.path.clone();
+        drop(store);
+        std::fs::write(&database, b"synthetic damaged database").unwrap();
+        std::fs::write(
+            database.with_file_name("history.sqlite3-wal"),
+            b"synthetic wal",
+        )
+        .unwrap();
+        std::fs::write(
+            database.with_file_name("history.sqlite3-shm"),
+            b"synthetic shm",
+        )
+        .unwrap();
+        let (replacement, receipt) = HistoryStore::recover_unavailable(&database).unwrap();
+        assert_eq!(
+            std::fs::read(receipt.backup_directory.join("history.sqlite3")).unwrap(),
+            b"synthetic damaged database"
+        );
+        assert_eq!(
+            std::fs::read(receipt.backup_directory.join("history.sqlite3-wal")).unwrap(),
+            b"synthetic wal"
+        );
+        assert_eq!(
+            std::fs::read(receipt.backup_directory.join("history.sqlite3-shm")).unwrap(),
+            b"synthetic shm"
+        );
+        assert!(!replacement.has_complete_coverage().unwrap());
+        assert!(replacement.is_session_excluded(&original).unwrap());
+        assert!(replacement
+            .observe(&path, &original, 2)
+            .unwrap_err()
+            .is::<PurgedSource>());
+        drop(replacement);
+        let reopened = HistoryStore::open(&database).unwrap();
+        assert!(!reopened.has_complete_coverage().unwrap());
+        assert_eq!(reopened.retention_status().unwrap().purged_sessions, 1);
+    }
+
+    #[test]
+    fn retention_confirmed_exclusion_survives_sql_rollback_then_corrupt_recovery() {
+        let (directory, store) = store();
+        let original = session("confirmed-before-commit-failure", 100);
+        let key = store
+            .observe(&directory.path().join("source.jsonl"), &original, 1)
+            .unwrap()
+            .key;
+        // Simulate failure after durable confirmed intent but before SQL commit.
+        let intent = vec![(
+            key.clone(),
+            provider_identity(&original).unwrap(),
+            first_event_fingerprint(&original),
+        )];
+        lifecycle::write_exclusions(&store.path, &intent, now_ms()).unwrap();
+        let database = store.path.clone();
+        drop(store);
+        let reopened = HistoryStore::open(&database).unwrap();
+        assert!(reopened.has_session_key(&key).unwrap());
+        assert!(!reopened.is_session_excluded(&original).unwrap());
+        drop(reopened);
+        std::fs::write(&database, b"synthetic damage after commit failure").unwrap();
+        let (replacement, _) = HistoryStore::recover_unavailable(&database).unwrap();
+        assert!(replacement.is_session_excluded(&original).unwrap());
+        assert!(!replacement.has_complete_coverage().unwrap());
+    }
+
+    #[test]
+    fn retention_recovery_marker_cannot_claim_complete_after_interrupted_replacement() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("history.sqlite3");
+        drop(HistoryStore::open(&database).unwrap());
+        let receipt = RecoveryReceipt {
+            backup_directory: directory.path().join("preserved"),
+            recovered_at_ms: now_ms(),
+        };
+        let marker = database.with_file_name("history.sqlite3.recovery.json");
+        std::fs::write(&marker, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let read_only = HistoryStore::open_read_only(&database, QueryControl::default()).unwrap();
+        assert!(!read_only.has_complete_coverage().unwrap());
+        assert!(!read_only.retention_status().unwrap().coverage_complete);
+        // Read-only queries must not repair SQL or remove the evidence.
+        assert!(marker.exists());
+        assert_eq!(
+            Connection::open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT value FROM history_meta WHERE key='coverage_complete'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "1"
+        );
+        drop(read_only);
+        let store = HistoryStore::open(&database).unwrap();
+        assert!(!store.has_complete_coverage().unwrap());
+        assert_eq!(
+            store.recovery_receipt().unwrap().unwrap().backup_directory,
+            receipt.backup_directory
+        );
+    }
+
+    #[test]
+    fn retention_unverified_exclusion_journal_fails_closed_without_erasing_backup() {
+        let (directory, store) = store();
+        let database = store.path.clone();
+        drop(store);
+        std::fs::write(
+            database.with_file_name("history.sqlite3.exclusions.jsonl"),
+            b"invalid complete record\n",
+        )
+        .unwrap();
+        assert!(HistoryStore::open(&database).is_err());
+        assert!(HistoryStore::recover_unavailable(&database).is_err());
+        let preserved = std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("history-recovery-")
+            })
+            .unwrap();
+        assert!(preserved.path().join("history.sqlite3").is_file());
+    }
+
+    #[test]
+    fn retention_exclusion_cache_survives_unavailable_ledger_and_rejects_invalid_journal() {
+        let (directory, store) = store();
+        let original = session("purged-unavailable", 100);
+        let database = store.path.clone();
+        let intent = vec![(
+            "codex:thread:purged-unavailable".into(),
+            provider_identity(&original).unwrap(),
+            first_event_fingerprint(&original),
+        )];
+        lifecycle::write_exclusions(&database, &intent, now_ms()).unwrap();
+        drop(store);
+        std::fs::write(&database, b"synthetic corruption").unwrap();
+        assert!(HistoryStore::open(&database).is_err());
+        let mut cache = ExclusionCache::at(database.clone());
+        let mut copy = original.clone();
+        copy.file_path = directory
+            .path()
+            .join("resumed-copy.jsonl")
+            .to_string_lossy()
+            .into_owned();
+        copy.tokens_total.input_tokens += 100;
+        assert!(cache.is_excluded(&copy).unwrap());
+        let fresh = session("never-purged", 10);
+        assert!(!cache.is_excluded(&fresh).unwrap());
+        let journal = database.with_file_name("history.sqlite3.exclusions.jsonl");
+        std::fs::write(&journal, b"invalid completed record\n").unwrap();
+        assert!(cache.is_excluded(&fresh).is_err());
+        std::fs::remove_file(&journal).unwrap();
+        assert!(cache.is_excluded(&copy).is_err());
+    }
+
+    #[test]
+    fn retention_complete_coverage_rejects_unverified_exclusions_after_open() {
+        let (directory, store) = store();
+        assert!(store.has_complete_coverage().unwrap());
+        let journal = directory.path().join("history.sqlite3.exclusions.jsonl");
+        std::fs::write(&journal, b"invalid complete erasure record\n").unwrap();
+        assert!(store.has_complete_coverage().is_err());
+        assert!(store.retention_status().is_err());
+        std::fs::remove_file(journal).unwrap();
+        // Removing previously observed evidence does not make it verified.
+        assert!(store.has_complete_coverage().is_err());
+    }
+
+    #[test]
+    fn retention_journal_repairs_chunked_partial_tail_and_preserves_completed_records() {
+        use std::io::Write;
+        let (directory, store) = store();
+        let original = session("prior-erasure", 100);
+        let next = session("next-erasure", 200);
+        let identities = |session: &Session| {
+            vec![(
+                session.effective_storage_id(),
+                provider_identity(session).unwrap(),
+                first_event_fingerprint(session),
+            )]
+        };
+        lifecycle::write_exclusions(&store.path, &identities(&original), now_ms()).unwrap();
+        let journal = directory.path().join("history.sqlite3.exclusions.jsonl");
+        let prior = std::fs::read(&journal).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&vec![b'x'; 96 * 1024 + 7])
+            .unwrap();
+        lifecycle::write_exclusions(&store.path, &identities(&next), now_ms()).unwrap();
+        assert!(std::fs::read(&journal).unwrap().starts_with(&prior));
+        let mut cache = ExclusionCache::at(store.path.clone());
+        assert!(cache.is_excluded(&original).unwrap());
+        assert!(cache.is_excluded(&next).unwrap());
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap()
+            .write_all(&vec![b'x'; 32 * 1024 * 1024 + 1])
+            .unwrap();
+        assert!(lifecycle::write_exclusions(&store.path, &identities(&next), now_ms()).is_err());
+    }
+
+    #[test]
+    fn retention_oversized_recovery_marker_fails_without_allocating_or_overwriting_history() {
+        let (_directory, store) = store();
+        let database = store.path.clone();
+        let marker = database.with_file_name("history.sqlite3.recovery.json");
+        std::fs::write(marker, vec![b'x'; 64 * 1024 + 1]).unwrap();
+        assert!(store
+            .recovery_receipt()
+            .unwrap_err()
+            .to_string()
+            .contains("safe size limit"));
+        drop(store);
+        assert!(HistoryStore::open(&database)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("safe size limit"));
+        assert!(database.is_file());
+    }
+
+    #[test]
+    fn retention_large_summary_listing_is_bounded_and_independent_of_full_snapshot_payloads() {
+        let (directory, store) = store();
+        for index in 0..256 {
+            let mut original = session(&format!("bounded-{index}"), 100);
+            original.thread_name = Some("λ".repeat(4096));
+            original.first_user_message = Some("λ".repeat(8192));
+            let path = directory.path().join(format!("source-{index}.jsonl"));
+            store.observe(&path, &original, 1).unwrap();
+            store.mark_path_missing(&path).unwrap();
+        }
+        // A summary read must not deserialize full stored sessions, even when
+        // a full payload would fail. The source of its preview is materialized.
+        store
+            .connection()
+            .unwrap()
+            .execute("UPDATE session_snapshots SET session_json=x'FF'", [])
+            .unwrap();
+        let summaries = store.session_summaries().unwrap();
+        assert_eq!(summaries.len(), 256);
+        for summary in &summaries {
+            assert_eq!(summary.lifecycle, SessionLifecycle::Retained);
+            assert_eq!(summary.thread_name.as_ref().unwrap().chars().count(), 512);
+            assert_eq!(
+                summary.first_user_message.as_ref().unwrap().chars().count(),
+                1024
+            );
+        }
+        let bytes = serde_json::to_vec(&summaries).unwrap();
+        assert!(bytes.len() < 2 * 1024 * 1024);
+        assert!(!String::from_utf8(bytes).unwrap().contains("tokens_history"));
+        assert!(store.load_one(&summaries[0].storage_id).is_err());
     }
 
     fn tool(
@@ -8517,50 +9052,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("history.sqlite3");
         let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                 INSERT INTO history_meta(key, value) VALUES('schema_version', '1');
-                 CREATE TABLE durable_token_events (
-                   session_key TEXT NOT NULL,
-                   event_key TEXT NOT NULL,
-                   event_index INTEGER NOT NULL,
-                   timestamp_ms INTEGER NOT NULL,
-                   model TEXT,
-                   service_tier TEXT,
-                   cumulative_total_tokens INTEGER NOT NULL,
-                   input_tokens INTEGER NOT NULL,
-                   cached_input_tokens INTEGER NOT NULL,
-                   output_tokens INTEGER NOT NULL,
-                   reasoning_output_tokens INTEGER NOT NULL,
-                   total_tokens INTEGER NOT NULL,
-                   PRIMARY KEY(session_key, event_key)
-                 );
-                 -- Present in every real v1 store; the v3 fact backfill reads
-                 -- current snapshots through these tables.
-                 CREATE TABLE durable_sessions (
-                   session_key TEXT PRIMARY KEY,
-                   identity_key TEXT NOT NULL,
-                   first_event_fingerprint TEXT NOT NULL,
-                   fingerprint_is_final INTEGER NOT NULL,
-                   collision INTEGER NOT NULL DEFAULT 0,
-                   current_snapshot_version INTEGER NOT NULL DEFAULT 0,
-                   current_snapshot_hash TEXT,
-                   created_at_ms INTEGER NOT NULL,
-                   last_seen_at_ms INTEGER NOT NULL
-                 );
-                 CREATE TABLE session_snapshots (
-                   session_key TEXT NOT NULL,
-                   version INTEGER NOT NULL,
-                   format_version INTEGER NOT NULL,
-                   snapshot_hash TEXT NOT NULL,
-                   captured_at_ms INTEGER NOT NULL,
-                   session_json BLOB NOT NULL,
-                   PRIMARY KEY(session_key, version)
-                 );
-                 PRAGMA user_version = 1;",
-            )
-            .unwrap();
+        connection.execute_batch(V1_MINIMAL_SCHEMA_SQL).unwrap();
         drop(connection);
 
         let store = HistoryStore::open(&path).unwrap();
@@ -9647,7 +10139,7 @@ mod tests {
     /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
     /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
     /// `HistoryStore::open` and pasting the result below.
-    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT, thread_name_overlay TEXT, thread_name_overlay_set INTEGER NOT NULL DEFAULT 0 )\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:purged_sessions_identity_idx:CREATE INDEX purged_sessions_identity_idx ON purged_sessions(identity_key, first_event_fingerprint)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT, thread_name_overlay TEXT, thread_name_overlay_set INTEGER NOT NULL DEFAULT 0 , lifecycle TEXT NOT NULL DEFAULT 'present' CHECK(lifecycle IN ('present','retained','superseded')))\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:purged_sessions:CREATE TABLE purged_sessions ( session_key TEXT NOT NULL, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, purged_at_ms INTEGER NOT NULL, PRIMARY KEY(session_key,first_event_fingerprint) )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:session_summaries:CREATE TABLE session_summaries ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), summary_json BLOB NOT NULL )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )";
 
     #[test]
     fn schema_fingerprint_matches_committed_expected_value() {
@@ -9882,6 +10374,7 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                11 => "DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; DELETE FROM history_meta WHERE key IN ('coverage_complete','retention_policy');",
                 10 => {
                     "ALTER TABLE durable_sessions DROP COLUMN thread_name_overlay;
                      ALTER TABLE durable_sessions DROP COLUMN thread_name_overlay_set;"
@@ -10111,6 +10604,7 @@ mod tests {
                 "v7_to_v8_tool_dimensions_backfill",
                 "v8_to_v9_last_seen_index",
                 "v9_to_v10_thread_name_overlay",
+                "v10_to_v11_retention",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );

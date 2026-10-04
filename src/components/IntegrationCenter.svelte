@@ -89,6 +89,9 @@
   {#if notice}<p class="text-xs text-ink-2 break-words" role="status">{notice}</p>{/if}
   {#if report}
     <p class="text-xs text-ink-faint">Ledger: {report.status.ledger_available ? `${report.status.sessions ?? 'unknown'} recorded sessions` : 'unavailable'} · Scan: {report.status.scan_status.replaceAll('_', ' ')} · Observation age: {report.status.observation.age_seconds === null ? 'unknown' : `${report.status.observation.age_seconds}s`}</p>
+    {#if report.status.ledger_available && report.status.coverage_complete !== true}
+      <p class="text-xs text-amber-600">{report.status.coverage_complete === false ? 'Partial history — recorded totals exclude purged or unrecovered historical usage.' : 'History coverage unavailable — recorded totals are not verified complete.'}</p>
+    {/if}
     {#each report.status.diagnostics as diagnostic}
       <p class="text-xs text-amber-500"><code>{diagnostic.code}</code>: {diagnostic.evidence} {diagnostic.next_action}</p>
     {/each}
