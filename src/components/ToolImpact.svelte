@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { compareToolImpact, listToolImpactTargets, writeExport } from '../lib/ipc';
+  import { accountingUnavailable } from '../lib/accountingAvailability';
+  import { compareToolImpact, listToolImpactTargets, publishToolDimensionExport } from '../lib/ipc';
   import type { ToolDimensionKind, ToolImpactCohort, ToolImpactResult, ToolImpactTarget } from '../lib/types';
   import { topDimensionValues, type DimensionTotals } from '../lib/toolDimensions';
-  import { dimensionExportRows, rowsToCsv } from '../lib/sessionProjection';
+  import { dimensionExportRows } from '../lib/sessionProjection';
 
   interface Props {
     active?: boolean;
@@ -10,6 +11,9 @@
     from: string | null;
     to: string | null;
     windowLabel: string;
+    /** Exact ledger bounds behind dimensionTotals; comparison bounds can be quantized. */
+    dimensionFrom?: string | null;
+    dimensionTo?: string | null;
     /** Issue #44 open-set dimension totals, already aggregated by the
      *  caller across the sessions in view. */
     dimensionTotals?: DimensionTotals;
@@ -24,6 +28,8 @@
     from,
     to,
     windowLabel,
+    dimensionFrom = null,
+    dimensionTo = null,
     dimensionTotals = {},
     dimensionAvailability = {
       mcp_server: false,
@@ -76,10 +82,9 @@
     dimensionExportError = null;
     try {
       const rows = dimensionExportRows(dimensionTotals);
-      const content = format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows);
-      await writeExport(`odometer-tool-dimensions-${new Date().toISOString().slice(0, 10)}.${format}`, format, content);
+      await publishToolDimensionExport({ session_ids: [...sessionIds], from: dimensionFrom, to: dimensionTo, format, rows }, `odometer-tool-dimensions-${new Date().toISOString().slice(0, 10)}.${format}`);
     } catch (error) {
-      dimensionExportError = String(error);
+      dimensionExportError = accountingUnavailable(error);
     } finally {
       dimensionExportBusy = false;
     }
@@ -94,11 +99,6 @@
   let comparisonError = $state<string | null>(null);
   let targetRequestGeneration = 0;
   let comparisonRequestGeneration = 0;
-  // Which target `result` describes. Deliberately not `$state`: the comparison
-  // effect both reads and writes it, and making it reactive would re-trigger
-  // that effect from its own completion handler.
-  let resultTargetId = '';
-
   const targetId = (target: ToolImpactTarget) => `${target.kind}:${target.key}`;
   const providerTargets = $derived(targets.filter((target) => target.kind === 'provider'));
   const toolTargets = $derived(targets.filter((target) => target.kind === 'tool'));
@@ -119,12 +119,15 @@
       loadingTargets = false;
       return;
     }
+    targets = [];
+    result = null;
+    targetError = null;
     loadingTargets = true;
-    // Cleared on success rather than at request time: a still-failing backend
-    // would otherwise blink the inline notice out and back on every retry.
+    const current = () => active && generation === targetRequestGeneration
+      && sessionIds === ids && from === rangeFrom && to === rangeTo;
     listToolImpactTargets(rangeFrom, rangeTo, ids)
       .then((value) => {
-        if (!active || generation !== targetRequestGeneration) return;
+        if (!current()) return;
         targets = value;
         targetError = null;
         const selectionStillExists = value.some(
@@ -135,7 +138,7 @@
         }
       })
       .catch((reason) => {
-        if (generation === targetRequestGeneration) targetError = String(reason);
+        if (current()) { targets = []; result = null; targetError = accountingUnavailable(reason); }
       })
       .finally(() => {
         if (generation === targetRequestGeneration) loadingTargets = false;
@@ -153,32 +156,27 @@
     const rangeTo = to;
     if (!active || !target || ids.length === 0) {
       result = null;
-      resultTargetId = '';
       comparisonError = null;
       loadingComparison = false;
       return;
     }
-    // A background refresh keeps the previous numbers on screen while the new
-    // ones load (see the template). Switching target is different: those
-    // numbers — and any error about them — describe something else, so drop
-    // both and show the loading line.
-    if (resultTargetId !== targetId(target)) {
-      result = null;
-      resultTargetId = '';
-      comparisonError = null;
-    }
+    // A report is authoritative only for this exact request. Keep the
+    // selection and open panel, but withhold all previous numeric results.
+    result = null;
+    comparisonError = null;
     loadingComparison = true;
-    // Cleared on success, not at request time — see the targets effect above.
+    const current = () => active && generation === comparisonRequestGeneration
+      && sessionIds === ids && from === rangeFrom && to === rangeTo
+      && selectedTargetId === targetId(target);
     compareToolImpact(target.kind, target.key, rangeFrom, rangeTo, ids)
       .then((value) => {
-        if (active && generation === comparisonRequestGeneration) {
+        if (current()) {
           result = value;
-          resultTargetId = targetId(target);
           comparisonError = null;
         }
       })
       .catch((reason) => {
-        if (generation === comparisonRequestGeneration) comparisonError = String(reason);
+        if (current()) { result = null; comparisonError = accountingUnavailable(reason); }
       })
       .finally(() => {
         if (generation === comparisonRequestGeneration) loadingComparison = false;
@@ -243,13 +241,6 @@
   <summary class="cursor-pointer text-xs font-semibold text-ink">
     Tool impact comparison · observed use · {windowLabel}
   </summary>
-  <!-- Loading and error states below are gated on there being nothing to show
-       yet. Live sessions re-run both fetches in the background, and swapping
-       the rendered table for a one-line placeholder or an error each time made
-       this section — and everything under it in the scrolling analytics panel —
-       jump. Once there is content, a failed refresh reports itself inline on a
-       row that already exists, so the table neither moves nor lies about being
-       current. -->
   <div class="mt-2 flex flex-col gap-2" aria-busy={loadingTargets || loadingComparison}>
     {#if loadingTargets && targets.length === 0}
       <p class="text-xs text-ink-faint py-2">Finding observed tools and providers…</p>
@@ -286,13 +277,6 @@
             </optgroup>
           {/if}
         </select>
-        {#if targetError}
-          <!-- Shares the select's row, so surfacing it costs no vertical space.
-               The full message stays reachable on hover. -->
-          <span class="text-neg" role="alert" title={targetError}>
-            Target list is stale — last refresh failed
-          </span>
-        {/if}
       </label>
 
       {#if loadingComparison && !result}
@@ -311,13 +295,6 @@
         <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-[11px] text-ink-muted">
           <span class="font-semibold text-ink">{useMatched ? `${result.matched_pairs} matched pairs` : 'All observed turns'}</span>
           <span>{useMatched ? 'same harness, model, and task category; nearest in time' : `${result.observed.turn_count} observed · ${result.baseline.turn_count} not observed`}</span>
-          {#if comparisonError}
-            <!-- Shares the summary row rather than displacing the table below
-                 it. The full message stays reachable on hover. -->
-            <span class="text-neg" role="alert" title={comparisonError}>
-              Showing the last successful comparison — refresh failed
-            </span>
-          {/if}
         </div>
         <div class="overflow-x-auto">
           <table class="w-full text-[11px] font-mono">

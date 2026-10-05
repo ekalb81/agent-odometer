@@ -157,7 +157,7 @@ describe('pricing conformance fixture (issue #47)', () => {
 
     const summaryPricing = { ...withServer.pricing!, plan: { ...withServer.pricing!.plan, total: 456 } };
     const allTime = projectSessions([session], rateCard, { [session.storage_id]: withServer }, false,
-      { [session.storage_id]: { pricing: summaryPricing, categories: {} } }, true).get(session.storage_id)!;
+      { [session.storage_id]: { tokens: session.tokens_total, category_totals: {}, pricing: summaryPricing, categories: {} } }, true).get(session.storage_id)!;
     expect(allTime.tokens).toEqual(session.tokens_total);
     expect(allTime.planCost).toBe(456);
     const missingSummary = projectSessions([session], rateCard, { [session.storage_id]: withServer }, false, {}, true)

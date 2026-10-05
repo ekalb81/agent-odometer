@@ -98,10 +98,15 @@ export class RangeDataCache {
   private results: Record<string, RangeTotals>[] | null = null;
 
   plan(input: RangePlanInput): RangePlan {
+    const scope = new Set(input.ids);
+    const removed = new Set(input.removedIds);
     if (
       this.results === null ||
       this.rangesKey !== input.rangesKey ||
-      input.changedIds === null
+      input.changedIds === null ||
+      // A filter contraction must not leave hidden cache rows contributing
+      // to map-based tool/model aggregates outside the proved scope.
+      [...this.known].some(id => !scope.has(id) && !removed.has(id))
     ) {
       return { mode: 'full' };
     }

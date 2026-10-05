@@ -194,6 +194,7 @@ pub fn project_usage<'a>(
     rates: &crate::rates::RateCard,
     now: DateTime<Utc>,
     scan_complete: bool,
+    authoritative: Option<&std::collections::HashMap<String, crate::query::SummaryPricing>>,
 ) -> Result<WidgetUsage, String> {
     let mut out = WidgetUsage {
         session_count: 0,
@@ -240,9 +241,17 @@ pub fn project_usage<'a>(
                     .into(),
             );
         }
+        let accounting = authoritative
+            .map(|values| {
+                values.get(&summary.storage_id).ok_or_else(|| {
+                    crate::history_store::AccountingIntegrityError::Unverified.to_string()
+                })
+            })
+            .transpose()?;
+        let tokens = accounting.map_or(&summary.tokens_total, |price| &price.tokens);
         out.total_tokens = out
             .total_tokens
-            .checked_add(summary.tokens_total.total_tokens)
+            .checked_add(tokens.total_tokens)
             .ok_or("Usage total is unavailable")?;
         out.latest_activity_at = Some(
             out.latest_activity_at
@@ -250,7 +259,10 @@ pub fn project_usage<'a>(
                     prior.max(summary.last_event_at)
                 }),
         );
-        let price = crate::query::price_surfaces(&summary.buckets, provider.id(), rates, now);
+        let price = accounting.map_or_else(
+            || crate::query::price_surfaces(&summary.buckets, provider.id(), rates, now),
+            |price| price.pricing.clone(),
+        );
         plan += price.plan.total;
         any_plan |= price.plan.by_model.iter().any(|m| !m.unpriced);
         out.estimate_partial |=
@@ -300,19 +312,40 @@ pub fn snapshot(
             out.quota = Some(project_quota(snapshot, now));
         }
         WidgetKind::Usage => {
-            // Resident summaries only: no session bodies, archive query or source I/O.
+            // Metadata selects current source rows; numerical authority is a
+            // bounded, guarded cumulative ledger projection. No source bodies.
             let entries: Vec<_> = state
                 .sessions
                 .iter()
                 .take(100_001)
                 .map(|entry| entry.value().clone())
                 .collect();
+            let keys: Vec<_> = entries
+                .iter()
+                .filter(|entry| {
+                    let summary = &entry.summary;
+                    summary.harness.as_str() == out.settings.preferences.provider.id()
+                        && summary.source_availability == crate::model::SourceAvailability::Present
+                        && summary.lifecycle == crate::model::SessionLifecycle::Present
+                })
+                .map(|entry| entry.summary.storage_id.clone())
+                .collect();
+            if keys.len() > MAX_SUMMARIES || keys.iter().any(|key| state.ledger_is_stale(key)) {
+                return Err(crate::history_store::AccountingIntegrityError::Unverified.to_string());
+            }
+            let history = state.history_ready().ok_or_else(|| {
+                crate::history_store::AccountingIntegrityError::Unverified.to_string()
+            })?;
+            let prices = history
+                .accounting_summary_prices(&keys, &keys, rates, now)
+                .map_err(|error| error.to_string())?;
             out.usage = Some(project_usage(
                 entries.iter().map(|entry| &entry.summary),
                 out.settings.preferences.provider,
                 rates,
                 now,
                 state.scanned.load(Ordering::Acquire),
+                Some(&prices),
             )?);
         }
     }
@@ -499,6 +532,7 @@ mod tests {
             &rates,
             now,
             false,
+            None,
         )
         .unwrap();
         assert_eq!(result.session_count, 1);

@@ -5,6 +5,7 @@ import { sessionsStore } from '../lib/stores/sessions.svelte';
 import { zeroToolMetrics, zeroTotals } from '../lib/sessionProjection';
 import type { EventCorrelation, ExternalEvent, SessionSummary } from '../lib/types';
 import ConfigTimeline from './ConfigTimeline.svelte';
+import { historyStore } from '../lib/stores/history.svelte';
 import { rates } from '../lib/stores/rates';
 import type { RateCard } from '../lib/types';
 
@@ -148,4 +149,52 @@ describe('ConfigTimeline', () => {
     expect(screen.queryByText(/Tokens \+300/)).not.toBeInTheDocument();
     expect(screen.getByText(/Loading local change history/)).toBeInTheDocument();
   });
+  it('withholds same-ID correlations immediately on mutation and after a guarded failure', async () => {
+    const session = { id: 'session', storage_id: 'session', started_at: event.timestamp, last_event_at: event.timestamp } as SessionSummary;
+    sessionsStore.replaceAll([session]);
+    correlateEvents.mockResolvedValueOnce({ results: [correlation()] });
+    correlateEvents.mockRejectedValue(new Error('accounting_identity_ambiguous: private detail'));
+    render(ConfigTimeline, { props: { events: [event] } });
+    await flushRequest();
+    expect(screen.getByText(/Tokens \+300/)).toBeInTheDocument();
+    sessionsStore.upsert({ ...session, last_event_at: '2026-01-01T00:02:00Z' });
+    await tick();
+    expect(screen.queryByText(/Tokens \+300/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Observed samples/)).not.toBeInTheDocument();
+    expect(screen.getByText(/size 10 -> 20 bytes/)).toBeInTheDocument();
+    await flushRequest();
+    expect(screen.getByTestId('accounting-correlation-status')).toHaveTextContent(/ambiguous accounting identities/);
+    expect(screen.queryByText(/Tokens \+300/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/private detail/)).not.toBeInTheDocument();
+  });
+
+  it('clears old sample counts when a collecting-window boundary needs a new proof', async () => {
+    correlateEvents.mockResolvedValueOnce({ results: [correlation({ after_window_complete: false, after_window_end: '2026-01-01T00:00:01Z' })] });
+    correlateEvents.mockRejectedValue(new Error('accounting_identity_unverified: boundary'));
+    render(ConfigTimeline, { props: { events: [event] } });
+    await flushRequest();
+    expect(screen.getByText(/Observed samples/)).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(900);
+    await tick();
+    expect(screen.queryByText(/Observed samples/)).not.toBeInTheDocument();
+    await flushRequest();
+    expect(screen.getByTestId('accounting-correlation-status')).toHaveTextContent(/verification is incomplete/);
+  });
+
+  it('rejects an old failure after a history readiness change and newer successful proof', async () => {
+    const initialHistory = historyStore.status;
+    let rejectOld!: (reason: Error) => void;
+    correlateEvents.mockReturnValueOnce(new Promise((_resolve, reject) => { rejectOld = reject; }));
+    correlateEvents.mockResolvedValue({ results: [correlation({ token_delta: 901 })] });
+    render(ConfigTimeline, { props: { events: [event] } });
+    await flushRequest();
+    historyStore.set({ ...initialHistory, status: 'ready' });
+    await flushRequest();
+    rejectOld(new Error('accounting_identity_unverified: obsolete'));
+    await tick();
+    expect(screen.getByText(/Tokens \+901/)).toBeInTheDocument();
+    expect(screen.queryByTestId('accounting-correlation-status')).not.toBeInTheDocument();
+    historyStore.set(initialHistory);
+  });
+
 });

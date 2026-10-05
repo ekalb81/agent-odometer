@@ -133,7 +133,7 @@ pub fn category_report(
         BTreeMap::new();
     let mut sessions = 0;
     let mut bucket_rows = 0;
-    store.stream_category_snapshots(|snapshot| {
+    store.stream_category_snapshots_in_range(from, to, |snapshot| {
         store.check_query()?;
         if from.is_some_and(|bound| snapshot.last_event_at < bound)
             || to.is_some_and(|bound| snapshot.started_at > bound)

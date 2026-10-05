@@ -1,12 +1,13 @@
 import { render, screen, waitFor } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { sessionsStore } from '../lib/stores/sessions.svelte';
 import CalendarActivity from './CalendarActivity.svelte';
 import type { HistoryStatus, RangeTotals } from '../lib/types';
 import { historyStore } from '../lib/stores/history.svelte';
 
-const mocks = vi.hoisted(() => ({ query: vi.fn(), queryHistory: vi.fn(), scan: { complete: true } }));
-vi.mock('../lib/ipc', () => ({ sessionsInRanges: mocks.query, getHistoryStatus: mocks.queryHistory }));
+const mocks = vi.hoisted(() => ({ query: vi.fn(), queryHistory: vi.fn(), publish: vi.fn(), scan: { complete: true } }));
+vi.mock('../lib/ipc', () => ({ sessionsInRanges: mocks.query, getHistoryStatus: mocks.queryHistory, publishActivitySummaryExport: mocks.publish }));
 vi.mock('../lib/stores/scan.svelte', () => ({ scanStore: { get status() { return mocks.scan; } } }));
 const range = { tokens: { total_tokens: 70 }, tool_metrics: { calls: 4 } } as RangeTotals;
 function setHistory(status: HistoryStatus['status'], coverage_complete: boolean): void {
@@ -18,6 +19,7 @@ beforeEach(() => {
   setHistory('ready', true); mocks.scan = { complete: true };
   mocks.query.mockReset().mockImplementation(async (bounds: unknown[]) => bounds.map(() => ({})));
   mocks.queryHistory.mockReset().mockImplementation(async () => historyStore.status);
+  mocks.publish.mockReset().mockResolvedValue(true);
 });
 afterEach(() => vi.unstubAllEnvs());
 const props = { from: '2026-07-28T00:00:00Z', to: '2026-07-29T23:59:59.999Z', sessionIds: ['codex:parent', 'codex:tools'], onbucket: vi.fn() };
@@ -30,6 +32,15 @@ describe('calendar activity', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Preview summary card' }));
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     expect((screen.getByLabelText('Companion Markdown') as HTMLTextAreaElement).value).toContain('70 recorded tokens');
+    await userEvent.click(screen.getByRole('button', { name: 'Save SVG…' }));
+    expect(mocks.publish).toHaveBeenCalledWith(expect.objectContaining({
+      session_ids: props.sessionIds,
+      coverage_complete: true,
+      days: [
+        { from: '2026-07-28T00:00:00.000Z', to: '2026-07-28T23:59:59.999Z', tokens: 70, tool_calls: 4 },
+        { from: '2026-07-29T00:00:00.000Z', to: '2026-07-29T23:59:59.999Z', tokens: 0, tool_calls: 0 },
+      ],
+    }), 'odometer-activity.svg');
     await view.rerender({ ...props, sessionIds: ['claude:other'] });
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     setHistory('unavailable', false);
@@ -82,11 +93,11 @@ describe('calendar activity', () => {
   it('does not turn failed or truncated query responses into an empty day', async () => {
     mocks.query.mockRejectedValueOnce('archive read failed');
     render(CalendarActivity, props);
-    expect(await screen.findByRole('alert')).toHaveTextContent('archive read failed');
+    expect(await screen.findByRole('alert')).toHaveTextContent('complete accounting scope could not be verified');
     expect(screen.queryByTestId('calendar-total')).not.toBeInTheDocument();
     mocks.query.mockResolvedValueOnce([{}]);
     await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('response is incomplete'));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('complete accounting scope could not be verified'));
     mocks.query.mockResolvedValueOnce([{}, {}]);
     await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
     expect(await screen.findByText('Zero activity in the recorded history for this range.')).toBeInTheDocument();
@@ -116,4 +127,28 @@ describe('calendar activity', () => {
     await waitFor(() => expect(screen.getByTestId('calendar-total')).toHaveTextContent('2026-01-01 – 2026-03-31'));
     expect(mocks.query.mock.calls.slice(-2).map((call) => call[0].length)).toEqual([64, 26]);
   });
+  it('proves the unchanged cache scope and withholds obsolete activity after identity failure', async () => {
+    mocks.query.mockResolvedValue([{ 'codex:parent': range }, {}]);
+    render(CalendarActivity, props);
+    await screen.findByTestId('calendar-total');
+    mocks.query.mockRejectedValueOnce('accounting_identity_ambiguous');
+    sessionsStore.applyMutations([], ['irrelevant']);
+    await screen.findByRole('alert');
+    expect(screen.queryByTestId('calendar-total')).not.toBeInTheDocument();
+    expect(mocks.query.mock.calls.at(-1)?.[1]).toEqual([]);
+    expect(mocks.query.mock.calls.at(-1)?.[2]).toEqual(props.sessionIds);
+    expect(screen.getByRole('alert')).toHaveTextContent('ambiguous accounting identities');
+  });
+  it('rejects an old success after a same-layout mutation while preserving the replacement proof', async () => {
+    let resolve!: (value: Record<string, RangeTotals>[]) => void;
+    mocks.query.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+    render(CalendarActivity, props);
+    await waitFor(() => expect(mocks.query).toHaveBeenCalledTimes(1));
+    sessionsStore.applyMutations([], ['irrelevant']);
+    resolve([{ 'codex:parent': range }, {}]);
+    await screen.findByText('Zero activity in the recorded history for this range.');
+    expect(screen.queryByRole('button', { name: /70 tokens/ })).not.toBeInTheDocument();
+    expect(mocks.query.mock.calls.at(-1)?.[2]).toEqual(props.sessionIds);
+  });
+
 });

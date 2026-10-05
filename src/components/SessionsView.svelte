@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { accountingUnavailable, hasVerifiedTokens, unavailableTokens } from '../lib/accountingAvailability';
   import ExecutionBoard from './ExecutionBoard.svelte';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { organizationStore } from '../lib/stores/organization.svelte';
@@ -7,12 +8,13 @@
   import { sessionGridStore, type SessionGridColumnId } from '../lib/stores/sessionGrid.svelte';
   import { sessionDetailPaneStore } from '../lib/stores/sessionDetailPane.svelte';
   import { projectStore } from '../lib/stores/projects.svelte';
+  import { historyStore } from '../lib/stores/history.svelte';
   import { scanStore } from '../lib/stores/scan.svelte';
   import { rates } from '../lib/stores/rates';
   import { primarySurfaces } from '../lib/sessionProjection';
   import { formatCredits, harnessCurrency } from '../lib/currency';
   import { formatCompactTokens } from '../lib/format';
-  import { getSessionPricing, getSessionDetails, listExternalEvents, onConfigEvent, sessionsInRanges, writeExport } from '../lib/ipc';
+  import { getSessionPricing, getSessionDetails, listExternalEvents, onConfigEvent, sessionsInRanges, prepareSessionSummaryExport, publishSessionSummaryExport } from '../lib/ipc';
   import type { ExternalEvent, Harness, RangeTotals, RateCard, SummaryPricing, Session } from '../lib/types';
   import type { FilterState } from './Filters.svelte';
   import { rangeLabelFor } from '../lib/dateRange';
@@ -21,14 +23,12 @@
     aggregateModelMetrics,
     addTotals,
     defaultFilters,
-    exportRows,
     filterSessions,
     costIsUnmeasured,
     disambiguateSiblingNames,
     isSubagent,
     orderSessionsForDisplay,
     projectSessions,
-    rowsToCsv,
     sessionName,
     filterBounds,
     type ViewScope,
@@ -43,13 +43,12 @@
   import SpeedMonitor from './SpeedMonitor.svelte';
   import CalendarActivity from './CalendarActivity.svelte';
   import { calendarFilterValue, type ActivityDay } from '../lib/calendarActivity';
-  import { measureAsync, measureNextPaint, measureSync } from '../lib/performance';
+  import { measureAsync, measureNextPaint } from '../lib/performance';
   import { clearRenderedSessionRows, publishRenderedSessionRows } from '../lib/paintContext';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
   import { formatStartedLocal, formatTokenCategory, formatTokenTotal, modelProviderVisual } from '../lib/sessionGrid';
   import {
     collectSessionExportTree,
-    sessionExportContent,
     sessionExportFileName,
     type SessionExportFormat,
   } from '../lib/sessionExport';
@@ -291,7 +290,21 @@
   let rangeTotals = $state<Record<string, RangeTotals>>({});
   let summaryPricing = $state<Record<string, SummaryPricing>>({});
   let tableReady = $state(false);
+  let tableAccountingReady = $state(false);
+  let accountingRetry = $state(0);
+  let lastTableRetry = -1;
+  let lastAnalyticsRetry = -1;
+  let categoryError = $state<string | null>(null);
+  let tableError = $state<string | null>(null);
+  let analyticsError = $state<string | null>(null);
+  let lastTableMutation = -1;
+  let lastTableScope = '';
+  let lastTableHistory: unknown = null;
+  let lastAnalyticsHistory: unknown = null;
+  let lastAnalyticsMutation = -1;
+  let lastAnalyticsScope = '';
   let analyticsReady = $state(false);
+  let analyticsAccountingReady = $state(false);
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
   // Debounce is only for coalescing live store flushes. A changed range is a
   // discrete user action (preset click, committed input) and fetches
@@ -302,6 +315,8 @@
   // Bumped alongside cache invalidation so an in-flight job discards its
   // fetch instead of applying stale-range data over freshly cleared state.
   let tableEpoch = 0;
+  let viewAlive = true;
+  onDestroy(() => { viewAlive = false; tableEpoch++; analyticsEpoch++; });
   let lastTableRates: RateCard | null = null;
   let tableQueue: Promise<void> = Promise.resolve();
   const tableCache = new RangeDataCache();
@@ -311,12 +326,18 @@
     return Object.fromEntries(Object.entries(data).map(([id, total]) => [id, { ...total, pricing: undefined }]));
   }
 
-  async function fetchTableBatch(from: string | null, to: string | null, ids: string[]) {
-    const [summaries, ranges] = await Promise.all([
-      getSessionPricing(ids),
-      from || to ? sessionsInRanges([{ from, to }], ids) : Promise.resolve([{}]),
+  async function fetchTableBatch(from: string | null, to: string | null, ids: string[], scope: string[]) {
+    const [cumulative, window] = await Promise.allSettled([
+      getSessionPricing(ids, scope),
+      from || to ? sessionsInRanges([{ from, to }], ids, scope) : Promise.resolve([{}]),
     ]);
-    return { summaries, ranges };
+    const cumulativeValid = cumulative.status === 'fulfilled' && ids.every(id => hasVerifiedTokens(cumulative.value[id]?.tokens));
+    if (!(from || to) && !cumulativeValid) throw cumulative.status === 'rejected' ? cumulative.reason : new Error('accounting_identity_unverified: cumulative snapshot incomplete');
+    if (window.status === 'rejected') throw window.reason;
+    const cumulativeError = cumulativeValid ? null : accountingUnavailable(cumulative.status === 'rejected' ? cumulative.reason : 'accounting_identity_unverified');
+    const categoryReady = cumulative.status === 'fulfilled' && cumulativeValid && ids.every(id => cumulative.value[id]?.category_totals !== undefined);
+    return { summaries: cumulative.status === 'fulfilled' && cumulativeValid ? cumulative.value : {}, ranges: window.value,
+      cumulativeError, categoryError: cumulativeError ?? (categoryReady ? null : accountingUnavailable('accounting_identity_unverified')) };
   }
 
   // Jobs are serialized so a drain/plan never races an unapplied fetch; a job
@@ -330,6 +351,9 @@
     sessionIds: string[],
   ): Promise<void> {
     if (generation !== tableJobGeneration) return;
+    const mutation = sessionsStore.mutationLog.generation;
+    const history = historyStore.status;
+    const rateCard = $rates;
     const rangesKey = `table:${from}|${to}`;
     const drained = tableMutations.drain();
     const plan = tableCache.plan({
@@ -338,39 +362,40 @@
       changedIds: drained.changedIds,
       removedIds: drained.removedIds,
     });
-    if (plan.mode === 'none') return;
     try {
       let results: Record<string, RangeTotals>[];
       if (plan.mode === 'full') {
         const fetched = await measureAsync(
           'frontend.table_range_fetch',
-          () => fetchTableBatch(from, to, sessionIds),
+          () => fetchTableBatch(from, to, sessionIds, sessionIds),
           { sessions: sessionIds.length, ranges: 1, fetched: sessionIds.length, mode: 'full' },
         );
         if (epoch !== tableEpoch) return;
+        if (generation !== tableJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { tableCache.invalidate(); return; }
         results = tableCache.applyFull(rangesKey, sessionIds, fetched.ranges);
-        summaryPricing = fetched.summaries;
+        summaryPricing = fetched.summaries; categoryError = fetched.categoryError;
       } else {
-        const fetched = plan.fetchIds.length > 0
-          ? await measureAsync(
+        const fetched = await measureAsync(
               'frontend.table_range_fetch',
-              () => fetchTableBatch(from, to, plan.fetchIds),
-              { sessions: sessionIds.length, ranges: 1, fetched: plan.fetchIds.length, mode: 'delta' },
-            )
-          : null;
+              () => fetchTableBatch(from, to, plan.mode === 'delta' ? plan.fetchIds : [], sessionIds),
+              { sessions: sessionIds.length, ranges: 1, fetched: plan.mode === 'delta' ? plan.fetchIds.length : 0, mode: 'delta' },
+            );
         if (epoch !== tableEpoch) return;
-        results = tableCache.applyDelta(plan.fetchIds, drained.removedIds, fetched?.ranges ?? null);
+        if (generation !== tableJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { tableCache.invalidate(); return; }
+        results = tableCache.applyDelta(plan.mode === 'delta' ? plan.fetchIds : [], drained.removedIds, fetched.ranges);
         const next = { ...summaryPricing };
-        for (const id of [...plan.fetchIds, ...drained.removedIds]) delete next[id];
-        Object.assign(next, fetched?.summaries ?? {});
-        summaryPricing = next;
+        for (const id of [...(plan.mode === 'delta' ? plan.fetchIds : []), ...drained.removedIds]) delete next[id];
+        Object.assign(next, fetched.summaries);
+        summaryPricing = fetched.cumulativeError ? {} : next; categoryError = fetched.categoryError;
       }
       rangeTotals = results[0];
-      tableReady = true;
+      tableReady = true; tableAccountingReady = true; tableError = null;
     } catch (e) {
       if (epoch !== tableEpoch) return;
+      if (generation !== tableJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { tableCache.invalidate(); return; }
       tableCache.invalidate();
-      tableReady = false;
+      tableReady = false; tableAccountingReady = false; rangeTotals = {}; summaryPricing = {};
+      tableError = accountingUnavailable(e);
       console.error('sessions_in_ranges failed:', e);
     }
   }
@@ -379,11 +404,18 @@
     const from = fromUtc;
     const to = toUtc;
     const sessionIds = filteredIds;
+    const mutationGeneration = sessionsStore.mutationLog.generation;
     tableMutations.observe(sessionsStore.mutationLog);
+    const history = historyStore.status;
+    const historyChanged = history !== lastTableHistory; lastTableHistory = history;
+    const retryChanged = accountingRetry !== lastTableRetry; lastTableRetry = accountingRetry;
+    const dataChanged = retryChanged || historyChanged || mutationGeneration !== lastTableMutation || sessionIds.join('|') !== lastTableScope;
+    lastTableMutation = mutationGeneration; lastTableScope = sessionIds.join('|');
+    const generation = ++tableJobGeneration;
     const ratesChanged = $rates !== lastTableRates;
     lastTableRates = $rates;
     if (!active) {
-      rangeTotals = {};
+      rangeTotals = {}; tableAccountingReady = false; tableReady = false; summaryPricing = {};
       lastTableRange = null;
       tableCache.invalidate();
       tableJobGeneration += 1;
@@ -396,23 +428,23 @@
     if (rangeChanged) {
       rangeTotals = {};
     }
-    if (rangeChanged || ratesChanged) {
+    if (rangeChanged || ratesChanged || historyChanged || retryChanged) {
       tableReady = false;
-      summaryPricing = {};
       tableCache.invalidate();
-      tableJobGeneration += 1;
       tableEpoch += 1;
     }
+    if (rangeChanged || dataChanged) { tableAccountingReady = false; tableReady = false; tableError = null; categoryError = null; }
     lastTableRange = key;
+    const requestEpoch = tableEpoch;
     if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
     rangeFetchTimer = setTimeout(() => {
       rangeFetchTimer = null;
-      const generation = ++tableJobGeneration;
       tableQueue = tableQueue
-        .then(() => runTableRefresh(generation, tableEpoch, from, to, sessionIds))
+        .then(() => runTableRefresh(generation, requestEpoch, from, to, sessionIds))
         .catch(() => {});
     }, delay);
     return () => {
+      if (generation === tableJobGeneration) tableJobGeneration++;
       if (rangeFetchTimer !== null) {
         clearTimeout(rangeFetchTimer);
         rangeFetchTimer = null;
@@ -424,7 +456,7 @@
   // filter when one is active so the row numbers add up to the totals row.
   // Export and the model comparison consume this exact projection too.
   const sessionDisplayMap = $derived(
-    projectSessions(filtered, $rates, tableReady ? rangeTotals : withoutPricing(rangeTotals), dateScoped, tableReady ? summaryPricing : {}, tableReady),
+    projectSessions(filtered, $rates, tableReady ? rangeTotals : withoutPricing(rangeTotals), dateScoped, summaryPricing, tableReady, tableAccountingReady),
   );
 
   /** The money-column value for a session (Est.$ on Codex, Cost elsewhere). */
@@ -520,26 +552,26 @@
         cmp = (a.tool_metrics?.calls ?? 0) - (b.tool_metrics?.calls ?? 0);
         break;
       case 'input': {
-        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? unavailableTokens();
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? unavailableTokens();
         cmp = at.input_tokens - bt.input_tokens;
         break;
       }
       case 'cached': {
-        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? unavailableTokens();
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? unavailableTokens();
         cmp = at.cached_input_tokens - bt.cached_input_tokens;
         break;
       }
       case 'output': {
-        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? unavailableTokens();
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? unavailableTokens();
         cmp = at.output_tokens - bt.output_tokens;
         break;
       }
       case 'total': {
-        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? a.tokens_total;
-        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? b.tokens_total;
+        const at = sessionDisplayMap.get(a.storage_id)?.tokens ?? unavailableTokens();
+        const bt = sessionDisplayMap.get(b.storage_id)?.tokens ?? unavailableTokens();
         cmp = at.total_tokens - bt.total_tokens;
         break;
       }
@@ -671,7 +703,7 @@
       if (cached !== undefined) return cached;
       const display = sessionDisplayMap.get(session.storage_id);
       const own = {
-        tokens: display?.tokens.total_tokens ?? session.tokens_total.total_tokens,
+        tokens: display?.tokens.total_tokens ?? NaN,
         cost: costOf(session.storage_id),
         unpriced: (display?.unpricedModels.length ?? 0) > 0,
       };
@@ -871,15 +903,15 @@
     return m;
   })());
 
-  const filteredTokenTotals = $derived(filtered.reduce((sum, s) => {
-    const tokens = sessionDisplayMap.get(s.storage_id)?.tokens ?? s.tokens_total;
+  const filteredTokenTotals = $derived(!tableAccountingReady ? unavailableTokens() : filtered.reduce((sum, s) => {
+    const tokens = sessionDisplayMap.get(s.storage_id)?.tokens ?? unavailableTokens();
     addTotals(sum, tokens);
     return sum;
   }, zeroTotals()));
   const filteredTotal = $derived(filteredTokenTotals.total_tokens);
 
   // Money total for the pinned totals row (matches the column semantics).
-  const costTotal = $derived(filtered.reduce((sum, s) => sum + costOf(s.storage_id), 0));
+  const costTotal = $derived(!tableAccountingReady ? NaN : filtered.reduce((sum, s) => sum + costOf(s.storage_id), 0));
 
   // ---------------------------------------------------------------------------
   // Analytics band: spend-by-day series + window totals for the delta pills.
@@ -893,6 +925,7 @@
   let analyticsBuckets = $state<DayBucket[]>([]);
   let analyticsPrev = $state<Record<string, RangeTotals> | null>(null);
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
+  let analyticsCurrentBounds = $state<{ from: string; to: string } | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
   let analyticsJobGeneration = 0;
 
@@ -1010,6 +1043,9 @@
     includePrev: boolean,
   ): Promise<void> {
     if (generation !== analyticsJobGeneration) return;
+    const mutation = sessionsStore.mutationLog.generation;
+    const history = historyStore.status;
+    const rateCard = $rates;
     // An open window's end bound must be taken at job time: during sustained
     // streaming the pulse-driven windowBounds end freezes, and a delta fetch
     // with a stale end would permanently exclude the burst's newest events
@@ -1049,37 +1085,39 @@
       changedIds: drained.changedIds,
       removedIds: drained.removedIds,
     });
-    if (plan.mode === 'none') return;
     try {
       let results: Record<string, RangeTotals>[];
       if (plan.mode === 'full') {
         const fetched = await measureAsync(
           'frontend.analytics_range_fetch',
-          () => sessionsInRanges(requestedRanges, sessionIds),
+          () => sessionsInRanges(requestedRanges, sessionIds, sessionIds),
           { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: sessionIds.length, mode: 'full' },
         );
         if (epoch !== analyticsEpoch) return;
+        if (generation !== analyticsJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { analyticsCache.invalidate(); return; }
         results = analyticsCache.applyFull(rangesKey, sessionIds, fetched);
       } else {
-        const fetched = plan.fetchIds.length > 0
-          ? await measureAsync(
+        const fetched = await measureAsync(
               'frontend.analytics_range_fetch',
-              () => sessionsInRanges(requestedRanges, plan.fetchIds),
-              { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: plan.fetchIds.length, mode: 'delta' },
-            )
-          : null;
+              () => sessionsInRanges(requestedRanges, plan.mode === 'delta' ? plan.fetchIds : [], sessionIds),
+              { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: plan.mode === 'delta' ? plan.fetchIds.length : 0, mode: 'delta' },
+            );
         if (epoch !== analyticsEpoch) return;
-        results = analyticsCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
+        if (generation !== analyticsJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { analyticsCache.invalidate(); return; }
+        results = analyticsCache.applyDelta(plan.mode === 'delta' ? plan.fetchIds : [], drained.removedIds, fetched);
       }
       analyticsCurrent = results[0];
-      analyticsReady = true;
+      analyticsCurrentBounds = requestedRanges[0];
+      analyticsReady = true; analyticsAccountingReady = true; analyticsError = null;
       analyticsPrev = includePrev ? results[1] : null;
       const days = results.slice(includePrev ? 2 : 1);
       analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
     } catch (e) {
       if (epoch !== analyticsEpoch) return;
+      if (generation !== analyticsJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { analyticsCache.invalidate(); return; }
       analyticsCache.invalidate();
-      analyticsReady = false;
+      analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = [];
+      analyticsError = accountingUnavailable(e);
       console.error('analytics sessions_in_ranges failed:', e);
     }
   }
@@ -1088,13 +1126,21 @@
     const { startMs, endMs } = windowBounds;
     const sessionIds = analyticsSessionIds;
     const includePrev = dateScoped;
+    const mutationGeneration = sessionsStore.mutationLog.generation;
     analyticsMutations.observe(sessionsStore.mutationLog);
+    const history = historyStore.status;
+    const historyChanged = history !== lastAnalyticsHistory; lastAnalyticsHistory = history;
+    const retryChanged = accountingRetry !== lastAnalyticsRetry; lastAnalyticsRetry = accountingRetry;
+    const dataChanged = retryChanged || historyChanged || mutationGeneration !== lastAnalyticsMutation || sessionIds.join('|') !== lastAnalyticsScope;
+    lastAnalyticsMutation = mutationGeneration; lastAnalyticsScope = sessionIds.join('|');
+    const generation = ++analyticsJobGeneration;
     const ratesChanged = $rates !== lastAnalyticsRates;
     lastAnalyticsRates = $rates;
     if (!active) {
+      analyticsAccountingReady = false; analyticsReady = false;
       analyticsBuckets = [];
       analyticsPrev = null;
-      analyticsCurrent = null;
+      analyticsCurrent = null; analyticsCurrentBounds = null;
       lastAnalyticsRange = null;
       analyticsCache.invalidate();
       analyticsJobGeneration += 1;
@@ -1108,28 +1154,29 @@
     if (rangeChanged) {
       analyticsBuckets = [];
       analyticsPrev = null;
-      analyticsCurrent = null;
+      analyticsCurrent = null; analyticsCurrentBounds = null;
     }
-    if (rangeChanged || ratesChanged) {
+    if (rangeChanged || ratesChanged || historyChanged || retryChanged) {
       analyticsReady = false;
       analyticsCache.invalidate();
-      analyticsJobGeneration += 1;
       analyticsEpoch += 1;
     }
+    if (rangeChanged || dataChanged) { analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = []; analyticsError = null; }
     lastAnalyticsRange = key;
+    const requestEpoch = analyticsEpoch;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
     // Debounced so a burst of store flushes coalesces into one refresh; the
     // refresh fetches only changed sessions unless the window layout changed.
     analyticsTimer = setTimeout(() => {
       analyticsTimer = null;
-      const generation = ++analyticsJobGeneration;
       analyticsQueue = analyticsQueue
         .then(() =>
-          runAnalyticsRefresh(generation, analyticsEpoch, startMs, endMs, openEnded, sessionIds, includePrev),
+          runAnalyticsRefresh(generation, requestEpoch, startMs, endMs, openEnded, sessionIds, includePrev),
         )
         .catch(() => {});
     }, delay);
     return () => {
+      if (generation === analyticsJobGeneration) analyticsJobGeneration++;
       if (analyticsTimer !== null) {
         clearTimeout(analyticsTimer);
         analyticsTimer = null;
@@ -1207,7 +1254,7 @@
       unpricedModels: [],
     };
     if (!data || !r || !analyticsReady) {
-      out.tokens = data ? filteredNoDate.reduce((sum, session) => sum + (data[session.storage_id]?.tokens.total_tokens ?? 0), 0) : 0;
+      out.tokens = analyticsAccountingReady && data ? filteredNoDate.reduce((sum, session) => sum + (data[session.storage_id]?.tokens.total_tokens ?? 0), 0) : NaN;
       out.cost = out.codexCredits = out.codexApiUsd = out.claudeUsd = Number.NaN;
       return out;
     }
@@ -1264,7 +1311,7 @@
       subagents: { count: 0, cost: 0 },
       allUnlimited: false,
     };
-    if (!data || !r) return out;
+    if (!data || !r || !analyticsAccountingReady) return out;
     for (const s of filteredNoDate) {
       const rt = data[s.storage_id];
       if (!rt || rt.tokens.total_tokens === 0) continue;
@@ -1476,9 +1523,9 @@
       cost: number;
       currency: string;
     }>();
-    if (!rateCard) return [];
+    if (!rateCard || !tableAccountingReady || categoryError) return [];
     for (const session of filtered) {
-      for (const [category, metric] of Object.entries(session.category_totals ?? {})) {
+      for (const [category, metric] of Object.entries(summaryPricing[session.storage_id]?.category_totals ?? {})) {
         if (!metric) continue;
         const key = `${session.harness}:${category}`;
         let row = grouped.get(key);
@@ -1514,45 +1561,38 @@
   let analyticsOpen = $state(false);
   let speedOpen = $state(false);
 
-  async function pricedExportProjection(exportSessions: TrackedSession[]) {
+  function invalidateExportAccounting(reason: unknown): void {
+    const code = String(reason);
+    if (!code.includes('accounting_identity_') && !code.includes('accounting_export_changed')) return;
+    tableEpoch++; analyticsEpoch++;
+    tableCache.invalidate(); analyticsCache.invalidate();
+    tableAccountingReady = false; tableReady = false; analyticsAccountingReady = false; analyticsReady = false;
+    rangeTotals = {}; summaryPricing = {}; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = [];
+    tableError = accountingUnavailable(reason);
+    accountingRetry++;
+  }
+
+  async function prepareExport(exportSessions: TrackedSession[], format: SessionExportFormat, includePaths: boolean) {
     const rateCard = $rates;
-    const scoped = dateScoped;
-    const from = fromUtc;
-    const to = toUtc;
-    const { ranges, summaries } = await fetchTableBatch(from, to, exportSessions.map((session) => session.storage_id));
-    if (!rateCard || rateCard !== $rates) throw new Error('Rates changed during export. Please retry.');
-    if (exportSessions.some((session) => sessionsStore.map.get(session.storage_id) !== session)) {
+    const from = fromUtc; const to = toUtc;
+    const mutation = sessionsStore.mutationLog.generation;
+    const prepared = await prepareSessionSummaryExport({ session_ids: exportSessions.map(session => session.storage_id),
+      from, to, format, include_working_directory: includePaths });
+    if (!viewAlive || !active || from !== fromUtc || to !== toUtc || mutation !== sessionsStore.mutationLog.generation ||
+      exportSessions.some(session => sessionsStore.map.get(session.storage_id) !== session)) {
       throw new Error('Sessions changed during export. Please retry.');
     }
-    const projections = projectSessions(exportSessions, rateCard, ranges[0], scoped, summaries, true);
-    if ([...projections.values()].some((projection) => !projection.pricingAvailable)) {
-      throw new Error('Pricing is unavailable. Please retry when pricing has loaded.');
-    }
-    return projections;
+    if (!rateCard || rateCard !== $rates) throw new Error('Rates changed during export. Please retry.');
+    return prepared;
   }
 
   async function exportView(format: 'csv' | 'json') {
-    exportBusy = true;
-    exportError = null;
+    exportBusy = true; exportError = null;
     try {
-      const exportSessions = filtered;
-      const exportProjection = await pricedExportProjection(exportSessions);
-      const rows = measureSync(
-        'frontend.session_export_build',
-        () => exportRows(exportProjection.values(), includeWorkingDirectory),
-        { sessions: exportProjection.size, format },
-      );
-      const content = format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows);
-      await writeExport(
-        `odometer-${harness}-${new Date().toISOString().slice(0, 10)}.${format}`,
-        format,
-        content,
-      );
-    } catch (error) {
-      exportError = String(error);
-    } finally {
-      exportBusy = false;
-    }
+      const prepared = await prepareExport(filtered, format, includeWorkingDirectory);
+      await publishSessionSummaryExport(prepared, `odometer-${harness}-${new Date().toISOString().slice(0, 10)}.${format}`);
+    } catch (error) { exportError = String(error); invalidateExportAccounting(error); }
+    finally { exportBusy = false; }
   }
 
   interface SessionContextMenuState {
@@ -1624,21 +1664,14 @@
     sessionExportBusy = true;
     sessionExportError = null;
     try {
-      const projections = await pricedExportProjection(exportSessions);
-      const rows = measureSync(
-        'frontend.single_session_export_build',
-        () => exportRows(projections.values(), false),
-        { sessions: projections.size, format },
-      );
+      const prepared = await prepareExport(exportSessions, format, false);
       const descendantCount = exportSessions.length - 1;
-      await writeExport(
-        sessionExportFileName(exportSessions[0].harness, menu.sessionId, descendantCount, format),
-        format,
-        sessionExportContent(rows, format, rowsToCsv),
-      );
+      const written = await publishSessionSummaryExport(prepared,
+        sessionExportFileName(exportSessions[0].harness, menu.sessionId, descendantCount, format));
+      if (!written) return;
       sessionContextMenu = null;
     } catch (error) {
-      sessionExportError = String(error);
+      sessionExportError = String(error); invalidateExportAccounting(error);
     } finally {
       sessionExportBusy = false;
     }
@@ -1762,6 +1795,8 @@
   const gridCols = $derived(`grid-template-columns: ${visibleColumns.map((column) => column.width).join(' ')};`);
 </script>
 
+{#if tableError || analyticsError}<p data-testid="accounting-table-status" role="status" class="text-xs text-neg px-3 py-2">{tableError ?? `Analytics: ${analyticsError}`} <button type="button" class="underline" onclick={() => accountingRetry++}>Retry usage</button></p>{:else if active && !tableAccountingReady}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Verifying complete usage scope…</p>{/if}
+
 {#if organizationUnavailable}
   <div class="p-5 text-sm text-amber-500" role="alert">
     Organization-filtered results are unavailable. {organizationStore.recoveryUnrestored ? 'Earlier organization remains in the recovery backup and was not restored.' : organizationStore.error ?? 'Organization is loading, or a selected tag was renamed or deleted.'}
@@ -1861,7 +1896,7 @@
       <div>
         <div class="text-[11px] text-ink-muted font-medium">Sessions · {windowLabel}</div>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-          {windowStats.sessionCount}
+          {analyticsAccountingReady ? windowStats.sessionCount : 'unavailable'}
           <span class="text-[11px] text-ink-faint font-normal">of {allSessions.length}</span>
         </div>
       </div>
@@ -1887,7 +1922,7 @@
         <div>
           <div class="text-[11px] text-ink-muted font-medium">Subagents · {windowLabel}</div>
           <div class="text-xl font-bold font-mono mt-0.5 text-ink">
-            {windowStats.subagents.count}
+            {analyticsAccountingReady ? windowStats.subagents.count : 'unavailable'}
             {#if windowStats.subagents.count > 0}
               <span class="text-[11px] text-ink-faint font-normal">{allUsdAvailable ? `${fmtMoney(analyticsReady ? windowStats.subagents.cost : Number.NaN)} total` : 'cost unavailable'}</span>
             {/if}
@@ -1931,9 +1966,12 @@
       {/if}
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
-      <summary class="cursor-pointer text-xs font-semibold text-ink">Model comparison · {windowLabel} · {modelComparison.length} models</summary>
-      {#if harness === 'all' && !allUsdAvailable}
+      <summary class="cursor-pointer text-xs font-semibold text-ink">Model comparison · {windowLabel} · {analyticsReady ? modelComparison.length : 'unavailable'} models</summary>
+      {#if !analyticsAccountingReady}
+        <p class="text-xs text-ink-muted py-3">Model aggregates unavailable until the complete usage scope is verified.</p>
+      {:else if harness === 'all' && !allUsdAvailable}
         <p class="text-xs text-ink-faint py-3">Combined model shares are unavailable until both harnesses have USD rates.</p>
+      {:else if !analyticsReady}<p class="text-xs text-ink-muted py-3">Model comparison unavailable while prices are refreshing.</p>
       {:else if modelComparison.length === 0}
         <p class="text-xs text-ink-faint py-3">No model usage in this window.</p>
       {:else}
@@ -1964,15 +2002,17 @@
       {/if}
       </details>
 
-      <ToolImpact
+      {#if analyticsAccountingReady}<ToolImpact
         active={active && analyticsOpen}
         sessionIds={analyticsSessionIds}
         from={impactFrom}
         to={impactTo}
+        dimensionFrom={analyticsCurrentBounds?.from ?? null}
+        dimensionTo={analyticsCurrentBounds?.to ?? null}
         {windowLabel}
         {dimensionTotals}
         {dimensionAvailability}
-      />
+      />{:else}<p role="status" class="text-xs text-ink-muted">Tool aggregates unavailable until the complete usage scope is verified.</p>{/if}
 
       <WorkflowIntelligence active={active && analyticsOpen} sessionIds={analyticsSessionIds} onReview={reviewFindingSession} />
 
@@ -1985,7 +2025,7 @@
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
         <summary class="cursor-pointer text-xs font-semibold text-ink">Task categories · all-time for sessions in view</summary>
-        {#if categoryRows.length === 0}<p class="text-xs text-ink-faint py-2">No classified turns.</p>{:else}
+        {#if categoryError}<p data-testid="accounting-category-status" role="status" class="text-xs text-ink-muted">Cumulative category totals: {categoryError} <button type="button" class="underline" onclick={() => accountingRetry++}>Retry categories</button></p>{:else if !tableAccountingReady}<p class="text-xs text-ink-muted">Category aggregates unavailable</p>{:else if categoryRows.length === 0}<p class="text-xs text-ink-faint py-2">No classified turns.</p>{:else}
           <div class="grid grid-cols-6 gap-2 mt-2 text-[11px]">
             <div class="section-label col-span-2">Harness / category</div><div class="section-label text-right">Turns</div><div class="section-label text-right">Tokens</div><div class="section-label text-right">Tools</div><div class="section-label text-right">Cost</div>
             {#each categoryRows as row (`${row.harness}:${row.category}`)}
@@ -2048,7 +2088,7 @@
       <div class="flex items-center gap-2 text-xs">
         <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('csv')}>Export CSV</button>
         <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('json')}>Export JSON</button>
-        <label class="flex items-center gap-1.5 text-ink-muted"><input type="checkbox" bind:checked={includeWorkingDirectory} /> Include working directories</label>
+        <label class="flex items-center gap-1.5 text-ink-muted"><input type="checkbox" disabled={exportBusy} bind:checked={includeWorkingDirectory} /> Include working directories</label>
         {#if exportError}<span class="text-neg ml-auto" role="alert">{exportError}</span>{/if}
       </div>
     </div>
@@ -2127,7 +2167,7 @@
               {@const name = sessionName(session)}
               {@const sibling = siblingDisplay.get(session.storage_id)}
               {@const display = sessionDisplayMap.get(session.storage_id)}
-              {@const rowTokens = display?.tokens ?? session.tokens_total}
+              {@const rowTokens = display?.tokens ?? unavailableTokens()}
               {@const sub = isSubagent(session)}
               {@const kids = childCounts.get(session.storage_id) ?? 0}
               {@const combined = combinedUsage.get(session.storage_id)}
@@ -2199,7 +2239,7 @@
                   {:else if column.id === 'output'}
                     <span class="text-right font-mono text-xs text-ink" title={rowTokens.output_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.output_tokens)}</span>
                   {:else if column.id === 'total'}
-                    <span class="text-right font-mono text-xs text-ink">{fmt.format(rowTokens.total_tokens)}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {fmt.format(combined.tokens)}</span>{/if}</span>
+                    <span class="text-right font-mono text-xs text-ink">{Number.isFinite(rowTokens.total_tokens) ? fmt.format(rowTokens.total_tokens) : 'unavailable'}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {Number.isFinite(combined.tokens) ? fmt.format(combined.tokens) : 'unavailable'}</span>{/if}</span>
                   {:else if column.id === 'cost'}
                     {@const unpricedOnly = costIsUnmeasured(display?.unpricedModels, costOf(session.storage_id))}
                     <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{#if !allUsdAvailable}unavailable{:else if unpricedOnly}<span class="text-ink-faint cursor-help" title="Not measured: every model in this session is unpriced ({display?.unpricedModels.join(', ')}). This is not a zero cost.">—</span>{:else}{fmtAmount(costOf(session.storage_id))}{/if}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] {combined.unpriced ? 'text-amber-500/80' : 'text-ink-faint'} font-normal cursor-help" title={combined.unpriced ? 'At least one thread in this subtree ran an unpriced model, so this is a floor, not a total.' : 'This session plus its subagent threads (in view)'}>Σ {fmtAmount(combined.cost)}{combined.unpriced ? '+' : ''}</div>{/if}</span>

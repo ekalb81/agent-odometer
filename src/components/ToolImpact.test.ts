@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   TokenTotals,
@@ -9,13 +9,13 @@ import type {
 } from '../lib/types';
 import ToolImpact from './ToolImpact.svelte';
 
-const { compareToolImpact, listToolImpactTargets, writeExport } = vi.hoisted(() => ({
+const { compareToolImpact, listToolImpactTargets, publishToolDimensionExport } = vi.hoisted(() => ({
   compareToolImpact: vi.fn(),
   listToolImpactTargets: vi.fn(),
-  writeExport: vi.fn(),
+  publishToolDimensionExport: vi.fn(),
 }));
 
-vi.mock('../lib/ipc', () => ({ compareToolImpact, listToolImpactTargets, writeExport }));
+vi.mock('../lib/ipc', () => ({ compareToolImpact, listToolImpactTargets, publishToolDimensionExport }));
 
 function tokens(total: number): TokenTotals {
   return {
@@ -92,10 +92,31 @@ const LOADING_COMPARISON = /Comparing observed and baseline turns/;
 beforeEach(() => {
   compareToolImpact.mockReset();
   listToolImpactTargets.mockReset();
-  writeExport.mockReset();
+  publishToolDimensionExport.mockReset();
 });
 
 describe('ToolImpact', () => {
+  it.each(['csv', 'json'] as const)('exports %s dimensions with the full scope and exact ledger bounds, including context tokens', async (format) => {
+    listToolImpactTargets.mockResolvedValue([]);
+    publishToolDimensionExport.mockResolvedValue(true);
+    const dimensions = { context_source: { conversation_cache: { calls: 0, failures: 0, output_bytes: 0, duration_ms: 0, tokens: 321 } } };
+    render(ToolImpact, { ...BASE_PROPS, dimensionFrom: null, dimensionTo: '2026-08-07T00:00:42.999Z', dimensionTotals: dimensions });
+    await fireEvent.click(screen.getByRole('button', { name: `Export ${format.toUpperCase()}` }));
+    expect(publishToolDimensionExport).toHaveBeenCalledWith({
+      session_ids: ['a', 'b'], from: null, to: '2026-08-07T00:00:42.999Z', format,
+      rows: [{ dimension_kind: 'context_source', dimension_value: 'conversation_cache', ...dimensions.context_source.conversation_cache }],
+    }, expect.stringMatching(new RegExp(`^odometer-tool-dimensions-.*\\.${format}$`)));
+  });
+
+  it('shows a safe unavailable state when dimension authority changes during the picker', async () => {
+    listToolImpactTargets.mockResolvedValue([]);
+    publishToolDimensionExport.mockRejectedValue(new Error('accounting_export_changed: private location'));
+    render(ToolImpact, { ...BASE_PROPS, dimensionTotals: { context_source: { conversation_cache: { calls: 0, failures: 0, output_bytes: 0, duration_ms: 0, tokens: 321 } } } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Export CSV' }));
+    await screen.findByText(/Usage changed while choosing the export destination/);
+    expect(screen.queryByText(/private location/)).not.toBeInTheDocument();
+    expect(publishToolDimensionExport).toHaveBeenCalledTimes(1);
+  });
   it('shows loading placeholders only on the first load', async () => {
     listToolImpactTargets.mockResolvedValue([target('grep', 'grep')]);
     compareToolImpact.mockResolvedValue(result('grep', 2_000));
@@ -106,50 +127,66 @@ describe('ToolImpact', () => {
     await waitFor(() => expect(screen.getByText('Tokens / turn')).toBeTruthy());
   });
 
-  // Regression: live sessions re-run both fetches in the background. Tearing the
-  // rendered table down to a one-line placeholder each time made this section —
-  // and everything below it in the scrolling analytics panel — visibly jump.
-  it('keeps the comparison table rendered across a background refresh', async () => {
+  it('withholds the same-target report and numeric targets while refreshed scope is pending', async () => {
     listToolImpactTargets.mockResolvedValue([target('grep', 'grep')]);
     compareToolImpact.mockResolvedValue(result('grep', 2_000));
-
     const { rerender } = render(ToolImpact, { props: { ...BASE_PROPS } });
     await waitFor(() => expect(screen.getByText('Tokens / turn')).toBeTruthy());
-
-    // Both fetches stay pending, standing in for a slow in-flight refresh.
+    const panel = screen.getByText(/Tool impact comparison/).parentElement as HTMLDetailsElement;
+    panel.open = true;
     listToolImpactTargets.mockReturnValue(new Promise(() => {}));
-    compareToolImpact.mockReturnValue(new Promise(() => {}));
-
-    // A fresh array with the same ids is exactly what a store flush produced.
     await rerender({ ...BASE_PROPS, sessionIds: ['a', 'b'] });
     await waitFor(() => expect(listToolImpactTargets).toHaveBeenCalledTimes(2));
-
-    expect(screen.queryByText(LOADING_TARGETS)).toBeNull();
-    expect(screen.queryByText(LOADING_COMPARISON)).toBeNull();
-    expect(screen.getByText('Tokens / turn')).toBeTruthy();
+    expect(screen.queryByText('Tokens / turn')).toBeNull();
+    expect(screen.queryByText(/grep · 20 turns/)).toBeNull();
+    expect(screen.getByText(LOADING_TARGETS)).toBeTruthy();
+    expect(panel.open).toBe(true);
   });
 
-  // Regression: an error is a real state worth surfacing, but replacing the
-  // table with it displaced everything below just as the loading placeholder
-  // did. Once there is content, a failed refresh reports itself inline.
-  it('reports a failed background refresh inline, keeping the table', async () => {
+  it('withholds an old same-target report when the open-ended minute refresh fails proof', async () => {
     listToolImpactTargets.mockResolvedValue([target('grep', 'grep')]);
     compareToolImpact.mockResolvedValue(result('grep', 2_000));
-
     const { rerender } = render(ToolImpact, { props: { ...BASE_PROPS } });
     await waitFor(() => expect(screen.getByText('Tokens / turn')).toBeTruthy());
+    compareToolImpact.mockRejectedValue(new Error('accounting_identity_ambiguous: private detail'));
+    await rerender({ ...BASE_PROPS, to: '2026-08-07T00:01:00.000Z' });
+    await screen.findByText(/ambiguous accounting identities/i);
+    expect(screen.queryByText('Tokens / turn')).toBeNull();
+    expect(screen.queryByText(/private detail/)).toBeNull();
+    expect((screen.getByLabelText('Tool impact target') as HTMLSelectElement).value).toBe('tool:grep');
+  });
 
-    compareToolImpact.mockRejectedValue(new Error('backend unavailable'));
-    listToolImpactTargets.mockRejectedValue(new Error('backend unavailable'));
-    await rerender({ ...BASE_PROPS, sessionIds: ['a', 'b'] });
+  it('rejects superseded successful and failed comparisons after a newer minute completes', async () => {
+    listToolImpactTargets.mockResolvedValue([target('grep', 'grep')]);
+    let oldSuccess!: (value: ToolImpactResult) => void;
+    let oldFailure!: (reason: Error) => void;
+    compareToolImpact.mockImplementationOnce(() => new Promise(resolve => { oldSuccess = resolve; }));
+    const { rerender } = render(ToolImpact, { props: { ...BASE_PROPS } });
+    await waitFor(() => expect(compareToolImpact).toHaveBeenCalledTimes(1));
+    compareToolImpact.mockImplementationOnce(() => new Promise((_resolve, reject) => { oldFailure = reject; }));
+    await rerender({ ...BASE_PROPS, to: '2026-08-07T00:01:00.000Z' });
+    await waitFor(() => expect(compareToolImpact).toHaveBeenCalledTimes(2));
+    compareToolImpact.mockResolvedValue(result('grep', 9_000));
+    await rerender({ ...BASE_PROPS, to: '2026-08-07T00:02:00.000Z' });
+    await screen.findByText('900');
+    oldSuccess(result('grep', 2_000));
+    oldFailure(new Error('accounting_identity_unverified: old proof'));
+    await waitFor(() => expect(screen.getByText('900')).toBeTruthy());
+    expect(screen.queryByText('200')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
 
-    const comparisonNotice = await screen.findByText(/Showing the last successful comparison/);
-    expect(comparisonNotice.getAttribute('title')).toContain('backend unavailable');
-    const targetNotice = screen.getByText(/Target list is stale/);
-    expect(targetNotice.getAttribute('title')).toContain('backend unavailable');
-    // The numbers are still on screen, and so is the target picker.
-    expect(screen.getByText('Tokens / turn')).toBeTruthy();
-    expect(screen.getByLabelText('Tool impact target')).toBeTruthy();
+  it('clears numeric target counts and comparison after a current target proof fails', async () => {
+    listToolImpactTargets.mockResolvedValue([target('grep', 'grep')]);
+    compareToolImpact.mockResolvedValue(result('grep', 2_000));
+    const { rerender } = render(ToolImpact, { props: { ...BASE_PROPS } });
+    await screen.findByText('Tokens / turn');
+    listToolImpactTargets.mockRejectedValue(new Error('accounting_identity_unverified: private detail'));
+    await rerender({ ...BASE_PROPS, to: '2026-08-07T00:01:00.000Z' });
+    await screen.findByText(/accounting identity verification is incomplete/i);
+    expect(screen.queryByText('Tokens / turn')).toBeNull();
+    expect(screen.queryByText(/grep · 20 turns/)).toBeNull();
+    expect(screen.queryByText(/private detail/)).toBeNull();
   });
 
   it('shows a failed first load as the section body, with nothing to fall back on', async () => {
@@ -158,7 +195,7 @@ describe('ToolImpact', () => {
 
     render(ToolImpact, { props: { ...BASE_PROPS } });
 
-    await waitFor(() => expect(screen.getByText(/backend unavailable/)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/complete accounting scope could not be verified/i)).toBeTruthy());
     expect(screen.queryByText('Tokens / turn')).toBeNull();
     expect(screen.queryByText(/Showing the last successful comparison/)).toBeNull();
   });

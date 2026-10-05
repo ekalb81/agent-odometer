@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { accountingUnavailable } from '../lib/accountingAvailability';
   import { untrack } from 'svelte';
   import { getHistoryStatus, sessionsInRanges } from '../lib/ipc';
   import { calendarDays, activityDays, calendarEvidence, type ActivityDay, type ActivityMetric, type CalendarZone } from '../lib/calendarActivity';
@@ -6,7 +7,7 @@
   import { scanStore } from '../lib/stores/scan.svelte';
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
-  import type { RangeTotals } from '../lib/types';
+  import type { ActivitySummaryExportRequest, RangeTotals } from '../lib/types';
   import { activitySummary } from '../lib/activitySummary';
   import ActivitySummary from './ActivitySummary.svelte';
 
@@ -22,7 +23,7 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let retry = $state(0);
-  let summary = $state<{ svg: string; markdown: string } | null>(null);
+  let summary = $state<{ svg: string; markdown: string; request: Omit<ActivitySummaryExportRequest, 'svg'> } | null>(null);
   let summaryError = $state('');
   let epoch = 0;
   let jobGeneration = 0;
@@ -47,7 +48,16 @@
 
   function previewSummary(): void {
     if (loading || error || !days.length || (evidence.state !== 'complete' && evidence.state !== 'partial')) return;
-    try { summary = activitySummary({ days, metric, zone, harness, selectedProject: !!projectKey, coverage: evidence.state }); }
+    try {
+      summary = {
+        ...activitySummary({ days, metric, zone, harness, selectedProject: !!projectKey, coverage: evidence.state }),
+        request: {
+          session_ids: [...selectedIds],
+          days: days.map(({ from, to, tokens, tool_calls }) => ({ from, to, tokens, tool_calls })),
+          coverage_complete: evidence.state === 'complete',
+        },
+      };
+    }
     catch (reason) { summaryError = String(reason).replace(/^Error: /, ''); }
   }
 
@@ -58,6 +68,7 @@
     const state = evidence.state;
     const scanComplete = scanStore.status.complete;
     void retry;
+    const mutation = sessionsStore.mutationLog.generation;
     mutations.observe(sessionsStore.mutationLog);
     if (!active || state === 'pending' || state === 'unavailable') {
       epoch++;
@@ -77,15 +88,16 @@
     const key = `${selectedZone}|${fromBound}|${toBound}|${bounds.map((day) => day.date).join(',')}|${ids.join(',')}`;
     if (key !== layoutKey) { epoch++; days = []; cache.invalidate(); layoutKey = key; }
     const request = epoch;
-    loading = true; error = null;
+    const delay = untrack(() => days.length ? 250 : 0);
+    loading = true; error = null; days = [];
     const timer = setTimeout(() => {
       queue = queue.then(async () => {
-        if (request !== epoch || job !== jobGeneration) return;
+        if (request !== epoch || job !== jobGeneration || mutation !== sessionsStore.mutationLog.generation) return;
         try {
           // The archive can become unhealthy after opening. Read current
           // provenance before every query rather than trusting mount state.
           const history = await getHistoryStatus();
-          if (request !== epoch) return;
+          if (request !== epoch || job !== jobGeneration || mutation !== sessionsStore.mutationLog.generation) return;
           if (calendarEvidence(history, scanComplete).state !== state) {
             historyStore.set(history);
             cache.invalidate(); days = []; loading = false;
@@ -95,29 +107,29 @@
           const plan = cache.plan({ rangesKey: key, ids, changedIds: drained.changedIds, removedIds: drained.removedIds });
           const fetchIds = plan.mode === 'full' ? ids : plan.mode === 'delta' ? plan.fetchIds : [];
           let fetched: Record<string, RangeTotals>[] | null = null;
-          if (plan.mode === 'full' || fetchIds.length) {
+          {
             fetched = [];
             // IPC permits at most 64 windows. Serialized chunks keep backend
             // work bounded without creating a separate aggregation authority.
             for (let index = 0; index < bounds.length; index += 64) {
               const batch = bounds.slice(index, index + 64);
-              const result = await sessionsInRanges(batch.map(({ from, to }) => ({ from, to })), fetchIds);
-              if (request !== epoch) { cache.invalidate(); return; }
+              const result = await sessionsInRanges(batch.map(({ from, to }) => ({ from, to })), fetchIds, ids);
+              if (request !== epoch || job !== jobGeneration || mutation !== sessionsStore.mutationLog.generation) { cache.invalidate(); return; }
               if (result.length !== batch.length) throw new Error('Activity response is incomplete. Retry the range.');
               fetched.push(...result);
             }
           }
           const result = plan.mode === 'full' ? cache.applyFull(key, ids, fetched!)
             : plan.mode === 'delta' ? cache.applyDelta(plan.fetchIds, drained.removedIds, fetched) : cache.current();
-          if (request !== epoch) return;
+          if (request !== epoch || job !== jobGeneration || mutation !== sessionsStore.mutationLog.generation) return;
           days = activityDays(bounds, result!); loading = false;
         } catch (reason) {
-          if (request !== epoch) return;
+          if (request !== epoch || job !== jobGeneration || mutation !== sessionsStore.mutationLog.generation) return;
           cache.invalidate(); days = []; loading = false;
-          error = `Activity unavailable: ${String(reason).replace(/^Error: /, '')}`;
+          error = accountingUnavailable(reason);
         }
       }).catch(() => {});
-    }, untrack(() => days.length ? 250 : 0));
+    }, delay);
     return () => clearTimeout(timer);
   });
 
@@ -157,7 +169,7 @@
   {#if projectError}<p class="mt-1 text-[11px] text-neg">Project choices unavailable: {projectError}</p>{/if}
   <p class="mt-1 text-[11px] text-ink-muted" role="status">{evidence.message}</p>
   {#if error}
-    <p role="alert" class="mt-1 text-[11px] text-neg">{error} <button class="underline" type="button" onclick={() => retry++}>Retry</button></p>
+    <p data-testid="accounting-calendar-status" role="alert" class="mt-1 text-[11px] text-neg">{error} <button class="underline" type="button" onclick={() => retry++}>Retry</button></p>
   {:else if loading && !days.length}
     <p role="status" class="mt-2 text-[11px] text-ink-muted">Loading recorded activity…</p>
   {:else if days.length}

@@ -4,7 +4,7 @@ import generated from './pricing.generated.json';
 import type { PricedSurface, RangePricing, RateCard, Session, SessionPricing, SummaryPricing } from '../lib/types';
 
 interface FixturePricing {
-  summary: SummaryPricing;
+  summary: Omit<SummaryPricing, 'tokens' | 'category_totals'> & Partial<Pick<SummaryPricing, 'tokens' | 'category_totals'>>;
   detail: SessionPricing;
   range: RangePricing;
 }
@@ -44,7 +44,8 @@ export function mockRangePricing(key: string, fraction: number): RangePricing {
 }
 
 export function mockSummaryPricing(key: string): SummaryPricing {
-  return fixturePricing(key).summary;
+  const value = fixturePricing(key).summary;
+  return value as SummaryPricing;
 }
 
 export function mockSessionPricing(key: string, session: Session): SessionPricing {

@@ -760,8 +760,15 @@ fn retention_lifecycle_reconciles_copies_replacement_purge_and_hour_edges_across
     let erased = store.purge_retained(&preview, now).unwrap();
     assert_eq!(erased.removed_keys.len(), 3);
     assert!(store.session_summaries().unwrap().is_empty());
+    // A caller retaining purged IDs has lost its accounting authority. Do
+    // not silently turn that obsolete full scope into a plausible zero.
     assert!(store
         .range_totals_multi(&[old_key, new_key, zero_key], &bounds)
+        .unwrap_err()
+        .to_string()
+        .starts_with("accounting_identity_unverified:"));
+    assert!(store
+        .range_totals_multi(&[], &bounds)
         .unwrap()
         .iter()
         .all(|range| range.is_empty()));

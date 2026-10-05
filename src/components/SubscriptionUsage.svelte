@@ -1,10 +1,12 @@
 <script lang="ts">
+  import { historyStore } from '../lib/stores/history.svelte';
+  import { sessionsStore } from '../lib/stores/sessions.svelte';
+  import { accountingUnavailable } from '../lib/accountingAvailability';
   // Provider-reported subscription quota (Codex rate-limit windows) plus
   // trailing token consumption, shown at the top of the analytics panel.
   // Fetches independently of the rest of SessionsView's range machinery —
-  // deliberately NOT re-fetched on every store flush, only on a slow
-  // interval, to avoid the refetch storms this repo just eliminated
-  // elsewhere (see rangeData.ts).
+  // Observation refreshes use a slow interval. Accounting mutations invalidate
+  // trailing numbers immediately, then coalesce a bounded proof refresh.
   import {
     getQuotaSnapshots,
     getSubscriptionUsage,
@@ -77,41 +79,47 @@
     return total;
   }
 
-  async function refresh(): Promise<void> {
-    try {
-      const [usage, ranges, snapshots] = await Promise.all([
-        getSubscriptionUsage(),
-        // Scoped to the tab's sessions so a per-harness tab's trailing
-        // figures match the analytics beside them ('all' passes every id).
-        sessionsInRanges(
-          TRAILING_WINDOWS.map(({ ms }) => ({ from: new Date(Date.now() - ms).toISOString(), to: null })),
-          sessionIds,
-        ),
-        getQuotaSnapshots(),
-      ]);
-      entries = harness === 'all' ? usage : usage.filter((entry) => entry.harness === harness);
-      trailingTokens = ranges.map(sumTokens);
-      quotaSnapshots = harness === 'all' ? snapshots : snapshots.filter((s) => s.provider === harness);
-      error = null;
-      quotaError = null;
-    } catch (reason) {
-      error = String(reason);
-      quotaError = String(reason);
-    } finally {
-      loaded = true;
-    }
-
+  let refreshGeneration = 0;
+  let trailingError = $state<string | null>(null);
+  async function refresh(observations = true): Promise<void> {
+    const generation = ++refreshGeneration;
+    const scope = harness;
+    const ids = [...sessionIds];
+    const mutation = sessionsStore.mutationLog.generation;
+    const history = historyStore.status;
+    trailingTokens = null; trailingError = null;
+    const [usage, ranges, snapshots] = await Promise.allSettled([
+      observations ? getSubscriptionUsage() : Promise.resolve(entries),
+      sessionsInRanges(TRAILING_WINDOWS.map(({ ms }) => ({ from: new Date(Date.now() - ms).toISOString(), to: null })), ids, ids),
+      observations ? getQuotaSnapshots() : Promise.resolve(quotaSnapshots),
+    ]);
+    if (generation !== refreshGeneration || !active || scope !== harness || ids.join('|') !== sessionIds.join('|') || mutation !== sessionsStore.mutationLog.generation || history !== historyStore.status) return;
+    if (usage.status === 'fulfilled') {
+      entries = scope === 'all' ? usage.value : usage.value.filter(entry => entry.harness === scope); error = null;
+    } else { entries = []; error = 'Provider quota observations unavailable.'; }
+    if (ranges.status === 'fulfilled') trailingTokens = ranges.value.map(sumTokens);
+    else { trailingTokens = null; trailingError = accountingUnavailable(ranges.reason); }
+    if (snapshots.status === 'fulfilled') {
+      quotaSnapshots = scope === 'all' ? snapshots.value : snapshots.value.filter(s => s.provider === scope); quotaError = null;
+    } else { quotaSnapshots = []; quotaError = 'Quota snapshots unavailable.'; }
+    loaded = true;
   }
 
   function handleBudgetAlerts(fired: QuotaAlert[]): void {
     void fired; // Desktop delivery is owned by the shared main-window monitor.
   }
 
+  let lastRefreshScope = '';
   $effect(() => {
+    const scope = `${active}|${harness}|${sessionIds.join('|')}`;
+    const scopeChanged = scope !== lastRefreshScope; lastRefreshScope = scope;
+    void historyStore.status; void harness; void sessionIds; void sessionsStore.mutationLog.generation;
+    refreshGeneration++; trailingTokens = null; trailingError = null;
     if (!active) return;
-    void refresh();
+    if (scopeChanged) { entries = []; quotaSnapshots = []; loaded = false; }
+    const timer = setTimeout(() => { void refresh(scopeChanged); }, scopeChanged ? 0 : 250);
     const interval = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
-    return () => clearInterval(interval);
+    return () => { clearInterval(interval); clearTimeout(timer); refreshGeneration++; };
   });
 
   // Keeps "as of Xm ago" and reset countdowns fresh without re-fetching.
@@ -178,6 +186,7 @@
     {/if}
   </div>
 
+  {#if trailingError}<p data-testid="accounting-trailing-status" role="status" class="text-[11px] text-neg mt-1.5">{trailingError}</p>{:else if !trailingTokens}<p data-testid="accounting-trailing-status" role="status" class="text-[11px] text-ink-faint mt-1.5">Verifying trailing usage…</p>{/if}
   {#if error}
     <p class="text-[11px] text-neg mt-1.5">{error}</p>
   {:else if loaded && entries.length === 0}

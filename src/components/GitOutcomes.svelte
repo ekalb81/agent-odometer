@@ -1,21 +1,53 @@
 <script lang="ts">
   import { correlateEvents, listExternalEvents, scanGitOutcomes } from '../lib/ipc';
+  import { accountingUnavailable } from '../lib/accountingAvailability';
+  import { historyStore } from '../lib/stores/history.svelte';
+  import { sessionsStore } from '../lib/stores/sessions.svelte';
+  import { rates } from '../lib/stores/rates';
   import type { EventCorrelation, GitOutcome, GitOutcomeKind } from '../lib/types';
 
   let outcomes = $state<GitOutcome[]>([]);
   let busy = $state(false);
   let error = $state<string | null>(null);
+  let comparisonError = $state<string | null>(null);
   let correlations = $state<Record<string, EventCorrelation>>({});
   let postWindowHours = $state(24);
   const kinds: GitOutcomeKind[] = ['kept', 'reverted', 'abandoned', 'ambiguous', 'not_evaluated'];
   const correlationBatchSize = 2_000;
+  let generation = 0;
+
+  $effect(() => {
+    void sessionsStore.mutationLog.generation;
+    void historyStore.status;
+    void $rates;
+    void postWindowHours;
+    generation++;
+    correlations = {};
+    comparisonError = null;
+    error = null;
+    busy = false;
+    return () => { generation++; };
+  });
 
   async function scan() {
-    busy = true; error = null;
+    const request = ++generation;
+    const mutation = sessionsStore.mutationLog.generation;
+    const history = historyStore.status;
+    const rateCard = $rates;
+    const hours = postWindowHours;
+    const current = () => request === generation
+      && mutation === sessionsStore.mutationLog.generation
+      && history === historyStore.status && rateCard === $rates && hours === postWindowHours;
+    busy = true; error = null; comparisonError = null; correlations = {};
+    let comparing = false;
     try {
-      outcomes = await scanGitOutcomes(postWindowHours);
+      const scanned = await scanGitOutcomes(hours);
+      if (!current()) return;
+      outcomes = scanned;
       const sessionIds = new Set(outcomes.map((outcome) => outcome.session_id));
+      comparing = true;
       const events = (await listExternalEvents()).filter((event) => event.source === 'git' && sessionIds.has(event.metadata.session_id));
+      if (!current()) return;
       const results: EventCorrelation[] = [];
       for (let offset = 0; offset < events.length; offset += correlationBatchSize) {
         const batch = await correlateEvents({
@@ -25,12 +57,18 @@
           exclude_confounded: false,
           include_subagents: true,
         });
+        if (!current()) return;
         results.push(...batch.results);
       }
       correlations = Object.fromEntries(results.map((item) => [item.event.metadata.session_id, item]));
     }
-    catch (reason) { error = String(reason); }
-    finally { busy = false; }
+    catch (reason) {
+      if (!current()) return;
+      correlations = {};
+      if (comparing) comparisonError = accountingUnavailable(reason);
+      else error = String(reason);
+    }
+    finally { if (current()) busy = false; }
   }
 </script>
 
@@ -44,6 +82,7 @@
     <span class="text-[11px] text-ink-faint">HEAD-reachable commits · no remotes or worktree changes</span>
   </div>
   {#if error}<p class="text-xs text-neg mt-2">{error}</p>{/if}
+  {#if comparisonError}<p data-testid="accounting-git-outcomes-status" role="status" class="text-xs text-neg mt-2">{comparisonError}</p>{/if}
   {#if outcomes.length > 0}
     <div class="grid grid-cols-5 gap-2 mt-2">
       {#each kinds as kind}

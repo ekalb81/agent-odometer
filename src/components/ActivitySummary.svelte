@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { writeExport } from '../lib/ipc';
-  let { svg, markdown, onclose }: { svg: string; markdown: string; onclose: () => void } = $props();
+  import { publishActivitySummaryExport } from '../lib/ipc';
+  import { accountingUnavailable } from '../lib/accountingAvailability';
+  import type { ActivitySummaryExportRequest } from '../lib/types';
+  let { svg, markdown, request, onclose }: { svg: string; markdown: string; request: Omit<ActivitySummaryExportRequest, 'svg'>; onclose: () => void } = $props();
   let dialog: HTMLDialogElement;
   let saving = $state(false);
   let status = $state('');
@@ -10,9 +12,9 @@
   async function save(): Promise<void> {
     saving = true; status = '';
     try {
-      const saved = await writeExport('odometer-activity.svg', 'svg', svg);
+      const saved = await publishActivitySummaryExport({ ...request, svg }, 'odometer-activity.svg');
       if (alive) status = saved ? 'Saved the exact SVG preview to your selected file.' : 'Save canceled.';
-    } catch { if (alive) status = 'The summary could not be saved.'; }
+    } catch (reason) { if (alive) status = `The summary could not be saved. ${accountingUnavailable(reason)}`; }
     finally { if (alive) saving = false; }
   }
   async function copy(): Promise<void> {

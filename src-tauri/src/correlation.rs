@@ -269,7 +269,7 @@ type EventWindow = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 /// [`candidate_session_keys`] so both agree on exactly the same windows —
 /// the pre-filter would be unsound if it computed these independently and
 /// drifted even slightly from what the final pass uses.
-fn event_windows(query: &CorrelationQuery) -> Vec<(EventWindow, EventWindow)> {
+pub(crate) fn event_windows(query: &CorrelationQuery) -> Vec<(EventWindow, EventWindow)> {
     query
         .events
         .iter()
@@ -291,7 +291,7 @@ fn event_windows(query: &CorrelationQuery) -> Vec<(EventWindow, EventWindow)> {
 /// Computes each event's confounding-event ids and whether it is excluded,
 /// from the query's events and `exclude_confounded`. Shared for the same
 /// reason as [`event_windows`].
-fn event_exclusions(
+pub(crate) fn event_exclusions(
     query: &CorrelationQuery,
     windows: &[(EventWindow, EventWindow)],
 ) -> (Vec<Vec<String>>, Vec<bool>) {

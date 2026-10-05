@@ -40,8 +40,13 @@ pub use recovery::{HistoryFailure, HistoryFailureKind, RecoveryReceipt};
 #[path = "history_search.rs"]
 mod search;
 pub(crate) use search::RetainedSearchMessages;
+#[path = "history_integrity.rs"]
+mod integrity;
 #[path = "history_workflow.rs"]
 mod workflow;
+pub use integrity::AccountingIntegrityError;
+#[path = "history_accounting_export.rs"]
+pub mod accounting_export;
 
 #[path = "history_curated.rs"]
 pub mod curated;
@@ -399,6 +404,15 @@ impl HistoryStore {
     /// The borrowed SQLite blob is visited once and never copied into a Session.
     pub fn stream_category_snapshots(
         &self,
+        visit: impl FnMut(CategorySnapshot) -> Result<()>,
+    ) -> Result<()> {
+        self.stream_category_snapshots_in_range(None, None, visit)
+    }
+
+    pub(crate) fn stream_category_snapshots_in_range(
+        &self,
+        from: Option<chrono::DateTime<chrono::Utc>>,
+        to: Option<chrono::DateTime<chrono::Utc>>,
         mut visit: impl FnMut(CategorySnapshot) -> Result<()>,
     ) -> Result<()> {
         #[derive(serde::Deserialize)]
@@ -408,23 +422,54 @@ impl HistoryStore {
             #[serde(default)]
             category_totals: BTreeMap<crate::model::TaskCategory, crate::model::CategoryMetric>,
         }
-        let connection = self.open_reader()?;
-        self.check_session_count(&connection)?;
-        let mut statement = connection.prepare("SELECT d.session_key, s.session_json FROM durable_sessions d LEFT JOIN session_snapshots s ON s.session_key = d.session_key AND s.version = d.current_snapshot_version ORDER BY d.session_key")?;
-        let mut rows = statement.query([])?;
+        let (connection, control) = self.accounting_reader()?;
+        let all_keys = self.accounting_keys_on(&connection, &control)?;
+        self.bounded_snapshots_on(&connection, &all_keys)?;
+        let unclassifiable: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM durable_sessions d LEFT JOIN session_snapshots s
+             ON s.session_key=d.session_key AND s.version=d.current_snapshot_version
+             WHERE s.session_key IS NULL OR julianday(json_extract(s.session_json,'$.started_at')) IS NULL
+               OR julianday(json_extract(s.session_json,'$.last_event_at')) IS NULL)", [], |row| row.get(0),
+        ).map_err(|_| AccountingIntegrityError::Unverified)?;
+        if unclassifiable {
+            return Err(AccountingIntegrityError::Unverified.into());
+        }
+        let mut selected = connection.prepare(
+            "SELECT d.session_key FROM durable_sessions d JOIN session_snapshots s
+             ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+             WHERE (?1 IS NULL OR julianday(json_extract(s.session_json, '$.last_event_at')) >= julianday(?1))
+               AND (?2 IS NULL OR julianday(json_extract(s.session_json, '$.started_at')) <= julianday(?2))
+             ORDER BY d.session_key LIMIT ?3",
+        )?;
+        let keys: Vec<String> = selected
+            .query_map(
+                params![
+                    from.map(|v| v.to_rfc3339()),
+                    to.map(|v| v.to_rfc3339()),
+                    control.max_sessions.saturating_add(1) as i64
+                ],
+                |row| row.get(0),
+            )?
+            .collect_bounded(Some(&control))?;
+        drop(selected);
+        // Category totals are cumulative for each interval-overlapping session,
+        // rather than event-window deltas. Prove their entire accounting lifetime.
+        self.prove_accounting_on(&connection, &keys, &[(None, None)], &control)?;
+        self.prove_cumulative_on(&connection, &keys, &control)?;
+        let selected_json = serde_json::to_string(&keys)?;
+        let mut statement = connection.prepare("SELECT d.session_key, s.session_json FROM durable_sessions d LEFT JOIN session_snapshots s ON s.session_key = d.session_key AND s.version = d.current_snapshot_version WHERE d.session_key IN (SELECT value FROM json_each(?1)) ORDER BY d.session_key")?;
+        let mut rows = statement.query([selected_json.as_str()])?;
         while let Some(row) = rows.next()? {
-            self.check_query()?;
-            if let Some(control) = &self.query_control {
-                control.consume_row()?;
-            }
+            control.check()?;
+            control.consume_row()?;
             let session_key: String = row.get(0)?;
             let raw = row.get_ref(1)?.as_bytes()?;
-            if self.query_control.is_some() && raw.len() > 64 * 1024 * 1024 {
+            if raw.len() > 64 * 1024 * 1024 {
                 bail!("query snapshot size limit exceeded (64 MiB)");
             }
             let fields: Fields =
                 serde_json::from_slice(raw).context("invalid category snapshot")?;
-            self.check_query()?;
+            control.check()?;
             let harness = session_key
                 .split_once(':')
                 .and_then(|(provider, suffix)| (!suffix.is_empty()).then_some(provider))
@@ -512,8 +557,9 @@ impl HistoryStore {
         if matches!((from, to), (Some(from), Some(to)) if from > to) {
             bail!("query end precedes start");
         }
-        let connection = self.open_reader()?;
-        self.check_session_count(&connection)?;
+        let (connection, control) = self.accounting_reader()?;
+        let keys = self.accounting_keys_on(&connection, &control)?;
+        self.prove_accounting_on(&connection, &keys, &[(from, to)], &control)?;
         let plan = plan_window(
             from.map(|v| v.timestamp_millis()),
             to.map(|v| v.timestamp_millis()),
@@ -534,10 +580,8 @@ impl HistoryStore {
         ])?;
         let mut out: BTreeMap<String, RangeTotals> = BTreeMap::new();
         while let Some(row) = rows.next()? {
-            self.check_query()?;
-            if let Some(control) = &self.query_control {
-                control.consume_row()?;
-            }
+            control.check()?;
+            control.consume_row()?;
             let provider: String = row.get(0)?;
             let model: String = row.get(1)?;
             let tier: String = row.get(2)?;
@@ -1654,7 +1698,23 @@ impl HistoryStore {
         from_bucket: Option<i64>,
         to_bucket: Option<i64>,
     ) -> Result<Vec<HourlyActivity>> {
-        let connection = self.open_reader()?;
+        let (connection, control) = self.accounting_reader()?;
+        let keys = self.accounting_keys_on(&connection, &control)?;
+        let from = from_bucket.and_then(|b| {
+            chrono::Utc
+                .timestamp_millis_opt(b.saturating_mul(HOUR_MS))
+                .single()
+        });
+        let to = to_bucket.and_then(|b| {
+            chrono::Utc
+                .timestamp_millis_opt(
+                    b.saturating_add(1)
+                        .saturating_mul(HOUR_MS)
+                        .saturating_sub(1),
+                )
+                .single()
+        });
+        self.prove_accounting_on(&connection, &keys, &[(from, to)], &control)?;
         let mut statement = connection.prepare(
             "SELECT hour_bucket,
                     SUM(total_tokens),
@@ -1677,7 +1737,7 @@ impl HistoryStore {
                     sessions: row.get::<_, i64>(4)?.max(0) as u64,
                 })
             })?
-            .collect_bounded(self.query_control.as_ref())?;
+            .collect_bounded(Some(&control))?;
         Ok(rows)
     }
 
@@ -1736,6 +1796,27 @@ impl HistoryStore {
         to_ms: i64,
         control: &QueryControl,
     ) -> Result<bool> {
+        let connection = self.open_reader()?;
+        connection.busy_timeout(control.remaining().min(Duration::from_millis(50)))?;
+        let progress = control.clone();
+        connection.progress_handler(1000, Some(move || progress.check().is_err()))?;
+        self.has_ambiguous_accounting_identity_on(
+            &connection,
+            selected_keys,
+            from_ms,
+            to_ms,
+            control,
+        )
+    }
+
+    fn has_ambiguous_accounting_identity_on(
+        &self,
+        connection: &Connection,
+        selected_keys: &[String],
+        from_ms: i64,
+        to_ms: i64,
+        control: &QueryControl,
+    ) -> Result<bool> {
         control.check()?;
         if from_ms > to_ms {
             bail!("identity window end precedes start");
@@ -1750,9 +1831,6 @@ impl HistoryStore {
         if selected_json.len() > 8 * 1024 * 1024 {
             bail!("identity key proof size exceeded");
         }
-        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        configure_query_reader(&connection, Some(control))?;
-
         // The affected old ledgers can have a present source location routed
         // through an artifact still owned by the superseded session.
         let mut mismatches = connection.prepare(
@@ -1837,8 +1915,61 @@ impl HistoryStore {
         session_keys: &[String],
         windows: &[RangeWindow],
     ) -> Result<Vec<HashMap<String, RangeTotals>>> {
-        self.check_query()?;
-        if let Some(control) = &self.query_control {
+        self.range_totals_multi_for_scope(session_keys, session_keys, windows)
+    }
+
+    /// A delta may fetch fewer rows, but its proof covers every cached contributor.
+    pub(crate) fn range_totals_multi_for_scope(
+        &self,
+        session_keys: &[String],
+        aggregate_keys: &[String],
+        windows: &[RangeWindow],
+    ) -> Result<Vec<HashMap<String, RangeTotals>>> {
+        self.range_totals_multi_for_scope_impl(session_keys, aggregate_keys, windows, None, || {
+            Ok(())
+        })
+    }
+
+    pub(crate) fn range_totals_multi_with_control(
+        &self,
+        keys: &[String],
+        windows: &[RangeWindow],
+        control: &QueryControl,
+    ) -> Result<Vec<HashMap<String, RangeTotals>>> {
+        self.range_totals_multi_for_scope_impl(keys, keys, windows, Some(control), || Ok(()))
+    }
+
+    fn range_totals_multi_for_scope_impl(
+        &self,
+        session_keys: &[String],
+        aggregate_keys: &[String],
+        windows: &[RangeWindow],
+        provided: Option<&QueryControl>,
+        after_proof: impl FnOnce() -> Result<()>,
+    ) -> Result<Vec<HashMap<String, RangeTotals>>> {
+        let (connection, control) = self.accounting_reader_with_control(provided)?;
+        self.prove_accounting_on(&connection, aggregate_keys, windows, &control)?;
+        after_proof()?;
+        let scope: std::collections::HashSet<_> = aggregate_keys.iter().collect();
+        let fetched: std::collections::HashSet<_> = session_keys.iter().collect();
+        if fetched.len() != session_keys.len()
+            || session_keys.iter().any(|key| !scope.contains(key))
+        {
+            return Err(AccountingIntegrityError::Unverified.into());
+        }
+        self.range_totals_multi_on(&connection, &control, session_keys, windows)
+            .map_err(AccountingIntegrityError::from_query)
+    }
+
+    fn range_totals_multi_on(
+        &self,
+        connection: &Connection,
+        control: &QueryControl,
+        session_keys: &[String],
+        windows: &[RangeWindow],
+    ) -> Result<Vec<HashMap<String, RangeTotals>>> {
+        control.check()?;
+        {
             if session_keys.len() > control.max_sessions {
                 bail!("query session limit exceeded ({})", control.max_sessions);
             }
@@ -1858,7 +1989,6 @@ impl HistoryStore {
                 }
             }
         }
-        let connection = self.open_reader()?;
         let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); windows.len()];
 
         let window_ms: Vec<(Option<i64>, Option<i64>)> = windows
@@ -1953,7 +2083,7 @@ impl HistoryStore {
             .transpose()?;
 
         for key in session_keys {
-            self.check_query()?;
+            control.check()?;
             let bucket_params = interval_params(key, &full_bucket_ranges);
             let bucket_refs: Vec<&dyn rusqlite::ToSql> =
                 bucket_params.iter().map(|value| value.as_ref()).collect();
@@ -1976,7 +2106,7 @@ impl HistoryStore {
                         },
                     ))
                 })?
-                .collect_bounded(self.query_control.as_ref())?;
+                .collect_bounded(Some(control))?;
             let tool_rows: Vec<(i64, String, ToolMetrics)> = tool_rollup_query
                 .query_map(bucket_refs.as_slice(), |row| {
                     Ok((
@@ -2002,7 +2132,7 @@ impl HistoryStore {
                         },
                     ))
                 })?
-                .collect_bounded(self.query_control.as_ref())?;
+                .collect_bounded(Some(control))?;
             let chain_rows: Vec<(i64, String, String, String, u64)> = chain_rollup_query
                 .query_map(bucket_refs.as_slice(), |row| {
                     Ok((
@@ -2013,7 +2143,7 @@ impl HistoryStore {
                         row.get::<_, i64>(4)? as u64,
                     ))
                 })?
-                .collect_bounded(self.query_control.as_ref())?;
+                .collect_bounded(Some(control))?;
             let dimension_rows: Vec<(i64, String, String, ToolDimensionMetrics)> =
                 dimension_rollup_query
                     .query_map(bucket_refs.as_slice(), |row| {
@@ -2030,7 +2160,7 @@ impl HistoryStore {
                             },
                         ))
                     })?
-                    .collect_bounded(self.query_control.as_ref())?;
+                    .collect_bounded(Some(control))?;
             let edge_params = |key: &str| interval_params(key, &edge_ranges);
             let edge_tokens: Vec<TokenHistoryPoint> = match token_edge_query.as_mut() {
                 Some(query) => {
@@ -2060,7 +2190,7 @@ impl HistoryStore {
                                 },
                             })
                         })?
-                        .collect_bounded(self.query_control.as_ref())?
+                        .collect_bounded(Some(control))?
                 }
                 None => Vec::new(),
             };
@@ -2107,7 +2237,7 @@ impl HistoryStore {
                                 output_bytes: row.get::<_, i64>(7)? as u64,
                             })
                         })?
-                        .collect_bounded(self.query_control.as_ref())?
+                        .collect_bounded(Some(control))?
                 }
                 None => Vec::new(),
             };
@@ -2129,7 +2259,7 @@ impl HistoryStore {
                                     .map(|value| value as u64),
                             })
                         })?
-                        .collect_bounded(self.query_control.as_ref())?
+                        .collect_bounded(Some(control))?
                 }
                 None => Vec::new(),
             };
@@ -2145,7 +2275,7 @@ impl HistoryStore {
                         ..OptimizationFinding::default()
                     })
                 })?
-                .collect_bounded(self.query_control.as_ref())?;
+                .collect_bounded(Some(control))?;
 
             for (window_index, ((from_ms, to_ms), plan)) in window_ms.iter().zip(&plans).enumerate()
             {
@@ -6395,22 +6525,26 @@ mod tests {
         let mut control = QueryControl::default();
         control.max_windows = 1;
         let reader = HistoryStore::open_read_only(&path, control).unwrap();
-        assert!(reader
-            .range_totals_multi(
-                std::slice::from_ref(&stored.key),
-                &[(None, None), (None, None)]
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("window limit"));
+        assert_eq!(
+            reader
+                .range_totals_multi(
+                    std::slice::from_ref(&stored.key),
+                    &[(None, None), (None, None)]
+                )
+                .unwrap_err()
+                .downcast_ref::<AccountingIntegrityError>(),
+            Some(&AccountingIntegrityError::Unverified)
+        );
         let mut control = QueryControl::default();
         control.max_rows = 4;
         let reader = HistoryStore::open_read_only(&path, control).unwrap();
-        assert!(reader
-            .range_totals_multi(&[stored.key], &[(None, None)])
-            .unwrap_err()
-            .to_string()
-            .contains("row limit"));
+        assert_eq!(
+            reader
+                .range_totals_multi(&[stored.key], &[(None, None)])
+                .unwrap_err()
+                .downcast_ref::<AccountingIntegrityError>(),
+            Some(&AccountingIntegrityError::Unverified)
+        );
     }
 
     #[test]
@@ -6789,6 +6923,8 @@ mod tests {
         let warm_max = warm.iter().max().unwrap();
         eprintln!("synthetic statusline: sessions={SESSIONS}, historical_token_rows={}, queried_hours=4, cold_connection={cold:?}, warm_mean={warm_mean:?}, warm_max={warm_max:?}, deadline=250ms, snapshot_parses=0", SESSIONS * HOURS);
     }
+
+    include!("history_integrity_tests.rs");
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         value.parse().unwrap()

@@ -2,6 +2,8 @@
 // Loaded only when import.meta.env.DEV is set and Tauri isn't present — see
 // main.ts. Production builds tree-shake this module away entirely.
 
+import { exportRows, projectSessions, rowsToCsv } from './lib/sessionProjection';
+import type { SessionSummaryExportRequest, PreparedSessionSummaryExport } from './lib/types';
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
 import { mockOrganization } from './dev-mock/organization';
@@ -565,11 +567,26 @@ mockIPC((cmd, payload) => {
         generated_at: new Date(now).toISOString(), rows, excluded_count: 2, scanned_rows: 5, truncated: false,
       } satisfies SpeedReport;
     }
+    case 'prepare_session_summary_export': {
+      // Browser-only presentation fixture. Real identity proof/publication requires Rust.
+      const { request } = payload as { request: SessionSummaryExportRequest };
+      const byId = new Map(visibleFixtures().map(f => [summary(f).storage_id, f]));
+      const fixtures = request.session_ids.map(id => { const fixture = byId.get(id); if (!fixture) throw new Error('accounting_identity_unverified'); return fixture; });
+      const sessions = fixtures.map(summary);
+      const prices = Object.fromEntries(fixtures.map(f => [summary(f).storage_id, { ...mockSummaryPricing(pricingKey(f)), tokens: summary(f).tokens_total, category_totals: summary(f).category_totals ?? {} }]));
+      const ranges = rangeTotals(request.from, request.to, request.session_ids);
+      const rows = exportRows(projectSessions(sessions, currentRates(), ranges, !!(request.from || request.to), prices, true).values(), request.include_working_directory);
+      return { request, as_of: new Date(now).toISOString(), digest: 'browser-fixture-only', content: request.format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows), session_count: sessions.length } satisfies PreparedSessionSummaryExport;
+    }
+    case 'publish_session_summary_export':
+    case 'publish_activity_summary_export':
+    case 'publish_tool_dimension_export':
+      return true; // Synthetic browser fixture performs no file publication.
     case 'get_session_pricing': {
       const { sessionIds } = payload as { sessionIds: string[] };
       const ids = new Set(sessionIds);
       return Object.fromEntries(visibleFixtures().filter(f => ids.has(summary(f).storage_id))
-        .map(f => [summary(f).storage_id, mockSummaryPricing(pricingKey(f))]));
+        .map(f => [summary(f).storage_id, { ...mockSummaryPricing(pricingKey(f)), tokens: summary(f).tokens_total, category_totals: summary(f).category_totals }]));
     }
     case 'get_transcript_page': {
       const page = transcriptFixture((payload as { request: TranscriptRequest }).request);

@@ -141,7 +141,7 @@ describe('App tray pricing refresh', () => {
     await flush();
     expect(sessionsStore.mutationLog.generation).toBe(generation);
     expect(mocks.ranges).toHaveBeenCalledTimes(2);
-    for (const call of mocks.ranges.mock.calls) expect(call).toHaveLength(1);
+    for (const call of mocks.ranges.mock.calls) { expect(call[1]).toEqual(['synthetic']); expect(call[2]).toEqual(['synthetic']); }
     expect(mocks.compute.mock.lastCall?.[2]).toBe(replacement);
   });
 
@@ -157,7 +157,7 @@ describe('App tray pricing refresh', () => {
     await flush();
     expect(apply).toHaveBeenCalledTimes(1);
     expect(apply.mock.calls[0][2]).toBe(newResult);
-    expect(mocks.tray).toHaveBeenCalledTimes(1);
+    expect(mocks.tray.mock.calls.filter(([value]) => value.tokens !== 'verifying')).toHaveLength(1);
     expect(mocks.compute.mock.lastCall?.[1]).toBe(newResult[0]);
     expect(mocks.compute.mock.lastCall?.[2]).toBe(replacement);
   });
@@ -170,12 +170,12 @@ describe('App tray pricing refresh', () => {
     expect(mocks.quota).toHaveBeenCalledTimes(1);
     rates.set(replacement);
     await flush();
-    expect(mocks.tray).toHaveBeenCalledTimes(1);
+    expect(mocks.tray.mock.calls.filter(([value]) => value.tokens !== 'verifying')).toHaveLength(1);
     expect(mocks.compute.mock.lastCall?.[1]).toEqual({ synthetic: { pricing: undefined } });
     if (outcome === 'resolve') pending.resolve([]);
     else pending.reject(new Error('synthetic stale quota failure'));
     await flush();
-    expect(mocks.tray).toHaveBeenCalledTimes(2);
+    expect(mocks.tray.mock.calls.filter(([value]) => value.tokens !== 'verifying')).toHaveLength(2);
     expect(mocks.compute.mock.lastCall?.[1]).toBe(newResult[0]);
     expect(mocks.compute.mock.lastCall?.[2]).toBe(replacement);
     expect(mocks.ranges).toHaveBeenCalledTimes(2);
@@ -193,7 +193,29 @@ describe('App tray pricing refresh', () => {
     pending.reject(new Error('synthetic stale range failure'));
     await flush();
     expect(invalidate).toHaveBeenCalledTimes(invalidations);
-    expect(mocks.tray).toHaveBeenCalledTimes(1);
+    expect(mocks.tray.mock.calls.filter(([value]) => value.tokens !== 'verifying')).toHaveLength(1);
     expect(mocks.compute.mock.lastCall?.[2]).toBe(replacement);
   });
+  it('withholds cached raw totals on a combined rate and accounting mutation', async () => {
+    render(App); await flush();
+    mocks.compute.mockClear(); mocks.tray.mockClear();
+    const pending = deferred<Record<string, RangeTotals>[]>();
+    mocks.ranges.mockImplementationOnce(() => pending.promise);
+    sessionsStore.applyMutations([{ ...sessionsStore.map.get('synthetic')!, thread_name: 'Updated synthetic' }], []);
+    rates.set(replacement);
+    await flush();
+    expect(mocks.compute).not.toHaveBeenCalled();
+    expect(mocks.tray.mock.lastCall?.[0]).toMatchObject({ tokens: 'verifying' });
+    pending.resolve(newResult); await flush();
+    expect(mocks.compute).toHaveBeenCalledTimes(1);
+  });
+  it('revalidates a full cached scope when the fetch subset is empty', async () => {
+    render(App); await flush();
+    mocks.ranges.mockClear();
+    sessionsStore.remove('outside-scope'); await flush();
+    await vi.advanceTimersByTimeAsync(250); await flush();
+    expect(mocks.ranges.mock.lastCall?.[1]).toEqual([]);
+    expect(mocks.ranges.mock.lastCall?.[2]).toEqual(['synthetic']);
+  });
+
 });

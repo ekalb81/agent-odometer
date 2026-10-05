@@ -22,6 +22,7 @@ export function formatStartedLocal(
 /** Zero is the aggregate wire representation for a category that may be
  * measured as zero, omitted, or not applicable. Keep that ambiguity visible. */
 export function formatTokenCategory(value: number, locales?: Intl.LocalesArgument): string {
+  if (!Number.isFinite(value)) return 'unavailable';
   return value === 0 ? '—' : new Intl.NumberFormat(locales).format(value);
 }
 
@@ -30,6 +31,7 @@ export function formatTokenCategory(value: number, locales?: Intl.LocalesArgumen
  * which at the grid's fixed column width ran into the neighbouring cell; the
  * exact value stays available in a title attribute. */
 export function formatTokenTotal(value: number, locales?: Intl.LocalesArgument): string {
+  if (!Number.isFinite(value)) return 'unavailable';
   if (value === 0) return '—';
   if (Math.abs(value) < 1_000_000_000) return new Intl.NumberFormat(locales).format(value);
   return new Intl.NumberFormat(locales, {

@@ -1,3 +1,4 @@
+import { hasVerifiedTokens, unavailableTokens } from './accountingAvailability';
 import {
   harnessCurrency,
 } from './currency';
@@ -54,6 +55,7 @@ const projectionCache = new WeakMap<SessionSummary, {
   range: RangeTotals | undefined;
   dateScoped: boolean;
   pricing: RangePricing | undefined;
+  tokens: TokenTotals;
   value: SessionProjection;
 }>();
 
@@ -214,12 +216,12 @@ export function projectSession<T extends SessionSummary>(
   range: RangeTotals | undefined,
   dateScoped: boolean,
   pricing: RangePricing | undefined = dateScoped ? range?.pricing : undefined,
+  tokens: TokenTotals = dateScoped ? (range?.tokens ?? zeroTotals()) : session.tokens_total,
 ): SessionProjection<T> {
   const cached = projectionCache.get(session);
-  if (cached && cached.rates === rates && cached.range === range && cached.dateScoped === dateScoped && cached.pricing === pricing) {
+  if (cached && cached.rates === rates && cached.range === range && cached.dateScoped === dateScoped && cached.pricing === pricing && cached.tokens === tokens) {
     return cached.value as SessionProjection<T>;
   }
-  const tokens = dateScoped ? (range?.tokens ?? zeroTotals()) : session.tokens_total;
   if (!rates || !pricing) {
     const value: SessionProjection<T> = {
       session,
@@ -241,7 +243,7 @@ export function projectSession<T extends SessionSummary>(
       rateCardVersion: null,
       rateCardFetchedAt: null,
     };
-    projectionCache.set(session, { rates, range, dateScoped, pricing, value });
+    projectionCache.set(session, { rates, range, dateScoped, pricing, tokens, value });
     return value;
   }
 
@@ -275,7 +277,7 @@ export function projectSession<T extends SessionSummary>(
     rateCardVersion: rates.version,
     rateCardFetchedAt: rates.fetched_at,
   };
-  projectionCache.set(session, { rates, range, dateScoped, pricing, value });
+  projectionCache.set(session, { rates, range, dateScoped, pricing, tokens, value });
   return value;
 }
 
@@ -286,12 +288,19 @@ export function projectSessions<T extends SessionSummary>(
   dateScoped: boolean,
   summaries: Record<string, SummaryPricing> = {},
   ready = false,
+  accountingReady = ready,
 ): Map<string, SessionProjection<T>> {
   const result = new Map<string, SessionProjection<T>>();
   for (const session of sessions) {
-    result.set(session.storage_id, projectSession(session, rates, ranges[session.storage_id], dateScoped, dateScoped
-      ? (ranges[session.storage_id]?.pricing ?? (ready && !ranges[session.storage_id] ? emptyPricing(session.harness, rates) : undefined))
-      : summaries[session.storage_id]?.pricing));
+    const tokens = accountingReady ? dateScoped
+      ? (ranges[session.storage_id]?.tokens ?? zeroTotals())
+      : summaries[session.storage_id]?.tokens : undefined;
+    const verified = hasVerifiedTokens(tokens);
+    const pricing = ready && verified ? dateScoped
+      ? (ranges[session.storage_id]?.pricing ?? (!ranges[session.storage_id] ? emptyPricing(session.harness, rates) : undefined))
+      : summaries[session.storage_id]?.pricing : undefined;
+    result.set(session.storage_id, projectSession(session, rates, ranges[session.storage_id], dateScoped,
+      pricing, verified ? tokens : unavailableTokens()));
   }
   return result;
 }
@@ -482,8 +491,8 @@ export function rowsToCsv(rows: Record<string, string | number | boolean | null>
  */
 export function dimensionExportRows(
   totals: DimensionTotals,
-): Record<string, string | number | boolean | null>[] {
-  const rows: Record<string, string | number | boolean | null>[] = [];
+): import('./types').ToolDimensionExportRow[] {
+  const rows: import('./types').ToolDimensionExportRow[] = [];
   for (const kind of Object.keys(totals).sort()) {
     const values = totals[kind as keyof DimensionTotals];
     if (!values) continue;

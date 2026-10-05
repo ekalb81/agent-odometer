@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { accountingUnavailable } from '../lib/accountingAvailability';
+  import { historyStore } from '../lib/stores/history.svelte';
   import { correlateEvents } from '../lib/ipc';
   import { formatCredits, harnessCurrency } from '../lib/currency';
   import {
@@ -19,44 +21,46 @@
   let requestGeneration = 0;
   let error = $state<string | null>(null);
   let boundaryRefresh = $state(0);
-  let lastPricingRates: typeof $rates = null;
   let displayEvents = $derived(events.slice(-50).reverse());
   let revertLabels = $derived.by(() => rapidRevertLabels(events.slice(-50)));
 
   $effect(() => {
     const generation = ++requestGeneration;
     const source = events;
-    // Correlations depend on the current session corpus as well as the event
-    // list. Store mutations replace this Map, providing a bounded refresh key.
-    void sessionsStore.map;
-    void boundaryRefresh;
-    // Server pricing belongs to the saved card, even when token observations
-    // and the event list have not changed. Discard stale prices while loading.
+    const mutation = sessionsStore.mutationLog.generation;
+    const boundary = boundaryRefresh;
     const rateCard = $rates;
-    if (rateCard !== lastPricingRates) correlations = [];
-    lastPricingRates = rateCard;
+    const history = historyStore.status;
+    // Event descriptions remain inspectable; numeric correlations require a
+    // fresh proof whenever their data, window, history or pricing changes.
+    correlations = [];
+    error = null;
+    const current = () => active && generation === requestGeneration
+      && source === events && mutation === sessionsStore.mutationLog.generation
+      && boundary === boundaryRefresh && rateCard === $rates
+      && history === historyStore.status;
     if (!active) {
       loading = false;
       return;
     }
     loading = true;
-    error = null;
     let boundaryTimer: ReturnType<typeof setTimeout> | null = null;
     const requestTimer = setTimeout(() => {
+      if (!current()) return;
       const recent = source.slice(-50).reverse();
       (recent.length > 0 ? correlateEvents({ events: recent, before_days: 7, after_days: 7, exclude_confounded: false, include_subagents: true }) : Promise.resolve({ results: [] }))
         .then((result) => {
-          if (!active || generation !== requestGeneration) return;
+          if (!current()) return;
           correlations = result.results;
           const delay = nextCorrelationBoundaryDelay(result.results);
           if (delay !== null) {
             boundaryTimer = setTimeout(() => {
-              if (active && generation === requestGeneration) boundaryRefresh += 1;
+              if (current()) boundaryRefresh += 1;
             }, delay);
           }
         })
-        .catch((reason) => { if (generation === requestGeneration) error = String(reason); })
-        .finally(() => { if (generation === requestGeneration) loading = false; });
+        .catch((reason) => { if (current()) { correlations = []; error = accountingUnavailable(reason); } })
+        .finally(() => { if (current()) loading = false; });
     }, 250);
     return () => {
       if (generation === requestGeneration) requestGeneration += 1;
@@ -98,7 +102,7 @@
   <details class="bg-card border border-edge rounded-lg px-3 py-2">
     <summary class="cursor-pointer text-xs font-semibold text-ink">{title} · {events.length} recent changes</summary>
     {#if loading}<p class="text-xs text-ink-faint py-2">Loading local change history…</p>{/if}
-    {#if error}<p class="text-xs text-neg py-2">{error}</p>{/if}
+    {#if error}<p data-testid="accounting-correlation-status" role="status" class="text-xs text-neg py-2">{error}</p>{/if}
     <div class="mt-2 max-h-56 overflow-y-auto space-y-1.5">
       {#each displayEvents as event (event.id)}
         {@const correlation = correlations.find((item) => item.event.id === event.id)}
