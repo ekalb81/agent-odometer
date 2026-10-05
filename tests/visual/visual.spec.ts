@@ -1006,6 +1006,33 @@ visualPanelTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and com
   return panel;
 });
 
+visualPanelTest('workflow-action-preview-narrow', 'workflow remediation stays a reviewed dry run at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { view: 'codex' });
+  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  const panel = page.getByTestId('workflow-panel').filter({ visible: true });
+  await panel.locator('summary').first().click();
+  await expect(panel.getByText('Tool failure rate')).toBeVisible();
+  await panel.getByRole('button', { name: 'Record measurement' }).click();
+  await panel.getByRole('button', { name: 'Preview future action' }).click();
+  await expect(panel.getByText('Dry run only', { exact: false })).toBeVisible();
+  await expect(panel.getByText(/Apply and undo are unavailable/)).toBeVisible();
+  return panel;
+});
+
+visualPanelTest('quota-guard-preview-narrow', 'quota guard stays a reviewed dry run at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { view: 'codex' });
+  const panel = await openQuotaPanel(page, 'quota-budgets-panel');
+  await panel.getByRole('button', { name: 'Add budget' }).click();
+  await panel.getByRole('button', { name: 'Save budget' }).click();
+  await panel.getByRole('button', { name: 'Preview future guard' }).click();
+  await expect(panel.getByText('Dry run only', { exact: false })).toBeVisible();
+  await expect(panel.getByText(/Apply and undo are unavailable/)).toBeVisible();
+  await panel.evaluate((element) => element.classList.add('bg-card'));
+  return panel;
+});
+
 async function prepareOfflinePreview(page: Page): Promise<Locator> {
   const dataset=await prepareCuratedPreview(page);
   await dataset.getByRole('checkbox',{name:/I reviewed every included section/}).check();

@@ -76,6 +76,8 @@
     "execution-board-narrow-coverage",
     "workflow-measurement-desktop",
     "workflow-lifecycle-narrow",
+    "workflow-action-preview-narrow",
+    "quota-guard-preview-narrow",
     "curated-example-preview",
     "curated-example-removal-narrow",
     "offline-comparison-freeze-preview",

@@ -119,6 +119,33 @@ pub async fn get_workflow_report(
     workflow_report(state, request, false).await
 }
 
+/// Read-only proposal. No action executor, hook, or undo command is registered.
+#[tauri::command]
+pub async fn preview_controlled_action(
+    state: State<'_, Arc<AppState>>,
+    request: crate::action_contract::PreviewRequest,
+) -> Result<crate::action_contract::ActionPreview, String> {
+    crate::action_contract::validate_version(request.contract_version).map_err(str::to_owned)?;
+    match request.action {
+        crate::action_contract::ActionDraft::BudgetGuard(draft) => {
+            tauri::async_runtime::spawn_blocking(move || {
+                let store = crate::quota_store::QuotaStoreFile::load_checked().map_err(|_| {
+                    "Action source is unavailable; refresh before previewing.".to_owned()
+                })?;
+                crate::action_contract::preview_budget_guard(&draft, &store).map_err(str::to_owned)
+            })
+            .await
+            .map_err(|_| "Action preview could not finish.".to_owned())?
+        }
+        crate::action_contract::ActionDraft::WorkflowRemediation(draft) => {
+            let scope = draft.scope.clone().into();
+            let report = get_workflow_report(state, scope).await?;
+            crate::action_contract::preview_workflow_remediation(&draft, &report.findings)
+                .map_err(str::to_owned)
+        }
+    }
+}
+
 /// Explicit local observation metadata write; no configurations or accounting are changed.
 #[tauri::command]
 pub async fn record_workflow_measurement(

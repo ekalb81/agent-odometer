@@ -9,7 +9,7 @@ import type { TranscriptPage, TranscriptRequest, ExecutionPage } from './types';
 import type { TranscriptSearchRequest, TranscriptSearchPage, TranscriptSearchTarget, RetainedSearchLanding } from './types';
 import type { IntegrationClient, IntegrationScope, IntegrationChange, IntegrationCenterReport, IntegrationPreview, IntegrationApplyResult, IntegrationVerifyReport } from './types';
 import type { SpeedQuery, SpeedReport } from './types';
-import type { WorkflowReport, WorkflowRequest, FindingSuppressionEdit } from './types';
+import type { WorkflowReport, WorkflowRequest, FindingSuppressionEdit, ControlledActionDraft, ControlledActionPreview } from './types';
 import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, HistoryRebuildStatus, Config, RateCard, ExternalEvent, CorrelationQuery, CorrelationResult, GitOutcome, PerformanceStatus, PerformanceLiveStatus, ToolImpactResult, ToolImpactTarget, ToolImpactTargetKind, InstructionInventory, InstructionScanProgress, InstructionContent, ProviderDescriptor, TurnReceiptIntegrationStatus, DefenderExclusionReceipt, SubscriptionUsageEntry, WorkingDirectoryInfo, DiagnosticsReport, ProjectInfo, QuotaSnapshot, QuotaConfigWire, QuotaAlert, QuotaBudgetCheck } from './types';
 
 // ---------------------------------------------------------------------------
@@ -35,6 +35,12 @@ export function recordWorkflowMeasurement(request: WorkflowRequest): Promise<Wor
 }
 export function setWorkflowFindingSuppression(edit: FindingSuppressionEdit): Promise<void> {
   return invoke('set_workflow_finding_suppression', { edit });
+}
+/** Read-only proposal; no apply or undo action is exposed. */
+export function previewControlledAction(action: ControlledActionDraft): Promise<ControlledActionPreview> {
+  return invoke<ControlledActionPreview>('preview_controlled_action', {
+    request: { contract_version: 1, action },
+  });
 }
 
 /** Explicit private desktop reads; never called by export or MCP flows. */

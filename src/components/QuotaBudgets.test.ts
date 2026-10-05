@@ -7,14 +7,15 @@ import { historyStore } from '../lib/stores/history.svelte';
 import { rates } from '../lib/stores/rates';
 import type { ProjectInfo, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire, RateCard } from '../lib/types';
 
-const { checkQuotaBudgets, getQuotaConfig, resolveProjects, setQuotaConfig } = vi.hoisted(() => ({
+const { checkQuotaBudgets, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig } = vi.hoisted(() => ({
   checkQuotaBudgets: vi.fn(),
   getQuotaConfig: vi.fn(),
+  previewControlledAction: vi.fn(),
   resolveProjects: vi.fn(),
   setQuotaConfig: vi.fn(),
 }));
 
-vi.mock('../lib/ipc', () => ({ checkQuotaBudgets, getQuotaConfig, resolveProjects, setQuotaConfig }));
+vi.mock('../lib/ipc', () => ({ checkQuotaBudgets, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig }));
 vi.mock('../lib/stores/providers.svelte', () => ({
   providersStore: {
     descriptors: [
@@ -61,9 +62,50 @@ describe('QuotaBudgets', () => {
       persistedConfig = { ...next, revision: 'revision-2' };
       return persistedConfig;
     });
+    previewControlledAction.mockReset().mockResolvedValue({ target_type: 'provider_guard_configuration',
+      proposed_change: 'Future reviewed guard', backup_requirement: 'Exact backup required',
+      postcondition_requirement: 'Read-back required', apply_available: false, undo_available: false });
   });
 
   afterEach(() => vi.useRealTimers());
+
+  it('previews an existing advisory budget without applying or undoing a guard', async () => {
+    const user = userEvent.setup();
+    render(QuotaBudgets);
+    await screen.findByText('Soft budgets & alerts');
+    await user.click(screen.getByText('Soft budgets & alerts'));
+    await user.click(screen.getByRole('button', { name: 'Preview future guard' }));
+    await screen.findByText('Future reviewed guard');
+    expect(previewControlledAction).toHaveBeenCalledWith({ kind: 'budget_guard', draft: {
+      budget_id: 'claude-week', expected_config_revision: 'revision-1',
+    } });
+    expect(screen.getByText(/Apply and undo are unavailable/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Apply|^Undo/ })).toBeNull();
+    expect(setQuotaConfig).not.toHaveBeenCalled();
+  });
+
+  it('keeps the latest dry-run result when an older preview returns late', async () => {
+    const user = userEvent.setup();
+    const first = deferred<{ target_type: string; proposed_change: string; backup_requirement: string;
+      postcondition_requirement: string; apply_available: false; undo_available: false }>();
+    previewControlledAction.mockReset()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce({ target_type: 'provider_guard_configuration',
+        proposed_change: 'Latest reviewed guard', backup_requirement: 'Exact backup required',
+        postcondition_requirement: 'Read-back required', apply_available: false, undo_available: false });
+    render(QuotaBudgets);
+    await user.click(await screen.findByText('Soft budgets & alerts'));
+    const button = screen.getByRole('button', { name: 'Preview future guard' });
+    await user.click(button);
+    await user.click(button);
+    await screen.findByText('Latest reviewed guard');
+    first.resolve({ target_type: 'provider_guard_configuration', proposed_change: 'Old guard',
+      backup_requirement: 'Exact backup required', postcondition_requirement: 'Read-back required',
+      apply_available: false, undo_available: false });
+    await tick();
+    expect(screen.getByText('Latest reviewed guard')).toBeInTheDocument();
+    expect(screen.queryByText('Old guard')).not.toBeInTheDocument();
+  });
 
   it.each(['history', 'rates'] as const)('invalidates displayed budget values on %s changes and rejects late prior results', async (source) => {
     const row = (value: number) => report([{ budget_id: existingBudget.id, current_value: value, unavailable: null }]);

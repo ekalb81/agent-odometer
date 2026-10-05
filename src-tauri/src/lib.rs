@@ -5,6 +5,8 @@
 #[unsafe(link_section = ".drectve")]
 static TEST_COMMON_CONTROLS: [u8; 168] = *b" \"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\" ";
 
+pub mod action_contract;
+mod action_executor;
 pub mod attention;
 pub mod claude_parser;
 pub mod commands;
@@ -76,9 +78,9 @@ use commands::{
     get_workflow_report, identify_quota_account, list_external_events, list_instruction_files,
     list_organization_tags, list_providers, list_saved_searches, list_sessions,
     list_tool_impact_targets, merge_projects, open_instruction_file,
-    open_integration_configuration, open_task_in_chatgpt, preview_history_purge,
-    preview_integration_change, purge_retained_history, read_instruction_file,
-    reassign_session_project, rebuild_history, record_frontend_performance,
+    open_integration_configuration, open_task_in_chatgpt, preview_controlled_action,
+    preview_history_purge, preview_integration_change, purge_retained_history,
+    read_instruction_file, reassign_session_project, rebuild_history, record_frontend_performance,
     record_workflow_measurement, recover_history, repair_turn_receipt_integrations,
     resolve_projects, resolve_retained_search_target, resolve_working_directories,
     retry_history_open, reveal_in_file_manager, save_search, scan_git_outcomes,
@@ -193,6 +195,7 @@ pub fn run() {
             write_export,
             list_external_events,
             get_workflow_report,
+            preview_controlled_action,
             record_workflow_measurement,
             set_workflow_finding_suppression,
             list_instruction_files,

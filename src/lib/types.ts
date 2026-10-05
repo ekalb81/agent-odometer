@@ -1593,6 +1593,24 @@ export interface WorkflowReport {
   } | null;
   limitations: string[];
 }
+export type ControlledActionDraft =
+  | { kind: 'budget_guard'; draft: { budget_id: string; expected_config_revision: string } }
+  | { kind: 'workflow_remediation'; draft: { scope: WorkflowRequest; finding_id: string;
+      expected_finding_revision: number } };
+export interface ControlledActionPreview {
+  contract_version: number;
+  kind: 'budget_guard' | 'workflow_remediation';
+  target_type: string;
+  redacted_target: string;
+  source_revision: string;
+  preconditions: { code: string; satisfied: boolean }[];
+  proposed_change: string;
+  backup_requirement: string;
+  postcondition_requirement: string;
+  apply_available: false;
+  undo_available: false;
+  unavailable_reason: 'writes_disabled_pending_security_review';
+}
 /** Private desktop organization; never part of SessionSummary or exports. */
 export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
 export interface RecordBookmark { identity: AnnotationIdentity; revision: number; bookmarked: boolean }
