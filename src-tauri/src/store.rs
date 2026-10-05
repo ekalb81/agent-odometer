@@ -1621,7 +1621,11 @@ impl AppState {
     /// still a streaming change, not a semantic one — `state.sessions` and
     /// `ledger_stale` end up populated exactly as before.
     pub fn hydrate_history(&self) -> crate::history_store::HydrationStats {
-        self.hydrate_history_inner(false)
+        // Match watcher/reopen lock order: publication precedes the ledger
+        // writer. Keep the streamed snapshot and its publication together so
+        // an older hydration row cannot replace a newer update or removal.
+        let _publication = self.history_publication.lock().unwrap();
+        self.hydrate_history_inner(true)
     }
 
     fn hydrate_history_inner(
@@ -2394,6 +2398,102 @@ mod tests {
             quota_evaluation: Mutex::new(()),
             quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
+    }
+
+    #[test]
+    fn warm_hydration_serializes_with_live_updates_and_source_removal() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let history =
+            Arc::new(HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap());
+        let path = directory.path().join("live.jsonl");
+        let removed_path = directory.path().join("removed.jsonl");
+        let original = session("warm-live", 1);
+        let removed = session("warm-removed", 1);
+        let key = history.observe(&path, &original, 1).unwrap().key;
+        let removed_key = history.observe(&removed_path, &removed, 1).unwrap().key;
+        let state = Arc::new(state());
+        state.set_history_ready(Some(history.clone()));
+
+        let (publication_tx, publication_rx) = mpsc::channel();
+        let (write_tx, write_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer_state = state.clone();
+        let writer_history = history.clone();
+        let writer = std::thread::spawn(move || {
+            // The watcher reconciles a live parse while holding publication.
+            // Pause immediately before its durable write so warm hydration
+            // contends with exactly that publication -> writer lock order.
+            let _publication = writer_state.history_publication.lock().unwrap();
+            publication_tx.send(()).unwrap();
+            write_rx.recv().unwrap();
+            let mut latest = original;
+            latest.total_turns = 9;
+            latest.last_event_at += chrono::Duration::seconds(1);
+            let reconciled = writer_state.reconcile_session_at_generation(&path, latest, 1, false);
+            writer_state.apply_loaded_session_inner(
+                writer_history
+                    .load_one(&reconciled.session.storage_id)
+                    .unwrap(),
+            );
+            let missing = writer_history
+                .mark_path_missing(&removed_path)
+                .unwrap()
+                .unwrap();
+            writer_state.apply_loaded_session_inner(missing);
+            finished_tx.send(()).unwrap();
+        });
+        publication_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (hydrated_tx, hydrated_rx) = mpsc::channel();
+        let hydration_state = state.clone();
+        let hydration = std::thread::spawn(move || {
+            // Keep the isolated database alive if the bounded deadlock check
+            // fails; detached blocked workers must not touch a removed file.
+            started_tx.send(()).unwrap();
+            hydrated_tx.send(hydration_state.hydrate_history()).unwrap();
+            directory
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(hydrated_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_err());
+        write_tx.send(()).unwrap();
+        finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("warm hydration must not hold the writer while waiting for publication");
+        assert_eq!(
+            hydrated_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .sessions,
+            2
+        );
+        writer.join().unwrap();
+        let _directory = hydration.join().unwrap();
+
+        assert_eq!(history.load_one(&key).unwrap().session.total_turns, 9);
+        assert_eq!(state.sessions.get(&key).unwrap().summary.total_turns, 9);
+        assert_eq!(
+            history
+                .load_one(&removed_key)
+                .unwrap()
+                .session
+                .source_availability,
+            SourceAvailability::Missing
+        );
+        assert_eq!(
+            state
+                .sessions
+                .get(&removed_key)
+                .unwrap()
+                .summary
+                .source_availability,
+            SourceAvailability::Missing
+        );
     }
 
     #[test]
