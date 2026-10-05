@@ -1,5 +1,7 @@
 {
   "snapshots": [
+    "ambient-shared-policy",
+    "ambient-recent-narrow",
     "provider-status-opt-in",
     "provider-status-narrow",
     "attention-observations",
@@ -81,6 +83,7 @@
     "curated-example-preview",
     "curated-example-removal-narrow",
     "offline-comparison-freeze-preview",
-    "offline-comparison-report-narrow"
+    "offline-comparison-report-narrow",
+    "live-account-alerts-narrow"
   ]
 }

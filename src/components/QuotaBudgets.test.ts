@@ -7,15 +7,15 @@ import { historyStore } from '../lib/stores/history.svelte';
 import { rates } from '../lib/stores/rates';
 import type { ProjectInfo, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire, RateCard } from '../lib/types';
 
-const { checkQuotaBudgets, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig } = vi.hoisted(() => ({
-  checkQuotaBudgets: vi.fn(),
+const { getQuotaBudgetStatuses, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig } = vi.hoisted(() => ({
+  getQuotaBudgetStatuses: vi.fn(),
   getQuotaConfig: vi.fn(),
   previewControlledAction: vi.fn(),
   resolveProjects: vi.fn(),
   setQuotaConfig: vi.fn(),
 }));
 
-vi.mock('../lib/ipc', () => ({ checkQuotaBudgets, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig }));
+vi.mock('../lib/ipc', () => ({ getQuotaBudgetStatuses, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig }));
 vi.mock('../lib/stores/providers.svelte', () => ({
   providersStore: {
     descriptors: [
@@ -54,7 +54,7 @@ describe('QuotaBudgets', () => {
   beforeEach(() => {
     historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: true });
     rates.set(null);
-    checkQuotaBudgets.mockReset().mockResolvedValue(report());
+    getQuotaBudgetStatuses.mockReset().mockResolvedValue(report());
     persistedConfig = config;
     getQuotaConfig.mockReset().mockImplementation(async () => persistedConfig);
     resolveProjects.mockReset().mockResolvedValue([project]);
@@ -109,20 +109,20 @@ describe('QuotaBudgets', () => {
 
   it.each(['history', 'rates'] as const)('invalidates displayed budget values on %s changes and rejects late prior results', async (source) => {
     const row = (value: number) => report([{ budget_id: existingBudget.id, current_value: value, unavailable: null }]);
-    checkQuotaBudgets.mockResolvedValueOnce(row(123));
+    getQuotaBudgetStatuses.mockResolvedValueOnce(row(123));
     render(QuotaBudgets);
     await screen.findByText('123 tokens now');
     const stale = deferred<QuotaBudgetCheck>();
-    checkQuotaBudgets.mockReturnValueOnce(stale.promise);
+    getQuotaBudgetStatuses.mockReturnValueOnce(stale.promise);
     const invalidate = (complete: boolean) => {
       if (source === 'history') historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: complete });
       // Only object identity changes; pricing invalidation must not use version.
       else rates.set({ version: 13 } as RateCard);
     };
     invalidate(false);
-    await waitFor(() => expect(checkQuotaBudgets).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(getQuotaBudgetStatuses).toHaveBeenCalledTimes(2));
     expect(screen.queryByText('123 tokens now')).not.toBeInTheDocument();
-    checkQuotaBudgets.mockResolvedValueOnce(row(456));
+    getQuotaBudgetStatuses.mockResolvedValueOnce(row(456));
     invalidate(true);
     await screen.findByText('456 tokens now');
     stale.resolve(row(999));
@@ -131,17 +131,18 @@ describe('QuotaBudgets', () => {
     expect(screen.getByText('456 tokens now')).toBeInTheDocument();
   });
 
-  it('notifies every provider crossing while keeping budget rows scoped to the selected harness', async () => {
+  it('keeps rows scoped while presentation reads cannot deliver an alert edge', async () => {
     const alert = {
       budget_id: existingBudget.id, provider: 'claude_code', project_key: null,
       message: 'Claude budget crossed', current_value: 600_000, threshold: 500_000,
       fired_at: '2026-10-04T15:00:00.000Z',
     };
-    checkQuotaBudgets.mockResolvedValue({ ...report(), alerts: [alert] });
+    getQuotaBudgetStatuses.mockResolvedValue({ ...report(), alerts: [] });
     const onAlerts = vi.fn();
     render(QuotaBudgets, { harness: 'codex', onAlerts });
 
-    await waitFor(() => expect(onAlerts).toHaveBeenCalledWith([alert]));
+    await waitFor(() => expect(getQuotaBudgetStatuses).toHaveBeenCalled());
+    expect(onAlerts).not.toHaveBeenCalled();
     expect(screen.queryByTestId('quota-budget-row')).not.toBeInTheDocument();
     expect(screen.queryByText(alert.message)).not.toBeInTheDocument();
   });
@@ -150,7 +151,7 @@ describe('QuotaBudgets', () => {
     const user = userEvent.setup();
     render(QuotaBudgets);
     await screen.findByText(/500,000 tokens/);
-    expect(checkQuotaBudgets).toHaveBeenCalledTimes(1);
+    expect(getQuotaBudgetStatuses).toHaveBeenCalledTimes(1);
 
     await user.click(screen.getByText('Soft budgets & alerts'));
     await user.click(screen.getByRole('button', { name: 'Add budget' }));
@@ -178,7 +179,7 @@ describe('QuotaBudgets', () => {
 
   it('renders unavailable values honestly and leaves the saved config intact when a save fails', async () => {
     const user = userEvent.setup();
-    checkQuotaBudgets.mockResolvedValue(report([
+    getQuotaBudgetStatuses.mockResolvedValue(report([
       { budget_id: existingBudget.id, current_value: null, unavailable: 'pricing_incomplete' },
     ]));
     setQuotaConfig.mockRejectedValueOnce('settings changed; reload before saving');
@@ -233,7 +234,7 @@ describe('QuotaBudgets', () => {
     const oldReport = deferred<QuotaBudgetCheck>();
     const freshBudget = { ...existingBudget, id: 'fresh-budget', threshold: 900_000 };
     getQuotaConfig.mockReset().mockReturnValueOnce(oldConfig.promise).mockResolvedValueOnce({ ...config, budgets: [freshBudget] });
-    checkQuotaBudgets.mockReset().mockReturnValueOnce(oldReport.promise).mockResolvedValueOnce(report());
+    getQuotaBudgetStatuses.mockReset().mockReturnValueOnce(oldReport.promise).mockResolvedValueOnce(report());
     render(QuotaBudgets);
 
     await tick();

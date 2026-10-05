@@ -1247,7 +1247,7 @@ pub struct QuotaBudgetCheck {
     pub alerts: Vec<QuotaAlert>,
 }
 
-fn in_quiet_hours(range: Option<(u8, u8)>, local_hour: u8) -> bool {
+pub(crate) fn in_quiet_hours(range: Option<(u8, u8)>, local_hour: u8) -> bool {
     let Some((start, end)) = range else {
         return false;
     };
@@ -1343,6 +1343,7 @@ pub fn evaluate_alerts(
             NotificationLogEntry {
                 dedup_key: key,
                 fired_at: now,
+                notice: None,
             },
         );
         if settings.enabled && !quiet {
@@ -2573,6 +2574,7 @@ mod tests {
         NotificationSettings {
             enabled: true,
             quiet_hours: None,
+            ambient: Default::default(),
         }
     }
 
@@ -2586,6 +2588,7 @@ mod tests {
         let settings = NotificationSettings {
             enabled: false,
             quiet_hours: None,
+            ambient: Default::default(),
         };
         let (alerts, log) = evaluate_alerts(&evaluations, &settings, &[], Utc::now(), 12);
         assert!(alerts.is_empty());
@@ -2641,6 +2644,7 @@ mod tests {
         let settings = NotificationSettings {
             enabled: true,
             quiet_hours: Some((22, 7)), // wraps past midnight
+            ambient: Default::default(),
         };
         let evaluations = [BudgetEvaluation {
             budget: &b,

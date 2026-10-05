@@ -1305,7 +1305,12 @@ export interface QuotaBudget {
   enabled: boolean;
 }
 
+export interface AmbientCategories { attention: boolean; provider_incidents: boolean; stale_quota: boolean; retention_risk: boolean }
+export type AmbientRoute = "budgets" | "attention" | "provider_status" | "retention" | "quota";
+export interface AmbientNotice { id: string; route: AmbientRoute; provider: string; code: string; observed_at: string; delivered_at: string }
+export interface AmbientSnapshot { available: boolean; as_of: string; notifications: NotificationSettings; alerts: AmbientNotice[]; recent: AmbientNotice[] }
 export interface NotificationSettings {
+  ambient?: AmbientCategories;
   /** Opt-in: no alert is ever surfaced while this is false. */
   enabled: boolean;
   /** Local-hour [start, end) range during which alerts are tracked but not shown. */
@@ -1314,10 +1319,21 @@ export interface NotificationSettings {
 
 /** get_quota_config / set_quota_config payload. Never includes the backend's
  *  internal notification dedup log. */
+export interface LiveAccountBudget {
+  id: string;
+  account_id: string;
+  consented_at: string;
+  limit_id: string;
+  window_kind: string;
+  window_minutes: number;
+  threshold_percent: number;
+  enabled: boolean;
+}
 export interface QuotaConfigWire {
   /** Optimistic edit revision. Preserve it on writes to reject stale edits. */
   revision?: string | null;
   budgets: QuotaBudget[];
+  live_account_budgets?: LiveAccountBudget[];
   notifications: NotificationSettings;
   max_cache_age_secs: number;
 }

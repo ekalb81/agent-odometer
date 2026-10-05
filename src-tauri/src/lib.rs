@@ -7,6 +7,7 @@ static TEST_COMMON_CONTROLS: [u8; 168] = *b" \"/MANIFESTDEPENDENCY:type='win32' 
 
 pub mod action_contract;
 mod action_executor;
+mod ambient;
 pub mod attention;
 pub mod claude_parser;
 pub mod commands;
@@ -39,6 +40,7 @@ pub mod query_control;
 mod query_desktop;
 mod query_reports;
 pub mod quota;
+mod quota_account_alerts;
 pub mod quota_accounts;
 pub mod quota_live;
 pub mod quota_store;
@@ -215,6 +217,9 @@ pub fn run() {
             set_quota_config,
             check_quota_alerts,
             commands::get_attention_status,
+            commands::check_ambient_alerts,
+            commands::get_ambient_status,
+            commands::get_quota_budget_statuses,
             commands::set_attention_preferences,
             check_quota_budgets,
             get_live_quota_status,

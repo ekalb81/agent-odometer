@@ -15,6 +15,11 @@ export default defineConfig({
       include: [
         'src/components/CuratedDataset.svelte',
         'src/components/OfflineComparisons.svelte',
+        'src/components/LiveAccountAlerts.svelte',
+        'src/lib/liveAccountAlerts.ts',
+        'src/components/AmbientSettings.svelte',
+        'src/lib/ambientTray.ts',
+        'src/lib/stores/ambient.ts',
         'src/components/LocalWidget.svelte',
         'src/components/WidgetSettings.svelte',
         'src/components/ActivitySummary.svelte',

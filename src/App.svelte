@@ -9,7 +9,7 @@
   import { organizationStore } from './lib/stores/organization.svelte';
   import type { FilterState } from './components/Filters.svelte';
   import { defaultFilters, type ViewScope } from './lib/sessionProjection';
-  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, getHistoryStatus, onHistoryProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, setConfig } from './lib/ipc';
+  import { listSessions, onSessionUpdated, onSessionRemoved, getRates, getConfig, onRatesUpdated, onConfigUpdated, getScanStatus, onScanProgress, getHistoryStatus, onHistoryProgress, onInstructionScanProgress, sessionsInRanges, getQuotaSnapshots, setTrayTotals, onOpenSettings, onTrayProviderSelected, setConfig } from './lib/ipc';
   import { sessionsStore } from './lib/stores/sessions.svelte';
   import { scanStore } from './lib/stores/scan.svelte';
   import { projectStore } from './lib/stores/projects.svelte';
@@ -24,9 +24,10 @@
   import { getVersion } from '@tauri-apps/api/app';
   import type { InstructionScanProgress, RateCard, SessionSummary } from './lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
-  import { computeTrayTotals } from './lib/trayTotals';
-  import { quotaTrayLabel } from './lib/subscriptionUsage';
-  import { getLiveQuotaStatus, liveQuotaTrayLabel, onLiveQuotaUpdated } from './lib/liveQuota';
+  import { computeScopedTrayTotals } from './lib/trayTotals';
+  import { ambientQuotaLabel } from './lib/ambientTray';
+  import { ambient, ambientLabels } from './lib/stores/ambient';
+  import { getLiveQuotaStatus, onLiveQuotaUpdated } from './lib/liveQuota';
   import { MutationAccumulator, RangeDataCache } from './lib/rangeData';
   import { computeFlushDelay, recordFlush } from './lib/flushCadence';
   import { configurePerformanceTracking, measureAsync, measureNextPaint, measureSync } from './lib/performance';
@@ -36,6 +37,13 @@
   import { providerAccent } from './lib/providerAccents';
 
   let activeView: AppView = $state('all');
+  let trayProvider = $state('all');
+  function openAmbientEvidence(route: import('./lib/types').AmbientRoute): void {
+    activeView = route === 'budgets' || route === 'quota' ? 'all' : 'settings';
+    const targets = { budgets: '[data-testid=quota-budgets-panel]', quota: '[data-testid=quota-budgets-panel]', attention: '#attention-settings', provider_status: '#provider-status-settings', retention: '#history-retention-settings' };
+    const target = targets[route];
+    requestAnimationFrame(() => { const element = document.querySelector(target); if (element instanceof HTMLDetailsElement) element.open = true; element?.scrollIntoView?.({ block: 'center' }); });
+  }
   let appVersion = $state('');
   const appStarted = performance.now();
 
@@ -152,13 +160,15 @@
       let quotaLabel: string | null = null;
       try {
         const [snapshots, live] = await Promise.all([getQuotaSnapshots(), getLiveQuotaStatus()]);
-        quotaLabel = liveQuotaTrayLabel(live) ?? quotaTrayLabel(snapshots);
+        quotaLabel = ambientQuotaLabel(trayProvider, snapshots, live, Date.now());
       } catch (error) {
         if (epoch !== trayEpoch) return;
         console.error('quota tray label refresh failed:', error);
       }
       if (epoch !== trayEpoch) return;
-      await setTrayTotals(computeTrayTotals(sessionsStore.map.values(), results[0], rateCard, quotaLabel));
+      const totals = computeScopedTrayTotals(sessionsStore.map.values(), results[0], rateCard, trayProvider, quotaLabel);
+      const latest = $ambient?.recent[0];
+      await setTrayTotals({ ...totals, provider: trayProvider, recent: latest ? `${latest.provider}: ${ambientLabels[latest.code] ?? "Local alert"}` : "none" });
     } catch (error) {
       if (epoch !== trayEpoch) return;
       trayCache.invalidate();
@@ -170,6 +180,8 @@
     trayMutations.observe(sessionsStore.mutationLog);
     const rateCard = $rates;
     void trayRefreshGeneration;
+    void trayProvider;
+    void $ambient?.recent;
     const ratesChanged = rateCard !== lastTrayRates;
     lastTrayRates = rateCard;
     if (ratesChanged) {
@@ -179,7 +191,7 @@
       if (previous && rateCard) {
         const raw = Object.fromEntries(Object.entries(previous[0]).map(([id, totals]) => [id, { ...totals, pricing: undefined }]));
         const epoch = trayEpoch;
-        void setTrayTotals(computeTrayTotals(sessionsStore.map.values(), raw, rateCard))
+        void setTrayTotals(computeScopedTrayTotals(sessionsStore.map.values(), raw, rateCard, trayProvider))
           .catch((error) => { if (epoch === trayEpoch) console.error('tray pricing invalidation failed:', error); });
       }
       trayJobGeneration += 1;
@@ -494,6 +506,9 @@
           configurePerformanceTracking(newConfig.performance_tracking_enabled);
           if (sourcesChanged) void reloadSessions('frontend.config_list_sessions');
         })),
+        attach('tray-provider-selected', onTrayProviderSelected(provider => {
+          if (!disposed && ['all', 'codex', 'claude_code', 'gemini_cli'].includes(provider)) { trayProvider = provider; trayEpoch++; trayRefreshGeneration++; }
+        })),
         attach('open-settings', onOpenSettings(() => {
           if (!disposed) activeView = 'settings';
         })),
@@ -666,7 +681,7 @@
     {/if}
   </header>
 
-  <AttentionMonitor />
+  <AttentionMonitor onOpen={openAmbientEvidence} />
 
   <!-- Main content. Harness views stay mounted so filters/sort survive tab switches. -->
   <main class="flex-1 overflow-hidden">
@@ -696,7 +711,7 @@
       <InstructionsView onhide={hideInstructionsTab} />
     {/if}
     {#if activeView === 'settings'}
-      <SettingsView onopeninstructions={() => (activeView = 'instructions')} />
+      <SettingsView onAmbientEvidence={openAmbientEvidence} onopeninstructions={() => (activeView = 'instructions')} />
     {/if}
   </main>
 

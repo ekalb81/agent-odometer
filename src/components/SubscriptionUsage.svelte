@@ -32,6 +32,7 @@
   import { formatCompactTokens } from '../lib/format';
   import QuotaBudgets from './QuotaBudgets.svelte';
   import LiveQuotaAccounts from './LiveQuotaAccounts.svelte';
+  import LiveAccountAlerts from './LiveAccountAlerts.svelte';
 
   interface Props {
     /** Gate on `active && analyticsOpen`: `<details>` keeps collapsed
@@ -76,17 +77,6 @@
     return total;
   }
 
-  function notifyIfPermitted(alert: QuotaAlert): void {
-    if (typeof Notification === 'undefined') return;
-    if (Notification.permission !== 'granted') return;
-    try {
-      new Notification('Odometer quota alert', { body: alert.message });
-    } catch {
-      // Notification construction can throw in restricted webview contexts;
-      // the in-panel alert list below still shows it either way.
-    }
-  }
-
   async function refresh(): Promise<void> {
     try {
       const [usage, ranges, snapshots] = await Promise.all([
@@ -114,7 +104,7 @@
   }
 
   function handleBudgetAlerts(fired: QuotaAlert[]): void {
-    for (const alert of fired) notifyIfPermitted(alert);
+    void fired; // Desktop delivery is owned by the shared main-window monitor.
   }
 
   $effect(() => {
@@ -283,5 +273,6 @@
   {/if}
 
   <LiveQuotaAccounts {active} {harness} />
+  <LiveAccountAlerts {active} {harness} />
   <QuotaBudgets {active} {harness} onAlerts={handleBudgetAlerts} />
 </div>
