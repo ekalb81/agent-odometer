@@ -154,20 +154,15 @@ pub struct QuotaHealth {
     pub message: String,
 }
 
-/// Reports this provider's real quota status: whether it has a
-/// transcript-derived quota source at all, and whether anything has been
-/// observed from it yet. Never reports a live/polled API — none exists for
-/// any provider — and the message says so explicitly rather than letting
-/// `transcript_derived` be mistaken for an authoritative subscription
-/// source. See `crate::quota` for the snapshot/forecast/budget service this
-/// reflects.
+/// Reports transcript-source availability only. Consented live-account quota
+/// is a separate surface; this diagnostic reads no sign-in or live status.
 fn quota_health(quota_source_capability: bool, has_quota_observation: bool) -> QuotaHealth {
     if !quota_source_capability {
         return QuotaHealth {
             status: QuotaStatus::NotAvailable,
             reason_code: "quota_source_not_available".to_string(),
-            message: "This provider's transcripts do not report account-wide quota, and Odometer \
-                      does not poll a live quota API for any provider yet."
+            message: "This provider's transcripts do not report quota. Consented live-account \
+                      readings are a separate surface in Subscription Usage."
                 .to_string(),
         };
     }
@@ -183,9 +178,9 @@ fn quota_health(quota_source_capability: bool, has_quota_observation: bool) -> Q
     QuotaHealth {
         status: QuotaStatus::TranscriptDerived,
         reason_code: "quota_transcript_derived".to_string(),
-        message: "Quota values come from this provider's own transcript snapshots, not a live \
-                  polled API — Odometer does not poll any provider's quota API yet. See the \
-                  Subscription Usage panel for provenance and staleness on each window."
+        message: "These quota values come from transcript snapshots, not live-account readings. \
+                  See Subscription Usage for transcript provenance and staleness, and the \
+                  separate consented live-account quota surface."
             .to_string(),
     }
 }
@@ -845,17 +840,15 @@ mod tests {
         assert_eq!(quota.status, QuotaStatus::TranscriptDerived);
         assert_eq!(quota.reason_code, "quota_transcript_derived");
         assert!(
-            quota.message.to_lowercase().contains("not") || quota.message.contains("does not poll"),
+            quota.message.contains("transcript snapshots")
+                && quota.message.contains("separate consented"),
             "the transcript-derived message must still disclaim a live polled API"
         );
     }
 
     #[test]
-    fn never_reports_a_live_quota_status_no_provider_implements_one() {
-        // `QuotaStatus` has exactly two variants; this is a compile-time
-        // reminder as much as a runtime check — if a `Live` variant is ever
-        // added, this test (and the honest-message assertion above) must be
-        // revisited alongside the actual polling implementation.
+    fn transcript_diagnostic_does_not_claim_live_account_status() {
+        // This diagnostic is independent of any consented live account.
         for quota in [
             quota_health(false, false),
             quota_health(true, false),

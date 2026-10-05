@@ -3,6 +3,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/LiveAccountAlerts.svelte',
+  'src/lib/liveAccountAlerts.ts',
   'src/components/AmbientSettings.svelte',
   'src/lib/ambientTray.ts',
   'src/lib/stores/ambient.ts',

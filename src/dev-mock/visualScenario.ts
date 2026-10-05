@@ -6,6 +6,7 @@
 export const VISUAL_SCENARIOS = [
   'default',
   'ambient-recent',
+  'live-account-alerts',
   'sessions-empty',
   'sessions-scanning',
   'sessions-availability-fallback',

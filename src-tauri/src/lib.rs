@@ -40,6 +40,7 @@ pub mod query_control;
 mod query_desktop;
 mod query_reports;
 pub mod quota;
+mod quota_account_alerts;
 pub mod quota_accounts;
 pub mod quota_live;
 pub mod quota_store;

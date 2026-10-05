@@ -126,6 +126,7 @@ function quotaSnapshots(): QuotaSnapshot[] {
 let quotaConfigMock: QuotaConfigWire = {
   revision: 'dev-mock-revision-1',
   budgets: [],
+  live_account_budgets: [],
   notifications: { enabled: false, quiet_hours: null },
   max_cache_age_secs: 21_600,
 };
@@ -657,8 +658,13 @@ mockIPC((cmd, payload) => {
       return checkQuotaAlerts();
     case 'check_quota_budgets':
       return checkQuotaBudgets();
-    case 'get_live_quota_status':
-      return { accounts: [], busy: false, configuration_error: null };
+    case 'get_live_quota_status': {
+      if (visualScenario !== 'live-account-alerts') return { accounts: [], busy: false, configuration_error: null };
+      const snapshot = quotaSnapshots()[0];
+      snapshot.provenance = 'live_provider';
+      snapshot.windows = snapshot.windows.filter(window => window.unit === 'percent');
+      return { busy: false, configuration_error: null, accounts: [{ provider: 'codex', consent: { account_id: 'synthetic-approved-account', label: 'Synthetic work account', consented_at: new Date(now - DAY).toISOString(), enabled: true }, observed_at: snapshot.windows[0].observed_at, ordinary_usage_allowed: true, unavailable: null, buckets: [{ limit_id: 'synthetic-model-limit', limit_name: 'Synthetic model limit', spend_control_reached: false, snapshot }] }] };
+    }
     case 'identify_quota_account':
     case 'approve_quota_account':
     case 'change_quota_account':

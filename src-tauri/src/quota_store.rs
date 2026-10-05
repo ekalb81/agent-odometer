@@ -12,7 +12,7 @@
 //! own store and migrations independent of `history-v1.sqlite3`, not a
 //! table added to it.
 //!
-//! Stored at `<config_dir>/agent-odometer/quota-v2.json` using the same
+//! Stored at `<config_dir>/agent-odometer/quota-v3.json` using the same
 //! atomic write pattern as `rates.rs::RateCard::save` (temp file + rename).
 
 use crate::provider::ProviderId;
@@ -20,7 +20,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const QUOTA_STORE_VERSION: u32 = 2;
+pub const QUOTA_STORE_VERSION: u32 = 3;
+pub const LIVE_ACCOUNT_LOG_PREFIX: &str = "live-account:";
 
 /// Keeps the dedup log bounded regardless of how long the app runs.
 const MAX_LOG_ENTRIES: usize = 500;
@@ -71,6 +72,25 @@ pub struct QuotaBudget {
     pub enabled: bool,
 }
 
+/// One explicit, consent-generation-bound live-provider alert rule. This is
+/// separate from transcript budgets, which have no reliable account identity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveAccountBudget {
+    pub id: String,
+    pub account_id: String,
+    pub consented_at: DateTime<Utc>,
+    pub limit_id: String,
+    pub window_kind: String,
+    pub window_minutes: u64,
+    pub threshold_percent: f64,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+pub fn live_account_log_key(id: &str) -> String {
+    format!("{LIVE_ACCOUNT_LOG_PREFIX}{id}")
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NotificationSettings {
     /// Opt-in: no alert is ever surfaced while this is false. Crossings are
@@ -114,6 +134,8 @@ pub struct QuotaStoreFile {
     #[serde(default)]
     pub budgets: Vec<QuotaBudget>,
     #[serde(default)]
+    pub live_account_budgets: Vec<LiveAccountBudget>,
+    #[serde(default)]
     pub notifications: NotificationSettings,
     #[serde(default)]
     pub notification_log: Vec<NotificationLogEntry>,
@@ -131,6 +153,7 @@ impl Default for QuotaStoreFile {
         Self {
             version: QUOTA_STORE_VERSION,
             budgets: Vec::new(),
+            live_account_budgets: Vec::new(),
             notifications: NotificationSettings::default(),
             notification_log: Vec::new(),
             max_cache_age_secs: default_max_cache_age_secs(),
@@ -139,7 +162,7 @@ impl Default for QuotaStoreFile {
 }
 
 fn quota_store_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("agent-odometer").join("quota-v2.json"))
+    dirs::config_dir().map(|d| d.join("agent-odometer").join("quota-v3.json"))
 }
 
 impl QuotaStoreFile {
@@ -153,8 +176,8 @@ impl QuotaStoreFile {
         })
     }
 
-    /// Preserve the legacy file so older releases cannot overwrite USD
-    /// budgets they do not understand. Reads alone never migrate or write.
+    /// Preserve both legacy files so older releases cannot overwrite live
+    /// account rules they do not understand. Reads alone never migrate/write.
     pub fn load_checked() -> Result<Self, String> {
         let path = quota_store_path().ok_or("quota configuration location unavailable")?;
         Self::load_at(&path)
@@ -162,16 +185,22 @@ impl QuotaStoreFile {
 
     fn load_at(path: &std::path::Path) -> Result<Self, String> {
         use std::io::Read;
-        let legacy = path.with_file_name("quota-v1.json");
-        let path = if path
+        let v2 = path.with_file_name("quota-v2.json");
+        let v1 = path.with_file_name("quota-v1.json");
+        let selected = if path
             .try_exists()
             .map_err(|_| "quota configuration unreadable; existing file preserved")?
         {
             path
+        } else if v2
+            .try_exists()
+            .map_err(|_| "quota configuration unreadable; existing file preserved")?
+        {
+            &v2
         } else {
-            &legacy
+            &v1
         };
-        let file = match std::fs::File::open(path) {
+        let file = match std::fs::File::open(selected) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default())
@@ -185,17 +214,44 @@ impl QuotaStoreFile {
         if raw.len() > 512_000 {
             return Err("quota configuration is too large; existing file preserved".into());
         }
+        if selected == path {
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|_| "quota configuration invalid; existing file preserved")?;
+            let required = [
+                "version",
+                "budgets",
+                "live_account_budgets",
+                "notifications",
+                "notification_log",
+                "max_cache_age_secs",
+            ];
+            if required.iter().any(|key| value.get(key).is_none()) {
+                return Err("quota configuration invalid; existing file preserved".into());
+            }
+        }
         let mut store: Self = serde_json::from_str(&raw)
             .map_err(|_| "quota configuration invalid; existing file preserved")?;
-        if !(1..=QUOTA_STORE_VERSION).contains(&store.version) {
+        let valid_version = if selected == path {
+            store.version == QUOTA_STORE_VERSION
+        } else if selected == v2 {
+            store.version == 2
+        } else {
+            store.version == 1
+        };
+        if !valid_version {
             return Err("quota configuration requires a newer Odometer version".into());
+        }
+        if selected != path {
+            // Legacy formats never authorized live-account alert rules.
+            // Unknown extension fields cannot silently opt in during migration.
+            store.live_account_budgets.clear();
         }
         validate_quota_config(&QuotaConfigWire::from(&store))?;
         store.version = QUOTA_STORE_VERSION;
         Ok(store)
     }
 
-    /// Atomic-ish write to `<config_dir>/agent-odometer/quota-v2.json`.
+    /// Atomic-ish write to `<config_dir>/agent-odometer/quota-v3.json`.
     pub fn save(&self) -> anyhow::Result<()> {
         let path =
             quota_store_path().ok_or_else(|| anyhow::anyhow!("could not determine config dir"))?;
@@ -212,13 +268,31 @@ impl QuotaStoreFile {
     /// Bounds the dedup log by both age and count so long-running installs
     /// cannot grow it unboundedly.
     pub fn prune_log(&mut self, now: DateTime<Utc>, retention: chrono::Duration) {
-        self.notification_log
-            .retain(|entry| now.signed_duration_since(entry.fired_at) <= retention);
+        let armed_live_keys: std::collections::HashSet<_> = self
+            .live_account_budgets
+            .iter()
+            .map(|rule| live_account_log_key(&rule.id))
+            .collect();
+        let mut seen_live = std::collections::HashSet::new();
+        self.notification_log.retain(|entry| {
+            if armed_live_keys.contains(&entry.dedup_key) {
+                // Unknown observations never resolve a crossing. Configured
+                // live keys are bounded by 32 rules, independent of log age.
+                seen_live.insert(entry.dedup_key.clone())
+            } else {
+                now.signed_duration_since(entry.fired_at) <= retention
+            }
+        });
         self.notification_log.sort_by_key(|entry| entry.fired_at);
-        if self.notification_log.len() > MAX_LOG_ENTRIES {
-            let excess = self.notification_log.len() - MAX_LOG_ENTRIES;
-            self.notification_log.drain(0..excess);
-        }
+        let mut excess = self.notification_log.len().saturating_sub(MAX_LOG_ENTRIES);
+        self.notification_log.retain(|entry| {
+            if excess > 0 && !armed_live_keys.contains(&entry.dedup_key) {
+                excess -= 1;
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -231,15 +305,21 @@ pub struct QuotaConfigWire {
     #[serde(default)]
     pub revision: Option<String>,
     pub budgets: Vec<QuotaBudget>,
+    #[serde(default)]
+    pub live_account_budgets: Vec<LiveAccountBudget>,
     pub notifications: NotificationSettings,
     pub max_cache_age_secs: i64,
 }
 
 impl QuotaStoreFile {
     pub fn config_revision(&self) -> String {
-        let bytes =
-            serde_json::to_vec(&(&self.budgets, &self.notifications, self.max_cache_age_secs))
-                .expect("validated quota settings serialize");
+        let bytes = serde_json::to_vec(&(
+            &self.budgets,
+            &self.live_account_budgets,
+            &self.notifications,
+            self.max_cache_age_secs,
+        ))
+        .expect("validated quota settings serialize");
         format!("{:016x}", crate::stable_hash::fnv1a64(&bytes))
     }
 
@@ -256,6 +336,7 @@ impl From<&QuotaStoreFile> for QuotaConfigWire {
         Self {
             revision: Some(store.config_revision()),
             budgets: store.budgets.clone(),
+            live_account_budgets: store.live_account_budgets.clone(),
             notifications: store.notifications.clone(),
             max_cache_age_secs: store.max_cache_age_secs,
         }
@@ -270,6 +351,9 @@ pub fn validate_quota_config(config: &QuotaConfigWire) -> Result<(), String> {
     }
     if config.budgets.len() > 64 {
         return Err("at most 64 soft budgets are supported".into());
+    }
+    if config.live_account_budgets.len() > 32 {
+        return Err("at most 32 live account alert rules are supported".into());
     }
     if config
         .notifications
@@ -294,6 +378,7 @@ pub fn validate_quota_config(config: &QuotaConfigWire) -> Result<(), String> {
         if budget.id.trim().is_empty()
             || budget.id.len() > 128
             || budget.id.starts_with(crate::ambient::PREFIX)
+            || budget.id.starts_with(LIVE_ACCOUNT_LOG_PREFIX)
         {
             return Err("budget id must contain 1 to 128 bytes".to_string());
         }
@@ -339,6 +424,38 @@ pub fn validate_quota_config(config: &QuotaConfigWire) -> Result<(), String> {
             }
         }
     }
+    let mut live_ids = std::collections::HashSet::new();
+    let mut live_windows = std::collections::HashSet::new();
+    for budget in &config.live_account_budgets {
+        if budget.id.trim().is_empty()
+            || budget.id.len() > 128
+            || budget.id.chars().any(char::is_control)
+            || budget.account_id.is_empty()
+            || budget.account_id.len() > 256
+            || budget.account_id.chars().any(char::is_control)
+            || budget.limit_id.is_empty()
+            || budget.limit_id.len() > 128
+            || budget.limit_id.chars().any(char::is_control)
+            || !matches!(
+                budget.window_kind.as_str(),
+                "burst" | "daily" | "weekly" | "monthly"
+            )
+            || !(1..=527_040).contains(&budget.window_minutes)
+            || !budget.threshold_percent.is_finite()
+            || !(0.0..=100.0).contains(&budget.threshold_percent)
+            || budget.threshold_percent == 0.0
+            || !live_ids.insert(&budget.id)
+            || !live_windows.insert((
+                &budget.account_id,
+                budget.consented_at,
+                &budget.limit_id,
+                &budget.window_kind,
+                budget.window_minutes,
+            ))
+        {
+            return Err("live account alert rule is invalid or duplicated".into());
+        }
+    }
     Ok(())
 }
 
@@ -351,6 +468,7 @@ mod tests {
         QuotaConfigWire {
             revision: None,
             budgets,
+            live_account_budgets: Vec::new(),
             notifications: NotificationSettings::default(),
             max_cache_age_secs: 3600,
         }
@@ -370,21 +488,76 @@ mod tests {
     }
 
     #[test]
-    fn legacy_migration_is_read_only_and_invalid_newer_file_never_falls_back() {
+    fn legacy_migration_preserves_ambient_policy_and_never_falls_back_from_bad_v3() {
         let dir = tempfile::tempdir().unwrap();
-        let old = dir.path().join("quota-v1.json");
-        let current = dir.path().join("quota-v2.json");
+        let v1 = dir.path().join("quota-v1.json");
+        let v2 = dir.path().join("quota-v2.json");
+        let v3 = dir.path().join("quota-v3.json");
         let legacy = r#"{"version":1,"budgets":[],"notifications":{"enabled":true}}"#;
-        std::fs::write(&old, legacy).unwrap();
-        let loaded = QuotaStoreFile::load_at(&current).unwrap();
-        assert_eq!(loaded.version, 2);
-        assert!(loaded.notifications.enabled);
-        assert!(!current.exists());
-        assert_eq!(std::fs::read_to_string(&old).unwrap(), legacy);
-        for invalid in [r#"{"version":99}"#, "not json"] {
-            std::fs::write(&current, invalid).unwrap();
-            assert!(QuotaStoreFile::load_at(&current).is_err());
-            assert_eq!(std::fs::read_to_string(&current).unwrap(), invalid);
+        std::fs::write(&v1, legacy).unwrap();
+        let from_v1 = QuotaStoreFile::load_at(&v3).unwrap();
+        assert_eq!(from_v1.version, 3);
+        assert!(from_v1.notifications.enabled);
+        assert!(!v3.exists());
+        assert_eq!(std::fs::read_to_string(&v1).unwrap(), legacy);
+
+        let now = Utc::now();
+        let mut old_store = QuotaStoreFile {
+            version: 2,
+            ..Default::default()
+        };
+        old_store.notifications.ambient.attention = true;
+        old_store.notification_log.push(NotificationLogEntry {
+            dedup_key: "@ambient/condition".into(),
+            fired_at: now,
+            notice: Some(crate::ambient::Notice {
+                id: "@ambient/recent".into(),
+                route: crate::ambient::Route::Attention,
+                provider: "Codex".into(),
+                code: "attention".into(),
+                observed_at: now,
+                delivered_at: now,
+            }),
+        });
+        let mut old_value = serde_json::to_value(&old_store).unwrap();
+        old_value
+            .as_object_mut()
+            .unwrap()
+            .remove("live_account_budgets");
+        let v2_bytes = serde_json::to_vec(&old_value).unwrap();
+        std::fs::write(&v2, &v2_bytes).unwrap();
+        let migrated = QuotaStoreFile::load_at(&v3).unwrap();
+        assert_eq!(migrated.version, 3);
+        assert!(migrated.notifications.ambient.attention);
+        assert_eq!(migrated.notification_log, old_store.notification_log);
+        assert!(migrated.live_account_budgets.is_empty());
+        assert!(!v3.exists());
+        let mut extended_v2 = old_value.clone();
+        extended_v2["live_account_budgets"] = serde_json::json!([{
+            "id": "unrecognized-extension", "account_id": "synthetic-account",
+            "consented_at": "2026-10-01T00:00:00Z", "limit_id": "synthetic-limit",
+            "window_kind": "burst", "window_minutes": 300,
+            "threshold_percent": 80.0, "enabled": true
+        }]);
+        std::fs::write(&v2, serde_json::to_vec(&extended_v2).unwrap()).unwrap();
+        assert!(QuotaStoreFile::load_at(&v3)
+            .unwrap()
+            .live_account_budgets
+            .is_empty());
+        assert!(!v3.exists(), "migration must remain read-only");
+
+        // A new active file wins over any subsequent write by an old binary.
+        std::fs::write(&v3, serde_json::to_vec(&migrated).unwrap()).unwrap();
+        std::fs::write(&v2, legacy).unwrap();
+        assert_eq!(
+            QuotaStoreFile::load_at(&v3).unwrap().notification_log,
+            old_store.notification_log
+        );
+        for invalid in [r#"{"version":99}"#, "{}", "not json"] {
+            std::fs::write(&v3, invalid).unwrap();
+            assert!(QuotaStoreFile::load_at(&v3).is_err());
+            assert_eq!(std::fs::read_to_string(&v3).unwrap(), invalid);
+            assert_eq!(std::fs::read_to_string(&v2).unwrap(), legacy);
         }
     }
 
@@ -406,6 +579,135 @@ mod tests {
     #[test]
     fn valid_config_passes() {
         assert!(validate_quota_config(&wire(vec![percent_budget()])).is_ok());
+    }
+
+    #[test]
+    fn unreadable_newer_and_oversized_v3_never_fall_back_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let v3 = dir.path().join("quota-v3.json");
+        let v2 = dir.path().join("quota-v2.json");
+        let mut legacy = QuotaStoreFile {
+            version: 2,
+            ..Default::default()
+        };
+        legacy.notifications.enabled = true;
+        std::fs::write(&v2, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        std::fs::create_dir(&v3).unwrap();
+        assert!(QuotaStoreFile::load_at(&v3).is_err());
+        std::fs::remove_dir(&v3).unwrap();
+        let newer = QuotaStoreFile {
+            version: 4,
+            ..Default::default()
+        };
+        let newer_bytes = serde_json::to_vec(&newer).unwrap();
+        std::fs::write(&v3, &newer_bytes).unwrap();
+        assert!(QuotaStoreFile::load_at(&v3).unwrap_err().contains("newer"));
+        assert_eq!(std::fs::read(&v3).unwrap(), newer_bytes);
+        std::fs::write(&v3, " ".repeat(512_001)).unwrap();
+        assert!(QuotaStoreFile::load_at(&v3).is_err());
+        assert_eq!(std::fs::metadata(&v3).unwrap().len(), 512_001);
+    }
+
+    #[test]
+    fn configured_live_crossing_survives_unknown_beyond_retention_and_log_pressure() {
+        let now = Utc::now();
+        let old = now - chrono::Duration::days(40);
+        let rule: LiveAccountBudget = serde_json::from_value(serde_json::json!({
+            "id": "synthetic", "account_id": "account", "consented_at": "2026-10-01T00:00:00Z",
+            "limit_id": "model", "window_kind": "burst", "window_minutes": 300, "threshold_percent": 80.0, "enabled": true
+        })).unwrap();
+        let mut store = QuotaStoreFile::default();
+        store.live_account_budgets.push(rule.clone());
+        store.notification_log = (0..600)
+            .map(|i| NotificationLogEntry {
+                dedup_key: format!("ordinary-{i}"),
+                fired_at: now,
+                notice: None,
+            })
+            .collect();
+        store.notification_log.push(NotificationLogEntry {
+            dedup_key: live_account_log_key(&rule.id),
+            fired_at: old,
+            notice: None,
+        });
+        store.prune_log(now, chrono::Duration::days(30));
+        assert_eq!(store.notification_log.len(), 500);
+        let budget = QuotaBudget {
+            id: live_account_log_key(&rule.id),
+            provider: codex_provider_id(),
+            project_key: None,
+            unit: BudgetUnit::PercentOfWindow,
+            window_kind: Some("burst".into()),
+            period_hours: None,
+            threshold: 80.0,
+            enabled: true,
+        };
+        let settings = NotificationSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let (unknown, log) = crate::quota::evaluate_alerts(
+            &[crate::quota::BudgetEvaluation {
+                budget: &budget,
+                current_value: None,
+            }],
+            &settings,
+            &store.notification_log,
+            now,
+            12,
+        );
+        assert!(unknown.is_empty());
+        let (again, _) = crate::quota::evaluate_alerts(
+            &[crate::quota::BudgetEvaluation {
+                budget: &budget,
+                current_value: Some(90.0),
+            }],
+            &settings,
+            &log,
+            now,
+            12,
+        );
+        assert!(
+            again.is_empty(),
+            "retention cannot turn unknown into an observed resolution"
+        );
+        store.live_account_budgets.clear();
+        store.prune_log(now, chrono::Duration::days(30));
+        assert!(!store
+            .notification_log
+            .iter()
+            .any(|entry| entry.dedup_key == budget.id));
+    }
+
+    #[test]
+    fn live_rules_default_off_and_reserved_keys_cannot_collide() {
+        let mut rule: LiveAccountBudget = serde_json::from_value(serde_json::json!({
+            "id": "synthetic", "account_id": "account", "consented_at": "2026-10-01T00:00:00Z",
+            "limit_id": "model", "window_kind": "burst", "window_minutes": 300, "threshold_percent": 80.0
+        })).unwrap();
+        assert!(!rule.enabled);
+        let mut config = wire(vec![]);
+        config.live_account_budgets.push(rule.clone());
+        assert!(validate_quota_config(&config).is_ok());
+        config.live_account_budgets.push(rule.clone());
+        assert!(validate_quota_config(&config).is_err());
+        config.live_account_budgets.pop();
+        rule.threshold_percent = f64::NAN;
+        config.live_account_budgets[0] = rule;
+        assert!(validate_quota_config(&config).is_err());
+        let mut config = wire(vec![QuotaBudget {
+            id: live_account_log_key("synthetic"),
+            provider: codex_provider_id(),
+            project_key: None,
+            unit: BudgetUnit::Tokens,
+            window_kind: None,
+            period_hours: Some(24),
+            threshold: 1.0,
+            enabled: true,
+        }]);
+        assert!(validate_quota_config(&config).is_err());
+        config.budgets[0].id = "ordinary".into();
+        assert!(validate_quota_config(&config).is_ok());
     }
 
     #[test]

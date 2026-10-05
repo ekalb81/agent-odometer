@@ -32,6 +32,7 @@
   import { formatCompactTokens } from '../lib/format';
   import QuotaBudgets from './QuotaBudgets.svelte';
   import LiveQuotaAccounts from './LiveQuotaAccounts.svelte';
+  import LiveAccountAlerts from './LiveAccountAlerts.svelte';
 
   interface Props {
     /** Gate on `active && analyticsOpen`: `<details>` keeps collapsed
@@ -272,5 +273,6 @@
   {/if}
 
   <LiveQuotaAccounts {active} {harness} />
+  <LiveAccountAlerts {active} {harness} />
   <QuotaBudgets {active} {harness} onAlerts={handleBudgetAlerts} />
 </div>

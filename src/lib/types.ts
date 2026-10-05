@@ -1319,10 +1319,21 @@ export interface NotificationSettings {
 
 /** get_quota_config / set_quota_config payload. Never includes the backend's
  *  internal notification dedup log. */
+export interface LiveAccountBudget {
+  id: string;
+  account_id: string;
+  consented_at: string;
+  limit_id: string;
+  window_kind: string;
+  window_minutes: number;
+  threshold_percent: number;
+  enabled: boolean;
+}
 export interface QuotaConfigWire {
   /** Optimistic edit revision. Preserve it on writes to reject stale edits. */
   revision?: string | null;
   budgets: QuotaBudget[];
+  live_account_budgets?: LiveAccountBudget[];
   notifications: NotificationSettings;
   max_cache_age_secs: number;
 }

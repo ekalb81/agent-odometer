@@ -22,6 +22,7 @@ export async function readAmbient(): Promise<void> {
   } catch { if (request === generation && !hadCollector && !collecting) ambient.set(null); }
 }
 export const ambientLabels: Record<string, string> = {
+  live_account_threshold: 'Approved account quota threshold crossed',
   budget_crossed: 'Soft budget crossed', provider_incident: 'Public provider incident observed',
   stale_quota: 'Transcript quota observation expired', retained_sources_missing: 'Stored history has missing source transcripts',
   turn_started: 'Turn started', input_requested: 'Input requested', tool_completed: 'Tool completed',

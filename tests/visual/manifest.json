@@ -83,6 +83,7 @@
     "curated-example-preview",
     "curated-example-removal-narrow",
     "offline-comparison-freeze-preview",
-    "offline-comparison-report-narrow"
+    "offline-comparison-report-narrow",
+    "live-account-alerts-narrow"
   ]
 }

@@ -2140,10 +2140,22 @@ impl AppState {
         let mut cache = self.quota_store_cache.lock().unwrap();
         let mut store = crate::quota_store::QuotaStoreFile::load_checked()?;
         store.check_revision(config.revision.as_deref())?;
-        let policy_changed = store.notifications != config.notifications;
+        let policy_changed = store.notifications != config.notifications
+            || store.live_account_budgets != config.live_account_budgets;
         store.notification_log.retain(|entry| {
             if entry.dedup_key.starts_with(crate::ambient::PREFIX) {
                 return true;
+            }
+            if let Some(id) = entry
+                .dedup_key
+                .strip_prefix(crate::quota_store::LIVE_ACCOUNT_LOG_PREFIX)
+            {
+                let previous = store.live_account_budgets.iter().find(|rule| rule.id == id);
+                let next = config
+                    .live_account_budgets
+                    .iter()
+                    .find(|rule| rule.id == id);
+                return previous.is_some() && previous == next;
             }
             store
                 .budgets
@@ -2159,6 +2171,7 @@ impl AppState {
                     .any(|budget| budget.id == entry.dedup_key)
         });
         store.budgets = config.budgets;
+        store.live_account_budgets = config.live_account_budgets;
         store.notifications = config.notifications;
         store.max_cache_age_secs = config.max_cache_age_secs;
         store

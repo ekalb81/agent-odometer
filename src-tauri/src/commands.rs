@@ -5274,6 +5274,14 @@ fn check_ambient_impl(state: &AppState) -> crate::ambient::Snapshot {
         now,
         Local::now().hour() as u8,
     );
+    let (live_alerts, budget_log) = crate::quota_account_alerts::evaluate_live_account_alerts(
+        &store.live_account_budgets,
+        &state.live_quota.status(now),
+        &store.notifications,
+        &budget_log,
+        now,
+        Local::now().hour() as u8,
+    );
     let mut candidates = Vec::new();
     let mut resolved = Vec::new();
     let attention = state.attention.snapshot(now, |id| {
@@ -5390,6 +5398,28 @@ fn check_ambient_impl(state: &AppState) -> crate::ambient::Snapshot {
             provider: crate::ambient::provider_label(budget.provider.as_str()),
             code: "budget_crossed".into(),
             observed_at: budget.fired_at,
+            delivered_at: now,
+        };
+        log.push(crate::quota_store::NotificationLogEntry {
+            dedup_key: format!("{}recent/{}", crate::ambient::PREFIX, notice.id),
+            fired_at: now,
+            notice: Some(notice.clone()),
+        });
+        alerts.push(notice);
+    }
+    for live in live_alerts
+        .into_iter()
+        .filter(|_| runtime.initialized && runtime.failed.is_empty() && !runtime.policy_baseline)
+    {
+        let notice = crate::ambient::Notice {
+            id: crate::ambient::key(&format!(
+                "live-budget:{}:{}",
+                live.alert.budget_id, live.alert.fired_at
+            )),
+            route: Route::Budgets,
+            provider: "Codex".into(),
+            code: "live_account_threshold".into(),
+            observed_at: live.observed_at,
             delivered_at: now,
         };
         log.push(crate::quota_store::NotificationLogEntry {

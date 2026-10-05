@@ -1153,6 +1153,21 @@ visualTest('ambient-recent-narrow', 'bounded recent alerts and evidence at narro
   await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
 });
 
+visualPanelTest('live-account-alerts-narrow', 'exact approved account rules stay opt-in at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { view: 'codex', scenario: 'live-account-alerts' });
+  const panel = await openQuotaPanel(page, 'live-account-alerts');
+  const options = panel.getByRole('combobox', { name: 'Approved account and window' });
+  await expect(options.getByRole('option', { name: /Synthetic work account/ }).first()).toBeAttached();
+  await options.selectOption({ index: 1 });
+  await expect(panel.getByRole('checkbox', { name: 'Enable this new account rule' })).not.toBeChecked();
+  await panel.getByRole('button', { name: 'Add account rule' }).click();
+  await expect(panel.getByRole('button', { name: 'Enable account rule' })).toBeVisible();
+  await expect(panel).toContainText('300 min');
+  await panel.evaluate(element => element.classList.add('bg-card'));
+  return panel;
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {
@@ -1165,3 +1180,4 @@ test('visual manifest covers every registered top-level view in light and dark',
   const expectedIds = primaryViews.map((view) => view.id).sort();
   expect(registeredIds).toEqual(expectedIds);
 });
+
