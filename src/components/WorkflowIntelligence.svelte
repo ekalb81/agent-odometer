@@ -111,6 +111,7 @@
         <p>Before {utcDate(report.before.from)}–{utcDate(report.before.to)} · after {utcDate(report.after.from)}–{utcDate(report.after.to)} · UTC</p>
       </div>
       <div class="overflow-x-auto">
+        <p class="mb-1 text-ink-faint sm:hidden">Scroll sideways for the evidence column.</p>
         <details class="mb-2 rounded-sm border border-edge p-2">
           <summary class="cursor-pointer text-ink">Local setup health</summary>
           {#if report.setup_health}
@@ -122,23 +123,23 @@
             </ul>
           {:else}<p class="mt-2 text-ink-muted">Setup health is unavailable because saved source configuration could not be read.</p>{/if}
         </details>
-        <table class="w-full min-w-96 text-left text-[11px]">
-          <thead class="text-ink-muted"><tr><th class="py-1">Measurement</th><th>Before</th><th>After</th><th>Current evidence</th></tr></thead>
+        <table class="w-full min-w-[660px] text-left text-[11px]">
+          <thead class="text-ink-muted"><tr><th class="px-2 py-1">Measurement</th><th class="px-2">Before</th><th class="px-2">After</th><th class="px-2">Current evidence</th></tr></thead>
           <tbody>
             {#each report.after.ledger_metrics.metrics as metric (metric.id)}
               <tr class="border-t border-edgerow">
-                <th class="py-2 font-medium text-ink" title={metric.denominator_is}>{labels[metric.id] ?? metric.id}</th>
-                <td class="font-mono text-ink-muted">{value(report.before.ledger_metrics.metrics.find((row) => row.id === metric.id))}</td>
-                <td class="font-mono text-ink">{value(metric)}</td>
-                <td class="text-ink-muted">{metric.numerator.toLocaleString()} / {metric.denominator.toLocaleString()} · {metric.denominator_is}</td>
+                <th class="px-2 py-2 font-medium text-ink" title={metric.denominator_is}>{labels[metric.id] ?? metric.id}</th>
+                <td class="px-2 font-mono text-ink-muted">{value(report.before.ledger_metrics.metrics.find((row) => row.id === metric.id))}</td>
+                <td class="px-2 font-mono text-ink">{value(metric)}</td>
+                <td class="px-2 text-ink-muted">{metric.numerator.toLocaleString()} / {metric.denominator.toLocaleString()} · {metric.denominator_is}</td>
               </tr>
             {/each}
             {#each report.after.additional_metrics as metric (metric.id)}
               <tr class="border-t border-edgerow">
-                <th class="py-2 font-medium text-ink" title={metric.coverage_is}>{labels[metric.id] ?? metric.id}</th>
-                <td class="font-mono text-ink-muted">{value(report.before.additional_metrics.find((row) => row.id === metric.id))}</td>
-                <td class="font-mono text-ink">{value(metric)}</td>
-                <td class="text-ink-muted">{metric.covered_samples} / {metric.eligible_samples} covered · {metric.denominator_is}{#if metric.missing_data}<span class="block">{metric.missing_data.replaceAll('_', ' ')}</span>{/if}</td>
+                <th class="px-2 py-2 font-medium text-ink" title={metric.coverage_is}>{labels[metric.id] ?? metric.id}</th>
+                <td class="px-2 font-mono text-ink-muted">{value(report.before.additional_metrics.find((row) => row.id === metric.id))}</td>
+                <td class="px-2 font-mono text-ink">{value(metric)}</td>
+                <td class="px-2 text-ink-muted">{metric.covered_samples} / {metric.eligible_samples} covered · {metric.denominator_is}{#if metric.missing_data}<span class="block">{metric.missing_data.replaceAll('_', ' ')}</span>{/if}</td>
               </tr>
             {/each}
           </tbody>
