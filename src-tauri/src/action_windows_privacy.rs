@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::{NamedTempFile, TempPath};
 use windows_sys::Win32::Foundation::{
-    GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, INVALID_HANDLE_VALUE,
+    GetLastError, LocalFree, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER,
+    INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -105,6 +106,19 @@ pub(crate) struct PrivateJournal {
 
 impl PrivateJournal {
     pub(crate) fn open_or_create(root: &Path, journal: &Path) -> Result<Self, PrivacyError> {
+        Self::open(root, journal, true)
+    }
+
+    pub(crate) fn open_existing(root: &Path, journal: &Path) -> Result<Option<Self>, PrivacyError> {
+        match std::fs::symlink_metadata(journal) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(PrivacyError::Io),
+            Ok(_) => {}
+        }
+        Self::open(root, journal, false).map(Some)
+    }
+
+    fn open(root: &Path, journal: &Path, create: bool) -> Result<Self, PrivacyError> {
         if !root.is_absolute() || journal.parent() != Some(root) || journal.file_name().is_none() {
             return Err(PrivacyError::Unsafe);
         }
@@ -115,7 +129,8 @@ impl PrivateJournal {
         let journal_wide = wide_path(journal)?;
         let attributes = policy.attributes(true);
         // An existing directory is inspected without changing its ACL.
-        if unsafe { CreateDirectoryW(journal_wide.as_ptr(), &attributes) } == 0
+        if create
+            && unsafe { CreateDirectoryW(journal_wide.as_ptr(), &attributes) } == 0
             && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
         {
             return Err(PrivacyError::Io);
@@ -172,6 +187,10 @@ impl PrivateJournal {
     }
 
     pub(crate) fn open_file(&self, path: &Path) -> Result<File, PrivacyError> {
+        self.open_file_optional(path)?.ok_or(PrivacyError::Io)
+    }
+
+    pub(crate) fn open_file_optional(&self, path: &Path) -> Result<Option<File>, PrivacyError> {
         self.check_child(path)?;
         let wide = wide_path(path)?;
         let raw = unsafe {
@@ -186,12 +205,15 @@ impl PrivateJournal {
             )
         };
         if raw == INVALID_HANDLE_VALUE {
+            if unsafe { GetLastError() } == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
             return Err(PrivacyError::Io);
         }
         let file = unsafe { File::from_raw_handle(raw) };
         verify_type(&file, false)?;
         verify_security(&file, &self.policy.user_sid, false)?;
-        Ok(file)
+        Ok(Some(file))
     }
 
     pub(crate) fn verify_binding(&self) -> Result<(), PrivacyError> {

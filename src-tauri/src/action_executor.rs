@@ -6,9 +6,15 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(not(windows))]
+use std::fs::{File, OpenOptions};
+#[cfg(windows)]
+use std::io::Read;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +46,16 @@ enum ActionError {
 impl From<std::io::Error> for ActionError {
     fn from(_: std::io::Error) -> Self {
         Self::Io
+    }
+}
+
+#[cfg(windows)]
+impl From<crate::action_windows_privacy::PrivacyError> for ActionError {
+    fn from(error: crate::action_windows_privacy::PrivacyError) -> Self {
+        match error {
+            crate::action_windows_privacy::PrivacyError::Unsafe => Self::UnsafeTarget,
+            crate::action_windows_privacy::PrivacyError::Io => Self::Io,
+        }
     }
 }
 
@@ -142,6 +158,7 @@ fn checked_target(target: &ResolvedTarget) -> Result<(), ActionError> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn ensure_journal_dir(target: &ResolvedTarget) -> Result<(), ActionError> {
     checked_target(target)?;
     if !target.journal.exists() {
@@ -184,6 +201,32 @@ fn ensure_journal_dir(target: &ResolvedTarget) -> Result<(), ActionError> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn open_private_journal(
+    target: &ResolvedTarget,
+) -> Result<crate::action_windows_privacy::PrivateJournal, ActionError> {
+    checked_target(target)?;
+    Ok(
+        crate::action_windows_privacy::PrivateJournal::open_or_create(
+            &target.root,
+            &target.journal,
+        )?,
+    )
+}
+
+#[cfg(windows)]
+fn open_existing_private_journal(
+    target: &ResolvedTarget,
+) -> Result<Option<crate::action_windows_privacy::PrivateJournal>, ActionError> {
+    checked_target(target)?;
+    Ok(
+        crate::action_windows_privacy::PrivateJournal::open_existing(
+            &target.root,
+            &target.journal,
+        )?,
+    )
+}
+
 fn read_target(target: &ResolvedTarget) -> Result<Vec<u8>, ActionError> {
     checked_target(target)?;
     crate::harness_integration::read_bounded_regular_file(&target.file, MAX_TARGET_BYTES)
@@ -219,6 +262,7 @@ fn backup_path(target: &ResolvedTarget, id: &str) -> Result<PathBuf, ActionError
     Ok(target.journal.join(format!("{id}.backup")))
 }
 
+#[cfg(not(windows))]
 fn private_new_file(path: &Path) -> Result<File, ActionError> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -281,6 +325,8 @@ fn read_journal_events(
         Err(_) => return Err(ActionError::Io),
         Ok(_) => {}
     }
+    #[cfg(windows)]
+    let _journal = open_existing_private_journal(target)?.ok_or(ActionError::Io)?;
     for suffix in JOURNAL_SUFFIXES {
         if let Some(record) = read_event(target, id, suffix)? {
             events.insert(suffix.to_owned(), record);
@@ -344,13 +390,28 @@ fn write_event(
         return Err(ActionError::InvalidJournal);
     }
     let path = journal_path(target, id, suffix)?;
+    #[cfg(windows)]
+    let journal = open_private_journal(target)?;
+    #[cfg(not(windows))]
     ensure_journal_dir(target)?;
+    #[cfg(windows)]
+    let mut staged = journal.create_event_stage()?;
+    #[cfg(not(windows))]
     let mut staged = tempfile::NamedTempFile::new_in(&target.journal)?;
     staged.write_all(&bytes)?;
     staged.as_file().sync_all()?;
     staged
-        .persist_noclobber(path)
+        .persist_noclobber(&path)
         .map_err(|_| ActionError::Io)?;
+    #[cfg(windows)]
+    {
+        journal.verify_binding()?;
+        let file = journal.open_file(&path)?;
+        if file.metadata()?.len() > MAX_JOURNAL_BYTES {
+            return Err(ActionError::InvalidJournal);
+        }
+        journal.verify_binding()?;
+    }
     #[cfg(unix)]
     File::open(&target.journal)?.sync_all()?;
     Ok(())
@@ -362,15 +423,40 @@ fn read_event(
     suffix: &str,
 ) -> Result<Option<JournalRecord>, ActionError> {
     let path = journal_path(target, id, suffix)?;
+    #[cfg(windows)]
+    let Some(journal) = open_existing_private_journal(target)?
+    else {
+        return Ok(None);
+    };
+    #[cfg(not(windows))]
     ensure_journal_dir(target)?;
+    #[cfg(not(windows))]
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(ActionError::Io),
     };
+    #[cfg(not(windows))]
     if !metadata.file_type().is_file() {
         return Err(ActionError::InvalidJournal);
     }
+    #[cfg(windows)]
+    let bytes = {
+        let Some(file) = journal.open_file_optional(&path)? else {
+            return Ok(None);
+        };
+        if file.metadata()?.len() > MAX_JOURNAL_BYTES {
+            return Err(ActionError::InvalidJournal);
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_JOURNAL_BYTES {
+            return Err(ActionError::InvalidJournal);
+        }
+        journal.verify_binding()?;
+        bytes
+    };
+    #[cfg(not(windows))]
     let bytes = crate::harness_integration::read_bounded_regular_file(&path, MAX_JOURNAL_BYTES)
         .map_err(|_| ActionError::InvalidJournal)?;
     let record: JournalRecord =
@@ -381,13 +467,33 @@ fn read_event(
 
 fn read_backup(target: &ResolvedTarget, record: &JournalRecord) -> Result<Vec<u8>, ActionError> {
     let path = backup_path(target, &record.action_id)?;
+    #[cfg(windows)]
+    let journal = open_existing_private_journal(target)?.ok_or(ActionError::InvalidJournal)?;
+    #[cfg(not(windows))]
     ensure_journal_dir(target)?;
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_TARGET_BYTES {
-        return Err(ActionError::InvalidJournal);
-    }
-    let bytes = crate::harness_integration::read_bounded_regular_file(&path, MAX_TARGET_BYTES)
-        .map_err(|_| ActionError::InvalidJournal)?;
+    #[cfg(windows)]
+    let bytes = {
+        let file = journal.open_file(&path)?;
+        if file.metadata()?.len() > MAX_TARGET_BYTES {
+            return Err(ActionError::InvalidJournal);
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_TARGET_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_TARGET_BYTES {
+            return Err(ActionError::InvalidJournal);
+        }
+        journal.verify_binding()?;
+        bytes
+    };
+    #[cfg(not(windows))]
+    let bytes = {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_TARGET_BYTES {
+            return Err(ActionError::InvalidJournal);
+        }
+        crate::harness_integration::read_bounded_regular_file(&path, MAX_TARGET_BYTES)
+            .map_err(|_| ActionError::InvalidJournal)?
+    };
     if bytes.len() as u64 > MAX_TARGET_BYTES || sha256(&bytes) != record.before_sha256 {
         return Err(ActionError::InvalidJournal);
     }
@@ -489,6 +595,8 @@ fn apply_batch_using(
 }
 
 fn rollback_failed_attempt(target: &ResolvedTarget, id: &str) -> Result<(), ActionError> {
+    #[cfg(windows)]
+    let _journal = open_existing_private_journal(target)?;
     // A preparation-free failure has no markers. Orphan later events are
     // an invalid transaction, not evidence that the attempt wrote nothing.
     let events = read_journal_events(target, id)?;
@@ -545,6 +653,9 @@ fn apply_transaction_with_id(
         return Err(ActionError::Conflict);
     }
     let id = id.to_owned();
+    #[cfg(windows)]
+    let journal = open_private_journal(target)?;
+    #[cfg(not(windows))]
     ensure_journal_dir(target)?;
     // Refuse an existing transaction before creating a backup or any event.
     let existing = read_journal_events(target, &id)?;
@@ -552,9 +663,14 @@ fn apply_transaction_with_id(
         validate_journal(&existing)?;
         return Err(ActionError::Conflict);
     }
+    #[cfg(windows)]
+    let mut backup = journal.create_file(&backup_path(target, &id)?)?;
+    #[cfg(not(windows))]
     let mut backup = private_new_file(&backup_path(target, &id)?)?;
     backup.write_all(&before)?;
     backup.sync_all()?;
+    #[cfg(windows)]
+    journal.verify_binding()?;
     let record = JournalRecord {
         version: JOURNAL_VERSION,
         action_id: id.clone(),
@@ -606,6 +722,8 @@ fn apply_transaction_with_id(
 }
 
 fn undo_transaction(target: &ResolvedTarget, id: &str) -> Result<(), ActionError> {
+    #[cfg(windows)]
+    let _journal = open_existing_private_journal(target)?;
     let journal = read_validated_journal(target, id)?;
     let prepared = journal["prepared"].clone();
     if journal.contains_key("undone") {
@@ -646,6 +764,8 @@ fn undo_transaction(target: &ResolvedTarget, id: &str) -> Result<(), ActionError
 }
 
 fn recover_transaction(target: &ResolvedTarget, id: &str) -> Result<Recovery, ActionError> {
+    #[cfg(windows)]
+    let _journal = open_existing_private_journal(target)?;
     let journal = read_validated_journal(target, id)?;
     let prepared = journal["prepared"].clone();
     read_backup(target, &prepared)?;
@@ -723,6 +843,21 @@ mod tests {
         };
         fs::write(&target.file, bytes).unwrap();
         target
+    }
+
+    fn write_new_journal_fixture(target: &ResolvedTarget, path: &PathBuf, bytes: &[u8]) {
+        #[cfg(windows)]
+        {
+            let journal = open_private_journal(target).unwrap();
+            let mut file = journal.create_file(path).unwrap();
+            file.write_all(bytes).unwrap();
+            file.sync_all().unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = target;
+            fs::write(path, bytes).unwrap();
+        }
     }
 
     fn bytes_on_disk(target: &ResolvedTarget) -> (Vec<u8>, BTreeMap<std::ffi::OsString, Vec<u8>>) {
@@ -868,11 +1003,11 @@ mod tests {
                     undo_state,
                     ..prepared.clone()
                 };
-                fs::write(
-                    journal_path(&target, &id, suffix).unwrap(),
-                    serde_json::to_vec(&record).unwrap(),
-                )
-                .unwrap();
+                write_new_journal_fixture(
+                    &target,
+                    &journal_path(&target, &id, suffix).unwrap(),
+                    &serde_json::to_vec(&record).unwrap(),
+                );
             }
             let before = bytes_on_disk(&target);
             assert_eq!(
@@ -906,11 +1041,11 @@ mod tests {
             undo_state: UndoState::Undone,
             ..prepared
         };
-        fs::write(
-            journal_path(&target, &id, "undone").unwrap(),
-            serde_json::to_vec(&undone).unwrap(),
-        )
-        .unwrap();
+        write_new_journal_fixture(
+            &target,
+            &journal_path(&target, &id, "undone").unwrap(),
+            &serde_json::to_vec(&undone).unwrap(),
+        );
         let before = bytes_on_disk(&target);
         assert_eq!(
             recover_transaction(&target, &id),
@@ -927,6 +1062,9 @@ mod tests {
     fn an_orphan_event_refuses_new_preparation_before_creating_a_backup() {
         let dir = tempfile::tempdir().unwrap();
         let target = fixture(&dir, "guard.json", b"before");
+        #[cfg(windows)]
+        let _journal = open_private_journal(&target).unwrap();
+        #[cfg(not(windows))]
         ensure_journal_dir(&target).unwrap();
         let id = action_id();
         let record = JournalRecord {
@@ -940,11 +1078,11 @@ mod tests {
             result: JournalResult::Applied,
             undo_state: UndoState::Available,
         };
-        fs::write(
-            journal_path(&target, &id, "applied").unwrap(),
-            serde_json::to_vec(&record).unwrap(),
-        )
-        .unwrap();
+        write_new_journal_fixture(
+            &target,
+            &journal_path(&target, &id, "applied").unwrap(),
+            &serde_json::to_vec(&record).unwrap(),
+        );
         let before = bytes_on_disk(&target);
         assert_eq!(
             recover_transaction(&target, &id),
