@@ -2,7 +2,7 @@
   import type { ViewScope } from '../lib/sessionProjection';
   import { getLiveQuotaStatus, identifyQuotaAccount, approveQuotaAccount, changeQuotaAccount, liveQuotaUnavailable,
     type DiscoveredQuotaAccount, type LiveQuotaStatus } from '../lib/liveQuota';
-  import { quotaWindowLabel, resetCountdown } from '../lib/subscriptionUsage';
+  import { quotaWindowLabel, quotaResetEvidence, resetCountdown } from '../lib/subscriptionUsage';
   let { active = true, harness = 'all' }: { active?: boolean; harness?: ViewScope } = $props();
   let status = $state<LiveQuotaStatus | null>(null);
   let candidate = $state<DiscoveredQuotaAccount | null>(null);
@@ -92,6 +92,7 @@
                 {#if window.stale} · Stale observation{/if}
                 {#if window.resets_at} · Resets {resetCountdown(window.resets_at, now)}{/if}
               </p>
+              {#if quotaResetEvidence(window, now)}<p>{quotaResetEvidence(window, now)}</p>{/if}
             {/each}
             {#if bucket.snapshot.windows.length === 0}<p>No quota windows reported.</p>{/if}
           </div>

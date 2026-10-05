@@ -22,6 +22,7 @@
     forecastSummary,
     quotaUnavailableLabel,
     quotaWindowLabel,
+    quotaResetEvidence,
     remainingPercent,
     reserveDeficitLabel,
     resetCountdown,
@@ -255,17 +256,13 @@
                 {/if}
                 {#if window.forecast}
                   <p class="text-[10px] text-ink-faint mt-0.5">
-                    {forecastSummary(window.forecast, nowTick)} · {reserveDeficitLabel(window.forecast.reserve_deficit_percent)}
+                    Estimated {forecastSummary(window.forecast, nowTick)} · {reserveDeficitLabel(window.forecast.reserve_deficit_percent)}
                     ({window.forecast.evidence_points} samples)
                   </p>
                 {/if}
-                <p class="text-[10px] text-ink-faint mt-0.5">
-                  {#if window.window_started_at && !window.window_started_at_estimated}
-                    Reset observed by {new Date(window.window_started_at).toLocaleString()}
-                  {:else}
-                    Last reset unknown
-                  {/if}
-                </p>
+                {#if quotaResetEvidence(window, nowTick)}
+                  <p class="text-[10px] text-ink-faint mt-0.5">{quotaResetEvidence(window, nowTick)}</p>
+                {/if}
               </div>
             {/each}
           {/if}

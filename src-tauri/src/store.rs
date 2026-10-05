@@ -3421,14 +3421,79 @@ mod tests {
             unavailable: Some("disabled"),
         });
         let original = statuses.clone();
+        let from_ms = (now - chrono::Duration::hours(8760)).timestamp_millis();
+        let proof = history.accounting_coverage_since(from_ms).unwrap().unwrap();
+        let proofs = vec![
+            Some((from_ms, proof.clone())),
+            Some((from_ms, proof)),
+            None,
+            None,
+        ];
+        let keys = vec![
+            vec![observed.effective_storage_id()],
+            vec![observed.effective_storage_id()],
+            Vec::new(),
+            Vec::new(),
+        ];
+        let durable_projects = history.session_project_rows().unwrap();
+        let project_scope = crate::commands::ProjectBudgetScope {
+            sessions: history.list_session_project_overrides().unwrap(),
+            projects: history
+                .list_project_overrides()
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.project_key.clone(), row))
+                .collect(),
+        };
+        let generation = state.sessions_generation();
+        let key = observed.effective_storage_id();
+        state.ledger_stale.insert(key.clone(), ());
+        let mut stale_statuses = original.clone();
+        crate::commands::finalize_scoped_quota_budget_statuses(
+            &state,
+            Some(&history),
+            &budgets,
+            &proofs,
+            &keys,
+            generation,
+            Some(&durable_projects),
+            Some(&project_scope),
+            &mut stale_statuses,
+        );
+        assert!(stale_statuses[..2]
+            .iter()
+            .all(|status| status.current_value.is_none()));
+        state.ledger_stale.remove(&key);
+        state.touch_sessions_generation();
+        let mut changed_statuses = original.clone();
+        crate::commands::finalize_scoped_quota_budget_statuses(
+            &state,
+            Some(&history),
+            &budgets,
+            &proofs,
+            &keys,
+            generation,
+            Some(&durable_projects),
+            Some(&project_scope),
+            &mut changed_statuses,
+        );
+        assert!(changed_statuses[..2]
+            .iter()
+            .all(|status| status.current_value.is_none()));
+        let generation = state.sessions_generation();
         let replacement =
             Arc::new(HistoryStore::open(&directory.path().join("replacement.sqlite3")).unwrap());
         assert!(replacement.has_complete_coverage().unwrap());
         state.set_history_ready(Some(replacement));
-        crate::commands::finalize_quota_budget_statuses(
+        crate::commands::finalize_scoped_quota_budget_statuses(
             &state,
             Some(&history),
             &budgets,
+            &proofs,
+            &keys,
+            generation,
+            Some(&durable_projects),
+            Some(&project_scope),
             &mut statuses,
         );
         assert!(statuses[..2]
@@ -3445,10 +3510,15 @@ mod tests {
         assert_eq!(preview.sessions, 1);
         state.purge_retained_history(&preview, |_| {}).unwrap();
         statuses = original.clone();
-        crate::commands::finalize_quota_budget_statuses(
+        crate::commands::finalize_scoped_quota_budget_statuses(
             &state,
             Some(&history),
             &budgets,
+            &proofs,
+            &keys,
+            generation,
+            Some(&durable_projects),
+            Some(&project_scope),
             &mut statuses,
         );
         assert!(statuses[..2]
@@ -3485,6 +3555,90 @@ mod tests {
             next_log, log,
             "unavailable history must not consume or rearm a crossing"
         );
+    }
+
+    #[test]
+    fn token_and_usd_budgets_use_only_proven_post_purge_windows() {
+        if !isolated_quota_test(
+            "store::tests::token_and_usd_budgets_use_only_proven_post_purge_windows",
+        ) {
+            return;
+        }
+        use crate::quota_store::{BudgetUnit, QuotaBudget};
+        let state = Arc::new(state());
+        let directory = tempfile::tempdir().unwrap();
+        let history =
+            Arc::new(HistoryStore::open(&directory.path().join("history.sqlite3")).unwrap());
+        let now = Utc::now();
+        for (id, age_hours, missing) in [("old", 60 * 24, true), ("recent", 1, false)] {
+            let mut observed = session(id, 1);
+            observed.started_at = now - chrono::Duration::hours(age_hours);
+            observed.last_event_at = observed.started_at;
+            observed.tokens_total = TokenTotals {
+                input_tokens: 1_000_000,
+                total_tokens: 1_000_000,
+                ..Default::default()
+            };
+            observed
+                .tokens_history
+                .push(crate::model::TokenHistoryPoint {
+                    timestamp: observed.started_at,
+                    model: Some("gpt-5.4".into()),
+                    service_tier: None,
+                    request_input_tokens: Some(1_000_000),
+                    total_tokens: 1_000_000,
+                    delta: observed.tokens_total.clone(),
+                });
+            let path = directory.path().join(format!("{id}.jsonl"));
+            history.observe(&path, &observed, 1).unwrap();
+            if missing {
+                history.mark_path_missing(&path).unwrap();
+            }
+        }
+        state.set_history_ready(Some(history.clone()));
+        history
+            .set_retention_policy(&crate::history_store::RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let preview = history.preview_purge(now).unwrap();
+        assert_eq!(preview.sessions, 1);
+        state.purge_retained_history(&preview, |_| {}).unwrap();
+        assert!(!history.has_complete_coverage().unwrap());
+        let budget = QuotaBudget {
+            id: "tokens".into(),
+            provider: codex_provider_id(),
+            project_key: None,
+            unit: BudgetUnit::Tokens,
+            window_kind: None,
+            period_hours: Some(48),
+            threshold: 1.0,
+            enabled: true,
+        };
+        let statuses = crate::commands::quota_budget_statuses(
+            &state,
+            &[
+                budget.clone(),
+                QuotaBudget {
+                    id: "usd".into(),
+                    unit: BudgetUnit::Usd,
+                    ..budget.clone()
+                },
+                QuotaBudget {
+                    id: "overlap".into(),
+                    period_hours: Some(8760),
+                    ..budget
+                },
+            ],
+            now,
+            chrono::Duration::hours(1),
+        );
+        assert_eq!(statuses[0].current_value, Some(1_000_000.0), "{statuses:?}");
+        assert!(
+            statuses[1].current_value.is_some_and(|value| value > 0.0),
+            "{statuses:?}"
+        );
+        assert_eq!(statuses[2].unavailable, Some("history_unavailable"));
     }
 
     #[test]

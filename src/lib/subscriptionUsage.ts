@@ -92,6 +92,16 @@ export function reserveDeficitLabel(reserveDeficitPercent: number): string {
     : `${magnitude}pt ahead of even pace`;
 }
 
+/** Report evidence without treating rolling-window decay as a provider reset. */
+export function quotaResetEvidence(window: Pick<QuotaWindow, 'unit' | 'window_started_at' | 'window_start_basis'>, nowMs: number): string | null {
+  if (window.unit !== 'percent') return null;
+  const observed = window.window_started_at ? Date.parse(window.window_started_at) : NaN;
+  if (window.window_start_basis === 'counter_decrease' && Number.isFinite(observed) && observed <= nowMs) {
+    return `Last reset not reported. Usage decrease observed at ${new Date(observed).toLocaleString()}.`;
+  }
+  return 'Last reset not reported.';
+}
+
 export type BudgetStatus = 'ok' | 'warning' | 'exceeded';
 
 /** Advisory-only (hard enforcement is issue #46) status for a budget given
