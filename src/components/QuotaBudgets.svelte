@@ -158,6 +158,8 @@
     const labels: Record<string, string> = {
       pricing_incomplete: 'Pricing unavailable', non_usd_rates: 'Non-USD rate card',
       history_unavailable: 'History unavailable', project_scope_unavailable: 'Project history unavailable',
+      history_identity_ambiguous: 'Historical identity is ambiguous',
+      history_identity_unverified: 'Historical identity could not be verified',
       project_unavailable: 'Project unavailable', stale_quota: 'Quota is stale',
       quota_unavailable: 'Quota unavailable', disabled: 'Budget disabled',
     };

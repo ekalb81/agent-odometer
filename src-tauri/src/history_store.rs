@@ -1725,6 +1725,113 @@ impl HistoryStore {
         Ok(rows)
     }
 
+    /// Detect older ambiguous identity records before claiming a scoped
+    /// accounting total. This only reads indexed metadata/events; it never
+    /// guesses which retained session to delete or drops historical usage.
+    /// A short SQLite deadline and row caps make an unproved answer an error.
+    pub fn has_ambiguous_accounting_identity(
+        &self,
+        selected_keys: &[String],
+        from_ms: i64,
+        to_ms: i64,
+        control: &QueryControl,
+    ) -> Result<bool> {
+        control.check()?;
+        if from_ms > to_ms {
+            bail!("identity window end precedes start");
+        }
+        if selected_keys.is_empty() {
+            return Ok(false);
+        }
+        if selected_keys.len() > control.max_sessions {
+            bail!("identity session proof limit exceeded");
+        }
+        let selected_json = serde_json::to_string(selected_keys)?;
+        if selected_json.len() > 8 * 1024 * 1024 {
+            bail!("identity key proof size exceeded");
+        }
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        configure_query_reader(&connection, Some(control))?;
+
+        // The affected old ledgers can have a present source location routed
+        // through an artifact still owned by the superseded session.
+        let mut mismatches = connection.prepare(
+            "SELECT l.session_key FROM json_each(?1) selected
+             JOIN source_locations l ON l.session_key = selected.value
+             LEFT JOIN source_artifacts a ON a.artifact_key = l.artifact_key
+             WHERE a.session_key IS NULL OR a.session_key <> l.session_key
+             LIMIT 1",
+        )?;
+        if mismatches
+            .query_row([selected_json.as_str()], |_| Ok(()))
+            .optional()?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        drop(mismatches);
+
+        // A superseded sibling can retain the very same token event as its
+        // replacement, even after all source locations have disappeared.
+        // Genuine present/present collisions remain separately measurable.
+        let mut pairs = connection.prepare(
+            "SELECT a.session_key, b.session_key FROM durable_sessions a
+             JOIN durable_sessions b
+               ON b.identity_key = a.identity_key AND b.session_key > a.session_key
+             WHERE a.session_key IN (SELECT value FROM json_each(?1))
+               AND b.session_key IN (SELECT value FROM json_each(?1))
+               AND a.collision = 1 AND b.collision = 1
+               AND (a.lifecycle = 'superseded' OR b.lifecycle = 'superseded')
+             LIMIT 1025",
+        )?;
+        let mut pair_rows = pairs.query([selected_json.as_str()])?;
+        let mut examined_pairs = 0;
+        let mut selected_pairs = Vec::new();
+        while let Some(row) = pair_rows.next()? {
+            control.consume_row()?;
+            examined_pairs += 1;
+            if examined_pairs > 1024 {
+                bail!("identity pair proof limit exceeded");
+            }
+            let left: String = row.get(0)?;
+            let right: String = row.get(1)?;
+            selected_pairs.push((left, right));
+        }
+        drop(pair_rows);
+        drop(pairs);
+
+        let mut events = connection.prepare(
+            "SELECT event_key, timestamp_ms FROM durable_token_events
+             WHERE session_key = ?1 AND timestamp_ms >= ?2 AND timestamp_ms <= ?3
+             LIMIT 4097",
+        )?;
+        let mut matching = connection.prepare(
+            "SELECT 1 FROM durable_token_events
+             WHERE session_key = ?1 AND event_key = ?2 AND timestamp_ms = ?3 LIMIT 1",
+        )?;
+        for (left, right) in selected_pairs {
+            let mut rows = events.query(params![left, from_ms, to_ms])?;
+            let mut examined_events = 0;
+            while let Some(row) = rows.next()? {
+                control.consume_row()?;
+                examined_events += 1;
+                if examined_events > 4096 {
+                    bail!("identity event proof limit exceeded");
+                }
+                let event_key: String = row.get(0)?;
+                let timestamp_ms: i64 = row.get(1)?;
+                if matching
+                    .query_row(params![right, event_key, timestamp_ms], |_| Ok(()))
+                    .optional()?
+                    .is_some()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub fn range_totals_multi(
         &self,
         session_keys: &[String],
@@ -4251,6 +4358,65 @@ fn reconcile_session(
     // transcripts: copied files may later diverge. Exact histories and prefix
     // histories are one lineage; a mismatch after their shared prefix is a
     // collision that must receive its own durable session.
+    // A token count can precede the first task_started record in an
+    // append-only rollout. Its first token is already final, but the later
+    // first turn changes the fingerprint. This is the same source and the
+    // same growing history, not a second provider session. Do not apply this
+    // to a shorter/replaced transcript or a different source location.
+    let prior_from_path: Option<(String, Vec<u8>, String)> = transaction
+        .query_row(
+            "SELECT d.session_key, s.session_json, l.artifact_key
+             FROM source_locations l JOIN durable_sessions d ON d.session_key = l.session_key
+             JOIN source_artifacts a ON a.artifact_key = l.artifact_key AND a.session_key = d.session_key
+             JOIN session_snapshots s ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
+             WHERE l.path = ?1 AND d.identity_key = ?2 AND d.fingerprint_is_final = 1
+               AND d.first_event_fingerprint <> ?3",
+            params![path, identity, fingerprint],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((key, raw, bound_artifact)) = prior_from_path {
+        let stored: Session = serde_json::from_slice(&raw)
+            .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
+        let gaining_first_turn = stored.turns.is_empty()
+            && !incoming.turns.is_empty()
+            && !stored.tokens_history.is_empty()
+            && incoming.tokens_history.len() >= stored.tokens_history.len()
+            && provisional_metadata_matches(incoming, &stored)
+            && histories_share_lineage(&incoming.tokens_history, &stored.tokens_history);
+        if gaining_first_turn {
+            transaction.execute(
+                "UPDATE durable_sessions SET first_event_fingerprint = ?2, last_seen_at_ms = ?3 WHERE session_key = ?1",
+                params![key, fingerprint, now],
+            )?;
+            transaction.execute(
+                "UPDATE source_artifacts SET first_event_fingerprint = ?2 WHERE session_key = ?1",
+                params![key, fingerprint],
+            )?;
+            return Ok(key);
+        }
+        // A stale copy may still lack the turn and later token events. Only
+        // its *already bound* artifact proves that this exact shorter source
+        // history was previously observed as this durable key. A new file
+        // replacement/truncation has no such binding.
+        let incoming_artifact = source_artifact_key(transaction, identity, incoming, &key)?;
+        if !stored.turns.is_empty()
+            && incoming.turns.is_empty()
+            && !stored.tokens_history.is_empty()
+            && !incoming.tokens_history.is_empty()
+            && incoming.tokens_history.len() <= stored.tokens_history.len()
+            && bound_artifact == incoming_artifact
+            && provisional_metadata_matches(incoming, &stored)
+            && histories_share_lineage(&incoming.tokens_history, &stored.tokens_history)
+        {
+            transaction.execute(
+                "UPDATE durable_sessions SET last_seen_at_ms = ?2 WHERE session_key = ?1",
+                params![key, now],
+            )?;
+            return Ok(key);
+        }
+    }
+
     let mut statement = transaction.prepare(
         "SELECT d.session_key, s.session_json
          FROM durable_sessions d JOIN session_snapshots s
@@ -4352,6 +4518,10 @@ fn reconcile_session(
             transaction.execute(
                 "UPDATE durable_sessions SET first_event_fingerprint = ?2, fingerprint_is_final = 1, last_seen_at_ms = ?3 WHERE session_key = ?1",
                 params![key, fingerprint, now],
+            )?;
+            transaction.execute(
+                "UPDATE source_artifacts SET first_event_fingerprint = ?2 WHERE session_key = ?1",
+                params![key, fingerprint],
             )?;
             return Ok(key);
         }
@@ -4597,7 +4767,6 @@ fn observe_one_in_transaction(
     let path = source_path_key(source_path);
     let identity = provider_identity(session)?;
     let fingerprint = first_event_fingerprint(session);
-    let lineage = history_lineage(session);
     let fingerprint_is_final = !session.tokens_history.is_empty();
     let now = now_ms();
     if lifecycle::is_excluded(transaction, session)? {
@@ -4629,16 +4798,19 @@ fn observe_one_in_transaction(
     let raw_snapshot =
         serde_json::to_vec(&archived_session).context("could not encode session snapshot")?;
     let snapshot_hash = stable_hash_bytes(&raw_snapshot);
-    let artifact_key = format!(
-        "artifact-{}",
-        stable_hash(&format!("{identity}\u{1f}{lineage}"))
-    );
-    transaction.execute(
+    let artifact_key = source_artifact_key(transaction, &identity, session, &key)?;
+    let artifact_rows = transaction.execute(
         "INSERT INTO source_artifacts(artifact_key, identity_key, first_event_fingerprint, session_key, created_at_ms, last_seen_at_ms)
-         VALUES(?1, ?2, ?3, ?4, ?5, ?5)
-         ON CONFLICT(artifact_key) DO UPDATE SET last_seen_at_ms = excluded.last_seen_at_ms",
-        params![artifact_key, identity, fingerprint, key, now],
+         SELECT ?1, identity_key, first_event_fingerprint, session_key, ?3, ?3
+         FROM durable_sessions WHERE session_key = ?2
+         ON CONFLICT(artifact_key) DO UPDATE SET last_seen_at_ms = excluded.last_seen_at_ms,
+             first_event_fingerprint = excluded.first_event_fingerprint
+         WHERE source_artifacts.session_key = excluded.session_key",
+        params![artifact_key, key, now],
     )?;
+    if artifact_rows != 1 {
+        bail!("source artifact belongs to a different durable session");
+    }
     transaction.execute(
         "INSERT INTO source_locations(path, artifact_key, session_key, present, first_seen_at_ms, last_seen_at_ms, seen_generation)
          VALUES(?1, ?2, ?3, 1, ?4, ?4, ?5)
@@ -5714,6 +5886,52 @@ fn history_lineage(session: &Session) -> String {
     stable_hash(&value)
 }
 
+/// An artifact is normally identified by provider identity plus event
+/// lineage. Two genuine sessions can have identical token events but differ
+/// in their first turn. Keep the first artifact's owner, and give the other
+/// durable key a deterministic disambiguated artifact instead of allowing a
+/// source location to point through another session's artifact.
+fn source_artifact_key(
+    transaction: &Transaction<'_>,
+    identity: &str,
+    session: &Session,
+    durable_key: &str,
+) -> Result<String> {
+    let lineage = history_lineage(session);
+    let base = format!(
+        "artifact-{}",
+        stable_hash(&format!("{identity}\u{1f}{lineage}"))
+    );
+    let owner: Option<String> = transaction
+        .query_row(
+            "SELECT session_key FROM source_artifacts WHERE artifact_key = ?1",
+            [&base],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if owner.as_deref().is_none_or(|owner| owner == durable_key) {
+        return Ok(base);
+    }
+    let distinct = format!(
+        "artifact-{}",
+        stable_hash(&format!("{identity}\u{1f}{lineage}\u{1f}{durable_key}"))
+    );
+    let distinct_owner: Option<String> = transaction
+        .query_row(
+            "SELECT session_key FROM source_artifacts WHERE artifact_key = ?1",
+            [&distinct],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if distinct_owner
+        .as_deref()
+        .is_some_and(|owner| owner != durable_key)
+    {
+        bail!("source artifact hash collision");
+    }
+    Ok(distinct)
+}
+
 fn token_event_signature(event: &TokenHistoryPoint) -> String {
     format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
@@ -5731,7 +5949,8 @@ fn token_event_signature(event: &TokenHistoryPoint) -> String {
 fn source_snapshot_is_monotonic(incoming: &Session, current: &Session) -> bool {
     incoming.tokens_history.len() > current.tokens_history.len()
         || (incoming.tokens_history.len() == current.tokens_history.len()
-            && incoming.last_event_at >= current.last_event_at)
+            && incoming.last_event_at >= current.last_event_at
+            && !(incoming.turns.is_empty() && !current.turns.is_empty()))
 }
 
 fn stable_hash(value: &str) -> String {
@@ -9925,6 +10144,354 @@ mod tests {
         let sessions = store.load_sessions().unwrap();
         assert_eq!(sessions.len(), 2);
         assert!(sessions.iter().all(|session| session.collision));
+    }
+
+    #[test]
+    fn first_turn_arriving_after_token_event_reuses_same_source_ledger_identity() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let initial = session("late-turn", 1_000_000);
+        let original = store
+            .observe(Path::new("late-turn.jsonl"), &initial, generation)
+            .unwrap();
+        let copy = store
+            .observe(Path::new("stale-copy.jsonl"), &initial, generation)
+            .unwrap();
+        assert_eq!(copy.key, original.key);
+        let old_fingerprint = first_event_fingerprint(&initial);
+
+        let mut continued = initial.clone();
+        continued.turns.push(TurnInfo {
+            turn_id: "first-task".into(),
+            index: 1,
+            started_at: Some(timestamp("2026-01-01T00:00:02Z")),
+            ..TurnInfo::default()
+        });
+        continued.total_turns = 1;
+        append_event(&mut continued, 20, "2026-01-01T00:00:03Z");
+        assert_ne!(first_event_fingerprint(&continued), old_fingerprint);
+        let after = store
+            .observe(Path::new("late-turn.jsonl"), &continued, generation)
+            .unwrap();
+        {
+            let connection = store.connection().unwrap();
+            let stale_copy_artifact_fingerprint: String = connection
+                .query_row(
+                    "SELECT a.first_event_fingerprint FROM source_locations l
+                     JOIN source_artifacts a USING(artifact_key) WHERE l.path = ?1",
+                    [source_path_key(Path::new("stale-copy.jsonl"))],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stale_copy_artifact_fingerprint,
+                first_event_fingerprint(&continued)
+            );
+        }
+        let stale_rescan = store
+            .observe(Path::new("stale-copy.jsonl"), &initial, generation)
+            .unwrap();
+
+        assert_eq!(after.key, original.key);
+        assert_eq!(stale_rescan.key, original.key);
+        assert_eq!(store.session_keys().unwrap(), vec![original.key.clone()]);
+        assert_eq!(store.stats().unwrap().token_events, 2);
+        let ranges = store
+            .range_totals_multi(&store.session_keys().unwrap(), &[(None, None)])
+            .unwrap();
+        let provider_total: u64 = ranges[0]
+            .values()
+            .map(|range| range.tokens.total_tokens)
+            .sum();
+        assert_eq!(provider_total, continued.tokens_total.total_tokens);
+
+        let connection = store.connection().unwrap();
+        for path in ["late-turn.jsonl", "stale-copy.jsonl"] {
+            let (location_key, artifact_key, artifact_fingerprint): (String, String, String) =
+                connection
+                    .query_row(
+                        "SELECT l.session_key, a.session_key, a.first_event_fingerprint
+                         FROM source_locations l JOIN source_artifacts a USING(artifact_key)
+                         WHERE l.path = ?1",
+                        [source_path_key(Path::new(path))],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+            assert_eq!(location_key, original.key);
+            assert_eq!(artifact_key, original.key);
+            assert_eq!(artifact_fingerprint, first_event_fingerprint(&continued));
+        }
+        drop(connection);
+        let stored = store.load_sessions().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].session.turns.len(), 1);
+        assert_eq!(stored[0].session.tokens_history.len(), 2);
+    }
+
+    #[test]
+    fn late_first_turn_does_not_merge_a_replaced_or_truncated_source() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let mut original = session("reused-id", 10);
+        append_event(&mut original, 20, "2026-01-01T00:00:03Z");
+        let first = store
+            .observe(Path::new("reused.jsonl"), &original, generation)
+            .unwrap();
+
+        let mut replacement = session("reused-id", 10);
+        replacement.turns.push(TurnInfo {
+            turn_id: "new-first-task".into(),
+            index: 1,
+            ..TurnInfo::default()
+        });
+        replacement.total_turns = 1;
+        let second = store
+            .observe(Path::new("reused.jsonl"), &replacement, generation)
+            .unwrap();
+        assert_ne!(first.key, second.key, "a truncated source is a replacement");
+
+        let mut changed_first = session("reused-id", 99);
+        changed_first.turns = replacement.turns;
+        changed_first.total_turns = 1;
+        let third = store
+            .observe(Path::new("reused.jsonl"), &changed_first, generation)
+            .unwrap();
+        assert_ne!(
+            second.key, third.key,
+            "a different first token is a collision"
+        );
+        assert_eq!(store.session_keys().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn distinct_first_turn_collisions_keep_separate_artifact_owners() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let mut alpha = session("shared-provider-id", 10);
+        alpha.turns.push(TurnInfo {
+            turn_id: "alpha".into(),
+            index: 1,
+            ..TurnInfo::default()
+        });
+        alpha.total_turns = 1;
+        let mut beta = alpha.clone();
+        beta.turns[0].turn_id = "beta".into();
+        let first = store
+            .observe(Path::new("alpha.jsonl"), &alpha, generation)
+            .unwrap();
+        let second = store
+            .observe(Path::new("beta.jsonl"), &beta, generation)
+            .unwrap();
+        assert_ne!(first.key, second.key);
+        assert_eq!(
+            store
+                .observe(Path::new("beta.jsonl"), &beta, generation)
+                .unwrap()
+                .key,
+            second.key
+        );
+        let keys = store.session_keys().unwrap();
+        assert_eq!(keys.len(), 2);
+        let ranges = store.range_totals_multi(&keys, &[(None, None)]).unwrap();
+        assert_eq!(
+            ranges[0]
+                .values()
+                .map(|range| range.tokens.total_tokens)
+                .sum::<u64>(),
+            alpha.tokens_total.total_tokens + beta.tokens_total.total_tokens
+        );
+        let connection = store.connection().unwrap();
+        for (path, key, expected_fingerprint) in [
+            ("alpha.jsonl", &first.key, first_event_fingerprint(&alpha)),
+            ("beta.jsonl", &second.key, first_event_fingerprint(&beta)),
+        ] {
+            let (location_key, artifact_key, artifact_fingerprint): (String, String, String) =
+                connection
+                    .query_row(
+                        "SELECT l.session_key, a.session_key, a.first_event_fingerprint
+                         FROM source_locations l JOIN source_artifacts a USING(artifact_key)
+                         WHERE l.path = ?1",
+                        [source_path_key(Path::new(path))],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+            assert_eq!(location_key, *key);
+            assert_eq!(artifact_key, *key);
+            assert_eq!(artifact_fingerprint, expected_fingerprint);
+        }
+        drop(connection);
+        let in_window = (
+            timestamp("2026-01-01T00:00:00Z").timestamp_millis(),
+            timestamp("2026-01-01T01:00:00Z").timestamp_millis(),
+        );
+        let control = QueryControl::with_timeout(Duration::from_secs(3));
+        assert!(
+            !store
+                .has_ambiguous_accounting_identity(&keys, in_window.0, in_window.1, &control)
+                .unwrap(),
+            "two present collisions are separately accounted"
+        );
+
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE durable_sessions SET lifecycle = 'superseded' WHERE session_key = ?1",
+                    [&first.key],
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .has_ambiguous_accounting_identity(&keys, in_window.0, in_window.1, &control)
+                .unwrap(),
+            "the same event under a superseded sibling is ambiguous"
+        );
+        assert!(
+            !store
+                .has_ambiguous_accounting_identity(
+                    &keys,
+                    timestamp("2026-01-02T00:00:00Z").timestamp_millis(),
+                    timestamp("2026-01-02T01:00:00Z").timestamp_millis(),
+                    &control,
+                )
+                .unwrap(),
+            "a disjoint window is not contaminated"
+        );
+
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute(
+                    "UPDATE durable_sessions SET lifecycle = 'present' WHERE session_key = ?1",
+                    [&first.key],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE source_artifacts SET session_key = ?1 WHERE session_key = ?2",
+                    params![first.key, second.key],
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .has_ambiguous_accounting_identity(&keys, in_window.0, in_window.1, &control)
+                .unwrap(),
+            "a mismatched source/artifact binding fails closed"
+        );
+    }
+
+    #[test]
+    fn identity_proof_exhaustion_is_unavailable_instead_of_clean() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let mut first_session = session("proof-cap", 10);
+        first_session.turns.push(TurnInfo {
+            turn_id: "first".into(),
+            ..TurnInfo::default()
+        });
+        let mut second_session = first_session.clone();
+        second_session.turns[0].turn_id = "second".into();
+        let first = store
+            .observe(Path::new("proof-first.jsonl"), &first_session, generation)
+            .unwrap();
+        let second = store
+            .observe(Path::new("proof-second.jsonl"), &second_session, generation)
+            .unwrap();
+        {
+            let mut connection = store.connection().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE durable_sessions SET lifecycle = 'superseded' WHERE session_key = ?1",
+                    [&first.key],
+                )
+                .unwrap();
+            transaction.execute(
+                "UPDATE durable_token_events SET event_key = 'different-event' WHERE session_key = ?1",
+                [&second.key],
+            ).unwrap();
+            let event_at = timestamp("2026-01-01T00:00:01Z").timestamp_millis();
+            for index in 0..4096 {
+                transaction.execute(
+                    "INSERT INTO durable_token_events(session_key,event_key,event_index,timestamp_ms,
+                     cumulative_total_tokens,input_tokens,cached_input_tokens,output_tokens,
+                     reasoning_output_tokens,total_tokens)
+                     VALUES(?1,?2,?3,?4,0,0,0,0,0,0)",
+                    params![first.key, format!("unmatched-{index}"), index + 1, event_at],
+                ).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        let keys = vec![first.key, second.key];
+        let control = QueryControl::with_timeout(Duration::from_secs(3));
+        assert!(
+            store
+                .has_ambiguous_accounting_identity(
+                    &keys,
+                    timestamp("2026-01-01T00:00:00Z").timestamp_millis(),
+                    timestamp("2026-01-01T01:00:00Z").timestamp_millis(),
+                    &control,
+                )
+                .is_err(),
+            "the event scan cap must not return a clean proof"
+        );
+    }
+
+    #[test]
+    fn unrelated_bad_bindings_do_not_exhaust_selected_identity_proof() {
+        let (_directory, store) = store();
+        let generation = store.begin_scan().unwrap();
+        let first = store
+            .observe(
+                Path::new("unrelated-one.jsonl"),
+                &session("unrelated-one", 10),
+                generation,
+            )
+            .unwrap();
+        let second = store
+            .observe(
+                Path::new("unrelated-two.jsonl"),
+                &session("unrelated-two", 10),
+                generation,
+            )
+            .unwrap();
+        let selected = store
+            .observe(
+                Path::new("selected.jsonl"),
+                &session("selected", 10),
+                generation,
+            )
+            .unwrap();
+        {
+            let mut connection = store.connection().unwrap();
+            let artifact: String = connection
+                .query_row(
+                    "SELECT artifact_key FROM source_locations WHERE session_key = ?1",
+                    [&second.key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let transaction = connection.transaction().unwrap();
+            for index in 0..4100 {
+                transaction.execute(
+                    "INSERT INTO source_locations(path,artifact_key,session_key,present,first_seen_at_ms,last_seen_at_ms,seen_generation)
+                     VALUES(?1,?2,?3,0,0,0,0)",
+                    params![format!("unrelated-{index}.jsonl"), artifact, first.key],
+                ).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        let control = QueryControl::with_timeout(Duration::from_secs(3));
+        assert!(!store
+            .has_ambiguous_accounting_identity(
+                &[selected.key],
+                timestamp("2026-01-01T00:00:00Z").timestamp_millis(),
+                timestamp("2026-01-01T01:00:00Z").timestamp_millis(),
+                &control,
+            )
+            .unwrap());
     }
 
     #[test]

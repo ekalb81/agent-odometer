@@ -4780,6 +4780,10 @@ pub(crate) fn quota_budget_statuses(
     });
     let rates = needs_ledger.then(get_rates);
     let mut selected_keys: Vec<Vec<String>> = vec![Vec::new(); budgets.len()];
+    // One deadline for every identity proof in this refresh, including the
+    // post-range rechecks. A long list of budgets cannot multiply the wait.
+    let identity_control =
+        crate::query_control::QueryControl::with_timeout(std::time::Duration::from_secs(3));
     // ponytail: at most 64 budgets, one bounded range per budget; batch shared
     // periods if profiling shows this dominates refresh time.
     let mut statuses: Vec<_> = budgets
@@ -4887,9 +4891,21 @@ pub(crate) fn quota_budget_statuses(
                     return Err("history_unavailable");
                 }
                 let history = history.as_ref().ok_or("history_unavailable")?;
+                let identity_proof = || match history.has_ambiguous_accounting_identity(
+                    &keys,
+                    since.timestamp_millis(),
+                    now.timestamp_millis(),
+                    &identity_control,
+                ) {
+                    Ok(false) => Ok(()),
+                    Ok(true) => Err("history_identity_ambiguous"),
+                    Err(_) => Err("history_identity_unverified"),
+                };
+                identity_proof()?;
                 let mut ranges = history
                     .range_totals_multi(&keys, &[(Some(since), Some(now))])
                     .map_err(|_| "history_unavailable")?;
+                identity_proof()?;
                 crate::query::enrich_range_pricing(&mut ranges, rates, now, |key| {
                     state
                         .sessions
