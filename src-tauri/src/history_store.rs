@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 #[path = "history_lifecycle.rs"]
 mod lifecycle;
 pub use lifecycle::{
-    ExclusionCache, PurgePreview, PurgeResult, PurgedSource, RetentionPolicy, RetentionStatus,
+    AccountingCoverageProof, ExclusionCache, PurgePreview, PurgeResult, PurgedSource,
+    RetentionPolicy, RetentionStatus,
 };
 #[path = "history_recovery.rs"]
 mod recovery;
@@ -6746,6 +6747,151 @@ mod tests {
         let mut different = original;
         different.started_at += chrono::Duration::days(1);
         assert!(reopened.observe(&path, &different, 3).is_ok());
+    }
+
+    #[test]
+    fn purged_accounting_is_complete_only_after_trusted_event_bound() {
+        let (directory, store) = store();
+        let path = directory.path().join("lost.jsonl");
+        let mut lost = session("lost-accounting", 100);
+        // A later token event than the summary endpoint must still bound the
+        // lost window. The budget reads events, not just session summaries.
+        lost.tokens_history[0].timestamp = timestamp("2026-09-01T12:34:56Z");
+        store.observe(&path, &lost, 1).unwrap();
+        store.mark_path_missing(&path).unwrap();
+        store
+            .set_retention_policy(&RetentionPolicy {
+                retained_days: Some(30),
+            })
+            .unwrap();
+        let now = timestamp("2026-10-04T12:00:00Z");
+        store
+            .purge_retained(&store.preview_purge(now).unwrap(), now)
+            .unwrap();
+        assert!(!store.has_complete_coverage().unwrap());
+        assert!(store
+            .accounting_coverage_since(timestamp("2026-09-01T12:34:56Z").timestamp_millis())
+            .unwrap()
+            .is_none());
+        assert!(store
+            .accounting_coverage_since(timestamp("2026-10-01T00:00:00Z").timestamp_millis())
+            .unwrap()
+            .is_some());
+        let database = store.path.clone();
+        drop(store);
+        let reopened = HistoryStore::open(&database).unwrap();
+        assert!(reopened
+            .accounting_coverage_since(timestamp("2026-10-01T00:00:00Z").timestamp_millis())
+            .unwrap()
+            .is_some());
+        let bound: i64 = reopened
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM history_meta WHERE key='accounting_loss_bound_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(reopened.accounting_coverage_since(bound).unwrap().is_none());
+        assert!(reopened
+            .accounting_coverage_since(bound + 1)
+            .unwrap()
+            .is_some());
+        let mut earlier = session("earlier-loss", 100);
+        earlier.tokens_history[0].timestamp = timestamp("2026-08-01T00:00:00Z");
+        let earlier_path = directory.path().join("earlier.jsonl");
+        reopened.observe(&earlier_path, &earlier, 2).unwrap();
+        reopened.mark_path_missing(&earlier_path).unwrap();
+        reopened
+            .purge_retained(&reopened.preview_purge(now).unwrap(), now)
+            .unwrap();
+        let (next_bound, count, revision): (i64, i64, i64) = reopened
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT
+                   (SELECT CAST(value AS INTEGER) FROM history_meta WHERE key='accounting_loss_bound_ms'),
+                   (SELECT CAST(value AS INTEGER) FROM history_meta WHERE key='accounting_loss_tombstone_count'),
+                   (SELECT CAST(value AS INTEGER) FROM history_meta WHERE key='accounting_loss_revision')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((next_bound, count, revision), (bound, 2, 2));
+        let marker = database.with_file_name("history.sqlite3.recovery.json");
+        std::fs::write(&marker, b"{}").unwrap();
+        assert!(reopened
+            .accounting_coverage_since(bound + 1)
+            .unwrap_or(None)
+            .is_none());
+        std::fs::remove_file(&marker).unwrap();
+        let connection = reopened.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE history_meta SET value='999' WHERE key='accounting_loss_tombstone_count'",
+                [],
+            )
+            .unwrap();
+        assert!(reopened
+            .accounting_coverage_since(bound + 1)
+            .unwrap()
+            .is_none());
+        connection
+            .execute(
+                "UPDATE history_meta SET value='2' WHERE key='accounting_loss_tombstone_count'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE history_meta SET value='bad' WHERE key='accounting_loss_revision'",
+                [],
+            )
+            .unwrap();
+        assert!(reopened
+            .accounting_coverage_since(bound + 1)
+            .unwrap()
+            .is_none());
+        connection
+            .execute(
+                "UPDATE history_meta SET value='2' WHERE key='accounting_loss_revision'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE history_meta SET value='bad' WHERE key='accounting_loss_bound_ms'",
+                [],
+            )
+            .unwrap();
+        assert!(reopened
+            .accounting_coverage_since(bound + 1)
+            .unwrap()
+            .is_none());
+        connection
+            .execute(
+                "DELETE FROM history_meta WHERE key='accounting_loss_bound_ms'",
+                [],
+            )
+            .unwrap();
+        assert!(reopened
+            .accounting_coverage_since(timestamp("2026-10-01T00:00:00Z").timestamp_millis())
+            .unwrap()
+            .is_none());
+        drop(connection);
+        let late_path = directory.path().join("late.jsonl");
+        reopened
+            .observe(&late_path, &session("later-legacy-loss", 100), 3)
+            .unwrap();
+        reopened.mark_path_missing(&late_path).unwrap();
+        reopened
+            .purge_retained(&reopened.preview_purge(now).unwrap(), now)
+            .unwrap();
+        assert!(reopened
+            .accounting_coverage_since(bound + 1)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

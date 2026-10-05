@@ -156,6 +156,92 @@ pub struct PurgeResult {
     pub purged_at: DateTime<Utc>,
 }
 
+/// A snapshot of the accounting-only completeness claim for a dated window.
+/// Equality across independent readers detects a purge or replacement while
+/// a budget is assembled. This never upgrades global history coverage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountingCoverageProof {
+    loss_bound_ms: Option<i64>,
+    tombstone_count: u64,
+    purge_revision: u64,
+}
+
+const LOSS_BOUND_KEY: &str = "accounting_loss_bound_ms";
+const LOSS_COUNT_KEY: &str = "accounting_loss_tombstone_count";
+const LOSS_REVISION_KEY: &str = "accounting_loss_revision";
+type AccountingLossRow = (
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+);
+
+fn meta_value(connection: &Connection, key: &str) -> Result<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT value FROM history_meta WHERE key=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// The session summary is the fallback upper interval endpoint when a source
+/// has no token events. SQL also checks raw events and the last rollup hour,
+/// so no lost priced event can sit above the persisted bound. Invalid dates
+/// or event timestamps make the new range proof unavailable, never zero.
+fn accounting_loss_bound(
+    transaction: &Transaction<'_>,
+    keys: &[(String, String, String)],
+) -> Result<Option<i64>> {
+    let mut bound: Option<i64> = None;
+    for (key, _, _) in keys {
+        let row: AccountingLossRow = transaction.query_row(
+            "SELECT
+               CAST(strftime('%s',json_extract(p.summary_json,'$.started_at')) AS INTEGER)*1000+999,
+               CAST(strftime('%s',json_extract(p.summary_json,'$.last_event_at')) AS INTEGER)*1000+999,
+               (SELECT min(timestamp_ms) FROM durable_token_events WHERE session_key=?1),
+               (SELECT max(timestamp_ms) FROM durable_token_events WHERE session_key=?1),
+               (SELECT min(timestamp_ms) FROM durable_tool_events WHERE session_key=?1),
+               (SELECT max(timestamp_ms) FROM durable_tool_events WHERE session_key=?1),
+               (SELECT max(hour_bucket) FROM rollup_token_totals WHERE session_key=?1)
+             FROM session_summaries p WHERE p.session_key=?1",
+            [key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )?;
+        let (Some(start), Some(end), token_min, token_max, tool_min, tool_max, rollup_hour) = row
+        else {
+            return Ok(None);
+        };
+        // The upper bound is deliberately conservative for a whole rollup
+        // hour; this can delay a claim, but can never admit lost usage.
+        let mut highest = start.max(end);
+        if token_min.is_some_and(|value| value < 0) || tool_min.is_some_and(|value| value < 0) {
+            return Ok(None);
+        }
+        for timestamp in [token_max, tool_max].into_iter().flatten() {
+            highest = highest.max(timestamp);
+        }
+        if let Some(hour) = rollup_hour {
+            let Some(hour_end) = hour
+                .checked_mul(3_600_000)
+                .and_then(|value| value.checked_add(3_599_999))
+            else {
+                return Ok(None);
+            };
+            highest = highest.max(hour_end);
+        }
+        if highest < 0 || start < 0 || end < 0 {
+            return Ok(None);
+        }
+        bound = Some(bound.map_or(highest, |previous| previous.max(highest)));
+    }
+    Ok(bound)
+}
+
 #[derive(Debug)]
 pub struct PurgedSource;
 impl std::fmt::Display for PurgedSource {
@@ -580,12 +666,74 @@ impl HistoryStore {
         if &current != preview {
             bail!("history changed after the purge preview; review a fresh preview");
         }
+        let old_tombstones: u64 = u64::try_from(transaction.query_row(
+            "SELECT count(*) FROM purged_sessions",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?)?;
+        let recovered = meta_value(&transaction, "recovered_at_ms")?.is_some()
+            || self.recovery_receipt()?.is_some();
+        let previous_proof = if old_tombstones == 0
+            && meta_value(&transaction, "coverage_complete")?.as_deref() == Some("1")
+            && !recovered
+        {
+            Some((None, 0))
+        } else if old_tombstones > 0 && !recovered {
+            let bound =
+                meta_value(&transaction, LOSS_BOUND_KEY)?.and_then(|raw| raw.parse::<i64>().ok());
+            let count =
+                meta_value(&transaction, LOSS_COUNT_KEY)?.and_then(|raw| raw.parse::<u64>().ok());
+            let revision = meta_value(&transaction, LOSS_REVISION_KEY)?
+                .and_then(|raw| raw.parse::<u64>().ok());
+            match (bound, count, revision) {
+                (Some(bound), Some(count), Some(revision))
+                    if bound >= 0 && count == old_tombstones && revision > 0 =>
+                {
+                    Some((Some(bound), revision))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let new_bound = if candidates.is_empty() {
+            None
+        } else {
+            accounting_loss_bound(&transaction, &candidates)?
+        };
         write_exclusions(&self.path, &candidates, now.timestamp_millis())?;
         if !candidates.is_empty() {
             transaction.execute(
                 "UPDATE history_meta SET value='0' WHERE key='coverage_complete'",
                 [],
             )?;
+            // Existing unbounded legacy/recovered purges can never be made
+            // complete by a later bounded purge. Drop any stale proof.
+            transaction.execute(
+                "DELETE FROM history_meta WHERE key IN (?1,?2,?3)",
+                params![LOSS_BOUND_KEY, LOSS_COUNT_KEY, LOSS_REVISION_KEY],
+            )?;
+            if let (Some((previous_bound, revision)), Some(current_bound)) =
+                (previous_proof, new_bound)
+            {
+                let bound = previous_bound.map_or(current_bound, |old| old.max(current_bound));
+                let count = old_tombstones
+                    .checked_add(u64::try_from(candidates.len())?)
+                    .ok_or_else(|| anyhow!("tombstone count overflow"))?;
+                let revision = revision
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("purge revision overflow"))?;
+                for (key, value) in [
+                    (LOSS_BOUND_KEY, bound.to_string()),
+                    (LOSS_COUNT_KEY, count.to_string()),
+                    (LOSS_REVISION_KEY, revision.to_string()),
+                ] {
+                    transaction.execute(
+                        "INSERT INTO history_meta(key,value) VALUES(?1,?2)",
+                        params![key, value],
+                    )?;
+                }
+            }
         }
         for (key, identity, fingerprint) in &candidates {
             transaction.execute("INSERT INTO purged_sessions(session_key,identity_key,first_event_fingerprint,purged_at_ms) VALUES(?1,?2,?3,?4)",params![key,identity,fingerprint,now.timestamp_millis()])?;
@@ -635,6 +783,63 @@ impl HistoryStore {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// Proven completeness for token/USD accounting in a bounded window.
+    /// A purge before `from_ms` may be excluded; all-time and other report
+    /// domains continue to use the global conservative coverage flag.
+    pub fn accounting_coverage_since(
+        &self,
+        from_ms: i64,
+    ) -> Result<Option<AccountingCoverageProof>> {
+        self.exclusion_cache.lock().unwrap().verify()?;
+        if self.recovery_receipt()?.is_some() {
+            return Ok(None);
+        }
+        let connection = self.open_reader()?;
+        // open_reader already starts a deferred transaction, so every value
+        // below is from one SQLite snapshot.
+        if meta_value(&connection, "recovered_at_ms")?.is_some() {
+            return Ok(None);
+        }
+        let coverage = meta_value(&connection, "coverage_complete")?;
+        let tombstones: u64 = u64::try_from(connection.query_row(
+            "SELECT count(*) FROM purged_sessions",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?)?;
+        let proof = match (coverage.as_deref(), tombstones) {
+            (Some("1"), 0) => Some(AccountingCoverageProof {
+                loss_bound_ms: None,
+                tombstone_count: 0,
+                purge_revision: 0,
+            }),
+            (Some("0"), count) if count > 0 => {
+                let bound = meta_value(&connection, LOSS_BOUND_KEY)?
+                    .and_then(|raw| raw.parse::<i64>().ok());
+                let recorded_count = meta_value(&connection, LOSS_COUNT_KEY)?
+                    .and_then(|raw| raw.parse::<u64>().ok());
+                let revision = meta_value(&connection, LOSS_REVISION_KEY)?
+                    .and_then(|raw| raw.parse::<u64>().ok());
+                match (bound, recorded_count, revision) {
+                    (Some(bound), Some(recorded_count), Some(revision))
+                        if bound >= 0
+                            && from_ms > bound
+                            && recorded_count == count
+                            && revision > 0 =>
+                    {
+                        Some(AccountingCoverageProof {
+                            loss_bound_ms: Some(bound),
+                            tombstone_count: count,
+                            purge_revision: revision,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        Ok(proof)
     }
 
     pub fn retention_status(&self) -> Result<RetentionStatus> {

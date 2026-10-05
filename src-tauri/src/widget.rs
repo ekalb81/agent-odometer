@@ -391,7 +391,7 @@ mod tests {
     fn quota_projection_keeps_recorded_values_but_marks_expiry_and_clock_skew_stale() {
         use crate::quota::{
             QuotaConfidence, QuotaProvenance, QuotaSnapshot, QuotaUnit, QuotaWindow,
-            QuotaWindowKind,
+            QuotaWindowKind, QuotaWindowStartBasis,
         };
         let now: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
         let window = QuotaWindow {
@@ -405,6 +405,7 @@ mod tests {
             resets_at: Some(now),
             window_started_at: None,
             window_started_at_estimated: false,
+            window_start_basis: QuotaWindowStartBasis::Unknown,
             observed_at: now,
             confidence: QuotaConfidence::Medium,
             stale: false,
