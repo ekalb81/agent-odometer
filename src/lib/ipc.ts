@@ -5,7 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { AnnotationIdentity, AnnotationEdit, OrganizationSummary, SessionAnnotation, SavedSearch, SavedSearchDefinition, RecordBookmark, RecordBookmarkList } from './types';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type { SummaryPricing } from './types';
-import type { TranscriptPage, TranscriptRequest } from './types';
+import type { TranscriptPage, TranscriptRequest, ExecutionPage } from './types';
 import type { TranscriptSearchRequest, TranscriptSearchPage, TranscriptSearchTarget, RetainedSearchLanding } from './types';
 import type { IntegrationClient, IntegrationScope, IntegrationChange, IntegrationCenterReport, IntegrationPreview, IntegrationApplyResult, IntegrationVerifyReport } from './types';
 import type { SpeedQuery, SpeedReport } from './types';
@@ -68,6 +68,10 @@ export function getSessionDetails(sessionId: string): Promise<Session | null> {
 /** Explicit source inspection; never called by list, pricing, diagnostics or MCP flows. */
 export function getTranscriptPage(request: TranscriptRequest): Promise<TranscriptPage> {
   return invoke<TranscriptPage>('get_transcript_page', { request });
+}
+/** Explicit bounded execution metadata; source bodies remain in Rust. */
+export function getExecutionPage(request: TranscriptRequest): Promise<ExecutionPage> {
+  return invoke<ExecutionPage>('get_execution_page', { request });
 }
 
 /** Opt-in bounded content search; query and snippets remain ephemeral. */

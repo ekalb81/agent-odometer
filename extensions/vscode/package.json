@@ -1,0 +1,111 @@
+{
+  "name": "odometer-local",
+  "displayName": "Odometer Local",
+  "description": "Read-only local agent usage in VS Code, backed by the Odometer CLI.",
+  "version": "0.1.0",
+  "publisher": "ekalb81",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.105.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./src/extension.cjs",
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Launching the explicitly selected local Odometer executable requires a trusted workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ekalb81/agent-odometer.git",
+    "directory": "extensions/vscode"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.cjs",
+    "test:host": "node test/run-host.cjs",
+    "package": "vsce package --no-dependencies --out odometer-local.vsix"
+  },
+  "devDependencies": {
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "4.0.0"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "odometer.open",
+        "title": "Odometer: Open Local Dashboard"
+      },
+      {
+        "command": "odometer.refresh",
+        "title": "Odometer: Refresh Local Data",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "odometer.configure",
+        "title": "Odometer: Select Local Executable",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "odometer.setup",
+        "title": "Odometer: Open Setup Guide"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "odometer",
+          "title": "Odometer",
+          "icon": "media/odometer.svg"
+        }
+      ]
+    },
+    "views": {
+      "odometer": [
+        {
+          "id": "odometer.dashboard",
+          "name": "Local usage"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "odometer.refresh",
+          "when": "view == odometer.dashboard",
+          "group": "navigation"
+        },
+        {
+          "command": "odometer.configure",
+          "when": "view == odometer.dashboard",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Odometer",
+      "properties": {
+        "odometer.executablePath": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "Absolute path to the local agent-odometer executable. No shell, scripts, or extra arguments. Select it with Odometer: Select Local Executable."
+        },
+        "odometer.refreshSeconds": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 3600,
+          "scope": "application",
+          "description": "Refresh while the dashboard is visible. 0 means manual; positive values are clamped to at least 30 seconds."
+        }
+      }
+    }
+  }
+}

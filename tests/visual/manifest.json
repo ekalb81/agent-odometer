@@ -68,6 +68,9 @@
     "transcript-export-preview",
     "transcript-export-narrow",
     "content-search-scopes",
-    "content-search-retained-narrow"
+    "content-search-retained-narrow",
+    "execution-board-overlap",
+    "execution-board-comparison",
+    "execution-board-narrow-coverage"
   ]
 }

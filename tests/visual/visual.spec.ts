@@ -277,6 +277,58 @@ visualTest('session-context-menu', 'session context menu', async (page) => {
   await expectSessionRollup(page, 8);
 });
 
+async function openExecutionBoard(page: Page) {
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: 'Compare execution' }).click();
+  const board = page.getByRole('dialog', { name: 'Execution board' });
+  await expect(board.getByText(/2 visited records/)).toBeVisible();
+  return board;
+}
+
+visualTest('execution-board-overlap', 'execution board shows bounded overlapping parent and child activity', async (page) => {
+  await visit(page, { view: 'codex' });
+  const board = await openExecutionBoard(page);
+  await board.getByText('Select sessions (1/8)').click();
+  await board.getByRole('checkbox', { name: /Search cookbook/ }).check();
+  await expect(board.getByText(/Recorded parent: Add dark mode toggle/)).toBeVisible();
+  await board.getByText('Select sessions (2/8)').click();
+  const parent = board.getByRole('region', { name: 'Execution of Add dark mode toggle' });
+  await parent.getByRole('button', { name: 'Load next bounded page' }).click();
+  await expect(parent.getByText(/4 visited records/)).toBeVisible();
+  await expect(board.getByText(/partial coverage; unvisited records/)).toBeVisible();
+  await expect(board.getByRole('group', { name: 'Transcript inspector' })).toHaveCount(0);
+});
+
+visualTest('execution-board-comparison', 'execution board lazily compares two exact bounded source panes', async (page) => {
+  await visit(page, { view: 'codex' });
+  const board = await openExecutionBoard(page);
+  await board.getByText('Select sessions (1/8)').click();
+  await board.getByRole('checkbox', { name: /Search cookbook/ }).check();
+  await board.getByText('Select sessions (2/8)').click();
+  await board.getByRole('region', { name: 'Execution of Add dark mode toggle' }).getByRole('button', { name: 'Inspect / compare' }).click();
+  await board.getByRole('region', { name: /Execution of Search cookbook/ }).getByRole('button', { name: 'Inspect / compare' }).click();
+  await expect(board.getByRole('group', { name: 'Transcript inspector' })).toHaveCount(2);
+  await expect(board.getByRole('button', { name: 'Collapse user' })).toHaveCount(2);
+  await expect(board.getByRole('button', { name: 'Bookmark record', exact: true })).toHaveCount(0);
+  await board.getByRole('heading', { name: 'Source comparison' }).scrollIntoViewIfNeeded();
+});
+
+visualTest('execution-board-narrow-coverage', 'execution board has honest partial and empty selection states at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 900 });
+  await visit(page, { view: 'codex', theme: 'dark' });
+  const board = await openExecutionBoard(page);
+  await expect(board.getByText(/partial coverage; unvisited records/)).toBeVisible();
+  await board.getByText('Select sessions (1/8)').click();
+  await board.getByRole('button', { name: 'Clear selection' }).click();
+  await expect(board.getByText(/Select sessions to compare/)).toBeVisible();
+  await board.getByRole('checkbox', { name: /Search cookbook/ }).check();
+  await expect(board.getByText('Parent relationship unresolved in selection')).toBeVisible();
+  await board.getByText('Select sessions (1/8)').click();
+  const bounds = await board.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
 visualTest('sessions-filtered-empty', 'session filtered empty', async (page) => {
   await visit(page, { view: 'all' });
   await page.getByRole('searchbox', { name: 'Search sessions' }).fill('no matching visual fixture');

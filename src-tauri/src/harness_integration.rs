@@ -130,9 +130,9 @@ impl JsonHookSpec {
         if handler.get("type").and_then(Value::as_str) != Some("command")
             || handler.get("timeout").and_then(Value::as_u64) != Some(5)
             || handler.get("statusMessage").and_then(Value::as_str) != Some(STATUS_MESSAGE)
-            || !handler
+            || handler
                 .get("async")
-                .is_none_or(|value| value.as_bool() == Some(false))
+                .is_some_and(|value| value.as_bool() != Some(false))
         {
             return false;
         }

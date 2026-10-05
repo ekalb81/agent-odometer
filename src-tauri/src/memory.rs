@@ -168,7 +168,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 /// in-progress reading just because the user changed an unrelated field.
 pub fn configure_heap_tracking(enabled: bool) {
     let was_enabled = HEAP_TRACKING_ENABLED.swap(enabled, Ordering::Relaxed);
-    if !enabled || (enabled && !was_enabled) {
+    if !enabled || !was_enabled {
         HEAP_ALLOCATED_BYTES.store(0, Ordering::Relaxed);
         HEAP_FREED_BYTES.store(0, Ordering::Relaxed);
         HEAP_PEAK_BYTES.store(0, Ordering::Relaxed);

@@ -1484,6 +1484,21 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
+/** Ephemeral board metadata. No source text, arguments, edits or raw JSON. */
+export interface ExecutionRecord {
+  record_id: string;
+  timestamp: string | null;
+  role: string | null;
+  issue: string | null;
+  blocks: { kind: string; call_id: string | null; name: string | null }[];
+}
+export interface ExecutionPage {
+  availability: TranscriptPage['availability'];
+  issues: string[];
+  records: ExecutionRecord[];
+  next_cursor: TranscriptCursor | null;
+  source_complete: boolean;
+}
 /** Private desktop organization; never part of SessionSummary or exports. */
 export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
 export interface RecordBookmark { identity: AnnotationIdentity; revision: number; bookmarked: boolean }

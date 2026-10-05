@@ -13,6 +13,7 @@ pub mod config_events;
 mod context_evidence;
 pub mod correlation;
 pub mod diagnostics;
+pub mod execution_board;
 pub mod gemini_parser;
 pub mod git_outcomes;
 pub mod harness_integration;
@@ -140,6 +141,7 @@ pub fn run() {
             get_widget_snapshot,
             get_session_details,
             get_transcript_page,
+            commands::get_execution_page,
             search_session_content,
             resolve_retained_search_target,
             get_session_pricing,

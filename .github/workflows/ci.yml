@@ -89,6 +89,9 @@ jobs:
       - name: Frontend tests and coverage gate
         run: npm run test:coverage
 
+      - name: Terminal monitor tests
+        run: node --test packages/terminal-monitor/monitor.test.mjs
+
       - name: Updater manifest validator tests
         run: npm run check:updater-manifest
 
@@ -123,6 +126,39 @@ jobs:
                  /^test result:/ { gsub(/;/, "", $0); printf("| `%s` | %s passed, %s failed |\n", suite, $4, $6) }' \
               src-tauri/test-output.txt
           } >> "$GITHUB_STEP_SUMMARY"
+
+  editor-extension:
+    name: Editor extension (${{ matrix.vscode }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        vscode: ['1.105.0', 'stable']
+    container:
+      image: mcr.microsoft.com/playwright:v1.63.0-jammy@sha256:957bb6b7cba151ced0b5bb841703e282c45df1d934af88933b1b655411ecba3a
+      options: --ipc=host
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extensions/vscode/package-lock.json
+      - name: Install editor development tools
+        run: npm ci --ignore-scripts
+        working-directory: extensions/vscode
+      - name: Test local adapter and state handling
+        run: npm test
+        working-directory: extensions/vscode
+      - name: Test real editor host
+        run: xvfb-run -a npm run test:host
+        working-directory: extensions/vscode
+        env:
+          VSCODE_TEST_VERSION: ${{ matrix.vscode }}
+      - name: Build local VSIX
+        run: npm run package
+        working-directory: extensions/vscode
 
   visual-regression:
     name: Visual regression

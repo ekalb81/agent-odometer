@@ -27,6 +27,7 @@ Usage history and pricing stay on your machine. Odometer reads local session fil
 - **Offline transcript export** — choose **Export transcript**, build a sanitized HTML preview, review it, then save to a local destination. Tool content is excluded by default; optional tool/reasoning content still passes heuristic redaction. Attachments and unknown source records are omitted. Missing or bounded source reads stay labeled incomplete; automatic redaction is not exhaustive.
 - **Reviewed handoff packets** — choose **Prepare handoff**, explicitly select retained fields or bounded original records, and add your own task-state note. Review the redacted preview before copying Markdown or saving HTML. Tools are opt-in, incomplete source stays labeled, and parent/subagent content is excluded. Preparing a handoff never launches an agent or runs a command.
 - **Conversation search** — choose **Search content** in a selected session for bounded message search, explicit tool-body scopes, exact source anchors, and separately labeled retained-message fallback. See [Session content search](docs/TRANSCRIPT_SEARCH.md).
+- **Execution comparison** — choose **Compare execution** from a session's context menu for an ephemeral board of up to eight sessions, recorded UTC activity, unresolved relationship evidence, and two bounded source inspectors. See [Execution board](docs/EXECUTION_BOARD.md).
 - **Context evidence** — choose **Explain context** for recorded contributor categories, compaction boundaries, per-call observations, exact source anchors, and explicit coverage limits. See [Context explanation](docs/CONTEXT_EXPLANATION.md).
 - **Subagents included** — background agents spawned by your sessions appear as their own badged, filterable entries linked to their parent.
 - **Live** — sessions update in the list while your agents are still running.
@@ -197,6 +198,8 @@ Frontend tests live beside the modules and components they cover as `*.test.ts`.
 
 The executable also provides local reports without starting the desktop: `agent-odometer report --from 2026-09-01 --format json`, `agent-odometer tools`, and `agent-odometer statusline`. Use `agent-odometer export --report models --format markdown` for a versioned export, or `agent-odometer mcp` for the bounded, read-only stdio server. Existing JSON and CSV formats remain compatible by default. See [headless commands, export schemas, and query limits](docs/HEADLESS.md).
 
+For an interactive terminal view, run `node packages/terminal-monitor/monitor.mjs`. The optional Host OS CPU/memory panel starts disabled. See [terminal monitor keys and source limits](docs/TERMINAL_MONITOR.md).
+
 ### Repository layout
 
 ```text
@@ -270,3 +273,5 @@ Use **Edit organization** in a session’s detail pane to pin it, add tags, or e
 Organization stays in the local history database and is excluded from ordinary exports, diagnostics, accounting, MCP, and provider files. Missing sources keep it. Confirmed history purge removes the selected sessions’ pins, tag assignments, and notes; global tag definitions and saved searches remain. A corrupt-database recovery preserves the original database backup and rebuilds source history, but does not reconstruct private organization from transcripts. The UI identifies those unrestored records and keeps dependent pin/tag results unavailable.
 
 Attention alerts are an opt-in local feature with explicit transcript-evidence limits; see [Agent attention](docs/ATTENTION_ALERTS.md).
+
+Optional editor surface: [Odometer Local for VS Code](extensions/vscode/README.md) reads the existing local CLI and ships as a separately built VSIX preview.
