@@ -3625,6 +3625,93 @@ mod tests {
     }
 
     #[test]
+    fn token_and_usd_budgets_withhold_ambiguous_retained_identity() {
+        if !isolated_quota_test(
+            "store::tests::token_and_usd_budgets_withhold_ambiguous_retained_identity",
+        ) {
+            return;
+        }
+        use crate::quota_store::{BudgetUnit, QuotaBudget};
+        let state = state();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let history = Arc::new(HistoryStore::open(&path).unwrap());
+        let now = Utc::now();
+        let event_at = now - chrono::Duration::minutes(30);
+        let mut first = session("same-id", 1);
+        first.started_at = event_at - chrono::Duration::seconds(1);
+        first.last_event_at = event_at;
+        first.tokens_total = TokenTotals {
+            input_tokens: 1_000_000,
+            total_tokens: 1_000_000,
+            ..Default::default()
+        };
+        first.tokens_history.push(crate::model::TokenHistoryPoint {
+            timestamp: event_at,
+            model: Some("gpt-5.4".into()),
+            service_tier: None,
+            request_input_tokens: Some(1_000_000),
+            total_tokens: 1_000_000,
+            delta: first.tokens_total.clone(),
+        });
+        first.turns.push(crate::model::TurnInfo {
+            turn_id: "first".into(),
+            ..Default::default()
+        });
+        let mut second = first.clone();
+        second.turns[0].turn_id = "second".into();
+        let first_key = history
+            .observe(&directory.path().join("first.jsonl"), &first, 1)
+            .unwrap()
+            .key;
+        history
+            .observe(&directory.path().join("second.jsonl"), &second, 1)
+            .unwrap();
+        state.set_history_ready(Some(history));
+        let token_budget = QuotaBudget {
+            id: "tokens".into(),
+            provider: codex_provider_id(),
+            project_key: None,
+            unit: BudgetUnit::Tokens,
+            window_kind: None,
+            period_hours: Some(24),
+            threshold: 1.0,
+            enabled: true,
+        };
+        let budgets = [
+            token_budget.clone(),
+            QuotaBudget {
+                id: "usd".into(),
+                unit: BudgetUnit::Usd,
+                ..token_budget
+            },
+        ];
+        let before = crate::commands::quota_budget_statuses(
+            &state,
+            &budgets,
+            now,
+            chrono::Duration::hours(1),
+        );
+        assert_eq!(before[0].current_value, Some(2_000_000.0));
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE durable_sessions SET lifecycle = 'superseded' WHERE session_key = ?1",
+                [&first_key],
+            )
+            .unwrap();
+        drop(connection);
+        let after = crate::commands::quota_budget_statuses(
+            &state,
+            &budgets,
+            now,
+            chrono::Duration::hours(1),
+        );
+        assert!(after.iter().all(|status| status.current_value.is_none()
+            && status.unavailable == Some("history_identity_ambiguous")));
+    }
+
+    #[test]
     fn quota_token_budget_counts_retained_ledger_edges_and_respects_project_changes() {
         let state = state();
         let dir = tempfile::tempdir().unwrap();
