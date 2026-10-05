@@ -735,6 +735,52 @@ struct RawCredits {
 pub(crate) mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    static SYNTHETIC_PROCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(unix)]
+    pub(crate) struct SyntheticProcessTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    fn wait_for_synthetic_readers() -> bool {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while PIPE_READERS.load(Ordering::Acquire) != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        true
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn synthetic_process_test_guard() -> SyntheticProcessTestGuard {
+        let lock = SYNTHETIC_PROCESS_TEST_LOCK.lock().unwrap();
+        assert!(
+            wait_for_synthetic_readers(),
+            "synthetic quota readers did not drain before the fixture"
+        );
+        SyntheticProcessTestGuard { _lock: lock }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SyntheticProcessTestGuard {
+        fn drop(&mut self) {
+            // Production readers stay detached. Only these synthetic fixtures
+            // wait, while retaining their shared lock, for the bounded pool to
+            // become idle before another fixture may acquire it.
+            let drained = wait_for_synthetic_readers();
+            if !thread::panicking() {
+                assert!(
+                    drained,
+                    "synthetic quota readers did not drain after the fixture"
+                );
+            }
+        }
+    }
+
     #[test]
     fn stalled_pipe_readers_cannot_accumulate_without_bound() {
         let counter = AtomicUsize::new(0);
@@ -960,7 +1006,44 @@ fi
 
     #[cfg(unix)]
     #[test]
+    fn a_full_shared_reader_pool_refuses_launch_before_identity_validation() {
+        let _fixture = synthetic_process_test_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let account = r#"{"id":2,"result":{"requiresOpenaiAuth":true,"account":{"type":"chatgpt","planType":"pro"},"workspaceRouting":null}}"#;
+        let executable = fake_app_server(dir.path(), account, "{}");
+        let started = executable.with_extension("started");
+        let script = std::fs::read_to_string(&executable).unwrap();
+        std::fs::write(
+            &executable,
+            script.replacen(
+                "#!/bin/sh\n",
+                "#!/bin/sh\nprintf started > \"$0.started\"\n",
+                1,
+            ),
+        )
+        .unwrap();
+        let permits = (0..MAX_PIPE_READERS)
+            .map(|_| ReaderPermit::acquire(&PIPE_READERS).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_codex_quota(&executable, "approved"),
+            Err(LiveQuotaError::LaunchFailed)
+        );
+        assert!(!started.exists(), "reader admission must precede launch");
+        assert!(!executable.with_extension("quota-request").exists());
+        drop(permits);
+        assert_eq!(
+            read_codex_quota(&executable, "approved"),
+            Err(LiveQuotaError::Unsupported)
+        );
+        assert!(started.exists());
+        assert!(!executable.with_extension("quota-request").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn synthetic_stdio_driver_checks_local_identity_before_requesting_quota() {
+        let _fixture = synthetic_process_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let rates = r#"{"id":3,"result":{"accountId":"approved","rateLimits":{"limitId":"codex","primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1893456000}},"rateLimitsByLimitId":null}}"#;
         for local in [None, Some("different"), Some("approved")] {
@@ -1000,6 +1083,7 @@ fi
     #[test]
     fn synthetic_unresponsive_child_is_stopped_at_the_deadline() {
         use std::os::unix::fs::PermissionsExt;
+        let _fixture = synthetic_process_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("unresponsive");
         std::fs::write(

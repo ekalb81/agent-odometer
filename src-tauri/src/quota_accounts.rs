@@ -762,6 +762,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn consented_service_reads_only_the_selected_synthetic_account_and_obeys_backoff() {
+        let _fixture = crate::quota_live::tests::synthetic_process_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let account = r#"{"id":2,"result":{"requiresOpenaiAuth":true,"account":{"type":"chatgpt","planType":"pro"},"workspaceRouting":{"chatgptAccountId":"approved"}}}"#;
         let rates = r#"{"id":3,"result":{"accountId":"approved","ordinaryUsageAllowed":true,"rateLimits":{"limitId":"codex","primary":{"usedPercent":25,"windowDurationMins":300,"resetsAt":1893456000}}}}"#;
