@@ -75,3 +75,27 @@ it('does not resurrect an account when a pre-revoke status read resolves late', 
   await tick(); await tick();
   expect(screen.queryByText('Account A')).not.toBeInTheDocument();
 });
+
+
+it('shows provider headroom and next reset without inventing a last reset', async () => {
+  const observed = new Date().toISOString();
+  const nextReset = new Date(Date.now() + 3_600_000).toISOString();
+  const status: LiveQuotaStatus = { busy: false, configuration_error: null, accounts: [{
+    provider: 'codex', consent: { account_id: 'synthetic-account', label: 'Work', enabled: true, consented_at: observed },
+    observed_at: observed, ordinary_usage_allowed: true, unavailable: null,
+    buckets: [{ limit_id: 'codex', limit_name: null, spend_control_reached: false, snapshot: {
+      provider: 'codex', provenance: 'live_provider', unavailable: null, windows: [{
+        kind: 'burst', unit: 'percent', window_minutes: 300, used: 40, remaining: 60, limit: 100,
+        unlimited: false, resets_at: nextReset, window_started_at: null, window_started_at_estimated: false,
+        window_start_basis: 'unknown', observed_at: observed, confidence: 'medium', stale: false,
+        unavailable: null, forecast: null,
+      }],
+    } }],
+  }] };
+  mocks.status.mockResolvedValue(status);
+  render(LiveQuotaAccounts);
+  expect(await screen.findByText('Last reset not reported.')).toBeInTheDocument();
+  expect(screen.getByText(/60% left/)).toHaveTextContent(/Resets/);
+  expect(screen.queryByText(/Reset observed|Usage decrease observed/)).not.toBeInTheDocument();
+  expect(mocks.identify).not.toHaveBeenCalled();
+});

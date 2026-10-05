@@ -4692,9 +4692,10 @@ pub fn set_quota_config(
 }
 
 /// Durable project assignments shared across one alert-evaluation batch.
-struct ProjectBudgetScope {
-    sessions: HashMap<String, String>,
-    projects: HashMap<String, crate::history_store::ProjectOverrideRow>,
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProjectBudgetScope {
+    pub(crate) sessions: HashMap<String, String>,
+    pub(crate) projects: HashMap<String, crate::history_store::ProjectOverrideRow>,
 }
 
 impl ProjectBudgetScope {
@@ -4720,19 +4721,39 @@ pub(crate) fn quota_budget_statuses(
     max_cache_age: chrono::Duration,
 ) -> Vec<crate::quota::QuotaBudgetStatus> {
     use crate::quota_store::BudgetUnit;
+    let sessions_generation = state.sessions_generation();
     let snapshots = state.quota_snapshots(max_cache_age, now);
     let needs_ledger = budgets
         .iter()
         .any(|budget| budget.enabled && budget.unit != BudgetUnit::PercentOfWindow);
-    // Purged/recovered archives remain readable but cannot establish complete
-    // budget headroom. Check once per batch; provider windows stay independent.
-    let history = needs_ledger
-        .then(|| state.history_ready())
-        .flatten()
-        .filter(|history| history.has_complete_coverage().unwrap_or(false));
+    // Token/USD budgets can use a bounded accounting proof after a known
+    // purge. The global history coverage flag remains conservative.
+    let history = needs_ledger.then(|| state.history_ready()).flatten();
+    let coverage: Vec<Option<(i64, crate::history_store::AccountingCoverageProof)>> = budgets
+        .iter()
+        .map(|budget| {
+            if !budget.enabled || budget.unit == BudgetUnit::PercentOfWindow {
+                return None;
+            }
+            let from = now.checked_sub_signed(chrono::Duration::hours(i64::from(
+                budget.period_hours.unwrap_or(24),
+            )))?;
+            let from_ms = from.timestamp_millis();
+            let proof = history
+                .as_ref()?
+                .accounting_coverage_since(from_ms)
+                .ok()??;
+            Some((from_ms, proof))
+        })
+        .collect();
+    let history = history.filter(|_| coverage.iter().any(Option::is_some));
     let durable_projects = history
         .as_ref()
         .and_then(|history| history.session_project_rows().ok());
+    let durable_keys: std::collections::HashSet<String> = durable_projects
+        .as_ref()
+        .map(|rows| rows.iter().map(|row| row.session_key.clone()).collect())
+        .unwrap_or_default();
     let mut detected_projects: HashMap<String, Option<String>> = durable_projects
         .as_ref()
         .map(|rows| {
@@ -4758,11 +4779,13 @@ pub(crate) fn quota_budget_statuses(
         })
     });
     let rates = needs_ledger.then(get_rates);
+    let mut selected_keys: Vec<Vec<String>> = vec![Vec::new(); budgets.len()];
     // ponytail: at most 64 budgets, one bounded range per budget; batch shared
     // periods if profiling shows this dominates refresh time.
     let mut statuses: Vec<_> = budgets
         .iter()
-        .map(|budget| {
+        .enumerate()
+        .map(|(index, budget)| {
             let value = (|| -> Result<f64, &'static str> {
                 if !budget.enabled {
                     return Err("disabled");
@@ -4787,6 +4810,9 @@ pub(crate) fn quota_budget_statuses(
                     return window.used.ok_or("quota_unavailable");
                 }
                 if durable_projects.is_none() {
+                    return Err("history_unavailable");
+                }
+                if coverage[index].is_none() {
                     return Err("history_unavailable");
                 }
                 let scope = project_scope.as_ref().ok_or("project_scope_unavailable")?;
@@ -4845,15 +4871,31 @@ pub(crate) fn quota_budget_statuses(
                     })
                     .map(|(key, _)| key.clone())
                     .collect();
+                selected_keys[index] = keys.clone();
                 let rates = rates.as_ref().ok_or("pricing_incomplete")?;
                 let since = now
                     .checked_sub_signed(chrono::Duration::hours(
                         budget.period_hours.unwrap_or(24) as i64
                     ))
                     .ok_or("invalid_period")?;
-                let (mut ranges, _) =
-                    range_totals_for_sessions(state, keys, &[(Some(since), Some(now))], rates, now)
-                        .map_err(|_| "history_unavailable")?;
+                // Budget headroom must not silently mix a partial resident
+                // fallback with a proof about the durable ledger.
+                if keys
+                    .iter()
+                    .any(|key| state.ledger_is_stale(key) || !durable_keys.contains(key))
+                {
+                    return Err("history_unavailable");
+                }
+                let history = history.as_ref().ok_or("history_unavailable")?;
+                let mut ranges = history
+                    .range_totals_multi(&keys, &[(Some(since), Some(now))])
+                    .map_err(|_| "history_unavailable")?;
+                crate::query::enrich_range_pricing(&mut ranges, rates, now, |key| {
+                    state
+                        .sessions
+                        .get(key)
+                        .map(|entry| entry.summary.harness.clone())
+                });
                 let values = ranges.pop().ok_or("history_unavailable")?;
                 if budget.unit == BudgetUnit::Tokens {
                     return Ok(values
@@ -4870,38 +4912,80 @@ pub(crate) fn quota_budget_statuses(
             }
         })
         .collect();
-    finalize_quota_budget_statuses(state, history.as_ref(), budgets, &mut statuses);
+    finalize_scoped_quota_budget_statuses(
+        state,
+        history.as_ref(),
+        budgets,
+        &coverage,
+        &selected_keys,
+        sessions_generation,
+        durable_projects.as_deref(),
+        project_scope.as_ref(),
+        &mut statuses,
+    );
     statuses
 }
 
-/// Queries use separate ledger readers. A purge or replacement between them
-/// must not publish a partial batch or consume ledger notification state.
-pub(crate) fn finalize_quota_budget_statuses(
+/// Recheck every input read by the budget batch because these queries use
+/// independent ledger snapshots and resident projections.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_scoped_quota_budget_statuses(
     state: &AppState,
     approved_history: Option<&Arc<crate::history_store::HistoryStore>>,
     budgets: &[crate::quota_store::QuotaBudget],
+    proofs: &[Option<(i64, crate::history_store::AccountingCoverageProof)>],
+    selected_keys: &[Vec<String>],
+    sessions_generation: u64,
+    durable_projects: Option<&[crate::history_store::SessionProjectRow]>,
+    project_scope: Option<&ProjectBudgetScope>,
     statuses: &mut [crate::quota::QuotaBudgetStatus],
 ) {
     use crate::quota_store::BudgetUnit;
-    if !budgets
-        .iter()
-        .any(|budget| budget.enabled && budget.unit != BudgetUnit::PercentOfWindow)
-    {
-        return;
-    }
     let current = state.history_ready();
-    let unchanged_and_complete =
-        approved_history
-            .zip(current.as_ref())
-            .is_some_and(|(approved, current)| {
-                Arc::ptr_eq(approved, current) && current.has_complete_coverage().unwrap_or(false)
-            });
-    if !unchanged_and_complete {
-        for (budget, status) in budgets.iter().zip(statuses) {
-            if budget.enabled && budget.unit != BudgetUnit::PercentOfWindow {
-                status.current_value = None;
-                status.unavailable = Some("history_unavailable");
-            }
+    let same_history = approved_history
+        .zip(current.as_ref())
+        .is_some_and(|(approved, current)| Arc::ptr_eq(approved, current));
+    let same_generation = state.sessions_generation() == sessions_generation;
+    let same_scope = current.as_ref().is_some_and(|current| {
+        current.session_project_rows().ok().as_deref() == durable_projects
+            && current
+                .list_session_project_overrides()
+                .ok()
+                .zip(current.list_project_overrides().ok())
+                .is_some_and(|(sessions, projects)| {
+                    Some(ProjectBudgetScope {
+                        sessions,
+                        projects: projects
+                            .into_iter()
+                            .map(|row| (row.project_key.clone(), row))
+                            .collect(),
+                    }) == project_scope.cloned()
+                })
+    });
+    for (((budget, proof), keys), status) in
+        budgets.iter().zip(proofs).zip(selected_keys).zip(statuses)
+    {
+        if !budget.enabled || budget.unit == BudgetUnit::PercentOfWindow {
+            continue;
+        }
+        let unchanged = same_history
+            && same_generation
+            && same_scope
+            && !keys.iter().any(|key| state.ledger_is_stale(key))
+            && current
+                .as_ref()
+                .zip(proof.as_ref())
+                .is_some_and(|(current, (from_ms, before))| {
+                    current
+                        .accounting_coverage_since(*from_ms)
+                        .ok()
+                        .flatten()
+                        .as_ref()
+                        == Some(before)
+                });
+        if !unchanged {
+            status.current_value = None;
+            status.unavailable = Some("history_unavailable");
         }
     }
 }
