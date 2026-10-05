@@ -685,19 +685,20 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_same_machine_administrator_sid_before_policy_comparison() {
-        let current = current_user_sid().unwrap();
-        let (machine_prefix, _) = current.rsplit_once('-').unwrap();
-        let administrator = format!("{machine_prefix}-500");
-        let raw = format!("O:{administrator}D:P(A;OICI;FA;;;{administrator})(A;OICI;FA;;;SY)");
-        let policy = descriptor(&raw).unwrap();
-        let canonical = canonical_owner_dacl(policy.0).unwrap();
-        // On this host the native formatter uses LA for the built-in account.
-        // The old comparison to `raw` would reject this valid policy.
-        assert_ne!(canonical, raw);
-        assert_eq!(
-            canonical,
-            permitted_owner_dacl(&administrator, true).unwrap()[0]
-        );
+    fn canonicalizes_builtin_sid_alias_before_policy_comparison() {
+        // LOCAL SERVICE has a stable well-known SID and is distinct from
+        // SYSTEM. Windows abbreviates it to LS on every installation.
+        let local_service = "S-1-5-19";
+        for directory in [true, false] {
+            let flags = if directory { "OICI" } else { "" };
+            let raw =
+                format!("O:{local_service}D:P(A;{flags};FA;;;{local_service})(A;{flags};FA;;;SY)");
+            let policy = descriptor(&raw).unwrap();
+            let canonical = canonical_owner_dacl(policy.0).unwrap();
+            assert_ne!(canonical, raw);
+            assert!(permitted_owner_dacl(local_service, directory)
+                .unwrap()
+                .contains(&canonical));
+        }
     }
 }
