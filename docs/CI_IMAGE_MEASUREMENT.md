@@ -98,10 +98,10 @@ were skipped. Total observed job time, including the report, was 1,734 seconds
 (28.90 runner-minutes). This establishes preparation overhead, not a relative
 image speed result.
 
-The next reviewed attempt uses faster compression and a 20-minute seed-only
-cap. Measured jobs retain their 15-minute cap, five planned samples per arm/lane,
-identical snapshot requirements, and adoption criteria. A new main-only dispatch
-is required; changing this workflow does not automatically rerun it.
+The second reviewed attempt used faster compression and a 20-minute seed-only
+cap. Measured jobs retained their 15-minute cap, five planned samples per arm/lane,
+identical snapshot requirements, and adoption criteria. The second attempt was
+dispatched separately after source and recipe review.
 
 Artifacts retain source/digest/tool/snapshot names/checksums, package versions, raw pull
 logs, per-command timings, complete job timestamps/conclusions and failures.
@@ -133,3 +133,21 @@ record its source/tool/package manifest, and repeat comparison after dependency
 or base-image updates. Reverting the consuming workflow to the existing apt
 action is the rollback; a moving tag is never a recovery strategy. Experimental
 package retention/deletion remains a separate repository-owner operation.
+
+## Second experiment: completed measurement and decision
+
+[Run 37262773383](https://github.com/ekalb81/agent-odometer/actions/runs/37262773383) completed on 2026-10-05 at source `e74cd3077e7383465c2ce81668130f704dd8b6a4`. The publisher, all three seeds, the three first apt/image pairs, and the first-pair parity gate passed. Of 30 planned measurements, 29 jobs passed. Check image repetition 3 failed its Rust tests: `quota_live::tests::synthetic_stdio_driver_checks_local_identity_before_requesting_quota` returned `LaunchFailed` where the test expected `Unsupported` (695 passed, 1 failed in that test binary). Preserve that failure; no retry or replacement observation was made. The failure's observation metadata says `status: success`, but `commands.tsv` records `rust-tests` exit 101 and the GitHub job conclusion is failure. The reducer correctly rejects the command list and reports the full comparison **inconclusive**. The separate repairs in PR #318 and PR #319 address a shared test-budget isolation risk and the composite action's misleading outer status respectively; the exact cause of this run's test failure is unproven.
+
+| Lane | Apt passed/planned | Apt median / sample max | Image passed/planned | Image median / sample max |
+|---|---:|---:|---:|---:|
+| Check | 5/5 | 441 / 522 s | 4/5 | 488 / 546 s among successes |
+| MSRV | 5/5 | 90 / 113 s | 5/5 | 87 / 97 s |
+| Coverage | 5/5 | 303 / 353 s | 5/5 | 351 / 367 s |
+
+These are full job start-to-completion times, excluding queue delay. The nearest-rank p95 with four or five samples is the observed maximum, not a reliable population-tail estimate. Check image's successful-only timing has a missing case and cannot qualify that lane. All ten Coverage observations passed the reducer's exact snapshot, source, recipe, image, identity, command and pull checks. Its image median was **48 seconds (15.8%) slower** than apt, whereas the adoption rule requires at least a 10% and 15-second improvement. Thus this measured image does **not meet the necessary Coverage benefit**, independently of the incomplete Check lane. Do not adopt it or run again solely to fill that failed Check case; the full 30-case comparison remains formally inconclusive.
+
+All 36 completed jobs, including publication, seeds, gate, failed measurement and report, consumed 10,213 observed runner-seconds, **170.22 runner-minutes** against the 540-minute cap. Summing each job rounded up gives 191 minutes, an estimate rather than billing data. The published in-job report says 170.08 minutes because its own eight-second job had not yet completed when it fetched timestamps. The first experiment ([run 37256139929](https://github.com/ekalb81/agent-odometer/actions/runs/37256139929)) remains separate: zero of 30 measurements and 1,734 seconds (28.90 runner-minutes) after Check seed upload timed out.
+
+The image was pulled by immutable digest `ghcr.io/ekalb81/agent-odometer-ci-probe@sha256:4b6b9a4350f47f3fd96c19a2eeb30a7e9ead4a926da737819300350c3efec2a6`. The publisher froze Node 22.23.3, Rust stable 1.99.0, MSRV 1.95.0 and cargo-llvm-cov 0.9.1; Dockerfile, production CI, apt action and lane recipe hashes are in `publisher/recipe-hashes.txt`. The Coverage snapshot SHA-256 is `2c547fd1bb72ba5dfffc197626e37ea539158f0d78321b3377ba758d702cff71`; all ten Coverage observations used it. Each image job measured a first registry pull and immediate cached pull. First pulls ranged 14.219–23.835 seconds and cached pulls 0.060–0.272 seconds; pre-pull inventory and logs show actual layer behavior, so fresh runners do not establish wholly cold layers. The same verified warm Cargo/npm artifact snapshot was restored in each arm; this is not a cold Cargo or production Actions-cache sample. Snapshot artifacts were 3,772,546,413 bytes (Check), 565,987,711 (MSRV) and 3,092,693,398 (Coverage), stored once per lane for the attempt with 14-day retention. Production lanes and caches remained unchanged.
+
+Evidence is retained in the run's `ci-image-full-report`, per-measurement observation, and `ci-image-publisher` artifacts. The final job timeline includes all 36 completed jobs. Review downloaded only small observations and logs; no seed tarballs were needed.
