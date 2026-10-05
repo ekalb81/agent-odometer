@@ -13,6 +13,7 @@ import { mockRangePricing, mockSessionPricing, mockSummaryPricing, assertFixture
 import { createFixtureData, tok, scaleTok, toolMetrics, type Fixture } from './dev-mock/fixtures';
 import { isUpdaterVisualScenario, selectVisualScenario, type VisualScenario } from './dev-mock/visualScenario';
 import type {
+  AttentionPreferences,
   DiagnosticsReport,
   HistoryRebuildStatus,
   HistoryStatus,
@@ -27,10 +28,13 @@ import type {
   SubscriptionUsageEntry,
   SpeedReport,
   TurnReceiptIntegrationStatus,
+  WidgetSettings,
+  WidgetSnapshot,
 } from './lib/types';
 
 const DAY = 86_400_000;
 let rateOverride: RateCard | null = null;
+let attentionPreferences: AttentionPreferences = { revision: 0, categories: [], providers: [], tool_kind: null, stale_after_seconds: 300 };
 const projectAssignments = new Map<string, string>();
 const currentRates = () => rateOverride ?? RATES;
 const now = import.meta.env.VITE_VISUAL_TEST === '1'
@@ -44,6 +48,12 @@ if (visualScenarioSelection.warning) console.warn(visualScenarioSelection.warnin
 // branch. It gives screenshot tests a stable readiness/state marker without
 // allowing query parameters to change native application behaviour.
 document.documentElement.dataset.visualScenario = visualScenario;
+let publicStatusEnabled = false;
+
+let widgetSettings: WidgetSettings = { version: 1, revision: 0, preferences: {
+  visible: new URLSearchParams(location.search).get('surface') === 'widget',
+  provider: 'codex', kind: visualScenario === 'widget-usage' || visualScenario === 'widget-empty' ? 'usage' : 'quota', always_on_top: false,
+} };
 
 const { fixtures: FIXTURES, rates: RATES, summary, details, buckets, fixtureModel, pricingKey } =
   createFixtureData(now, visualScenario, Number(new URLSearchParams(location.search).get('stress') ?? 0));
@@ -457,6 +467,40 @@ function emitUpdateProgress(channelId: number) {
   });
 }
 
+function publicStatusConfig() {
+  return {
+        config_version: 1,
+        provider_status_enabled: publicStatusEnabled,
+        providers: {
+          codex: {
+            live_roots: ['/home/dev/.codex/sessions'],
+            archive_roots: ['/home/dev/.codex/archived_sessions'],
+            session_index_path: '/home/dev/.codex/session_index.jsonl',
+          },
+          claude_code: {
+            live_roots: ['/home/dev/.claude/projects'],
+            archive_roots: [],
+            session_index_path: null,
+          },
+        },
+        session_roots: ['/home/dev/.codex/sessions'],
+        archive_roots: ['/home/dev/.codex/archived_sessions'],
+        session_index_path: '/home/dev/.codex/session_index.jsonl',
+        claude_session_roots: ['/home/dev/.claude/projects'],
+        defender_exclusion_receipt: null,
+        performance_tracking_enabled: false,
+        performance_log_max_mb: 64,
+        memory_heap_tracking_enabled: false,
+        instructions_enabled: true,
+        instructions_tab_visible: true,
+        instruction_roots: [{ path: '/home/dev/projects', recursive: true }],
+        turn_receipts_enabled: false,
+        turn_receipts_codex: true,
+        turn_receipts_claude: true,
+        turn_receipts_gemini: false,
+      };
+}
+
 mockIPC((cmd, payload) => {
   switch (cmd) {
     case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
@@ -521,6 +565,49 @@ mockIPC((cmd, payload) => {
       return subscriptionUsage();
     case 'get_quota_snapshots':
       return quotaSnapshots();
+    case 'get_attention_status':
+      return { preferences: attentionPreferences, available: true, alerts: [], observations: attentionPreferences.categories.length ? [
+        { session_ref: '0123456789abcdef', provider: 'codex', state: 'waiting', observed_state: 'waiting', observed_at: '2026-07-29T15:29:00Z', source: 'retained tool observation', stale: false, partial: false },
+        { session_ref: 'fedcba9876543210', provider: 'claude_code', state: 'unknown', observed_state: 'working', observed_at: '2026-07-29T15:00:00Z', source: 'retained turn start', stale: true, partial: true },
+      ] : [] };
+    case 'set_attention_preferences': {
+      const next = (payload as { preferences: AttentionPreferences }).preferences;
+      if (next.revision !== attentionPreferences.revision) throw new Error('Attention preferences changed');
+      attentionPreferences = { ...next, revision: next.revision + 1 }; return attentionPreferences;
+    }
+    case 'get_widget_settings': return structuredClone(widgetSettings);
+    case 'set_widget_settings': {
+      const request = payload as { revision: number; preferences: WidgetSettings['preferences'] };
+      if (request.revision !== widgetSettings.revision) throw new Error('Widget settings changed');
+      widgetSettings = { version: 1, revision: widgetSettings.revision + 1, preferences: request.preferences };
+      return structuredClone(widgetSettings);
+    }
+    case 'get_widget_snapshot': {
+      if (!widgetSettings.preferences.visible) throw new Error('Widget disabled');
+      const result: WidgetSnapshot = { settings: structuredClone(widgetSettings), computed_at: new Date(now).toISOString(), quota: null, usage: null };
+      if (widgetSettings.preferences.kind === 'quota') {
+        const quota = quotaSnapshots().find(value => value.provider === widgetSettings.preferences.provider)!;
+        result.quota = { provenance: quota.provenance, unavailable: quota.unavailable, windows_omitted: 0,
+          windows: quota.windows.slice(0, 8).map(window => ({ kind: window.kind, unit: window.unit,
+            used: window.used, remaining: window.remaining, unlimited: window.unlimited,
+            observed_at: visualScenario === 'widget-stale' ? new Date(now - DAY).toISOString() : window.observed_at,
+            resets_at: visualScenario === 'widget-stale' ? new Date(now - 3_600_000).toISOString() : window.resets_at,
+            stale: visualScenario === 'widget-stale' || window.stale, unavailable: window.unavailable })) };
+      } else {
+        const rows = visualScenario === 'widget-empty' ? [] : visibleFixtures().filter(f => {
+          const row = summary(f); return row.harness === widgetSettings.preferences.provider && (row.source_availability ?? 'present') === 'present' && (row.lifecycle ?? 'present') === 'present';
+        });
+        const prices = rows.map(f => mockSummaryPricing(pricingKey(f)).pricing);
+        result.usage = { session_count: rows.length, total_tokens: rows.reduce((sum, f) => sum + summary(f).tokens_total.total_tokens, 0),
+          latest_activity_at: rows.length ? rows.map(f => summary(f).last_event_at).sort().at(-1)! : null,
+          plan_amount: prices.length ? prices.reduce((sum, value) => sum + value.plan.total, 0) : null,
+          api_amount_usd: prices.length ? prices.reduce((sum, value) => sum + (value.api?.total ?? 0), 0) : null,
+          plan_currency: currentRates().currencies?.[widgetSettings.preferences.provider] ?? 'credits',
+          estimate_partial: prices.some(value => value.plan.missing_models.length > 0 || value.plan.unpriced_models.length > 0),
+          scan_complete: visualScenario !== 'widget-usage' };
+      }
+      return result;
+    }
     case 'get_quota_config':
       return quotaConfigMock;
     case 'set_quota_config':
@@ -695,39 +782,17 @@ mockIPC((cmd, payload) => {
       return { configuration_path: '/synthetic/config', backup_path: null, restart_required: true };
     case 'test_integration_client':
       return { schema_version: 1, ok: false, checks: [{ id: 'mcp_launch', status: 'unknown', detail: 'Browser fixtures cannot launch or verify a native server.' }] };
-    case 'get_config':
-      // Mirrors the backend's normalized shape: versioned provider map with
-      // the legacy flat fields as its builtin mirror.
-      return {
-        config_version: 1,
-        providers: {
-          codex: {
-            live_roots: ['/home/dev/.codex/sessions'],
-            archive_roots: ['/home/dev/.codex/archived_sessions'],
-            session_index_path: '/home/dev/.codex/session_index.jsonl',
-          },
-          claude_code: {
-            live_roots: ['/home/dev/.claude/projects'],
-            archive_roots: [],
-            session_index_path: null,
-          },
-        },
-        session_roots: ['/home/dev/.codex/sessions'],
-        archive_roots: ['/home/dev/.codex/archived_sessions'],
-        session_index_path: '/home/dev/.codex/session_index.jsonl',
-        claude_session_roots: ['/home/dev/.claude/projects'],
-        defender_exclusion_receipt: null,
-        performance_tracking_enabled: false,
-        performance_log_max_mb: 64,
-        memory_heap_tracking_enabled: false,
-        instructions_enabled: true,
-        instructions_tab_visible: true,
-        instruction_roots: [{ path: '/home/dev/projects', recursive: true }],
-        turn_receipts_enabled: false,
-        turn_receipts_codex: true,
-        turn_receipts_claude: true,
-        turn_receipts_gemini: false,
-      };
+    case 'get_provider_service_status':
+      return { enabled: publicStatusEnabled, providers: [
+        { provider: 'codex', source_url: 'https://status.openai.com/api/v2/status.json', state: publicStatusEnabled ? 'current' : 'disabled', current_indicator: publicStatusEnabled ? 'minor' : null, last_known_indicator: publicStatusEnabled ? 'minor' : null, checked_at: publicStatusEnabled ? '2026-07-29T15:30:00Z' : null, source_updated_at: publicStatusEnabled ? '2026-07-29T15:20:00Z' : null, last_attempt_at: publicStatusEnabled ? '2026-07-29T15:30:00Z' : null, next_attempt_at: publicStatusEnabled ? '2026-07-29T15:35:00Z' : null, failure: null },
+        { provider: 'claude_code', source_url: 'https://status.claude.com/api/v2/status.json', state: publicStatusEnabled ? 'unavailable' : 'disabled', current_indicator: null, last_known_indicator: publicStatusEnabled ? 'operational' : null, checked_at: publicStatusEnabled ? '2026-07-29T14:30:00Z' : null, source_updated_at: publicStatusEnabled ? '2026-07-28T12:00:00Z' : null, last_attempt_at: publicStatusEnabled ? '2026-07-29T15:30:00Z' : null, next_attempt_at: publicStatusEnabled ? '2026-07-29T15:40:00Z' : null, failure: publicStatusEnabled ? 'rate_limited' : null },
+        { provider: 'gemini_cli', source_url: null, state: 'unsupported', current_indicator: null, last_known_indicator: null, checked_at: null, source_updated_at: null, last_attempt_at: null, next_attempt_at: null, failure: null },
+      ] };
+    case 'get_config': return publicStatusConfig();
+    case 'set_provider_status_enabled':
+      if (visualScenario === 'settings-save-error') return Promise.reject(new Error('Fixture settings save failed.'));
+      publicStatusEnabled = (payload as { enabled: boolean }).enabled;
+      return publicStatusConfig();
     case 'list_instruction_files': {
       if (visualScenario === 'instructions-empty') return emptyInstructionInventory();
       if (visualScenario === 'instructions-loading') return new Promise<never>(() => {});
@@ -804,6 +869,7 @@ mockIPC((cmd, payload) => {
       if (visualScenario === 'settings-save-error') {
         return Promise.reject(new Error('Fixture settings save failed.'));
       }
+      publicStatusEnabled = (payload as { config: { provider_status_enabled?: boolean } }).config.provider_status_enabled === true;
       return true;
     case 'add_defender_exclusions':
       if (visualScenario === 'defender-error') {

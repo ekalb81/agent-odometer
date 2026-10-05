@@ -10,13 +10,15 @@
 
 ![Codex tab with the session list, cost overview, and a session open in the detail pane](docs/screenshots/codex-tab.png)
 
-Everything happens on your machine. Odometer never uploads, phones home, or sends your prompts anywhere — it only reads the local files your agents already produced (and checks GitHub for its own updates).
+Usage history and pricing stay on your machine. Odometer reads local session files and checks GitHub for app updates. Public provider status is optional and off by default; live quota checks require separate account consent. Neither feature uploads session content.
 
 ## What you can see
 
 - **Every session, across providers** — Codex, Claude Code, Gemini CLI, and an All tab that keeps credits and USD estimates explicitly separated.
 - **Per-project spend** — working directories resolve to a stable project identity (repository root, workspace root, provider project id, or the path itself), so linked worktrees collapse into one project while nested repos and monorepo subfolders stay distinct. Sort, group, and filter by it. Use **Change project** in session details to move one session, make it standalone, or restore detection; manage project names and merges in Settings.
+- **Public provider status** — an optional Settings panel reads fixed OpenAI and Claude public status endpoints while open, without credentials or session data. Failed, stale, and unsupported sources stay unavailable; status never changes accounting. [Status sources and boundaries](docs/PROVIDER_STATUS.md).
 - **Quota windows and budgets** — transcript observations with reset timing, pace, and projected run-out; editable provider/project token and USD API-estimate budgets; opt-in local alerts. Codex live quota uses a separately approved account through the installed native CLI. Account changes stop readings until separately approved, and unavailable sources never become zero usage. [Quota sources and consent](docs/QUOTAS.md).
+- **Compact local widget** — an optional app window for recorded quota observations or cumulative available-source usage, with explicit observation age and partial coverage. It works with live polling disabled. [Widget scope and platform limits](docs/LOCAL_WIDGET.md).
 - **Where tool overhead goes** — calls attributed by origin (core, MCP, provider), MCP server, allowlisted shell-command family, language, and context source, with exportable totals.
 - **Tokens where they went** — input, cached, output, and reasoning tokens per session, per model, and per turn.
 - **What it costs** — Codex sessions show plan credits *and* an informational "what would this cost at OpenAI API rates" estimate; Claude Code and Gemini CLI sessions show API-rate estimates in USD. Rates live in an editable rate card, and every priced figure carries its provenance: priced directly, resolved through a model alias, fallback-priced, estimated, or explicitly unpriced.
@@ -266,3 +268,5 @@ Client setup and verification are available in Settings → Integration Center. 
 Use **Edit organization** in a session’s detail pane to pin it, add tags, or edit a private note. **Organize** in the toolbar filters pins/tags and saves, restores, renames, replaces, or deletes summary searches. Saved searches keep their provider, model, archive/subagent choices, organization filters, and exact UTC date bounds. Summary text search covers the existing summary fields; it does not search private notes or full transcripts. A stored content search reports unavailable until its explicit content-search service can run it.
 
 Organization stays in the local history database and is excluded from ordinary exports, diagnostics, accounting, MCP, and provider files. Missing sources keep it. Confirmed history purge removes the selected sessions’ pins, tag assignments, and notes; global tag definitions and saved searches remain. A corrupt-database recovery preserves the original database backup and rebuilds source history, but does not reconstruct private organization from transcripts. The UI identifies those unrestored records and keeps dependent pin/tag results unavailable.
+
+Attention alerts are an opt-in local feature with explicit transcript-evidence limits; see [Agent attention](docs/ATTENTION_ALERTS.md).

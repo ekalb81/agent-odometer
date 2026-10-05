@@ -556,6 +556,8 @@ export interface ProviderSourceConfig {
 }
 
 export interface Config {
+  /** Public, unauthenticated service status; disabled unless explicitly enabled. */
+  provider_status_enabled?: boolean;
   /** 0 = legacy flat-field layout; 1 = `providers` is authoritative and the
    *  flat fields mirror its builtin entries. The Settings UI still edits the
    *  flat fields; the backend treats submitted payloads as legacy-authoritative. */
@@ -1274,6 +1276,15 @@ export interface QuotaSnapshot {
   unavailable: QuotaUnavailableReason | null;
 }
 
+export interface WidgetPreferences { visible: boolean; provider: 'codex' | 'claude_code' | 'gemini_cli'; kind: 'quota' | 'usage'; always_on_top: boolean; }
+export interface WidgetSettings { version: number; revision: number; preferences: WidgetPreferences; }
+export interface WidgetQuotaWindow { kind: QuotaWindowKind; unit: QuotaUnit; used: number | null; remaining: number | null; unlimited: boolean; observed_at: string; resets_at: string | null; stale: boolean; unavailable: QuotaUnavailableReason | null; }
+export interface WidgetSnapshot {
+  settings: WidgetSettings; computed_at: string;
+  quota: { provenance: 'transcript_derived' | 'live_provider'; unavailable: QuotaUnavailableReason | null; windows: WidgetQuotaWindow[]; windows_omitted: number } | null;
+  usage: { session_count: number; total_tokens: number; latest_activity_at: string | null; plan_amount: number | null; plan_currency: string; api_amount_usd: number | null; estimate_partial: boolean; scan_complete: boolean } | null;
+}
+
 export type BudgetUnit = 'percent_of_window' | 'tokens' | 'usd';
 
 export interface QuotaBudget {
@@ -1494,3 +1505,29 @@ export interface SavedSearchDefinition {
   pinned_only: boolean; tags: string[];
 }
 export interface SavedSearch { id: number; revision: number; definition: SavedSearchDefinition }
+
+
+export type ProviderStatusIndicator = 'operational' | 'minor' | 'major' | 'critical' | 'maintenance';
+export interface ProviderServiceStatus {
+  provider: string;
+  source_url: string | null;
+  state: 'disabled' | 'unsupported' | 'pending' | 'current' | 'stale' | 'unavailable';
+  current_indicator: ProviderStatusIndicator | null;
+  last_known_indicator: ProviderStatusIndicator | null;
+  checked_at: string | null;
+  source_updated_at: string | null;
+  last_attempt_at: string | null;
+  next_attempt_at: string | null;
+  failure: 'offline_or_timeout' | 'rate_limited' | 'http_error' | 'invalid_response' | null;
+}
+export interface ProviderServiceStatusSnapshot {
+  enabled: boolean;
+  providers: ProviderServiceStatus[];
+}
+// Local transcript evidence, separate from quota and accounting authorities.
+export type AttentionEventKind = 'turn_started' | 'input_requested' | 'tool_completed' | 'tool_failed' | 'turn_completed' | 'turn_interrupted';
+export type AttentionState = 'working' | 'waiting' | 'idle' | 'error' | 'unknown';
+export interface AttentionPreferences { revision: number; categories: AttentionEventKind[]; providers: string[]; tool_kind: 'read' | 'search' | 'mutation' | 'command' | 'other' | null; stale_after_seconds: number; }
+export interface AttentionObservation { session_ref: string; provider: string; state: AttentionState; observed_state: AttentionState; observed_at: string; source: string; stale: boolean; partial: boolean; }
+export interface AttentionAlert { id: string; session_ref: string; provider_label: string; category: AttentionEventKind; observed_at: string; source: string; }
+export interface AttentionSnapshot { preferences: AttentionPreferences; available: boolean; observations: AttentionObservation[]; alerts: AttentionAlert[]; }
