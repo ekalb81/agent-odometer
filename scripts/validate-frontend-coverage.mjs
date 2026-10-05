@@ -28,6 +28,8 @@ export const COVERAGE_SLICE = [
   'src/lib/organization.ts',
   'src/lib/stores/organization.svelte.ts',
   'src/components/TranscriptSearch.svelte',
+  'src/components/ExecutionBoard.svelte',
+  'src/lib/executionBoard.ts',
   'src/lib/configTimeline.ts',
   'src/lib/activitySummary.ts',
   'src/lib/defenderStatus.ts',

@@ -1,0 +1,9 @@
+{
+  "name": "odometer-terminal-monitor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "odometer-monitor": "monitor.mjs" },
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test monitor.test.mjs" }
+}

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ExecutionBoard from './ExecutionBoard.svelte';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { organizationStore } from '../lib/stores/organization.svelte';
   import { matchesOrganization } from '../lib/organization';
@@ -1564,6 +1565,8 @@
   }
 
   let sessionContextMenu = $state<SessionContextMenuState | null>(null);
+  let executionBoardInitialId = $state<string | null>(null);
+  $effect(() => { if (!active) executionBoardInitialId = null; });
   let sessionExportBusy = $state(false);
   let sessionExportError = $state<string | null>(null);
 
@@ -2263,11 +2266,13 @@
     error={sessionExportError}
     onincludechange={setSessionExportDescendants}
     onexport={(format) => void exportSession(format)}
+    oncompare={() => { executionBoardInitialId = sessionContextMenu!.sessionId; sessionContextMenu = null; }}
     onclose={() => { if (!sessionExportBusy) sessionContextMenu = null; }}
   />
 {/if}
 
 <!-- Narrow layouts: the pane collapses back to an overlay drawer -->
+{#if executionBoardInitialId}<ExecutionBoard sessions={Array.from(sessionsStore.map.values())} initialId={executionBoardInitialId} onclose={() => { executionBoardInitialId = null; }} />{/if}
 {#if !isWide && selectedSessionId !== null}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div class="fixed inset-0 bg-black/50 z-40" onclick={deselect} aria-hidden="true"></div>

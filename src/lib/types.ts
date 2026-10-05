@@ -1484,6 +1484,21 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
+/** Ephemeral board metadata. No source text, arguments, edits or raw JSON. */
+export interface ExecutionRecord {
+  record_id: string;
+  timestamp: string | null;
+  role: string | null;
+  issue: string | null;
+  blocks: { kind: string; call_id: string | null; name: string | null }[];
+}
+export interface ExecutionPage {
+  availability: TranscriptPage['availability'];
+  issues: string[];
+  records: ExecutionRecord[];
+  next_cursor: TranscriptCursor | null;
+  source_complete: boolean;
+}
 export type FindingState = 'new' | 'persistent' | 'improving' | 'resolved' | 'suppressed' | 'not_applicable';
 export interface WorkflowRequest {
   session_ids: string[];

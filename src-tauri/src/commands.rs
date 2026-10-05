@@ -795,6 +795,22 @@ pub async fn get_transcript_page(
     .map_err(|_| "transcript_reader_unavailable".to_owned())
 }
 
+/// Board metadata only; bounded source bodies are discarded before IPC serialization.
+#[tauri::command]
+pub async fn get_execution_page(
+    state: State<'_, Arc<AppState>>,
+    mut request: crate::transcript::TranscriptRequest,
+) -> Result<crate::execution_board::ExecutionPage, String> {
+    request.max_records = Some(request.max_records.unwrap_or(25).clamp(1, 25));
+    request.max_bytes = Some(request.max_bytes.unwrap_or(131_072).clamp(1, 131_072));
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::execution_board::project(crate::transcript::read_for_session(&state, request))
+    })
+    .await
+    .map_err(|_| "execution_page_unavailable".to_owned())
+}
+
 /// Explicit desktop search only. Queries and snippets never enter diagnostics,
 /// performance recordings, summaries, accounting, or the public MCP API.
 #[tauri::command]

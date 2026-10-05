@@ -573,6 +573,15 @@ mockIPC((cmd, payload) => {
         ? { ...page, availability: 'missing', source_complete: false, records: [], next_cursor: null }
         : page;
     }
+    case 'get_execution_page': {
+      const page = transcriptFixture((payload as { request: TranscriptRequest }).request);
+      if (visualScenario === 'content-search-retained') return { availability: 'missing', issues: [], source_complete: false, records: [], next_cursor: null };
+      return { availability: page.availability, issues: page.issues,
+        next_cursor: page.next_cursor, source_complete: page.source_complete,
+        records: page.records.map(record => ({ record_id: record.id,
+          timestamp: record.presentation?.timestamp ?? null, role: record.presentation?.role ?? null,
+          issue: record.issue, blocks: (record.presentation?.blocks ?? []).map(block => ({ kind: block.kind, call_id: block.call_id, name: block.name })) })) };
+    }
     case 'search_session_content':
       return contentSearchFixture((payload as { request: TranscriptSearchRequest }).request, visualScenario === 'content-search-retained');
     case 'resolve_retained_search_target':
