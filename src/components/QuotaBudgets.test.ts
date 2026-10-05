@@ -3,9 +3,11 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tick } from 'svelte';
 import QuotaBudgets from './QuotaBudgets.svelte';
+import { sessionsStore } from '../lib/stores/sessions.svelte';
+import { projectStore } from '../lib/stores/projects.svelte';
 import { historyStore } from '../lib/stores/history.svelte';
 import { rates } from '../lib/stores/rates';
-import type { ProjectInfo, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire, RateCard } from '../lib/types';
+import type { ProjectInfo, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire, RateCard, SessionSummary, ControlledActionPreview } from '../lib/types';
 
 const { getQuotaBudgetStatuses, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig } = vi.hoisted(() => ({
   getQuotaBudgetStatuses: vi.fn(),
@@ -52,6 +54,7 @@ function deferred<T>() {
 
 describe('QuotaBudgets', () => {
   beforeEach(() => {
+    sessionsStore.replaceAll([]);
     historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: true });
     rates.set(null);
     getQuotaBudgetStatuses.mockReset().mockResolvedValue(report());
@@ -247,4 +250,63 @@ describe('QuotaBudgets', () => {
     expect(screen.getByText(/900,000 tokens/)).toBeInTheDocument();
     expect(screen.queryByText(/500,000 tokens/)).not.toBeInTheDocument();
   });
+  it('immediately withholds same-ID budget values and preview while keeping editable settings', async () => {
+    const user = userEvent.setup();
+    const session = { storage_id: 'codex:thread:synthetic', id: 'synthetic' } as SessionSummary;
+    sessionsStore.replaceAll([session]);
+    getQuotaBudgetStatuses.mockResolvedValueOnce(report([{ budget_id: existingBudget.id, current_value: 123, unavailable: null }]));
+    getQuotaBudgetStatuses.mockReturnValue(new Promise(() => {}));
+    render(QuotaBudgets);
+    await screen.findByText('123 tokens now');
+    await user.click(screen.getByText('Soft budgets & alerts'));
+    await user.click(screen.getByRole('button', { name: 'Preview future guard' }));
+    await screen.findByText('Future reviewed guard');
+    sessionsStore.upsert({ ...session, last_event_at: '2026-10-04T15:01:00Z' });
+    await tick();
+    expect(screen.queryByText('123 tokens now')).not.toBeInTheDocument();
+    expect(screen.queryByText('Future reviewed guard')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    expect(screen.getByText(/500,000 tokens/)).toBeInTheDocument();
+  });
+
+  it('clears a periodic failed refresh without erasing the saved configuration', async () => {
+    vi.useFakeTimers();
+    getQuotaBudgetStatuses.mockResolvedValueOnce(report([{ budget_id: existingBudget.id, current_value: 123, unavailable: null }]));
+    getQuotaBudgetStatuses.mockRejectedValue(new Error('private error'));
+    render(QuotaBudgets);
+    await tick();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(screen.getByText('123 tokens now')).toBeInTheDocument();
+    await vi.advanceTimersByTimeAsync(60_000);
+    await tick();
+    expect(screen.queryByText('123 tokens now')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Budget status could not be refreshed.');
+    expect(screen.getByText(/500,000 tokens/)).toBeInTheDocument();
+  });
+
+  it('fences a late report and guard preview when project scope revision changes', async () => {
+    const user = userEvent.setup();
+    getQuotaBudgetStatuses.mockResolvedValueOnce(report([{ budget_id: existingBudget.id, current_value: 123, unavailable: null }]));
+    const staleReport = deferred<QuotaBudgetCheck>();
+    const stalePreview = deferred<ControlledActionPreview>();
+    getQuotaBudgetStatuses.mockReturnValueOnce(staleReport.promise)
+      .mockResolvedValue(report([{ budget_id: existingBudget.id, current_value: 456, unavailable: null }]));
+    previewControlledAction.mockReturnValueOnce(stalePreview.promise);
+    render(QuotaBudgets);
+    await screen.findByText('123 tokens now');
+    await user.click(screen.getByText('Soft budgets & alerts'));
+    await user.click(screen.getByRole('button', { name: 'Preview future guard' }));
+    await projectStore.refresh();
+    await waitFor(() => expect(getQuotaBudgetStatuses).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText('123 tokens now')).not.toBeInTheDocument();
+    await projectStore.refresh();
+    await screen.findByText('456 tokens now');
+    staleReport.resolve(report([{ budget_id: existingBudget.id, current_value: 999, unavailable: null }]));
+    stalePreview.resolve({ target_type: 'provider_guard_configuration', proposed_change: 'Obsolete project guard', backup_requirement: 'backup', postcondition_requirement: 'check', apply_available: false, undo_available: false } as ControlledActionPreview);
+    await tick();
+    expect(screen.getByText('456 tokens now')).toBeInTheDocument();
+    expect(screen.queryByText('999 tokens now')).not.toBeInTheDocument();
+    expect(screen.queryByText('Obsolete project guard')).not.toBeInTheDocument();
+  });
+
 });

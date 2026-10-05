@@ -3,6 +3,8 @@
   import type { BudgetUnit, ControlledActionPreview, ProjectInfo, QuotaAlert, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire } from '../lib/types';
   import type { ViewScope } from '../lib/sessionProjection';
   import { providersStore } from '../lib/stores/providers.svelte';
+  import { sessionsStore } from '../lib/stores/sessions.svelte';
+  import { projectStore } from '../lib/stores/projects.svelte';
   import { historyStore } from '../lib/stores/history.svelte';
   import { invalidateAmbient } from '../lib/stores/ambient';
   import { rates } from '../lib/stores/rates';
@@ -47,6 +49,24 @@
   let lifecycleGeneration = 0;
   let reportGeneration = 0;
   let actionGeneration = 0;
+  let lastMutation: number | null = null;
+
+  function authorityCurrent() {
+    const mutation = sessionsStore.mutationLog.generation;
+    const history = historyStore.status;
+    const rateCard = $rates;
+    const projects = projectStore.revision;
+    return () => active && mutation === sessionsStore.mutationLog.generation
+      && history === historyStore.status && rateCard === $rates
+      && projects === projectStore.revision;
+  }
+
+  function clearNumericEvidence() {
+    report = null;
+    actionGeneration++;
+    actionPreview = null;
+    actionError = null;
+  }
 
   const statusByBudget = $derived(new Map((report?.statuses ?? []).map((status) => [status.budget_id, status])));
   const availableProviders = $derived(providersStore.descriptors);
@@ -70,9 +90,13 @@
   async function refresh(lifecycleToken: number): Promise<void> {
     if (busy) return;
     const requestToken = ++reportGeneration;
+    const authority = authorityCurrent();
+    const current = () => lifecycleToken === lifecycleGeneration
+      && requestToken === reportGeneration && authority();
+    clearNumericEvidence();
     try {
       const [nextConfig, nextReport] = await Promise.all([getQuotaConfig(), getQuotaBudgetStatuses()]);
-      if (lifecycleToken !== lifecycleGeneration || requestToken !== reportGeneration) return;
+      if (!current()) return;
       config = nextConfig;
       report = nextReport;
       actionGeneration++;
@@ -83,22 +107,27 @@
       // harness is selected, or its crossing would be consumed silently.
       if (nextReport.alerts.length > 0) onAlerts?.(nextReport.alerts);
     } catch {
-      if (lifecycleToken === lifecycleGeneration && requestToken === reportGeneration) loadError = 'Budget status could not be refreshed.';
+      if (current()) { clearNumericEvidence(); loadError = 'Budget status could not be refreshed.'; }
     }
   }
 
   $effect(() => {
-    // Purge/recovery and same-version rate replacements invalidate headroom
-    // immediately. Cleanup rejects in-flight results from the previous inputs.
-    void historyStore.status.status;
-    void historyStore.status.coverage_complete;
+    const mutation = sessionsStore.mutationLog.generation;
+    const changed = lastMutation !== null && mutation !== lastMutation;
+    lastMutation = mutation;
+    // Project store revision advances before merges/reassignments re-resolve.
+    // Keep editable configuration, but withhold numeric status and dry runs.
+    void projectStore.revision;
+    void historyStore.status;
     void $rates;
-    report = null;
+    clearNumericEvidence();
+    loadError = null;
     const token = ++lifecycleGeneration;
     if (!active) return;
-    void refresh(token);
+    const refreshTimer = setTimeout(() => void refresh(token), changed ? 250 : 0);
     const timer = setInterval(() => void refresh(token), REFRESH_MS);
     return () => {
+      clearTimeout(refreshTimer);
       clearInterval(timer);
       lifecycleGeneration++;
       reportGeneration++;
@@ -238,15 +267,17 @@
     if (!config?.revision || !budget.enabled) return;
     const revision = config.revision;
     const token = ++actionGeneration;
+    const authority = authorityCurrent();
+    const current = () => token === actionGeneration && config?.revision === revision && authority();
     actionPreview = null;
     actionError = null;
     try {
       const value = await previewControlledAction({ kind: 'budget_guard', draft: {
         budget_id: budget.id, expected_config_revision: revision,
       } });
-      if (token === actionGeneration && config?.revision === revision) actionPreview = { budgetId: budget.id, value };
+      if (current()) actionPreview = { budgetId: budget.id, value };
     } catch {
-      if (token === actionGeneration && config?.revision === revision) actionError = { budgetId: budget.id,
+      if (current()) actionError = { budgetId: budget.id,
         message: 'Guard preview is stale or unavailable. Refresh the budget.' };
     }
   }
