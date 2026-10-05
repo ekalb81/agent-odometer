@@ -1738,6 +1738,11 @@ fn undo_restore_swap(path: &Path, displaced: &Path, backup: &Path) -> anyhow::Re
 }
 
 fn read_regular_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    read_bounded_regular_file(path, MAX_CONFIG_BYTES)
+}
+
+/// Check the opened handle, not a prior path lookup, before bounded reads.
+pub(crate) fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -1764,7 +1769,7 @@ fn read_regular_file(path: &Path) -> anyhow::Result<Vec<u8>> {
             ));
         }
     }
-    if !metadata.file_type().is_file() || metadata.len() > MAX_CONFIG_BYTES {
+    if !metadata.file_type().is_file() || metadata.len() > max_bytes {
         return Err(anyhow!(
             "configuration path {} is not a bounded regular file",
             path.display()
@@ -1772,8 +1777,9 @@ fn read_regular_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     }
     use std::io::Read;
     let mut bytes = Vec::new();
-    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
         return Err(anyhow!(
             "configuration exceeded its safety limit while reading"
         ));
@@ -2230,6 +2236,18 @@ mod tests {
         file.set_len(MAX_CONFIG_BYTES + 1).unwrap();
         assert!(read_regular_file(&path).is_err());
         assert!(read_optional_config(&path).is_err());
+    }
+
+    #[test]
+    fn bounded_reader_respects_journal_limits_without_changing_file_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        let bytes = vec![b'x'; 4097];
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_bounded_regular_file(&path, 4096).is_err());
+        assert_eq!(read_bounded_regular_file(&path, 128 * 1024).unwrap(), bytes);
+        assert_eq!(read_regular_file(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[cfg(unix)]
