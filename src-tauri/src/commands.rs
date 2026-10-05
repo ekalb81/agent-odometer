@@ -110,6 +110,90 @@ pub fn list_external_events(
     state.external_events_snapshot()
 }
 
+/// Explicit, bounded workflow measurement over selected durable sessions.
+#[tauri::command]
+pub async fn get_workflow_report(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    workflow_report(state, request, false).await
+}
+
+/// Explicit local observation metadata write; no configurations or accounting are changed.
+#[tauri::command]
+pub async fn record_workflow_measurement(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    workflow_report(state, request, true).await
+}
+
+#[tauri::command]
+pub async fn set_workflow_finding_suppression(
+    state: State<'_, Arc<AppState>>,
+    edit: crate::workflow::FindingSuppressionEdit,
+) -> Result<(), String> {
+    let history = state
+        .history_ready()
+        .ok_or("Workflow history is unavailable or still preparing.")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history.suppress_workflow_finding(&edit).map_err(|_| {
+            "Finding changed or is unavailable; refresh before editing suppression.".to_owned()
+        })
+    })
+    .await
+    .map_err(|_| "Finding suppression could not finish.".to_owned())?
+}
+
+async fn workflow_report(
+    state: State<'_, Arc<AppState>>,
+    request: crate::workflow::WorkflowRequest,
+    record: bool,
+) -> Result<crate::workflow::WorkflowReport, String> {
+    let history = state
+        .history_ready()
+        .ok_or_else(|| "Workflow history is unavailable or still preparing.".to_owned())?;
+    let events = state.external_events_snapshot();
+    let app_state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let reader = history
+            .workflow_reader()
+            .map_err(|_| "Workflow history is incomplete or could not be read.".to_owned())?;
+        let rates = get_rates();
+        let mut report = crate::workflow::report(&reader, &rates, request, &events, Utc::now())
+            .map_err(|_| {
+                "Workflow analysis is unavailable: check the selected window and history coverage."
+                    .to_owned()
+            })?;
+        if let Ok(config) = Config::load_read_only() {
+            report.setup_health = Some(crate::workflow::WorkflowSetupHealth::from_diagnostics(
+                crate::diagnostics::generate_report(&app_state, &config, &rates),
+            ));
+        }
+        reader
+            .load_workflow_lifecycle(&mut report)
+            .map_err(|_| "Workflow lifecycle metadata is unavailable.".to_owned())?;
+        drop(reader);
+        if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
+            return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
+        }
+        if record {
+            history
+                .record_workflow_measurement(&mut report)
+                .map_err(|_| {
+                    "Measurement changed or could not be recorded; refresh and try again."
+                        .to_owned()
+                })?;
+        }
+        if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
+            return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|_| "Workflow analysis could not finish.".to_owned())?
+}
+
 #[tauri::command]
 pub async fn list_instruction_files(
     app: AppHandle,
@@ -5012,6 +5096,298 @@ pub fn change_quota_account(
 }
 
 // Private desktop organization: never exposed by headless/MCP projections.
+fn publish_private_json(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    anyhow::ensure!(
+        path.extension()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case("json")),
+        "Private export must end in .json"
+    );
+    let mut file = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("Export destination unavailable"))?,
+    )?;
+    file.write_all(content.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
+}
+#[tauri::command]
+pub async fn export_curated_dataset(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    revision: i64,
+    digest: String,
+) -> Result<bool, String> {
+    if digest.len() > 128 {
+        return Err("Reload the reviewed dataset before exporting".into());
+    }
+    let Some(path) = app
+        .dialog()
+        .file()
+        .set_title("Export reviewed curated dataset")
+        .set_file_name("odometer-curated-dataset.json")
+        .add_filter("JSON", &["json"])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "Export destination unavailable".to_owned())?;
+    let history = state
+        .history_ready()
+        .ok_or("Dataset export requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .export_current_dataset(revision, &digest, |content| {
+                publish_private_json(&path, content)
+            })
+            .map_err(|_| {
+                "Dataset changed or export unavailable; reload and review before retrying"
+                    .to_owned()
+            })
+    })
+    .await
+    .map_err(|_| "Dataset export unavailable".to_owned())??;
+    Ok(true)
+}
+#[tauri::command]
+pub async fn export_offline_experiment(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    revision: i64,
+    digest: String,
+) -> Result<bool, String> {
+    if digest.len() > 128 {
+        return Err("Reload the reviewed comparison before exporting".into());
+    }
+    let Some(path) = app
+        .dialog()
+        .file()
+        .set_title("Export reviewed offline comparison")
+        .set_file_name("odometer-offline-comparison.json")
+        .add_filter("JSON", &["json"])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "Export destination unavailable".to_owned())?;
+    let history = state
+        .history_ready()
+        .ok_or("Comparison export requires ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .export_current_experiment(id, revision, &digest, &get_rates(), |content| {
+                publish_private_json(&path, content)
+            })
+            .map_err(|_| {
+                "Comparison changed or export unavailable; reload and review before retrying"
+                    .to_owned()
+            })
+    })
+    .await
+    .map_err(|_| "Comparison export unavailable".to_owned())??;
+    Ok(true)
+}
+#[tauri::command]
+pub async fn get_offline_experiments(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<crate::history_store::experiments::ExperimentHeader>, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Offline comparisons require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .experiment_headers()
+            .map_err(|_| "Offline comparisons unavailable; reload".to_owned())
+    })
+    .await
+    .map_err(|_| "Comparison operation unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn get_offline_experiment(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+) -> Result<crate::history_store::experiments::ExperimentReport, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Offline comparisons require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .experiment_report(id, &get_rates())
+            .map_err(|_| "Offline comparison unavailable; reload".to_owned())
+    })
+    .await
+    .map_err(|_| "Comparison operation unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn preview_offline_experiment(
+    state: State<'_, Arc<AppState>>,
+    request: crate::history_store::experiments::FreezeRequest,
+) -> Result<crate::history_store::experiments::FreezePreview, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Offline comparisons require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .preview_experiment(request, &get_rates())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Comparison preview unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn commit_offline_experiment(
+    state: State<'_, Arc<AppState>>,
+    token: String,
+    reviewed: bool,
+) -> Result<crate::history_store::experiments::ExperimentReport, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Offline comparisons require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .commit_experiment(&token, reviewed, &get_rates())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Comparison save unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn preview_offline_import(
+    state: State<'_, Arc<AppState>>,
+    request: crate::history_store::experiments::ImportRequest,
+) -> Result<crate::history_store::experiments::ImportPreview, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Offline comparisons require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .preview_experiment_import(request)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Result preview unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn commit_offline_import(
+    state: State<'_, Arc<AppState>>,
+    token: String,
+    reviewed: bool,
+) -> Result<crate::history_store::experiments::ExperimentReport, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Offline comparisons require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .commit_experiment_import(&token, reviewed, &get_rates())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Result save unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn remove_offline_experiment(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    revision: i64,
+) -> Result<(), String> {
+    let history = state
+        .history_ready()
+        .ok_or("Offline comparisons require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .remove_experiment(id, revision)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Comparison removal unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn get_curated_dataset(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::history_store::CuratedDataset, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Curated examples require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .curated_dataset()
+            .map_err(|_| "Curated dataset unavailable; reload history".into())
+    })
+    .await
+    .map_err(|_| "Dataset operation unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn get_curated_candidates(
+    state: State<'_, Arc<AppState>>,
+    session_key: String,
+    cursor: Option<crate::transcript::TranscriptCursor>,
+) -> Result<crate::history_store::curated::CuratedCandidates, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::history_store::curated::candidates(&state, session_key, cursor)
+    })
+    .await
+    .map_err(|_| "Example source unavailable".into())
+}
+#[tauri::command]
+pub async fn preview_curated_case(
+    state: State<'_, Arc<AppState>>,
+    request: crate::history_store::CuratedRequest,
+) -> Result<crate::history_store::CuratedPreview, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Curated examples require ready durable history")?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .prepare_curated(&state, request)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Example preview unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn commit_curated_case(
+    state: State<'_, Arc<AppState>>,
+    token: String,
+    reviewed: bool,
+) -> Result<crate::history_store::CuratedDataset, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Curated examples require ready durable history")?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .commit_curated(&state, &token, reviewed)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Example save unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn remove_curated_case(
+    state: State<'_, Arc<AppState>>,
+    case_id: i64,
+    revision: i64,
+) -> Result<crate::history_store::CuratedDataset, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Curated examples require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .remove_curated(case_id, revision)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|_| "Example removal unavailable".to_owned())?
+}
 #[tauri::command]
 pub async fn get_record_bookmarks(
     state: State<'_, Arc<AppState>>,

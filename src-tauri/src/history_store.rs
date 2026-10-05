@@ -39,15 +39,22 @@ pub use recovery::{HistoryFailure, HistoryFailureKind, RecoveryReceipt};
 #[path = "history_search.rs"]
 mod search;
 pub(crate) use search::RetainedSearchMessages;
+#[path = "history_workflow.rs"]
+mod workflow;
 
+#[path = "history_curated.rs"]
+pub mod curated;
+#[path = "history_experiments.rs"]
+pub mod experiments;
 #[path = "history_organization.rs"]
 mod organization;
+pub use curated::{CuratedCase, CuratedContent, CuratedDataset, CuratedPreview, CuratedRequest};
 pub use organization::{
-    AnnotationEdit, AnnotationIdentity, OrganizationSummary, RecordBookmark, RecordBookmarkList,
-    SavedSearch, SavedSearchDefinition, SessionAnnotation,
+    AnnotationEdit, AnnotationIdentity, HumanOutcome, OrganizationSummary, RecordBookmark,
+    RecordBookmarkList, SavedSearch, SavedSearchDefinition, SessionAnnotation,
 };
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 16;
 const SNAPSHOT_FORMAT_VERSION: i64 = 1;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -264,6 +271,8 @@ pub struct IntegrationObservation {
 /// Durable archive database. Errors are deliberately surfaced to callers: a
 /// failed archive must not quietly behave like a disposable cache.
 pub struct HistoryStore {
+    curated_previews: Mutex<Vec<curated::Pending>>,
+    experiment_previews: Mutex<Vec<experiments::Pending>>,
     connection: Mutex<Connection>,
     exclusion_cache: Mutex<ExclusionCache>,
     query_control: Option<QueryControl>,
@@ -335,6 +344,8 @@ impl HistoryStore {
         validate_query_ledger(&connection)?;
         let pragmas = crate::memory::query_sqlite_pragmas(&connection);
         Ok(Self {
+            curated_previews: Mutex::new(Vec::new()),
+            experiment_previews: Mutex::new(Vec::new()),
             connection: Mutex::new(connection),
             exclusion_cache: Mutex::new(ExclusionCache::at(path.to_path_buf())),
             query_control: Some(control),
@@ -609,6 +620,8 @@ impl HistoryStore {
             transaction.commit()?;
         }
         Ok(Self {
+            curated_previews: Mutex::new(Vec::new()),
+            experiment_previews: Mutex::new(Vec::new()),
             connection: Mutex::new(connection),
             exclusion_cache: Mutex::new(ExclusionCache::at(path.to_path_buf())),
             query_control: None,
@@ -2937,6 +2950,22 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 11 {
         steps += 1;
+        version = 12;
+    }
+    if version == 12 {
+        steps += 1;
+        version = 13;
+    }
+    if version == 13 {
+        steps += 1;
+        version = 14;
+    }
+    if version == 14 {
+        steps += 1;
+        version = 15;
+    }
+    if version == 15 {
+        steps += 1;
     }
     steps
 }
@@ -3067,6 +3096,10 @@ fn migrate(
         transaction.execute_batch(DIMENSION_SCHEMA_SQL)?;
         lifecycle::install_schema(&transaction)?;
         organization::install_schema(&transaction)?;
+        crate::workflow::lifecycle::install_schema(&transaction)?;
+        organization::install_outcome_schema(&transaction)?;
+        curated::install_schema(&transaction)?;
+        experiments::install_schema(&transaction)?;
         transaction.execute(
             "INSERT INTO history_meta(key, value) VALUES('schema_version', ?1)",
             [SCHEMA_VERSION.to_string()],
@@ -3809,6 +3842,102 @@ fn migrate(
             step_total,
             11,
             12,
+            started.elapsed(),
+        ));
+    }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 12 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v12_to_v13_workflow",
+            step_index,
+            step_total,
+            12,
+            13,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::workflow::lifecycle::install_schema(&transaction)?;
+        transaction.execute_batch("INSERT INTO history_meta(key,value) VALUES('schema_version','13') ON CONFLICT(key) DO UPDATE SET value=excluded.value; PRAGMA user_version=13;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v12_to_v13_workflow",
+            step_index,
+            step_total,
+            12,
+            13,
+            started.elapsed(),
+        ));
+    }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 13 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v13_to_v14_human_outcomes",
+            step_index,
+            step_total,
+            13,
+            14,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        organization::install_outcome_schema(&transaction)?;
+        transaction.execute_batch("INSERT INTO history_meta(key,value) VALUES('schema_version','14') ON CONFLICT(key) DO UPDATE SET value=excluded.value; PRAGMA user_version=14;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v13_to_v14_human_outcomes",
+            step_index,
+            step_total,
+            13,
+            14,
+            started.elapsed(),
+        ));
+    }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 14 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v14_to_v15_curated_dataset",
+            step_index,
+            step_total,
+            14,
+            15,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        curated::install_schema(&transaction)?;
+        transaction.execute_batch("UPDATE history_meta SET value='15' WHERE key='schema_version'; PRAGMA user_version=15;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v14_to_v15_curated_dataset",
+            step_index,
+            step_total,
+            14,
+            15,
+            started.elapsed(),
+        ));
+    }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 15 {
+        step_index += 1;
+        on_progress(MigrationStepEvent::started(
+            "v15_to_v16_offline_comparisons",
+            step_index,
+            step_total,
+            15,
+            16,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        experiments::install_schema(&transaction)?;
+        transaction.execute_batch("UPDATE history_meta SET value='16' WHERE key='schema_version'; PRAGMA user_version=16;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            "v15_to_v16_offline_comparisons",
+            step_index,
+            step_total,
+            15,
+            16,
             started.elapsed(),
         ));
     }
@@ -6539,7 +6668,7 @@ mod tests {
         let database = store.path.clone();
         drop(store);
         let connection = Connection::open(&database).unwrap();
-        connection.execute_batch("DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; PRAGMA user_version=10;").unwrap();
+        connection.execute_batch("DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; DROP TABLE offline_cases; DROP TABLE offline_experiments; DROP TABLE workflow_finding_lifecycle; DROP TABLE curated_cases; DROP TABLE curated_changes; PRAGMA user_version=10;").unwrap();
         drop(connection);
         let reopened = HistoryStore::open(&database).unwrap();
         let summaries = reopened.session_summaries().unwrap();
@@ -8858,7 +8987,7 @@ mod tests {
                      ALTER TABLE durable_token_events DROP COLUMN cache_creation_input_tokens;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '2')
                        ON CONFLICT(key) DO UPDATE SET value = '2';
-                     PRAGMA user_version = 2;",
+                     DROP TABLE offline_cases; DROP TABLE offline_experiments; DROP TABLE workflow_finding_lifecycle; DROP TABLE curated_cases; DROP TABLE curated_changes; PRAGMA user_version = 2;",
                 )
                 .unwrap();
         }
@@ -9034,7 +9163,7 @@ mod tests {
                      DROP TABLE rollup_mutation_chains;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '3')
                        ON CONFLICT(key) DO UPDATE SET value = '3';
-                     PRAGMA user_version = 3;",
+                     DROP TABLE offline_cases; DROP TABLE offline_experiments; DROP TABLE workflow_finding_lifecycle; DROP TABLE curated_cases; DROP TABLE curated_changes; PRAGMA user_version = 3;",
                 )
                 .unwrap();
         }
@@ -9282,7 +9411,7 @@ mod tests {
                      DROP TABLE IF EXISTS project_session_overrides;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '5')
                        ON CONFLICT(key) DO UPDATE SET value = '5';
-                     PRAGMA user_version = 5;",
+                     DROP TABLE offline_cases; DROP TABLE offline_experiments; DROP TABLE workflow_finding_lifecycle; DROP TABLE curated_cases; DROP TABLE curated_changes; PRAGMA user_version = 5;",
                 )
                 .unwrap();
         }
@@ -9359,7 +9488,7 @@ mod tests {
                      DROP TABLE IF EXISTS project_session_overrides;
                      INSERT INTO history_meta(key, value) VALUES('schema_version', '5')
                        ON CONFLICT(key) DO UPDATE SET value = '5';
-                     PRAGMA user_version = 5;",
+                     DROP TABLE offline_cases; DROP TABLE offline_experiments; DROP TABLE workflow_finding_lifecycle; DROP TABLE curated_cases; DROP TABLE curated_changes; PRAGMA user_version = 5;",
                 )
                 .unwrap();
         }
@@ -10178,7 +10307,7 @@ mod tests {
     /// existing `CREATE TABLE`/`CREATE INDEX`. Regenerate by printing
     /// `schema_fingerprint(&store.connection().unwrap())` from a fresh
     /// `HistoryStore::open` and pasting the result below.
-    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_organization_identity_idx:CREATE UNIQUE INDEX durable_sessions_organization_identity_idx ON durable_sessions(session_key,first_event_fingerprint)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:purged_sessions_identity_idx:CREATE INDEX purged_sessions_identity_idx ON purged_sessions(identity_key, first_event_fingerprint)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:annotation_tags:CREATE TABLE annotation_tags ( session_key TEXT NOT NULL, anchor TEXT NOT NULL, label TEXT NOT NULL REFERENCES organization_tags(label) ON UPDATE CASCADE ON DELETE CASCADE, PRIMARY KEY(session_key,anchor,label), FOREIGN KEY(session_key,anchor) REFERENCES session_annotations(session_key,anchor) ON DELETE CASCADE )\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT, thread_name_overlay TEXT, thread_name_overlay_set INTEGER NOT NULL DEFAULT 0 , lifecycle TEXT NOT NULL DEFAULT 'present' CHECK(lifecycle IN ('present','retained','superseded')))\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:organization_tags:CREATE TABLE organization_tags (label TEXT PRIMARY KEY)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:purged_sessions:CREATE TABLE purged_sessions ( session_key TEXT NOT NULL, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, purged_at_ms INTEGER NOT NULL, PRIMARY KEY(session_key,first_event_fingerprint) )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:saved_searches:CREATE TABLE saved_searches (id INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL, definition_json TEXT NOT NULL)\ntable:session_annotations:CREATE TABLE session_annotations ( session_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, anchor TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', PRIMARY KEY(session_key,anchor), FOREIGN KEY(session_key,first_event_fingerprint) REFERENCES durable_sessions(session_key,first_event_fingerprint) ON UPDATE CASCADE ON DELETE CASCADE )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:session_summaries:CREATE TABLE session_summaries ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), summary_json BLOB NOT NULL )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )\ntable:sqlite_sequence:CREATE TABLE sqlite_sequence(name,seq)";
+    const EXPECTED_SCHEMA_FINGERPRINT: &str = "index:curated_cases_session_idx:CREATE INDEX curated_cases_session_idx ON curated_cases(session_key)\nindex:durable_finding_events_session_idx:CREATE INDEX durable_finding_events_session_idx ON durable_finding_events(session_key)\nindex:durable_sessions_identity_idx:CREATE INDEX durable_sessions_identity_idx ON durable_sessions(identity_key)\nindex:durable_sessions_last_seen_idx:CREATE INDEX durable_sessions_last_seen_idx ON durable_sessions(last_seen_at_ms DESC, session_key)\nindex:durable_sessions_organization_identity_idx:CREATE UNIQUE INDEX durable_sessions_organization_identity_idx ON durable_sessions(session_key,first_event_fingerprint)\nindex:durable_sessions_project_idx:CREATE INDEX durable_sessions_project_idx ON durable_sessions(project_key)\nindex:durable_token_events_session_timestamp_idx:CREATE INDEX durable_token_events_session_timestamp_idx ON durable_token_events(session_key, timestamp_ms)\nindex:durable_tool_dimension_events_session_timestamp_idx:CREATE INDEX durable_tool_dimension_events_session_timestamp_idx ON durable_tool_dimension_events(session_key, timestamp_ms)\nindex:durable_tool_events_session_timestamp_idx:CREATE INDEX durable_tool_events_session_timestamp_idx ON durable_tool_events(session_key, timestamp_ms)\nindex:offline_cases_source_idx:CREATE INDEX offline_cases_source_idx ON offline_cases(case_id)\nindex:purged_sessions_identity_idx:CREATE INDEX purged_sessions_identity_idx ON purged_sessions(identity_key, first_event_fingerprint)\nindex:rollup_mutation_chains_key_idx:CREATE UNIQUE INDEX rollup_mutation_chains_key_idx ON rollup_mutation_chains(session_key, hour_bucket, model, turn_id, target)\nindex:rollup_token_totals_key_idx:CREATE UNIQUE INDEX rollup_token_totals_key_idx ON rollup_token_totals(session_key, hour_bucket, model, service_tier)\nindex:rollup_tool_dimensions_key_idx:CREATE UNIQUE INDEX rollup_tool_dimensions_key_idx ON rollup_tool_dimensions(session_key, hour_bucket, dimension_kind, dimension_value)\nindex:rollup_tool_metrics_key_idx:CREATE UNIQUE INDEX rollup_tool_metrics_key_idx ON rollup_tool_metrics(session_key, hour_bucket, model)\nindex:source_locations_session_idx:CREATE INDEX source_locations_session_idx ON source_locations(session_key, present)\ntable:annotation_tags:CREATE TABLE annotation_tags ( session_key TEXT NOT NULL, anchor TEXT NOT NULL, label TEXT NOT NULL REFERENCES organization_tags(label) ON UPDATE CASCADE ON DELETE CASCADE, PRIMARY KEY(session_key,anchor,label), FOREIGN KEY(session_key,anchor) REFERENCES session_annotations(session_key,anchor) ON DELETE CASCADE )\ntable:curated_cases:CREATE TABLE curated_cases(id INTEGER PRIMARY KEY AUTOINCREMENT,version INTEGER NOT NULL,session_key TEXT NOT NULL,first_event_fingerprint TEXT NOT NULL,content_json TEXT NOT NULL CHECK(length(CAST(content_json AS BLOB))<=16384),content_hash TEXT NOT NULL,FOREIGN KEY(session_key,first_event_fingerprint) REFERENCES durable_sessions(session_key,first_event_fingerprint) ON UPDATE CASCADE ON DELETE CASCADE)\ntable:curated_changes:CREATE TABLE curated_changes(revision INTEGER PRIMARY KEY,case_id INTEGER NOT NULL,change TEXT NOT NULL CHECK(change IN ('added','edited','removed')),content_hash TEXT NOT NULL)\ntable:durable_finding_events:CREATE TABLE durable_finding_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER, rule_id TEXT NOT NULL, severity TEXT NOT NULL, avoidable_calls INTEGER NOT NULL )\ntable:durable_sessions:CREATE TABLE durable_sessions ( session_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, fingerprint_is_final INTEGER NOT NULL, collision INTEGER NOT NULL DEFAULT 0, current_snapshot_version INTEGER NOT NULL DEFAULT 0, current_snapshot_hash TEXT, created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, ledger_dirty INTEGER NOT NULL DEFAULT 0, project_key TEXT, project_label TEXT, project_provenance TEXT, project_source_directory TEXT, thread_name_overlay TEXT, thread_name_overlay_set INTEGER NOT NULL DEFAULT 0 , lifecycle TEXT NOT NULL DEFAULT 'present' CHECK(lifecycle IN ('present','retained','superseded')))\ntable:durable_token_events:CREATE TABLE durable_token_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), event_key TEXT NOT NULL, event_index INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL, model TEXT, service_tier TEXT, request_input_tokens INTEGER, cumulative_total_tokens INTEGER NOT NULL, input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL, reasoning_output_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL, PRIMARY KEY(session_key, event_key) )\ntable:durable_tool_dimension_events:CREATE TABLE durable_tool_dimension_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, outcome TEXT NOT NULL, output_bytes INTEGER NOT NULL, duration_ms INTEGER )\ntable:durable_tool_events:CREATE TABLE durable_tool_events ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), timestamp_ms INTEGER NOT NULL, model TEXT, kind TEXT NOT NULL, outcome TEXT NOT NULL, turn_id TEXT, target TEXT, duration_ms INTEGER, output_bytes INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'unknown' )\ntable:history_meta:CREATE TABLE history_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\ntable:offline_cases:CREATE TABLE offline_cases(experiment_id INTEGER NOT NULL REFERENCES offline_experiments(id) ON DELETE CASCADE,case_id INTEGER NOT NULL REFERENCES curated_cases(id) ON DELETE CASCADE,input_json TEXT NOT NULL CHECK(length(CAST(input_json AS BLOB))<=16384),result_a_json TEXT CHECK(length(CAST(result_a_json AS BLOB))<=8192),result_b_json TEXT CHECK(length(CAST(result_b_json AS BLOB))<=8192),PRIMARY KEY(experiment_id,case_id))\ntable:offline_experiments:CREATE TABLE offline_experiments(id INTEGER PRIMARY KEY AUTOINCREMENT,revision INTEGER NOT NULL,manifest_json TEXT NOT NULL CHECK(length(CAST(manifest_json AS BLOB))<=65536))\ntable:organization_tags:CREATE TABLE organization_tags (label TEXT PRIMARY KEY)\ntable:project_overrides:CREATE TABLE project_overrides ( project_key TEXT PRIMARY KEY, display_label TEXT, canonical_project_key TEXT, updated_at_ms INTEGER NOT NULL )\ntable:project_session_overrides:CREATE TABLE project_session_overrides ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), project_key TEXT NOT NULL, updated_at_ms INTEGER NOT NULL )\ntable:purged_sessions:CREATE TABLE purged_sessions ( session_key TEXT NOT NULL, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, purged_at_ms INTEGER NOT NULL, PRIMARY KEY(session_key,first_event_fingerprint) )\ntable:rollup_mutation_chains:CREATE TABLE rollup_mutation_chains ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '', mutation_count INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_token_totals:CREATE TABLE rollup_token_totals ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', service_tier TEXT NOT NULL DEFAULT '', input_tokens INTEGER NOT NULL DEFAULT 0, cached_input_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, reasoning_output_tokens INTEGER NOT NULL DEFAULT 0, total_tokens INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_dimensions:CREATE TABLE rollup_tool_dimensions ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, dimension_kind TEXT NOT NULL, dimension_value TEXT NOT NULL, calls INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0 )\ntable:rollup_tool_metrics:CREATE TABLE rollup_tool_metrics ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), hour_bucket INTEGER NOT NULL, model TEXT NOT NULL DEFAULT '', calls INTEGER NOT NULL DEFAULT 0, reads INTEGER NOT NULL DEFAULT 0, searches INTEGER NOT NULL DEFAULT 0, mutations INTEGER NOT NULL DEFAULT 0, commands INTEGER NOT NULL DEFAULT 0, other INTEGER NOT NULL DEFAULT 0, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0, unknown INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, output_bytes INTEGER NOT NULL DEFAULT 0, core_origin_calls INTEGER NOT NULL DEFAULT 0, mcp_origin_calls INTEGER NOT NULL DEFAULT 0, provider_origin_calls INTEGER NOT NULL DEFAULT 0, unknown_origin_calls INTEGER NOT NULL DEFAULT 0 )\ntable:saved_searches:CREATE TABLE saved_searches (id INTEGER PRIMARY KEY AUTOINCREMENT, revision INTEGER NOT NULL, definition_json TEXT NOT NULL)\ntable:session_annotations:CREATE TABLE session_annotations ( session_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, anchor TEXT NOT NULL DEFAULT '', revision INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', outcome_label TEXT CHECK(outcome_label IS NULL OR outcome_label IN ('not_rated','accepted','rejected','unresolved')), repair_minutes INTEGER CHECK(repair_minutes IS NULL OR repair_minutes BETWEEN 0 AND 525600), first_pass_accepted INTEGER CHECK(first_pass_accepted IS NULL OR first_pass_accepted IN (0,1)), PRIMARY KEY(session_key,anchor), FOREIGN KEY(session_key,first_event_fingerprint) REFERENCES durable_sessions(session_key,first_event_fingerprint) ON UPDATE CASCADE ON DELETE CASCADE )\ntable:session_snapshots:CREATE TABLE session_snapshots ( session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), version INTEGER NOT NULL, format_version INTEGER NOT NULL, snapshot_hash TEXT NOT NULL, captured_at_ms INTEGER NOT NULL, session_json BLOB NOT NULL, PRIMARY KEY(session_key, version) )\ntable:session_summaries:CREATE TABLE session_summaries ( session_key TEXT PRIMARY KEY REFERENCES durable_sessions(session_key), summary_json BLOB NOT NULL )\ntable:source_artifacts:CREATE TABLE source_artifacts ( artifact_key TEXT PRIMARY KEY, identity_key TEXT NOT NULL, first_event_fingerprint TEXT NOT NULL, session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), created_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL )\ntable:source_locations:CREATE TABLE source_locations ( path TEXT PRIMARY KEY, artifact_key TEXT NOT NULL REFERENCES source_artifacts(artifact_key), session_key TEXT NOT NULL REFERENCES durable_sessions(session_key), present INTEGER NOT NULL, first_seen_at_ms INTEGER NOT NULL, last_seen_at_ms INTEGER NOT NULL, seen_generation INTEGER NOT NULL DEFAULT 0 )\ntable:sqlite_sequence:CREATE TABLE sqlite_sequence(name,seq)\ntable:workflow_finding_lifecycle:CREATE TABLE workflow_finding_lifecycle ( provider TEXT NOT NULL, project_key TEXT NOT NULL, rule_id TEXT NOT NULL, first_observed_ms INTEGER NOT NULL, last_observed_ms INTEGER NOT NULL, analyzer_version INTEGER NOT NULL, comparison_version INTEGER NOT NULL, state TEXT NOT NULL, suppressed INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL, PRIMARY KEY(provider,project_key,rule_id) )";
 
     #[test]
     fn schema_fingerprint_matches_committed_expected_value() {
@@ -10413,6 +10542,10 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                16 => "DROP TABLE offline_cases; DROP TABLE offline_experiments;",
+                15 => "DROP TABLE curated_cases; DROP TABLE curated_changes; DELETE FROM history_meta WHERE key='dataset_revision';",
+                14 => "ALTER TABLE session_annotations DROP COLUMN outcome_label; ALTER TABLE session_annotations DROP COLUMN repair_minutes; ALTER TABLE session_annotations DROP COLUMN first_pass_accepted;",
+                13 => "DROP TABLE workflow_finding_lifecycle;",
                 12 => "DROP TABLE annotation_tags; DROP TABLE session_annotations; DROP TABLE organization_tags; DROP TABLE saved_searches; DROP INDEX durable_sessions_organization_identity_idx;",
                 11 => "DROP TABLE session_summaries; DROP TABLE purged_sessions; ALTER TABLE durable_sessions DROP COLUMN lifecycle; DELETE FROM history_meta WHERE key IN ('coverage_complete','retention_policy');",
                 10 => {
@@ -10646,6 +10779,10 @@ mod tests {
                 "v9_to_v10_thread_name_overlay",
                 "v10_to_v11_retention",
                 "v11_to_v12_organization",
+                "v12_to_v13_workflow",
+                "v13_to_v14_human_outcomes",
+                "v14_to_v15_curated_dataset",
+                "v15_to_v16_offline_comparisons",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );

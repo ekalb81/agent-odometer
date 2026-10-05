@@ -10,6 +10,8 @@
     "widget-settings-opt-in",
     "handoff-reviewed-source",
     "handoff-retained-narrow",
+    "human-outcomes-summary",
+    "human-outcomes-recovery",
     "organization-saved-search",
     "organization-editor-narrow",
     "organization-recovery-unavailable",
@@ -71,6 +73,12 @@
     "content-search-retained-narrow",
     "execution-board-overlap",
     "execution-board-comparison",
-    "execution-board-narrow-coverage"
+    "execution-board-narrow-coverage",
+    "workflow-measurement-desktop",
+    "workflow-lifecycle-narrow",
+    "curated-example-preview",
+    "curated-example-removal-narrow",
+    "offline-comparison-freeze-preview",
+    "offline-comparison-report-narrow"
   ]
 }

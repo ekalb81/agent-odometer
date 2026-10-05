@@ -5,6 +5,9 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
 import { mockOrganization } from './dev-mock/organization';
+import { mockCurated } from './dev-mock/curated';
+import { mockExperiments } from './dev-mock/experiments';
+import { workflowFixture } from './dev-mock/workflow';
 import { contentSearchFixture, retainedLandingFixture } from './dev-mock/contentSearch';
 import type { TranscriptSearchRequest, TranscriptSearchTarget } from './lib/types';
 import type { TranscriptRequest } from './lib/types';
@@ -503,6 +506,26 @@ function publicStatusConfig() {
 
 mockIPC((cmd, payload) => {
   switch (cmd) {
+    case 'export_curated_dataset':
+    case 'export_offline_experiment': return true;
+    case 'get_offline_experiments':
+    case 'get_offline_experiment':
+    case 'preview_offline_experiment':
+    case 'commit_offline_experiment':
+    case 'preview_offline_import':
+    case 'commit_offline_import':
+    case 'remove_offline_experiment':
+      return mockExperiments(cmd, (payload ?? {}) as Record<string, unknown>, mockCurated('get_curated_dataset', {}) as import('./lib/types').CuratedDataset);
+    case 'get_curated_dataset':
+    case 'get_curated_candidates':
+    case 'preview_curated_case':
+    case 'commit_curated_case':
+    case 'remove_curated_case':
+      return mockCurated(cmd,(payload??{}) as Record<string,unknown>,visualScenario==='organization-recovered');
+    case 'get_workflow_report':
+    case 'record_workflow_measurement':
+    case 'set_workflow_finding_suppression':
+      return workflowFixture(cmd, (payload ?? {}) as Record<string, unknown>);
     case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
     case 'get_organization_summaries':
     case 'get_record_bookmarks':
