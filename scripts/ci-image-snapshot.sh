@@ -7,7 +7,9 @@ mkdir -p "$bundle"
 case "$1" in
   pack)
     mkdir -p "$HOME/.cargo/registry" "$HOME/.cargo/git" "$HOME/.npm/_cacache"
-    tar -czf "$bundle/snapshot.tar.gz" -C "$HOME" \
+    # Build artifacts are large; prefer quick compression over smaller transfers.
+    # Both measured arms still restore these identical, checksummed gzip bytes.
+    tar -I 'gzip -1' -cf "$bundle/snapshot.tar.gz" -C "$HOME" \
       .cargo/registry .cargo/git .npm/_cacache "$workspace/src-tauri/target" "$workspace/output/ci-image/snapshot.json"
     (cd "$bundle" && sha256sum snapshot.tar.gz > snapshot.sha256)
     ;;

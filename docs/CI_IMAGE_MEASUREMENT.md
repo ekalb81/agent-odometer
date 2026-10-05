@@ -26,12 +26,12 @@ No Codecov upload or OIDC permission is added to this experiment.
 | Stage | Jobs | Timeout/job | Maximum runner-minutes |
 |---|---:|---:|---:|
 | Build/publish/freeze tools | 1 | 20 min | 20 |
-| Warm independent lane snapshots | 3 | 15 min | 45 |
+| Warm independent lane snapshots | 3 | 20 min | 60 |
 | First apt/image pair in each lane | 6 | 15 min | 90 |
 | Identity/correctness gate | 1 | 5 min | 5 |
 | Repetitions 2–5, all lanes and arms | 24 | 15 min | 360 |
 | Full report | 1 | 5 min | 5 |
-| Total | 36 | | **525** |
+| Total | 36 | | **540** |
 
 At most six measured jobs run concurrently; seed concurrency is three. A first
 pair failure, differing tool/dependency identity or missing exact verified snapshot
@@ -43,8 +43,8 @@ experiments. This cap measures runner time, not queue delay or wall-clock time.
 
 The planning estimate is roughly 100–140 runner-minutes, based on the historical
 full-lane samples documented in `ci.yml` plus publication and seed overhead.
-This is an estimate, not a promised current result. The 525-minute limit is the
-explicit worst case. No timing result exists until a reviewed run completes.
+This is an estimate, not a promised current result. The 540-minute limit is the
+explicit worst case. A complete, valid run is required for a timing comparison.
 
 The publisher freezes exact source SHA, Node 22 patch, stable Rust patch, declared
 MSRV (normalized to its zero patch where omitted), cargo-llvm-cov version,
@@ -52,7 +52,8 @@ Dockerfile/base-image digest, installed image packages and recipe hashes. Each
 lane uses its own matching toolchain; coverage includes llvm-tools-preview.
 
 Seeds execute the complete apt-based lane once, pack Cargo registry/git/target
-and npm `_cacache` into an attempt-isolated immutable tar artifact, and record its
+and npm `_cacache` into an attempt-isolated immutable tar artifact with explicit
+gzip level 1 compression, and record its
 SHA-256 plus ownership. Tar preserves permissions and symlinks; extraction rejects
 escaping paths/links. Both arms download the same exact per-lane artifact and
 verify its checksum before restoring. There is no Actions cache read/write, so
@@ -87,6 +88,20 @@ RepoDigests, nonempty digest-bearing first/cached logs and nonnegative timings
 are required; absent or corrupt evidence makes the comparison inconclusive.
 
 ## Evidence and decision
+
+The first experiment, [run 37256139929](https://github.com/ekalb81/agent-odometer/actions/runs/37256139929),
+used source `9a35c2b3d84910cead9ab4c5fe0ae84ec6967ce6` and was inconclusive.
+Publication and the MSRV/Coverage seeds passed. All eight Check seed commands
+passed, but its default-compression snapshot took 7m36s to package 3,247,165,123
+bytes; the job reached its 15-minute cap during upload. All 30 measured cases
+were skipped. Total observed job time, including the report, was 1,734 seconds
+(28.90 runner-minutes). This establishes preparation overhead, not a relative
+image speed result.
+
+The next reviewed attempt uses faster compression and a 20-minute seed-only
+cap. Measured jobs retain their 15-minute cap, five planned samples per arm/lane,
+identical snapshot requirements, and adoption criteria. A new main-only dispatch
+is required; changing this workflow does not automatically rerun it.
 
 Artifacts retain source/digest/tool/snapshot names/checksums, package versions, raw pull
 logs, per-command timings, complete job timestamps/conclusions and failures.
