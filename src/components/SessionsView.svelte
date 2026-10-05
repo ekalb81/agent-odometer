@@ -291,20 +291,23 @@
   let summaryPricing = $state<Record<string, SummaryPricing>>({});
   let tableReady = $state(false);
   let tableAccountingReady = $state(false);
+  let tableRefreshing = $state(false);
   let accountingRetry = $state(0);
   let lastTableRetry = -1;
   let lastAnalyticsRetry = -1;
   let categoryError = $state<string | null>(null);
   let tableError = $state<string | null>(null);
   let analyticsError = $state<string | null>(null);
+  let lastTableScope = new Set<string>();
   let lastTableMutation = -1;
-  let lastTableScope = '';
   let lastTableHistory: unknown = null;
   let lastAnalyticsHistory: unknown = null;
+  let lastAnalyticsScope = new Set<string>();
   let lastAnalyticsMutation = -1;
-  let lastAnalyticsScope = '';
   let analyticsReady = $state(false);
   let analyticsAccountingReady = $state(false);
+  let analyticsRefreshing = $state(false);
+  const showingPreviousUsage = $derived((tableAccountingReady && tableRefreshing) || (analyticsAccountingReady && analyticsRefreshing));
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
   // Debounce is only for coalescing live store flushes. A changed range is a
   // discrete user action (preset click, committed input) and fetches
@@ -316,11 +319,33 @@
   // fetch instead of applying stale-range data over freshly cleared state.
   let tableEpoch = 0;
   let viewAlive = true;
-  onDestroy(() => { viewAlive = false; tableEpoch++; analyticsEpoch++; });
+  onDestroy(() => {
+    viewAlive = false; tableEpoch++; analyticsEpoch++;
+    if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
+    if (analyticsTimer !== null) clearTimeout(analyticsTimer);
+  });
   let lastTableRates: RateCard | null = null;
   let tableQueue: Promise<void> = Promise.resolve();
+  let tableQueued = false;
+  let pendingTableRefresh: (() => Promise<void>) | null = null;
   const tableCache = new RangeDataCache();
   const tableMutations = new MutationAccumulator();
+
+  function enqueueTableRefresh() {
+    rangeFetchTimer = null;
+    if (tableQueued) return;
+    tableQueued = true;
+    tableQueue = tableQueue.then(() => {
+      tableQueued = false;
+      const refresh = pendingTableRefresh;
+      pendingTableRefresh = null;
+      return refresh?.();
+    }).catch(() => {});
+  }
+
+  function sameScope(current: string[], previous: Set<string>): boolean {
+    return current.length === previous.size && current.every(id => previous.has(id));
+  }
 
   function withoutPricing(data: Record<string, RangeTotals>): Record<string, RangeTotals> {
     return Object.fromEntries(Object.entries(data).map(([id, total]) => [id, { ...total, pricing: undefined }]));
@@ -350,8 +375,10 @@
     to: string | null,
     sessionIds: string[],
   ): Promise<void> {
-    if (generation !== tableJobGeneration) return;
+    if (!viewAlive || epoch !== tableEpoch || generation !== tableJobGeneration) return;
     const mutation = sessionsStore.mutationLog.generation;
+    const mutationChanged = () => mutation !== sessionsStore.mutationLog.generation;
+    const scope = new Set(sessionIds);
     const history = historyStore.status;
     const rateCard = $rates;
     const rangesKey = `table:${from}|${to}`;
@@ -371,7 +398,7 @@
           { sessions: sessionIds.length, ranges: 1, fetched: sessionIds.length, mode: 'full' },
         );
         if (epoch !== tableEpoch) return;
-        if (generation !== tableJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { tableCache.invalidate(); return; }
+        if (!sameScope(filteredIds, scope) || rateCard !== $rates || history !== historyStore.status) return;
         results = tableCache.applyFull(rangesKey, sessionIds, fetched.ranges);
         summaryPricing = fetched.summaries; categoryError = fetched.categoryError;
       } else {
@@ -381,7 +408,7 @@
               { sessions: sessionIds.length, ranges: 1, fetched: plan.mode === 'delta' ? plan.fetchIds.length : 0, mode: 'delta' },
             );
         if (epoch !== tableEpoch) return;
-        if (generation !== tableJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { tableCache.invalidate(); return; }
+        if (!sameScope(filteredIds, scope) || rateCard !== $rates || history !== historyStore.status) return;
         results = tableCache.applyDelta(plan.mode === 'delta' ? plan.fetchIds : [], drained.removedIds, fetched.ranges);
         const next = { ...summaryPricing };
         for (const id of [...(plan.mode === 'delta' ? plan.fetchIds : []), ...drained.removedIds]) delete next[id];
@@ -390,13 +417,21 @@
       }
       rangeTotals = results[0];
       tableReady = true; tableAccountingReady = true; tableError = null;
+      tableRefreshing = mutationChanged();
     } catch (e) {
       if (epoch !== tableEpoch) return;
-      if (generation !== tableJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { tableCache.invalidate(); return; }
+      if (!sameScope(filteredIds, scope) || rateCard !== $rates || history !== historyStore.status) return;
+      if (mutationChanged()) { tableCache.invalidate(); return; }
       tableCache.invalidate();
       tableReady = false; tableAccountingReady = false; rangeTotals = {}; summaryPricing = {};
+      tableRefreshing = false;
       tableError = accountingUnavailable(e);
       console.error('sessions_in_ranges failed:', e);
+    } finally {
+      if (viewAlive && pendingTableRefresh && rangeFetchTimer !== null) {
+        clearTimeout(rangeFetchTimer);
+        rangeFetchTimer = setTimeout(enqueueTableRefresh, 0);
+      }
     }
   }
 
@@ -404,52 +439,56 @@
     const from = fromUtc;
     const to = toUtc;
     const sessionIds = filteredIds;
-    const mutationGeneration = sessionsStore.mutationLog.generation;
     tableMutations.observe(sessionsStore.mutationLog);
     const history = historyStore.status;
     const historyChanged = history !== lastTableHistory; lastTableHistory = history;
     const retryChanged = accountingRetry !== lastTableRetry; lastTableRetry = accountingRetry;
-    const dataChanged = retryChanged || historyChanged || mutationGeneration !== lastTableMutation || sessionIds.join('|') !== lastTableScope;
-    lastTableMutation = mutationGeneration; lastTableScope = sessionIds.join('|');
-    const generation = ++tableJobGeneration;
+    const scopeChanged = !sameScope(sessionIds, lastTableScope);
+    const dataChanged = retryChanged || historyChanged || scopeChanged || sessionsStore.mutationLog.generation !== lastTableMutation;
+    lastTableScope = new Set(sessionIds); lastTableMutation = sessionsStore.mutationLog.generation;
     const ratesChanged = $rates !== lastTableRates;
     lastTableRates = $rates;
     if (!active) {
-      rangeTotals = {}; tableAccountingReady = false; tableReady = false; summaryPricing = {};
+      rangeTotals = {}; tableAccountingReady = false; tableReady = false; tableRefreshing = false; summaryPricing = {};
       lastTableRange = null;
       tableCache.invalidate();
       tableJobGeneration += 1;
       tableEpoch += 1;
+      if (rangeFetchTimer !== null) { clearTimeout(rangeFetchTimer); rangeFetchTimer = null; }
+      pendingTableRefresh = null;
       return;
     }
     const key = `${from}|${to}`;
     const rangeChanged = key !== lastTableRange;
+    if (!rangeChanged && !ratesChanged && !dataChanged) return;
+    const generation = ++tableJobGeneration;
     const delay = rangeChanged || ratesChanged ? 0 : 250;
     if (rangeChanged) {
       rangeTotals = {};
     }
-    if (rangeChanged || ratesChanged || historyChanged || retryChanged) {
+    if (rangeChanged || scopeChanged || ratesChanged || historyChanged || retryChanged) {
       tableReady = false;
       tableCache.invalidate();
       tableEpoch += 1;
     }
-    if (rangeChanged || dataChanged) { tableAccountingReady = false; tableReady = false; tableError = null; categoryError = null; }
+    if (rangeChanged || scopeChanged || historyChanged || retryChanged) {
+      tableAccountingReady = false; tableReady = false; tableRefreshing = false;
+      rangeTotals = {}; summaryPricing = {}; tableError = null; categoryError = null;
+    } else if (dataChanged || ratesChanged) {
+      tableRefreshing = true; tableError = null;
+    }
     lastTableRange = key;
     const requestEpoch = tableEpoch;
-    if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
-    rangeFetchTimer = setTimeout(() => {
+    pendingTableRefresh = () => runTableRefresh(generation, requestEpoch, from, to, sessionIds);
+    if (rangeChanged || scopeChanged || ratesChanged || historyChanged || retryChanged) {
+      if (rangeFetchTimer !== null) clearTimeout(rangeFetchTimer);
       rangeFetchTimer = null;
-      tableQueue = tableQueue
-        .then(() => runTableRefresh(generation, requestEpoch, from, to, sessionIds))
-        .catch(() => {});
-    }, delay);
-    return () => {
-      if (generation === tableJobGeneration) tableJobGeneration++;
-      if (rangeFetchTimer !== null) {
-        clearTimeout(rangeFetchTimer);
-        rangeFetchTimer = null;
-      }
-    };
+    }
+    // Keep the first live-update deadline: a sliding debounce can postpone
+    // every attempt indefinitely while a harness streams. The queued job
+    // takes the latest scope. A proven same-scope success remains usable as
+    // an explicitly previous snapshot while newer mutations await a proof.
+    if (rangeFetchTimer === null) rangeFetchTimer = setTimeout(enqueueTableRefresh, delay);
   });
 
   // Per-session display values: tokens AND costs, both scoped to the date
@@ -950,8 +989,22 @@
   let analyticsEpoch = 0;
   let lastAnalyticsRates: RateCard | null = null;
   let analyticsQueue: Promise<void> = Promise.resolve();
+  let analyticsQueued = false;
+  let pendingAnalyticsRefresh: (() => Promise<void>) | null = null;
   const analyticsCache = new RangeDataCache();
   const analyticsMutations = new MutationAccumulator();
+
+  function enqueueAnalyticsRefresh() {
+    analyticsTimer = null;
+    if (analyticsQueued) return;
+    analyticsQueued = true;
+    analyticsQueue = analyticsQueue.then(() => {
+      analyticsQueued = false;
+      const refresh = pendingAnalyticsRefresh;
+      pendingAnalyticsRefresh = null;
+      return refresh?.();
+    }).catch(() => {});
+  }
 
   const DAY_MS = 86_400_000;
   const MAX_CHART_BUCKETS = 14;
@@ -1029,6 +1082,7 @@
   // store flushes are debounced. Keyed on the filter bounds, not windowBounds
   // — the default window's endMs is "now", which moves on every recompute.
   let lastAnalyticsRange: string | null = null;
+  let lastAnalyticsWindow: { startMs: number; endMinute: number } | null = null;
 
   // Serialized so a drain/plan never races an unapplied fetch. The previous
   // window is only requested when a date filter is active — it feeds the
@@ -1042,8 +1096,10 @@
     sessionIds: string[],
     includePrev: boolean,
   ): Promise<void> {
-    if (generation !== analyticsJobGeneration) return;
+    if (!viewAlive || epoch !== analyticsEpoch || generation !== analyticsJobGeneration) return;
     const mutation = sessionsStore.mutationLog.generation;
+    const mutationChanged = () => mutation !== sessionsStore.mutationLog.generation;
+    const scope = new Set(sessionIds);
     const history = historyStore.status;
     const rateCard = $rates;
     // An open window's end bound must be taken at job time: during sustained
@@ -1094,7 +1150,7 @@
           { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: sessionIds.length, mode: 'full' },
         );
         if (epoch !== analyticsEpoch) return;
-        if (generation !== analyticsJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { analyticsCache.invalidate(); return; }
+        if (!sameScope(analyticsSessionIds, scope) || rateCard !== $rates || history !== historyStore.status) return;
         results = analyticsCache.applyFull(rangesKey, sessionIds, fetched);
       } else {
         const fetched = await measureAsync(
@@ -1103,22 +1159,30 @@
               { sessions: sessionIds.length, ranges: requestedRanges.length, fetched: plan.mode === 'delta' ? plan.fetchIds.length : 0, mode: 'delta' },
             );
         if (epoch !== analyticsEpoch) return;
-        if (generation !== analyticsJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { analyticsCache.invalidate(); return; }
+        if (!sameScope(analyticsSessionIds, scope) || rateCard !== $rates || history !== historyStore.status) return;
         results = analyticsCache.applyDelta(plan.mode === 'delta' ? plan.fetchIds : [], drained.removedIds, fetched);
       }
       analyticsCurrent = results[0];
       analyticsCurrentBounds = requestedRanges[0];
       analyticsReady = true; analyticsAccountingReady = true; analyticsError = null;
+      analyticsRefreshing = mutationChanged();
       analyticsPrev = includePrev ? results[1] : null;
       const days = results.slice(includePrev ? 2 : 1);
       analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
     } catch (e) {
       if (epoch !== analyticsEpoch) return;
-      if (generation !== analyticsJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { analyticsCache.invalidate(); return; }
+      if (!sameScope(analyticsSessionIds, scope) || rateCard !== $rates || history !== historyStore.status) return;
+      if (mutationChanged()) { analyticsCache.invalidate(); return; }
       analyticsCache.invalidate();
       analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = [];
+      analyticsRefreshing = false;
       analyticsError = accountingUnavailable(e);
       console.error('analytics sessions_in_ranges failed:', e);
+    } finally {
+      if (viewAlive && pendingAnalyticsRefresh && analyticsTimer !== null) {
+        clearTimeout(analyticsTimer);
+        analyticsTimer = setTimeout(enqueueAnalyticsRefresh, 0);
+      }
     }
   }
 
@@ -1126,18 +1190,17 @@
     const { startMs, endMs } = windowBounds;
     const sessionIds = analyticsSessionIds;
     const includePrev = dateScoped;
-    const mutationGeneration = sessionsStore.mutationLog.generation;
     analyticsMutations.observe(sessionsStore.mutationLog);
     const history = historyStore.status;
     const historyChanged = history !== lastAnalyticsHistory; lastAnalyticsHistory = history;
     const retryChanged = accountingRetry !== lastAnalyticsRetry; lastAnalyticsRetry = accountingRetry;
-    const dataChanged = retryChanged || historyChanged || mutationGeneration !== lastAnalyticsMutation || sessionIds.join('|') !== lastAnalyticsScope;
-    lastAnalyticsMutation = mutationGeneration; lastAnalyticsScope = sessionIds.join('|');
-    const generation = ++analyticsJobGeneration;
+    const scopeChanged = !sameScope(sessionIds, lastAnalyticsScope);
+    const dataChanged = retryChanged || historyChanged || scopeChanged || sessionsStore.mutationLog.generation !== lastAnalyticsMutation;
+    lastAnalyticsScope = new Set(sessionIds); lastAnalyticsMutation = sessionsStore.mutationLog.generation;
     const ratesChanged = $rates !== lastAnalyticsRates;
     lastAnalyticsRates = $rates;
     if (!active) {
-      analyticsAccountingReady = false; analyticsReady = false;
+      analyticsAccountingReady = false; analyticsReady = false; analyticsRefreshing = false;
       analyticsBuckets = [];
       analyticsPrev = null;
       analyticsCurrent = null; analyticsCurrentBounds = null;
@@ -1145,43 +1208,43 @@
       analyticsCache.invalidate();
       analyticsJobGeneration += 1;
       analyticsEpoch += 1;
+      if (analyticsTimer !== null) { clearTimeout(analyticsTimer); analyticsTimer = null; }
+      pendingAnalyticsRefresh = null;
       return;
     }
     const key = `${fromUtc}|${toUtc}`;
     const openEnded = !toUtc;
-    const rangeChanged = key !== lastAnalyticsRange;
+    const endMinute = Math.floor(endMs / 60_000);
+    const rangeChanged = key !== lastAnalyticsRange || startMs !== lastAnalyticsWindow?.startMs;
+    const windowAdvanced = openEnded && endMinute !== lastAnalyticsWindow?.endMinute;
+    lastAnalyticsWindow = { startMs, endMinute };
+    if (!rangeChanged && !ratesChanged && !dataChanged && !windowAdvanced) return;
+    const generation = ++analyticsJobGeneration;
     const delay = rangeChanged || ratesChanged ? 0 : 250;
     if (rangeChanged) {
       analyticsBuckets = [];
       analyticsPrev = null;
       analyticsCurrent = null; analyticsCurrentBounds = null;
     }
-    if (rangeChanged || ratesChanged || historyChanged || retryChanged) {
+    if (rangeChanged || scopeChanged || ratesChanged || historyChanged || retryChanged) {
       analyticsReady = false;
       analyticsCache.invalidate();
       analyticsEpoch += 1;
     }
-    if (rangeChanged || dataChanged) { analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = []; analyticsError = null; }
+    if (rangeChanged || scopeChanged || historyChanged || retryChanged) {
+      analyticsReady = false; analyticsAccountingReady = false; analyticsRefreshing = false;
+      analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = []; analyticsError = null;
+    } else if (dataChanged || ratesChanged || windowAdvanced) {
+      analyticsRefreshing = true; analyticsError = null;
+    }
     lastAnalyticsRange = key;
     const requestEpoch = analyticsEpoch;
-    if (analyticsTimer !== null) clearTimeout(analyticsTimer);
-    // Debounced so a burst of store flushes coalesces into one refresh; the
-    // refresh fetches only changed sessions unless the window layout changed.
-    analyticsTimer = setTimeout(() => {
+    pendingAnalyticsRefresh = () => runAnalyticsRefresh(generation, requestEpoch, startMs, endMs, openEnded, sessionIds, includePrev);
+    if (rangeChanged || scopeChanged || ratesChanged || historyChanged || retryChanged) {
+      if (analyticsTimer !== null) clearTimeout(analyticsTimer);
       analyticsTimer = null;
-      analyticsQueue = analyticsQueue
-        .then(() =>
-          runAnalyticsRefresh(generation, requestEpoch, startMs, endMs, openEnded, sessionIds, includePrev),
-        )
-        .catch(() => {});
-    }, delay);
-    return () => {
-      if (generation === analyticsJobGeneration) analyticsJobGeneration++;
-      if (analyticsTimer !== null) {
-        clearTimeout(analyticsTimer);
-        analyticsTimer = null;
-      }
-    };
+    }
+    if (analyticsTimer === null) analyticsTimer = setTimeout(enqueueAnalyticsRefresh, delay);
   });
 
   /** Price one range-rollup map for the sessions currently in view. Uses the
@@ -1567,6 +1630,7 @@
     tableEpoch++; analyticsEpoch++;
     tableCache.invalidate(); analyticsCache.invalidate();
     tableAccountingReady = false; tableReady = false; analyticsAccountingReady = false; analyticsReady = false;
+    tableRefreshing = false; analyticsRefreshing = false;
     rangeTotals = {}; summaryPricing = {}; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = [];
     tableError = accountingUnavailable(reason);
     accountingRetry++;
@@ -1686,16 +1750,17 @@
   // ---------------------------------------------------------------------------
   let selectedSessionId = $state<string | null>(null);
   let selectedSession = $state<Session | null>(null);
+  let selectedDetailState = $state<'empty' | 'loading' | 'error' | 'ready'>('empty');
+  let selectedDetailRetry = $state(0);
   let detailsFetchTimer: ReturnType<typeof setTimeout> | null = null;
   let detailsRequestGeneration = 0;
   let lastDetailsRates: RateCard | null = null;
 
-  // Value-memoized so the fetch effect reruns only when the selected
-  // session's own summary changes — a derived on the raw map would refire on
-  // every store flush and re-serialize the full session ~1/s while streaming.
-  const selectedLastUpdated = $derived(
+  // Object identity changes only when this session's summary is upserted;
+  // unrelated store updates leave the selected detail fetch alone.
+  const selectedSummary = $derived(
     selectedSessionId !== null
-      ? (sessionsStore.map.get(selectedSessionId)?.lastUpdatedAt ?? null)
+      ? (sessionsStore.map.get(selectedSessionId) ?? null)
       : null,
   );
 
@@ -1706,24 +1771,42 @@
     if (ratesChanged) {
       untrack(() => { if (selectedSession) selectedSession = { ...selectedSession, pricing: undefined }; });
     }
+    void selectedDetailRetry;
     const id = selectedSessionId;
     if (!active) {
       selectedSession = null;
+      selectedDetailState = 'empty';
       return;
     }
-    // Reactive dep: refetch details when this session's summary updates.
-    void selectedLastUpdated;
+    // Reactive dep: refetch details when this session's summary is replaced.
+    void selectedSummary;
     if (id === null) {
       selectedSession = null;
+      selectedDetailState = 'empty';
       return;
+    }
+    const hasCurrentDetails = untrack(() => selectedSession?.storage_id === id);
+    if (!hasCurrentDetails) {
+      selectedSession = null;
+      selectedDetailState = 'loading';
+    } else {
+      selectedDetailState = 'ready';
     }
     let cancelled = false;
     const fetchDetails = () => {
       measureAsync('frontend.session_detail_fetch', () => getSessionDetails(id))
         .then((s) => {
-          if (!cancelled && active && generation === detailsRequestGeneration) selectedSession = s;
+          if (!cancelled && active && generation === detailsRequestGeneration) {
+            selectedSession = s;
+            selectedDetailState = 'ready';
+          }
         })
-        .catch((e) => { if (!cancelled && generation === detailsRequestGeneration) console.error('get_session_details failed:', e); });
+        .catch((e) => {
+          if (!cancelled && generation === detailsRequestGeneration) {
+            console.error('get_session_details failed:', e);
+            selectedDetailState = 'error';
+          }
+        });
     };
     // Untracked: the fetch below assigns selectedSession, and tracking it
     // here would turn every completed fetch into a rerun — a permanent
@@ -1745,7 +1828,13 @@
   });
 
   function selectSession(id: string) {
+    const sameSelection = selectedSessionId === id;
     selectedSessionId = id;
+    if (untrack(() => selectedSession?.storage_id) !== id) {
+      selectedSession = null;
+      if (sameSelection && selectedDetailState === 'error') retrySelectedDetails();
+      else selectedDetailState = 'loading';
+    }
     // Selecting a session is the obvious moment to reveal the wide-layout
     // pane: left closed, a click on a row would otherwise do nothing
     // visible. Narrow layouts ignore this (their drawer keys off selection
@@ -1769,6 +1858,12 @@
   function deselect() {
     selectedSessionId = null;
     selectedSession = null;
+    selectedDetailState = 'empty';
+  }
+
+  function retrySelectedDetails() {
+    selectedDetailState = 'loading';
+    selectedDetailRetry += 1;
   }
 
   // Escape deselects (kept from the drawer flow).
@@ -1795,7 +1890,7 @@
   const gridCols = $derived(`grid-template-columns: ${visibleColumns.map((column) => column.width).join(' ')};`);
 </script>
 
-{#if tableError || analyticsError}<p data-testid="accounting-table-status" role="status" class="text-xs text-neg px-3 py-2">{tableError ?? `Analytics: ${analyticsError}`} <button type="button" class="underline" onclick={() => accountingRetry++}>Retry usage</button></p>{:else if active && !tableAccountingReady}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Verifying complete usage scope…</p>{/if}
+{#if tableError || analyticsError}<p data-testid="accounting-table-status" role="status" class="text-xs text-neg px-3 py-2">{tableError ?? `Analytics: ${analyticsError}`} {#if showingPreviousUsage}Showing previous verified usage; refreshing… {/if}<button type="button" class="underline" onclick={() => accountingRetry++}>Retry usage</button></p>{:else if active && showingPreviousUsage}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Showing previous verified usage; refreshing…</p>{:else if active && (!tableAccountingReady || !analyticsAccountingReady)}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Verifying complete usage scope…</p>{/if}
 
 {#if organizationUnavailable}
   <div class="p-5 text-sm text-amber-500" role="alert">
@@ -1815,9 +1910,9 @@
   <div class="grid gap-3.5 p-4 shrink-0" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
     <!-- Spend card -->
     <div class="bg-card border border-edge rounded-xl px-5 pt-4 pb-3 min-w-0">
-      <div class="flex items-baseline gap-3">
+      <div class="flex flex-wrap items-baseline gap-x-4 gap-y-2">
         <div>
-          <div class="text-[11px] text-ink-muted font-medium">{spendCardLabel}</div>
+          <div class="text-xs text-ink-muted font-medium">{spendCardLabel}</div>
           <div class="text-[30px] font-bold tracking-[-0.03em] font-mono mt-0.5 {showApiCost ? 'text-accent-cost' : 'text-ink'}">
             {(harness === 'all' && !allUsdAvailable) || costIsUnmeasured(windowTotals.unpricedModels, windowTotals.cost) ? 'Unavailable' : fmtMoney(windowTotals.cost)}
           </div>
@@ -1852,7 +1947,7 @@
 
     <!-- Cost by model -->
     <div class="bg-card border border-edge rounded-xl px-5 py-4 min-w-0">
-      <div class="text-[11px] text-ink-muted font-medium mb-3">
+      <div class="text-xs text-ink-muted font-medium mb-3">
         {harness === 'codex' ? 'Cost by model' : harness === 'all' ? 'USD spend by model' : 'Spend by model'} · {windowLabel}
       </div>
       {#if !Number.isFinite(windowTotals.cost)}
@@ -1894,14 +1989,14 @@
     <!-- KPI stack -->
     <div class="bg-card border border-edge rounded-xl px-5 py-4 flex flex-col justify-between gap-2 min-w-0">
       <div>
-        <div class="text-[11px] text-ink-muted font-medium">Sessions · {windowLabel}</div>
+        <div class="text-xs text-ink-muted font-medium">Sessions · {windowLabel}</div>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
           {analyticsAccountingReady ? windowStats.sessionCount : 'unavailable'}
           <span class="text-[11px] text-ink-faint font-normal">of {allSessions.length}</span>
         </div>
       </div>
       <div>
-        <div class="text-[11px] text-ink-muted font-medium">Tokens · {windowLabel}</div>
+        <div class="text-xs text-ink-muted font-medium">Tokens · {windowLabel}</div>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
           {formatCompactTokens(windowTotals.tokens)}
           {#if tokensDelta !== null}
@@ -1913,14 +2008,14 @@
       </div>
       {#if harness === 'codex' || harness === 'all'}
         <div>
-          <div class="text-[11px] text-ink-muted font-medium">Purchased-credit estimate · {windowLabel}</div>
+          <div class="text-xs text-ink-muted font-medium">Purchased-credit estimate · {windowLabel}</div>
           <div class="text-xl font-bold font-mono mt-0.5 text-ink">{purchasedCreditSummary.value}</div>
-          {#if analyticsReady && purchasedCreditSummary.note}<p class="text-[11px] text-ink-faint" title={purchasedCreditSummary.title}>{purchasedCreditSummary.note}</p>{/if}
+          {#if analyticsReady && purchasedCreditSummary.note}<p class="text-xs leading-relaxed text-ink-muted mt-1" title={purchasedCreditSummary.title}>{purchasedCreditSummary.note}</p>{/if}
           {#if windowStats.credits.unlimitedCount > 0}<p class="text-[11px] text-ink-faint">{windowStats.allUnlimited ? 'all sessions unlimited' : `${windowStats.credits.unlimitedCount} unlimited excluded`}</p>{/if}
         </div>
       {:else}
         <div>
-          <div class="text-[11px] text-ink-muted font-medium">Subagents · {windowLabel}</div>
+          <div class="text-xs text-ink-muted font-medium">Subagents · {windowLabel}</div>
           <div class="text-xl font-bold font-mono mt-0.5 text-ink">
             {analyticsAccountingReady ? windowStats.subagents.count : 'unavailable'}
             {#if windowStats.subagents.count > 0}
@@ -1976,7 +2071,7 @@
         <p class="text-xs text-ink-faint py-3">No model usage in this window.</p>
       {:else}
         <div class="overflow-x-auto mt-2">
-          <table class="w-full text-[11px] font-mono">
+          <table class="w-full text-xs font-mono [&_th]:px-2 [&_td]:px-2 [&_th]:py-2 [&_td]:py-2">
             <thead class="text-ink-muted"><tr><th class="text-left py-1">Harness / model</th><th class="text-right">Input</th><th class="text-right">Cached</th><th class="text-right">Output</th><th class="text-right">Reasoning</th><th class="text-right">Total</th><th class="text-right">Calls</th><th class="text-right">One-shot</th><th class="text-right">Retries</th><th class="text-right">Failure</th><th class="text-right">Cost/call</th><th class="text-right">Cost</th><th class="text-right">Share</th></tr></thead>
             <tbody>
               {#each modelComparison as metric (`${metric.harness}:${metric.model}`)}
@@ -2141,14 +2236,14 @@
           </div>
         {/if}
         <div
-          class="flex-1 overflow-y-auto min-h-0 relative"
+          class="flex-1 grid auto-rows-max content-start gap-x-4 overflow-auto min-h-0 relative"
+          style={gridCols}
           bind:this={listViewport}
           onscroll={(event) => { listScrollTop = event.currentTarget.scrollTop; }}
         >
           <!-- Column header -->
           <div
-            class="grid px-5 py-2 border-b border-edge bg-panel sticky top-0 z-10 section-label"
-            style={gridCols}
+            class="grid grid-cols-subgrid col-span-full px-5 py-2 border-b border-edge bg-panel sticky top-0 z-10 section-label"
             role="row"
           >
             {#each visibleColumns as column (column.id)}
@@ -2158,10 +2253,10 @@
             {/each}
           </div>
 
-          <div aria-hidden="true" style:height={`${virtualList.top}px`}></div>
+          <div class="col-span-full" aria-hidden="true" style:height={`${virtualList.top}px`}></div>
           {#each virtualList.rows as row (row.key)}
             {#if row.kind === 'group'}
-              <div class="h-7 px-5 pb-[3px] flex items-end section-label">{row.label}</div>
+              <div class="col-span-full h-7 px-5 pb-[3px] flex items-end section-label">{row.label}</div>
             {:else}
               {@const session = row.session}
               {@const name = sessionName(session)}
@@ -2177,14 +2272,14 @@
               <div
                 role="button"
                 tabindex="0"
-                class="grid h-12 px-5 py-1 border-b border-edgerow items-center cursor-pointer transition-colors
+                class="grid grid-cols-subgrid col-span-full h-12 px-5 py-1 border-b border-edgerow items-center cursor-pointer transition-colors
                        {session.archived ? 'opacity-55' : ''}
                        {selected
                          ? 'bg-accent-rowbg shadow-[inset_2px_0_0_var(--accent)]'
                          : isPulsing(session.lastUpdatedAt)
                            ? 'bg-accent-rowbg animate-pulse'
                            : 'hover:bg-(--row-hover)'}"
-                style={`${gridCols}${sessionGridStore.colorByModelProvider ? `; background-image: linear-gradient(90deg, ${providerVisual.tint}, transparent 24%)` : ''}`}
+                style:background-image={sessionGridStore.colorByModelProvider ? `linear-gradient(90deg, ${providerVisual.tint}, transparent 24%)` : undefined}
                 data-model-provider={providerVisual.key}
                 onclick={() => selectSession(session.storage_id)}
                 oncontextmenu={(event) => openSessionContextMenuFromPointer(event, session)}
@@ -2202,7 +2297,7 @@
                       {#if harness === 'all'}<span class="text-[10px] font-semibold px-[7px] py-px rounded-full bg-panel text-ink-muted ml-1 whitespace-nowrap shrink-0">{providersStore.displayName(session.harness)}</span>{/if}
                     </span>
                   {:else if column.id === 'started'}
-                    <span class="text-ink-muted font-mono text-xs" title={`UTC: ${session.started_at}`}>{formatStartedLocal(session.startedMs)}</span>
+                    <span class="text-ink-muted font-mono text-xs truncate" title={`UTC: ${session.started_at}`}>{formatStartedLocal(session.startedMs)}</span>
                   {:else if column.id === 'duration'}
                     <span class="text-right text-ink-muted font-mono text-xs" title={`Ended ${session.last_event_at}`}>{formatDuration(durationMs(session))}</span>
                   {:else if column.id === 'agent'}
@@ -2248,12 +2343,11 @@
               </div>
             {/if}
           {/each}
-          <div aria-hidden="true" style:height={`${virtualList.bottom}px`}></div>
+          <div class="col-span-full" aria-hidden="true" style:height={`${virtualList.bottom}px`}></div>
 
           <!-- Pinned totals -->
           <div
-            class="grid px-5 py-2 items-center border-t border-edge bg-panel font-semibold sticky bottom-0"
-            style={gridCols}
+            class="grid grid-cols-subgrid col-span-full px-5 py-2 items-center border-t border-edge bg-panel font-semibold sticky bottom-0"
           >
             {#each visibleColumns as column (column.id)}
               {#if column.id === 'name'}<span class="section-label">Totals · in view</span>
@@ -2286,6 +2380,8 @@
         <div class="w-[410px] h-full">
           <DetailPane
             session={selectedSession}
+            detailState={selectedDetailState}
+            onretry={retrySelectedDetails}
             childCount={selectedSessionId ? (childCounts.get(selectedSessionId) ?? 0) : 0}
             onclose={() => sessionDetailPaneStore.setOpen(false)}
           />
@@ -2324,6 +2420,8 @@
   >
     <DetailPane
       session={selectedSession}
+      detailState={selectedDetailState}
+      onretry={retrySelectedDetails}
       childCount={childCounts.get(selectedSessionId) ?? 0}
       onclose={deselect}
     />

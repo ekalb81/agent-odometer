@@ -23,8 +23,8 @@ export interface SessionGridColumn {
 }
 
 export const SESSION_GRID_COLUMNS: readonly SessionGridColumn[] = [
-  { id: 'name', label: 'Name', width: 'minmax(12rem, 2.4fr)', sortable: true },
-  { id: 'started', label: 'Started', width: '9.5rem', sortable: true },
+  { id: 'name', label: 'Name', width: 'minmax(16rem, 2.4fr)', sortable: true },
+  { id: 'started', label: 'Started', width: '11.5rem', sortable: true },
   { id: 'duration', label: 'Duration', width: '6.5rem', sortable: true, align: 'right' },
   { id: 'repository', label: 'Repository', width: 'minmax(8rem, 1fr)', sortable: true },
   { id: 'agent', label: 'Agent', width: 'minmax(7rem, 1fr)', sortable: true },
