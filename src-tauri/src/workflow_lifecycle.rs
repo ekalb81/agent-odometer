@@ -291,7 +291,7 @@ mod tests {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE workflow_finding_lifecycle;
+                "DROP TABLE offline_cases; DROP TABLE offline_experiments; DROP TABLE curated_cases; DROP TABLE curated_changes; DROP TABLE workflow_finding_lifecycle;
             UPDATE history_meta SET value='12' WHERE key='schema_version';
             PRAGMA user_version=12;",
             )
@@ -303,7 +303,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            13
+            16
         );
         assert_eq!(record(&connection, 1000, 3, FindingState::New).revision, 1);
         drop(connection);

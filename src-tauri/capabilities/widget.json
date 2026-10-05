@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "local-widget",
+  "description": "The local compact widget can listen for snapshot invalidation and preferences changes. No updater, process, opener, filesystem or event emission permission.",
+  "windows": ["quota-widget"],
+  "permissions": ["core:event:allow-listen", "core:event:allow-unlisten"]
+}

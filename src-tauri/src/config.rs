@@ -76,6 +76,9 @@ pub struct Config {
     /// Local app performance measurements. Disabled unless explicitly enabled.
     #[serde(default)]
     pub performance_tracking_enabled: bool,
+    /// Explicit opt-in for fixed public provider-status endpoints. No credentials.
+    #[serde(default)]
+    pub provider_status_enabled: bool,
     /// Per-segment limit; the recorder keeps the current and previous segment.
     #[serde(default = "default_performance_log_max_mb")]
     pub performance_log_max_mb: u64,
@@ -178,6 +181,7 @@ impl Default for Config {
             claude_session_roots: default_claude_session_roots(),
             defender_exclusion_receipt: None,
             performance_tracking_enabled: false,
+            provider_status_enabled: false,
             performance_log_max_mb: default_performance_log_max_mb(),
             memory_heap_tracking_enabled: false,
             instructions_enabled: false,
@@ -418,6 +422,7 @@ mod tests {
                     .with_timezone(&Utc),
             }),
             performance_tracking_enabled: true,
+            provider_status_enabled: true,
             performance_log_max_mb: 32,
             memory_heap_tracking_enabled: true,
             instructions_enabled: true,
@@ -446,6 +451,7 @@ mod tests {
             cfg.defender_exclusion_receipt
         );
         assert!(loaded.performance_tracking_enabled);
+        assert!(loaded.provider_status_enabled);
         assert_eq!(loaded.performance_log_max_mb, 32);
         assert!(loaded.memory_heap_tracking_enabled);
         assert!(loaded.instructions_enabled);
@@ -462,6 +468,8 @@ mod tests {
         // Pre-existing on-disk configs from before this field was added must still parse.
         let raw = r#"{"session_roots":["/x"],"archive_roots":["/y"]}"#;
         let cfg: Config = serde_json::from_str(raw).unwrap();
+        assert!(!cfg.provider_status_enabled);
+        assert!(!Config::default().provider_status_enabled);
         assert_eq!(cfg.session_roots, vec![PathBuf::from("/x")]);
         assert_eq!(cfg.archive_roots, vec![PathBuf::from("/y")]);
         // session_index_path should fall back to the home-dir default, never empty.

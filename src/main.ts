@@ -1,5 +1,6 @@
 import './app.css';
 import App from './App.svelte';
+import LocalWidget from './components/LocalWidget.svelte';
 import { mount } from 'svelte';
 
 async function start() {
@@ -15,7 +16,8 @@ async function start() {
     const { sessionsStore } = await import('./lib/stores/sessions.svelte');
     (window as unknown as Record<string, unknown>).__sessionsStore = sessionsStore;
   }
-  mount(App, { target: document.getElementById('app')! });
+  const widget = new URLSearchParams(window.location.search).get('surface') === 'widget';
+  mount(widget ? LocalWidget : App, { target: document.getElementById('app')! });
 }
 
 void start();

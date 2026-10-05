@@ -1,0 +1,53 @@
+import { render, screen, act, waitFor } from '@testing-library/svelte';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, expect, it, vi } from 'vitest';
+import WidgetSettings from './WidgetSettings.svelte';
+import type { WidgetSettings as Settings } from '../lib/types';
+const mocks = vi.hoisted(() => ({ getWidgetSettings: vi.fn(), setWidgetSettings: vi.fn(), onWidgetSettingsUpdated: vi.fn(), onWidgetSettingsError: vi.fn() }));
+vi.mock('../lib/ipc', () => mocks);
+const off: Settings = { version: 1, revision: 4, preferences: { visible: false, provider: 'codex', kind: 'quota', always_on_top: false } };
+let updated: (value: Settings) => void;
+beforeEach(() => {
+  vi.resetAllMocks(); mocks.getWidgetSettings.mockResolvedValue(off);
+  mocks.setWidgetSettings.mockImplementation(async (revision, preferences) => ({ ...off, revision: revision + 1, preferences }));
+  mocks.onWidgetSettingsUpdated.mockImplementation(async callback => { updated = callback; return vi.fn(); }); mocks.onWidgetSettingsError.mockResolvedValue(vi.fn());
+});
+it('rejects late load and save responses after a newer settings event', async () => {
+  let finishLoad!: (value: Settings) => void;
+  mocks.getWidgetSettings.mockImplementationOnce(() => new Promise(resolve => { finishLoad = resolve; }));
+  render(WidgetSettings); await waitFor(() => expect(mocks.getWidgetSettings).toHaveBeenCalled());
+  const newer = { ...off, revision: 8, preferences: { ...off.preferences, visible: true, provider: 'claude_code' as const } };
+  await act(() => updated(newer)); await act(() => finishLoad(off));
+  expect(screen.getByRole('checkbox', { name: /Show widget/ })).toBeChecked();
+  expect(screen.getByRole('combobox', { name: 'Widget provider' })).toHaveValue('claude_code');
+  let finishSave!: (value: Settings) => void;
+  mocks.setWidgetSettings.mockImplementationOnce(() => new Promise(resolve => { finishSave = resolve; }));
+  await userEvent.click(screen.getByRole('button', { name: 'Apply widget settings' }));
+  await act(() => updated({ ...off, revision: 10 }));
+  await act(() => finishSave({ ...newer, revision: 9 }));
+  expect(screen.getByRole('checkbox', { name: /Show widget/ })).not.toBeChecked();
+  expect(screen.getByRole('combobox', { name: 'Widget provider' })).toHaveValue('codex');
+});
+it('requires explicit visibility and saves the selected summary using the loaded revision', async () => {
+  render(WidgetSettings); const user = userEvent.setup();
+  const visible = await screen.findByRole('checkbox', { name: /Show widget/ });
+  await screen.findByRole('button', { name: 'Apply widget settings' });
+  expect(visible).not.toBeChecked(); expect(mocks.setWidgetSettings).not.toHaveBeenCalled();
+  await user.click(visible);
+  await user.selectOptions(screen.getByRole('combobox', { name: 'Widget provider' }), 'claude_code');
+  await user.selectOptions(screen.getByRole('combobox', { name: 'Widget summary' }), 'usage');
+  await user.click(screen.getByRole('button', { name: 'Apply widget settings' }));
+  expect(mocks.setWidgetSettings).toHaveBeenCalledWith(4, { visible: true, provider: 'claude_code', kind: 'usage', always_on_top: false });
+});
+it('preserves a failed edit until explicit reload instead of overwriting newer preferences', async () => {
+  mocks.setWidgetSettings.mockRejectedValue(new Error('revision conflict synthetic private path'));
+  render(WidgetSettings); const user = userEvent.setup();
+  await screen.findByRole('button', { name: 'Apply widget settings' });
+  await user.click(screen.getByRole('checkbox', { name: /Show widget/ }));
+  await user.click(screen.getByRole('button', { name: 'Apply widget settings' }));
+  await screen.findByRole('alert');
+  expect(screen.queryByText(/synthetic private path/)).not.toBeInTheDocument();
+  expect(screen.getByRole('checkbox', { name: /Show widget/ })).toBeChecked();
+  await user.click(screen.getByRole('button', { name: 'Reload widget settings' }));
+  expect(screen.getByRole('checkbox', { name: /Show widget/ })).not.toBeChecked();
+});

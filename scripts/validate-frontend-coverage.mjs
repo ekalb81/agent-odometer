@@ -3,7 +3,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/LocalWidget.svelte',
+  'src/components/WidgetSettings.svelte',
   'src/components/ActivitySummary.svelte',
+        'src/components/AttentionSettings.svelte',
+        'src/components/AttentionMonitor.svelte',
+        'src/lib/stores/attention.ts',
   'src/components/ConvertedCost.svelte',
   'src/components/DiagnosticsPanel.svelte',
   'src/components/FxSettings.svelte',
@@ -12,8 +17,14 @@ export const COVERAGE_SLICE = [
   'src/components/SessionGridControls.svelte',
   'src/components/SessionProjectEditor.svelte',
   'src/components/TranscriptExport.svelte',
+  'src/components/ProviderStatus.svelte',
+  'src/components/TranscriptHandoff.svelte',
   'src/components/SessionOrganizationEditor.svelte',
   'src/components/OrganizationToolbar.svelte',
+  'src/components/HumanOutcomes.svelte',
+  'src/components/CuratedDataset.svelte',
+  'src/components/OfflineComparisons.svelte',
+  'src/lib/humanOutcomes.ts',
   'src/lib/organization.ts',
   'src/lib/stores/organization.svelte.ts',
   'src/components/TranscriptSearch.svelte',
@@ -31,6 +42,7 @@ export const COVERAGE_SLICE = [
   'src/lib/stores/sessionGrid.svelte.ts',
   'src/lib/trayTotals.ts',
   'src/lib/transcriptExport.ts',
+  'src/lib/transcriptHandoff.ts',
 ];
 export const MINIMUM_LINE_COVERAGE = 90;
 

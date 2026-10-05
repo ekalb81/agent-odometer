@@ -12,6 +12,7 @@ const FIXED_TIME = new Date('2026-07-29T15:30:00.000Z');
 const visualStyles = readFileSync(new URL('./screenshot.css', import.meta.url), 'utf8');
 
 interface VisitOptions {
+  surface?: 'widget';
   scenario?: string;
   theme?: Theme;
   view?: ViewId;
@@ -53,7 +54,14 @@ async function visit(page: Page, options: VisitOptions = {}): Promise<void> {
     else document.addEventListener('DOMContentLoaded', applyVisualCss, { once: true });
   }, { selectedTheme: theme, css: visualStyles });
 
-  await page.goto(visualUrl(scenario), { waitUntil: 'domcontentloaded' });
+  await page.goto(visualUrl(scenario) + (options.surface === 'widget' ? '&surface=widget' : ''), { waitUntil: 'domcontentloaded' });
+  if (options.surface === 'widget') {
+    await expect(page.getByRole('main', { name: 'Local quota and usage widget' })).toBeVisible();
+    await expect(page.getByText('Snapshot computed:', { exact: false })).toBeVisible();
+    await page.evaluate(async () => { await document.fonts.ready; });
+    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+    return;
+  }
   await page.locator('nav[aria-label="Views"]').waitFor();
   await page.evaluate(async () => { await document.fonts.ready; });
   await expect(page.locator('nav[aria-label="Views"]')).toBeVisible();
@@ -176,6 +184,27 @@ function assertManifestCasesAreRegistered(): void {
     throw new Error(`Manifest snapshots without a visual test: ${unregistered.join(', ')}`);
   }
 }
+
+visualTest('widget-stale-quota', 'local widget stale quota at compact width', async (page) => {
+  await page.setViewportSize({ width: 360, height: 440 });
+  await visit(page, { surface: 'widget', scenario: 'widget-stale' });
+  await expect(page.getByText('Recorded 37% remaining')).toBeVisible();
+});
+visualTest('widget-partial-usage', 'local widget partial usage in dark theme', async (page) => {
+  await page.setViewportSize({ width: 480, height: 640 });
+  await visit(page, { surface: 'widget', scenario: 'widget-usage', theme: 'dark' });
+  await expect(page.getByText(/Partial snapshot/)).toBeVisible();
+});
+visualTest('widget-empty-minimum', 'local widget empty usage at minimum size', async (page) => {
+  await page.setViewportSize({ width: 300, height: 220 });
+  await visit(page, { surface: 'widget', scenario: 'widget-empty' });
+  await expect(page.getByText('0 tokens')).toBeVisible();
+});
+visualTest('widget-settings-opt-in', 'local widget visibility settings remain opt-in', async (page) => {
+  await visit(page, { view: 'settings' });
+  await page.getByRole('heading', { name: 'Compact local widget', exact: true }).scrollIntoViewIfNeeded();
+  await expect(page.getByRole('checkbox', { name: /Show widget now/ })).not.toBeChecked();
+});
 
 visualTest('calendar-activity', 'calendar heatmap and daily trend', async (page) => {
   await visit(page, { view: 'codex' });
@@ -784,6 +813,117 @@ test('content search lands on a source record and Escape returns to the search w
   await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
 });
 
+visualTest('handoff-reviewed-source', 'handoff selects source records and returns from exact inspection', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Prepare handoff', exact: true }).click();
+  const handoff = page.getByRole('dialog', { name: 'Prepare handoff', exact: true });
+  await expect(handoff.getByRole('button', { name: 'Build handoff preview' })).toBeDisabled();
+  await handoff.getByRole('button', { name: 'Read source records' }).click();
+  await handoff.getByRole('button', { name: 'Inspect exact source' }).first().click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await expect(handoff).toBeVisible();
+  await handoff.getByRole('checkbox', { name: /Source record at byte/ }).first().check();
+  await handoff.getByRole('textbox', { name: /User-written/ }).fill('Next: review the recorded greeting change.');
+  await handoff.getByRole('button', { name: 'Build handoff preview' }).click();
+  await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
+  const preview = page.frameLocator('iframe[title="Exact handoff HTML preview"]');
+  await expect(preview.locator('script,img,object,link,iframe,a')).toHaveCount(0);
+  await expect(preview.locator('pre')).toContainText('Update the greeting in the synthetic demo.');
+  await handoff.getByRole('checkbox', { name: /I reviewed every/ }).check();
+  await expect(handoff.getByRole('button', { name: 'Save reviewed handoff…' })).toBeEnabled();
+});
+
+visualTest('handoff-retained-narrow', 'handoff labels missing source and stays usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { scenario: 'content-search-retained', view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Prepare handoff', exact: true }).click();
+  const handoff = page.getByRole('dialog', { name: 'Prepare handoff', exact: true });
+  await handoff.getByRole('button', { name: 'Read source records' }).click();
+  await expect(handoff.getByText(/Incomplete original source/)).toBeVisible();
+  await handoff.getByRole('checkbox', { name: /Retained turn.*user_message/ }).first().check();
+  await handoff.getByRole('button', { name: 'Build handoff preview' }).click();
+  const bounds = await handoff.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+  await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
+  await handoff.getByRole('textbox', { name: /Exact handoff Markdown/ }).scrollIntoViewIfNeeded();
+});
+
+async function prepareCuratedPreview(page: Page): Promise<Locator> {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByRole('combobox', { name: /^Task outcome/ }).selectOption('accepted');
+  await editor.getByRole('button', { name: 'Save organization' }).click();
+  await editor.getByRole('button', { name: 'Curate reviewed example' }).click();
+  const dataset = page.getByRole('dialog', { name: 'Curated local examples' });
+  await dataset.getByRole('checkbox', { name: /Record 1/ }).check();
+  await dataset.getByLabel('Example name').fill('Synthetic greeting review');
+  await dataset.getByLabel('Optional review rubric').fill('Preserve the requested greeting and explain the change.');
+  await dataset.getByLabel('Also redact these exact phrases, one per line').fill('synthetic demo');
+  await dataset.getByRole('button', { name: 'Build exact minimized preview' }).click();
+  await expect(dataset.getByRole('region', { name: 'Exact curated example preview' })).toContainText('[review phrase redacted]');
+  return dataset;
+}
+
+visualTest('curated-example-preview', 'exact minimized example requires explicit review before local persistence', async (page) => {
+  await page.setViewportSize({ width: 1100, height: 1000 });
+  const dataset = await prepareCuratedPreview(page);
+  await expect(dataset.getByRole('button', { name: 'Add reviewed example' })).toBeDisabled();
+  await dataset.getByRole('region', { name: 'Exact curated example preview' }).scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
+visualTest('curated-example-removal-narrow', 'narrow reviewed removal preserves content-free version history', async (page) => {
+  await page.setViewportSize({ width: 500, height: 850 });
+  const dataset = await prepareCuratedPreview(page);
+  await dataset.getByRole('checkbox', { name: /I reviewed every included section/ }).check();
+  await dataset.getByRole('button', { name: 'Add reviewed example' }).click();
+  await dataset.locator('details summary').click();
+  await dataset.getByRole('button', { name: 'Review removal of example 1' }).click();
+  await dataset.getByRole('region', { name: 'Review example removal' }).scrollIntoViewIfNeeded();
+  const bounds = await dataset.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+  await page.mouse.move(0, 0);
+});
+
+visualTest('human-outcomes-summary', 'explicit human outcomes show coverage and user-reported effort', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByRole('combobox', { name: /^Task outcome/ }).selectOption('accepted');
+  await editor.getByLabel('User-reported repair minutes (optional)').fill('12');
+  await editor.getByLabel('Accepted on first pass (explicit report)').selectOption('false');
+  await editor.getByRole('button', { name: 'Save organization' }).click();
+  await expect(editor.getByText(/Human: accepted/)).toBeVisible();
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const outcomes = page.getByLabel('Human task outcomes', { exact: true }).filter({ visible: true });
+  await outcomes.locator('summary').click();
+  await expect(outcomes).toContainText('0 / 1 explicitly reported');
+  await expect(outcomes).toContainText('12 minutes');
+  await outcomes.scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
+visualTest('human-outcomes-recovery', 'unrestored human ratings remain unavailable', async (page) => {
+  await page.setViewportSize({ width: 800, height: 900 });
+  await visit(page, { scenario: 'organization-recovered', view: 'codex' });
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const outcomes = page.getByLabel('Human task outcomes', { exact: true }).filter({ visible: true });
+  await outcomes.locator('summary').click();
+  await expect(outcomes).toContainText('Unrestored ratings are unavailable, not unrated');
+  await outcomes.scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
 visualPanelTest('workflow-measurement-desktop', 'workflow measurement shows before and after evidence with unavailable human outcomes', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
@@ -793,6 +933,9 @@ visualPanelTest('workflow-measurement-desktop', 'workflow measurement shows befo
   await expect(panel.getByText('User correction rate')).toBeVisible();
   await expect(panel.getByText('Unavailable').first()).toBeVisible();
   await expect(panel.getByText(/This is a scenario, not measured or causal savings/)).toBeVisible();
+  expect(await panel.locator('p').filter({ hasText: /Metrics v2/ }).textContent()).toContain('analyzer v2. Subagent');
+  expect(await panel.locator('p').filter({ hasText: /This is a scenario/ }).textContent()).toContain('savings. Token');
+  expect(await panel.getByRole('button', { name: /Review session evidence/ }).textContent()).toContain('evidence 1');
   return panel;
 });
 
@@ -836,6 +979,109 @@ visualPanelTest('quota-guard-preview-narrow', 'quota guard stays a reviewed dry 
   await expect(panel.getByText(/Apply and undo are unavailable/)).toBeVisible();
   await panel.evaluate((element) => element.classList.add('bg-card'));
   return panel;
+});
+
+async function prepareOfflinePreview(page: Page): Promise<Locator> {
+  const dataset=await prepareCuratedPreview(page);
+  await dataset.getByRole('checkbox',{name:/I reviewed every included section/}).check();
+  await dataset.getByRole('button',{name:'Add reviewed example'}).click();
+  await dataset.getByRole('button',{name:'Compare frozen offline runs'}).click();
+  const comparison=page.getByRole('dialog',{name:'Frozen offline comparisons'});
+  await comparison.getByLabel('Comparison name').fill('Synthetic greeting comparison');
+  await comparison.getByLabel('Outcome review rubric').fill('Human checks correctness and preserved greeting.');
+  for(const id of ['a','b']) {
+    await comparison.getByLabel(`Prompt identifier ${id}`,{exact:true}).fill(`greeting-${id}`);
+    await comparison.getByLabel(`Prompt version ${id}`,{exact:true}).fill('1');
+    await comparison.getByLabel(`Prompt text ${id}`,{exact:true}).fill(`Synthetic ${id}: preserve the requested greeting.`);
+  }
+  await comparison.getByRole('button',{name:'Build frozen comparison preview'}).click();
+  await expect(comparison.getByRole('region',{name:'Exact offline comparison preview'})).toContainText('imported_offline');
+  return comparison;
+}
+
+visualTest('offline-comparison-freeze-preview','frozen offline comparison requires review of minimized inputs and provenance',async(page)=>{
+  await page.setViewportSize({width:1100,height:1000});
+  const comparison=await prepareOfflinePreview(page);
+  await expect(comparison.getByRole('button',{name:'Save reviewed frozen comparison'})).toBeDisabled();
+  await comparison.getByRole('region',{name:'Exact offline comparison preview'}).scrollIntoViewIfNeeded();
+  await page.mouse.move(0,0);
+});
+
+visualTest('offline-comparison-report-narrow','narrow imported comparison keeps raw dimensions and missing evidence visible',async(page)=>{
+  await page.setViewportSize({width:500,height:900});
+  const comparison=await prepareOfflinePreview(page);
+  await comparison.getByRole('checkbox',{name:/I reviewed all included/}).check();
+  await comparison.getByRole('button',{name:'Save reviewed frozen comparison'}).click();
+  await comparison.getByLabel('Imported result JSON').fill(JSON.stringify([
+    {case_id:1,variant:'a',status:'completed',output:'Synthetic accepted greeting',elapsed_ms:120,actual_cost_usd:0.03,tokens:null,quality:'accepted'},
+    {case_id:1,variant:'b',status:'failed',output:'',elapsed_ms:80,actual_cost_usd:0.02,tokens:null,quality:null}
+  ]));
+  await comparison.getByRole('button',{name:'Build minimized import preview'}).click();
+  await comparison.getByRole('checkbox',{name:/I reviewed all included/}).check();
+  await comparison.getByRole('button',{name:'Save reviewed offline results'}).click();
+  await expect(comparison.getByRole('region',{name:'Offline comparison report'})).toContainText('1 completed; 0 failed; 0 missing / 1');
+  await expect(comparison.getByRole('region',{name:'Offline comparison report'})).toContainText('0 completed; 1 failed; 0 missing / 1');
+  await comparison.getByRole('region',{name:'Offline comparison report'}).scrollIntoViewIfNeeded();
+  await expect(comparison.getByRole('button',{name:'Close comparisons'})).toBeVisible();
+  const bounds=await comparison.boundingBox();expect(bounds!.x).toBeGreaterThanOrEqual(0);expect(bounds!.x+bounds!.width).toBeLessThanOrEqual(500);
+  await page.mouse.move(0,0);
+});
+
+visualTest('provider-status-opt-in', 'public provider status keeps incident and unavailable evidence separate', async (page) => {
+  await visit(page, { view: 'settings' });
+  const section = page.getByRole('region', { name: 'Provider service status' });
+  const consent = section.getByRole('checkbox', { name: 'Check public provider service status' });
+  await expect(consent).not.toBeChecked();
+  await consent.check();
+  await expect(section.getByText('Minor incident', { exact: true })).toBeVisible();
+  await expect(section.getByText(/This is not a current reading/)).toBeVisible();
+  await expect(section.getByText('Unavailable · no supported public source')).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+});
+
+visualTest('provider-status-narrow', 'public status opt-out remains usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 900 });
+  await visit(page, { view: 'settings', theme: 'dark' });
+  const section = page.getByRole('region', { name: 'Provider service status' });
+  const consent = section.getByRole('checkbox', { name: 'Check public provider service status' });
+  await consent.check();
+  await expect(section.getByText('Rate limited; waiting before retry.')).toBeVisible();
+  await consent.uncheck();
+  await expect(section.getByText(/Public status checks are off/)).toBeVisible();
+  await expect(section.getByText('Minor incident', { exact: true })).toHaveCount(0);
+  await consent.check();
+  await expect(section.getByText('Minor incident', { exact: true })).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+  const bounds = await section.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
+visualTest('attention-observations', 'attention opt-in preserves unknown and source evidence', async (page) => {
+  await visit(page, { view: 'settings' });
+  const section = page.getByRole('region', { name: 'Agent attention' });
+  await expect(section.getByRole('checkbox', { name: 'Input requested' })).not.toBeChecked();
+  await section.getByRole('checkbox', { name: 'Input requested' }).check();
+  await section.getByRole('button', { name: 'Save attention preferences' }).click();
+  await expect(section.getByText(/Session 01234567 · waiting/)).toBeVisible();
+  await expect(section.getByText(/Session fedcba98 · unknown/)).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+});
+
+visualTest('attention-narrow', 'attention matching and disabling remain usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 900 });
+  await visit(page, { view: 'settings', theme: 'dark' });
+  const section = page.getByRole('region', { name: 'Agent attention' });
+  await section.getByRole('checkbox', { name: 'Tool failed' }).check();
+  await section.getByLabel('Tool category').selectOption('command');
+  await section.getByRole('button', { name: 'Save attention preferences' }).click();
+  await expect(section.getByText(/Only new observations can notify/)).toBeVisible();
+  await section.getByRole('checkbox', { name: 'Tool failed' }).uncheck();
+  await section.getByRole('button', { name: 'Save attention preferences' }).click();
+  await expect(section.getByText('Most recent transcript evidence')).toHaveCount(0);
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+  const bounds = await section.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
 });
 
 assertManifestCasesAreRegistered();

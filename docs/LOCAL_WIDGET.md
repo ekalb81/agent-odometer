@@ -1,0 +1,17 @@
+# Compact local widget
+
+Enable **Show widget now and on startup** in Settings, under **Compact local widget**. Visibility starts off. Choose Codex, Claude Code, or Gemini CLI, then quota observations or cumulative local session usage. Apply saves a revisioned preference and opens a compact app window. Closing the widget disables startup visibility; if saving fails, Settings reports that visibility was only hidden for the current run. The tray continues to work independently.
+
+This is a Tauri app window on Windows, macOS, and Linux, with a 360 × 440 default size, a 300 × 220 minimum, and optional always-on-top visibility. It is not a Windows Widget Board, macOS WidgetKit, or desktop-shell widget. Those native platform integrations are not implemented. Narrow content scrolls within the window.
+
+Quota mode reads the existing local quota snapshot. It does not enable consent, use credentials, or start a network poll. A previously saved consented provider observation can be displayed with its provenance; otherwise the provider's local transcript observation or explicit unavailable state is shown. Recorded values retain their observation and reset timestamps. Stale, expired-reset, and future-dated observations remain marked stale; unavailable and unlimited values remain distinct from numeric zero. At most eight quota windows are displayed.
+
+Usage mode reads resident session summaries whose provider, source availability, and lifecycle are present. Archived files that remain present are included; retained, superseded, purged, and missing-source sessions are excluded. These are cumulative available-source totals, not a date-scoped ledger report or an account quota balance. Partial startup scans are labeled. The compact projection refuses more than 10,000 selected sessions or 100,000 visited summaries instead of presenting a truncated total as complete. No transcript body or archive query is performed.
+
+Plan estimates and API base references come from Rust's shared pricing service. The widget only formats returned values. Rate changes immediately invalidate displayed amounts, preserve raw totals, and reject older asynchronous responses. Missing/fallback model pricing is labeled separately. Zero-session usage has no recorded activity and unavailable cost estimates.
+
+The window refreshes from local evidence every minute and on existing source/scan/history/rates events, coalesced to at most one read per five seconds. Settings and source-generation checks reject obsolete responses. No new network, notification, accounting, parser, or tray refresh path is introduced.
+
+Preferences live in the separate, bounded `widget-v1.json` configuration file with atomic replacement, an explicit file lock, and optimistic revisions. Corrupt or unsupported files are preserved and fail closed. Snapshot payloads contain fixed provider choices, observation timestamps, quota values, counts, and aggregate Rust estimates; they omit session IDs, account IDs, project names, paths, model labels, prompts, and source bodies.
+
+The window uses a fixed bundled URL. Its added Tauri capability permits only event listening and unlistening. Settings writes require the main window. This is a trusted application surface; the event capability does not isolate it from every custom application IPC command. No remote content, filesystem, shell, opener, updater, or process capability is added to the widget.

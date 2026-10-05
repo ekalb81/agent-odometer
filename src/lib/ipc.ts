@@ -16,6 +16,13 @@ import type { Session, SessionSummary, RangeTotals, ScanStatus, HistoryStatus, H
 // Commands
 // ---------------------------------------------------------------------------
 
+export function getWidgetSettings(): Promise<import('./types').WidgetSettings> { return invoke('get_widget_settings'); }
+export function setWidgetSettings(revision: number, preferences: import('./types').WidgetPreferences): Promise<import('./types').WidgetSettings> { return invoke('set_widget_settings', { revision, preferences }); }
+export function getWidgetSnapshot(): Promise<import('./types').WidgetSnapshot> { return invoke('get_widget_snapshot'); }
+export function onWidgetSettingsUpdated(cb: (settings: import('./types').WidgetSettings) => void): Promise<UnlistenFn> { return listen<import('./types').WidgetSettings>('widget-settings-updated', event => cb(event.payload)); }
+export function onWidgetSettingsError(cb: (message: string) => void): Promise<UnlistenFn> { return listen<string>('widget-settings-error', event => cb(event.payload)); }
+export function onWidgetDataChanged(cb: () => void): Promise<UnlistenFn[]> { return Promise.all(['session-updated', 'session-removed', 'scan-progress', 'history-progress', 'live-quota-updated', 'config-updated'].map(name => listen(name, cb))); }
+
 export function listSessions(): Promise<SessionSummary[]> {
   return invoke<SessionSummary[]>('list_sessions');
 }
@@ -461,3 +468,30 @@ export function onConfigUpdated(cb: (config: Config) => void): Promise<UnlistenF
 export function onConfigEvent(cb: (event: ExternalEvent) => void): Promise<UnlistenFn> {
   return listen<ExternalEvent>('config-event', (event) => cb(event.payload));
 }
+
+export function getCuratedDataset(): Promise<import('./types').CuratedDataset> { return invoke('get_curated_dataset'); }
+export function getCuratedCandidates(sessionKey: string, cursor: import('./types').TranscriptCursor | null): Promise<import('./types').CuratedCandidates> { return invoke('get_curated_candidates', { sessionKey, cursor }); }
+export function previewCuratedCase(request: import('./types').CuratedRequest): Promise<import('./types').CuratedPreview> { return invoke('preview_curated_case', { request }); }
+export function commitCuratedCase(token: string, reviewed: boolean): Promise<import('./types').CuratedDataset> { return invoke('commit_curated_case', { token, reviewed }); }
+export function removeCuratedCase(caseId: number, revision: number): Promise<import('./types').CuratedDataset> { return invoke('remove_curated_case', { caseId, revision }); }
+
+export function getOfflineExperiments(): Promise<import('./types').ExperimentHeader[]> { return invoke('get_offline_experiments'); }
+export function getOfflineExperiment(id: number): Promise<import('./types').ExperimentReport> { return invoke('get_offline_experiment', { id }); }
+export function previewOfflineExperiment(request: import('./types').FreezeRequest): Promise<import('./types').FreezePreview> { return invoke('preview_offline_experiment', { request }); }
+export function commitOfflineExperiment(token: string, reviewed: boolean): Promise<import('./types').ExperimentReport> { return invoke('commit_offline_experiment', { token, reviewed }); }
+export function previewOfflineImport(request: import('./types').ImportRequest): Promise<import('./types').ImportPreview> { return invoke('preview_offline_import', { request }); }
+export function commitOfflineImport(token: string, reviewed: boolean): Promise<import('./types').ExperimentReport> { return invoke('commit_offline_import', { token, reviewed }); }
+export function removeOfflineExperiment(id: number, revision: number): Promise<void> { return invoke('remove_offline_experiment', { id, revision }); }
+
+export function exportCuratedDataset(revision: number, digest: string): Promise<boolean> { return invoke('export_curated_dataset', { revision, digest }); }
+export function exportOfflineExperiment(id: number, revision: number, digest: string): Promise<boolean> { return invoke('export_offline_experiment', { id, revision, digest }); }
+
+/** Public status has no authority over usage, pricing, quota, or budget data. */
+export function getProviderServiceStatus(): Promise<import('./types').ProviderServiceStatusSnapshot> {
+  return invoke('get_provider_service_status');
+}
+export function setProviderStatusEnabled(enabled: boolean): Promise<Config> {
+  return invoke('set_provider_status_enabled', { enabled });
+}
+export function getAttentionStatus(): Promise<import('./types').AttentionSnapshot> { return invoke('get_attention_status'); }
+export function setAttentionPreferences(preferences: import('./types').AttentionPreferences): Promise<import('./types').AttentionPreferences> { return invoke('set_attention_preferences', { preferences }); }
