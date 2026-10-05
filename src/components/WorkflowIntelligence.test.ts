@@ -5,9 +5,9 @@ import type { WorkflowReport, WorkflowWindow } from '../lib/types';
 import { rates } from '../lib/stores/rates';
 import { projectStore } from '../lib/stores/projects.svelte';
 
-const { getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression, resolveProjects } = vi.hoisted(() => ({
-  getWorkflowReport: vi.fn(), recordWorkflowMeasurement: vi.fn(), setWorkflowFindingSuppression: vi.fn(), resolveProjects: vi.fn() }));
-vi.mock('../lib/ipc', () => ({ getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression, resolveProjects }));
+const { getWorkflowReport, previewControlledAction, recordWorkflowMeasurement, setWorkflowFindingSuppression, resolveProjects } = vi.hoisted(() => ({
+  getWorkflowReport: vi.fn(), previewControlledAction: vi.fn(), recordWorkflowMeasurement: vi.fn(), setWorkflowFindingSuppression: vi.fn(), resolveProjects: vi.fn() }));
+vi.mock('../lib/ipc', () => ({ getWorkflowReport, previewControlledAction, recordWorkflowMeasurement, setWorkflowFindingSuppression, resolveProjects }));
 
 function period(): WorkflowWindow {
   return {
@@ -121,4 +121,30 @@ it('refreshes an open report when project scope is re-resolved', async () => {
   expect(getWorkflowReport).toHaveBeenCalledTimes(1);
   await projectStore.refresh();
   await waitFor(() => expect(getWorkflowReport).toHaveBeenCalledTimes(2));
+});
+
+it('previews a recorded finding without offering an apply or undo path', async () => {
+  const measured = report();
+  const observation = { sessions: 3, tool_calls: 12, findings: 2, likely_avoidable_calls: 1,
+    analyzer_version: 3, coverage_complete: true, window_duration_ms: 604800000 };
+  measured.findings = [{ id: 'finding:opaque', provider: 'codex', project_id: 'repo:opaque', rule_id: 'repeated-read',
+    before: observation, after: observation, comparison: { version: 1, state: 'improving', comparable: true,
+      before_calls_per_100: 20, after_calls_per_100: 10, observed_change_per_100_calls: -10, limitations: [] },
+    evidence: [], evidence_truncated: false, lifecycle: { first_observed_at: period().from,
+      last_observed_at: period().to, state: 'improving', suppressed: false, revision: 2, analyzer_changed: false } }];
+  getWorkflowReport.mockResolvedValue(measured);
+  previewControlledAction.mockResolvedValue({ target_type: 'agent_workflow_configuration',
+    proposed_change: 'Future reviewed change', backup_requirement: 'Exact backup required',
+    postcondition_requirement: 'Read-back required', apply_available: false, undo_available: false });
+  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  await open();
+  await screen.findByRole('button', { name: 'Preview future action' });
+  await fireEvent.click(screen.getByRole('button', { name: 'Preview future action' }));
+  await screen.findByText('Future reviewed change');
+  expect(previewControlledAction).toHaveBeenCalledWith({ kind: 'workflow_remediation', draft: {
+    scope: { session_ids: ['codex:one'], from: period().from, to: period().to },
+    finding_id: 'finding:opaque', expected_finding_revision: 2,
+  } });
+  expect(screen.getByText(/Apply and undo are unavailable/)).toBeTruthy();
+  expect(screen.queryByRole('button', { name: /^Apply|^Undo/ })).toBeNull();
 });

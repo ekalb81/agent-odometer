@@ -1,9 +1,9 @@
 <script lang="ts">
-  import { getWorkflowReport, recordWorkflowMeasurement, setWorkflowFindingSuppression } from '../lib/ipc';
+  import { getWorkflowReport, previewControlledAction, recordWorkflowMeasurement, setWorkflowFindingSuppression } from '../lib/ipc';
   import { rates } from '../lib/stores/rates';
   import { projectStore } from '../lib/stores/projects.svelte';
   import { findingRuleTitle } from '../lib/optimization';
-  import type { WorkflowFinding, WorkflowMetric, WorkflowReport } from '../lib/types';
+  import type { ControlledActionPreview, WorkflowFinding, WorkflowMetric, WorkflowReport } from '../lib/types';
 
   interface Props {
     active?: boolean;
@@ -18,8 +18,11 @@
   let error = $state<string | null>(null);
   let report = $state<WorkflowReport | null>(null);
   let generation = 0;
+  let actionGeneration = 0;
   let saving = $state(false);
   let hypotheticalReduction = $state('10');
+  let actionPreview = $state<{ findingId: string; value: ControlledActionPreview } | null>(null);
+  let actionError = $state<{ findingId: string; message: string } | null>(null);
   const afterCalls = $derived(report?.after.drilldowns.filter((row) => row.dimension === 'project')
     .reduce((sum, row) => sum + row.tool_calls, 0) ?? 0);
   const selectionKey = $derived(JSON.stringify(sessionIds));
@@ -46,6 +49,9 @@
     loading = true;
     error = null;
     report = null;
+    actionGeneration++;
+    actionPreview = null;
+    actionError = null;
     const end = new Date();
     const start = new Date(end.getTime() - days * 86_400_000 + 1);
     try {
@@ -63,6 +69,9 @@
   async function suppression(finding: WorkflowFinding): Promise<void> {
     if (!finding.lifecycle || saving) return;
     const token = ++generation;
+    actionGeneration++;
+    actionPreview = null;
+    actionError = null;
     saving = true;
     error = null;
     try {
@@ -73,6 +82,23 @@
     } catch {
       if (token === generation) error = 'Finding changed or suppression could not be saved. Refresh before trying again.';
     } finally { saving = false; }
+  }
+  async function previewAction(finding: WorkflowFinding): Promise<void> {
+    if (!report || !finding.lifecycle || saving) return;
+    const token = generation;
+    const actionToken = ++actionGeneration;
+    actionPreview = null;
+    actionError = null;
+    try {
+      const value = await previewControlledAction({ kind: 'workflow_remediation', draft: {
+        scope: { session_ids: JSON.parse(selectionKey), from: report.after.from, to: report.after.to },
+        finding_id: finding.id, expected_finding_revision: finding.lifecycle.revision,
+      } });
+      if (token === generation && actionToken === actionGeneration) actionPreview = { findingId: finding.id, value };
+    } catch {
+      if (token === generation && actionToken === actionGeneration) actionError = { findingId: finding.id,
+        message: 'This action preview is stale or unavailable. Refresh the measurement.' };
+    }
   }
   $effect(() => {
     const token = ++generation;
@@ -172,7 +198,19 @@
               {#if finding.lifecycle}
                 <p class="text-ink-faint">Recorded measurement observations: {utcDate(finding.lifecycle.first_observed_at)}–{utcDate(finding.lifecycle.last_observed_at)} UTC · revision {finding.lifecycle.revision}. These are not occurrence dates.</p>
                 <button type="button" disabled={saving || loading} onclick={() => void suppression(finding)} class="mt-1 rounded-sm border border-edge px-2 py-1 text-ink disabled:opacity-50">{finding.lifecycle.suppressed ? 'Unsuppress finding' : 'Suppress finding'}</button>
+                {#if finding.rule_id === 'repeated-read' && finding.comparison.comparable && !finding.lifecycle.suppressed}
+                  <button type="button" disabled={saving || loading} onclick={() => void previewAction(finding)} class="ml-2 mt-1 rounded-sm border border-edge px-2 py-1 text-ink disabled:opacity-50">Preview future action</button>
+                {/if}
               {:else}<p class="text-ink-faint">Not recorded. Record a measurement before editing suppression.</p>{/if}
+              {#if actionPreview?.findingId === finding.id}
+                <div class="mt-2 space-y-1 rounded-sm border border-edge bg-panel p-2 text-ink-muted" role="status">
+                  <p>Dry run only · {actionPreview.value.target_type.replaceAll('_', ' ')}</p>
+                  <p>{actionPreview.value.proposed_change}</p>
+                  <p>{actionPreview.value.backup_requirement}</p>
+                  <p>{actionPreview.value.postcondition_requirement}</p>
+                  <p>Apply and undo are unavailable pending a separate security review.</p>
+                </div>
+              {:else if actionError?.findingId === finding.id}<p role="alert" class="text-amber-500">{actionError.message}</p>{/if}
               {#if finding.comparison.observed_change_per_100_calls !== null}<p class="text-ink-muted">Observed change: {finding.comparison.observed_change_per_100_calls.toFixed(1)} likely avoidable calls per 100 calls. This is not realized savings.</p>{/if}
               <p class="text-ink-faint">{finding.comparison.limitations.map((reason) => reason.replaceAll('_', ' ')).join(' · ')}</p>
               <div class="mt-1 flex flex-wrap gap-2">

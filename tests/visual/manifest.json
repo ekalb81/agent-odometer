@@ -60,6 +60,8 @@
     "content-search-scopes",
     "content-search-retained-narrow",
     "workflow-measurement-desktop",
-    "workflow-lifecycle-narrow"
+    "workflow-lifecycle-narrow",
+    "workflow-action-preview-narrow",
+    "quota-guard-preview-narrow"
   ]
 }

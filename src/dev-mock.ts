@@ -5,6 +5,7 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
 import { mockOrganization } from './dev-mock/organization';
+import { actionPreviewFixture } from './dev-mock/action';
 import { workflowFixture } from './dev-mock/workflow';
 import { contentSearchFixture, retainedLandingFixture } from './dev-mock/contentSearch';
 import type { TranscriptSearchRequest, TranscriptSearchTarget } from './lib/types';
@@ -464,6 +465,8 @@ mockIPC((cmd, payload) => {
     case 'record_workflow_measurement':
     case 'set_workflow_finding_suppression':
       return workflowFixture(cmd, (payload ?? {}) as Record<string, unknown>);
+    case 'preview_controlled_action':
+      return actionPreviewFixture((payload as { request: { action: import('./lib/types').ControlledActionDraft } }).request.action);
     case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
     case 'get_organization_summaries':
     case 'get_record_bookmarks':
