@@ -172,6 +172,14 @@ pub async fn set_workflow_finding_suppression(
     .map_err(|_| "Finding suppression could not finish.".to_owned())?
 }
 
+// Preserve only the stable accounting contract; archive paths and underlying
+// database details are never user-facing workflow diagnostics.
+fn redacted_accounting_error(error: anyhow::Error, fallback: &str) -> String {
+    error
+        .downcast_ref::<crate::history_store::AccountingIntegrityError>()
+        .map_or_else(|| fallback.to_owned(), ToString::to_string)
+}
+
 async fn workflow_report(
     state: State<'_, Arc<AppState>>,
     request: crate::workflow::WorkflowRequest,
@@ -188,9 +196,11 @@ async fn workflow_report(
             .map_err(|_| "Workflow history is incomplete or could not be read.".to_owned())?;
         let rates = get_rates();
         let mut report = crate::workflow::report(&reader, &rates, request, &events, Utc::now())
-            .map_err(|_| {
-                "Workflow analysis is unavailable: check the selected window and history coverage."
-                    .to_owned()
+            .map_err(|error| {
+                redacted_accounting_error(
+                    error,
+                    "Workflow analysis is unavailable: check the selected window and history coverage.",
+                )
             })?;
         if let Ok(config) = Config::load_read_only() {
             report.setup_health = Some(crate::workflow::WorkflowSetupHealth::from_diagnostics(
@@ -199,7 +209,9 @@ async fn workflow_report(
         }
         reader
             .load_workflow_lifecycle(&mut report)
-            .map_err(|_| "Workflow lifecycle metadata is unavailable.".to_owned())?;
+            .map_err(|error| {
+                redacted_accounting_error(error, "Workflow lifecycle metadata is unavailable.")
+            })?;
         drop(reader);
         if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
             return Err("Workflow report exceeds its size limit; select fewer sessions.".into());
@@ -207,9 +219,11 @@ async fn workflow_report(
         if record {
             history
                 .record_workflow_measurement(&mut report)
-                .map_err(|_| {
-                    "Measurement changed or could not be recorded; refresh and try again."
-                        .to_owned()
+                .map_err(|error| {
+                    redacted_accounting_error(
+                        error,
+                        "Measurement changed or could not be recorded; refresh and try again.",
+                    )
                 })?;
         }
         if !crate::workflow::fits_output_budget(&report, 8 * 1024 * 1024) {
@@ -3414,6 +3428,33 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn workflow_errors_preserve_accounting_contract_and_redact_other_details() {
+        use crate::history_store::AccountingIntegrityError;
+        for fallback in [
+            "Workflow analysis is unavailable: check the selected window and history coverage.",
+            "Measurement changed or could not be recorded; refresh and try again.",
+        ] {
+            for kind in [
+                AccountingIntegrityError::Ambiguous,
+                AccountingIntegrityError::Unverified,
+            ] {
+                let error = anyhow::Error::from(kind).context("private synthetic archive path");
+                assert_eq!(
+                    super::redacted_accounting_error(error, fallback),
+                    kind.to_string()
+                );
+            }
+            assert_eq!(
+                super::redacted_accounting_error(
+                    anyhow::anyhow!("private synthetic database detail"),
+                    fallback
+                ),
+                fallback
+            );
+        }
+    }
 
     #[test]
     fn dollar_budget_uses_current_api_surface_and_rejects_partial_prices() {
