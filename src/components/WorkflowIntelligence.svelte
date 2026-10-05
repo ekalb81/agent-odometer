@@ -1,4 +1,8 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
+  import { sessionsStore } from '../lib/stores/sessions.svelte';
+  import { historyStore } from '../lib/stores/history.svelte';
+  import { accountingUnavailable } from '../lib/accountingAvailability';
   import { getWorkflowReport, previewControlledAction, recordWorkflowMeasurement, setWorkflowFindingSuppression } from '../lib/ipc';
   import { rates } from '../lib/stores/rates';
   import { projectStore } from '../lib/stores/projects.svelte';
@@ -19,6 +23,7 @@
   let report = $state<WorkflowReport | null>(null);
   let generation = 0;
   let actionGeneration = 0;
+  onDestroy(() => { generation++; actionGeneration++; });
   let saving = $state(false);
   let hypotheticalReduction = $state('10');
   let actionPreview = $state<{ findingId: string; value: ControlledActionPreview } | null>(null);
@@ -45,6 +50,11 @@
     return new Date(timestamp).toLocaleDateString(undefined, { timeZone: 'UTC' });
   }
   async function load(ids: string[], days: number, token: number, record = false): Promise<void> {
+    const mutation = sessionsStore.mutationLog.generation;
+    const history = historyStore.status;
+    const rateCard = $rates;
+    const projects = projectStore.revision;
+    const valid = () => token === generation && mutation === sessionsStore.mutationLog.generation && history === historyStore.status && rateCard === $rates && projects === projectStore.revision && JSON.stringify(ids) === selectionKey;
     const previousWindow = record ? report?.after : null;
     loading = true;
     error = null;
@@ -57,18 +67,20 @@
     try {
       const next = await (record ? recordWorkflowMeasurement : getWorkflowReport)({ session_ids: ids,
         from: previousWindow?.from ?? start.toISOString(), to: previousWindow?.to ?? end.toISOString() });
-      if (token !== generation) return;
+      if (!valid()) return;
       report = next;
-    } catch {
-      if (token !== generation) return;
-      error = 'Workflow analysis could not be loaded. Check history readiness, or select fewer sessions and retry.';
+    } catch (reason) {
+      if (!valid()) return;
+      error = String(reason).includes('accounting_identity_') ? accountingUnavailable(reason) : 'Workflow analysis could not be loaded. Check history readiness, or select fewer sessions and retry.';
     } finally {
-      if (token === generation) loading = false;
+      if (valid()) loading = false;
     }
   }
   async function suppression(finding: WorkflowFinding): Promise<void> {
     if (!finding.lifecycle || saving) return;
     const token = ++generation;
+    const mutation = sessionsStore.mutationLog.generation;
+    const valid = () => token === generation && mutation === sessionsStore.mutationLog.generation;
     actionGeneration++;
     actionPreview = null;
     actionError = null;
@@ -78,14 +90,16 @@
       await setWorkflowFindingSuppression({ provider: finding.provider, project_id: finding.project_id,
         rule_id: finding.rule_id, expected_revision: finding.lifecycle.revision,
         suppressed: !finding.lifecycle.suppressed });
-      if (token === generation) refresh += 1;
+      if (valid()) refresh += 1;
     } catch {
-      if (token === generation) error = 'Finding changed or suppression could not be saved. Refresh before trying again.';
-    } finally { saving = false; }
+      if (valid()) error = 'Finding changed or suppression could not be saved. Refresh before trying again.';
+    } finally { if (valid()) saving = false; }
   }
   async function previewAction(finding: WorkflowFinding): Promise<void> {
     if (!report || !finding.lifecycle || saving) return;
     const token = generation;
+    const mutation = sessionsStore.mutationLog.generation;
+    const valid = () => token === generation && mutation === sessionsStore.mutationLog.generation;
     const actionToken = ++actionGeneration;
     actionPreview = null;
     actionError = null;
@@ -94,23 +108,28 @@
         scope: { session_ids: JSON.parse(selectionKey), from: report.after.from, to: report.after.to },
         finding_id: finding.id, expected_finding_revision: finding.lifecycle.revision,
       } });
-      if (token === generation && actionToken === actionGeneration) actionPreview = { findingId: finding.id, value };
+      if (valid() && actionToken === actionGeneration) actionPreview = { findingId: finding.id, value };
     } catch {
-      if (token === generation && actionToken === actionGeneration) actionError = { findingId: finding.id,
+      if (valid() && actionToken === actionGeneration) actionError = { findingId: finding.id,
         message: 'This action preview is stale or unavailable. Refresh the measurement.' };
     }
   }
+  let lastMutation = -1;
   $effect(() => {
     const token = ++generation;
-    if (!active || !opened) return;
-    void projectStore.revision;
+    const mutation = sessionsStore.mutationLog.generation;
+    const mutationChanged = mutation !== lastMutation; lastMutation = mutation;
+    void historyStore.status; void projectStore.revision; void $rates;
     const ids: string[] = JSON.parse(selectionKey);
     const days = Number(period);
     void refresh;
-    void $rates;
-    void load(ids, days, token);
-    return () => { generation += 1; };
+    report = null; actionGeneration++; actionPreview = null; actionError = null; saving = false; error = null;
+    loading = active && opened;
+    if (!active || !opened) return;
+    const timer = setTimeout(() => { void load(ids, days, token); }, mutationChanged ? 250 : 0);
+    return () => { clearTimeout(timer); if (generation === token) generation++; };
   });
+
 </script>
 
 <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={opened} data-testid="workflow-panel">
@@ -127,9 +146,9 @@
     </div>
     <p class="text-ink-faint">Viewing is read-only. Record measurement saves only finding states and observation times locally; it changes no agent configuration.</p>
     {#if loading}
-      <p role="status" class="text-ink-muted">Measuring durable workflow evidence…</p>
+      <p data-testid="accounting-workflow-status" role="status" class="text-ink-muted">Measuring durable workflow evidence…</p>
     {:else if error}
-      <p role="alert" class="text-amber-500">{error}</p>
+      <p data-testid="accounting-workflow-status" role="alert" class="text-amber-500">{error}</p>
     {:else if report}
       <div class="rounded-sm border border-edge bg-panel p-2 text-ink-muted">
         <p>History coverage: {report.coverage_complete ? 'complete' : 'incomplete'} · {report.selected_sessions} selected sessions</p>

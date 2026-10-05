@@ -63,8 +63,7 @@ it('invalidates prices immediately and rejects superseded reads while coalescing
   await act(() => vi.advanceTimersByTimeAsync(5000));
   expect(mocks.getWidgetSnapshot).toHaveBeenCalledTimes(2);
   await act(() => ratesEvent());
-  expect(screen.getByText('123 tokens')).toBeInTheDocument();
-  expect(screen.getByText('Plan estimate: unavailable')).toBeInTheDocument();
+  expect(screen.queryByText('123 tokens')).not.toBeInTheDocument();
   await act(() => finish({ ...usage, usage: { ...usage.usage!, total_tokens: 999 } }));
   expect(screen.queryByText('999 tokens')).not.toBeInTheDocument();
   await act(() => vi.advanceTimersByTimeAsync(5000));
@@ -89,4 +88,15 @@ it('does not allow a late initial settings read to undo a settings event', async
   await act(() => finish(enabled));
   expect(screen.getByText(/Widget disabled/)).toBeInTheDocument();
   expect(mocks.getWidgetSnapshot).not.toHaveBeenCalled();
+});
+
+it('withholds old usage when a current identity proof fails', async () => {
+  render(LocalWidget); await screen.findByText('123 tokens');
+  vi.useFakeTimers();
+  mocks.getWidgetSnapshot.mockRejectedValueOnce('accounting_identity_ambiguous');
+  await act(() => dataEvent());
+  expect(screen.queryByText('123 tokens')).not.toBeInTheDocument();
+  await act(() => vi.advanceTimersByTimeAsync(5000));
+  expect(screen.getByRole('alert')).toHaveTextContent('ambiguous accounting identities');
+  expect(screen.queryByText('123 tokens')).not.toBeInTheDocument();
 });

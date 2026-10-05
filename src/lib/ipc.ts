@@ -72,9 +72,18 @@ export function getSpeedReport(query: SpeedQuery): Promise<SpeedReport> {
   return invoke<SpeedReport>('get_speed_report', { query });
 }
 
-/** Cumulative session/category pricing from resident summaries, batched by storage ID. */
-export function getSessionPricing(sessionIds: string[]): Promise<Record<string, SummaryPricing>> {
-  return invoke<Record<string, SummaryPricing>>('get_session_pricing', { sessionIds });
+/** Cumulative totals and category pricing proved in one durable snapshot for the full aggregate scope. */
+export function getSessionPricing(sessionIds: string[], aggregateSessionIds?: string[]): Promise<Record<string, SummaryPricing>> {
+  return invoke<Record<string, SummaryPricing>>('get_session_pricing', { sessionIds, aggregateSessionIds: aggregateSessionIds ?? sessionIds });
+}
+
+export function prepareSessionSummaryExport(request: import('./types').SessionSummaryExportRequest): Promise<import('./types').PreparedSessionSummaryExport> {
+  return invoke('prepare_session_summary_export', { request });
+}
+
+/** Backend re-proves the prepared scope after the picker, then publishes atomically. */
+export function publishSessionSummaryExport(prepared: import('./types').PreparedSessionSummaryExport, filename: string): Promise<boolean> {
+  return invoke('publish_session_summary_export', { prepared, filename });
 }
 
 /** Full session (turns + token history) for the detail drawer. */
@@ -107,10 +116,12 @@ export function resolveRetainedSearchTarget(target: TranscriptSearchTarget): Pro
 export function sessionsInRanges(
   ranges: { from: string | null; to: string | null }[],
   sessionIds?: string[],
+  aggregateSessionIds?: string[],
 ): Promise<Record<string, RangeTotals>[]> {
   return invoke<Record<string, RangeTotals>[]>('sessions_in_ranges', {
     ranges,
     sessionIds: sessionIds ?? null,
+    aggregateSessionIds: aggregateSessionIds ?? sessionIds ?? null,
   });
 }
 
@@ -379,6 +390,7 @@ export function scanGitOutcomes(postWindowHours = 24): Promise<GitOutcome[]> {
 }
 
 export interface TrayTotals {
+  quota?: string;
   gemini_plan?: string;
   provider?: string;
   recent?: string;

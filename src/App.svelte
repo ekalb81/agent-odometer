@@ -108,6 +108,7 @@
   let trayTimer: ReturnType<typeof setTimeout> | null = null;
   let trayJobGeneration = 0;
   let trayEpoch = 0;
+  let trayProof: { mutation: number; provider: string; day: string; ids: string; history: unknown } | null = null;
   let lastTrayRates: RateCard | null = null;
   let trayQueue: Promise<void> = Promise.resolve();
   const trayCache = new RangeDataCache();
@@ -122,8 +123,12 @@
     const end = new Date(start); end.setDate(end.getDate() + 1); end.setMilliseconds(-1);
     const trayRange = [{ from: start.toISOString(), to: end.toISOString() }];
     // The day is the only variable in the range, so rollover forces a full fetch.
-    const rangesKey = `tray:${trayRange[0].from}`;
-    const ids = [...sessionsStore.map.keys()];
+    const rangesKey = `tray:${trayRange[0].from}|${trayProvider}`;
+    const provider = trayProvider;
+    const ids = [...sessionsStore.map.values()].filter(s => provider === 'all' || s.harness === provider).map(s => s.storage_id);
+    const mutation = sessionsStore.mutationLog.generation;
+    const history = historyStore.status;
+    const valid = () => epoch === trayEpoch && generation === trayJobGeneration && mutation === sessionsStore.mutationLog.generation && provider === trayProvider && history === historyStore.status;
     const drained = trayMutations.drain();
     const plan = trayCache.plan({
       rangesKey,
@@ -136,23 +141,29 @@
       if (plan.mode === 'full') {
         const fetched = await measureAsync(
           'frontend.tray_range_fetch',
-          () => sessionsInRanges(trayRange),
+          () => sessionsInRanges(trayRange, ids, ids),
           { sessions: ids.length, fetched: ids.length, mode: 'full' },
         );
         if (epoch !== trayEpoch) return;
+      if (!valid()) { trayCache.invalidate(); return; }
         results = trayCache.applyFull(rangesKey, ids, fetched);
       } else if (plan.mode === 'delta') {
-        const fetched = plan.fetchIds.length > 0
-          ? await measureAsync(
+        const fetched = await measureAsync(
               'frontend.tray_range_fetch',
-              () => sessionsInRanges(trayRange, plan.fetchIds),
+              () => sessionsInRanges(trayRange, plan.fetchIds, ids),
               { sessions: ids.length, fetched: plan.fetchIds.length, mode: 'delta' },
-            )
-          : null;
+            );
         if (epoch !== trayEpoch) return;
+      if (!valid()) { trayCache.invalidate(); return; }
         results = trayCache.applyDelta(plan.fetchIds, drained.removedIds, fetched);
+      } else {
+        await sessionsInRanges(trayRange, [], ids);
+        if (epoch !== trayEpoch) return;
+      if (!valid()) { trayCache.invalidate(); return; }
       }
       if (!results) return;
+      trayProof = { mutation, provider, day: trayRange[0].from, ids: ids.join('|'), history: historyStore.status };
+
       // Best-effort: a quota-fetch failure must never block the existing
       // token/credit tray update, so it's fetched and formatted (via the
       // same helper the dashboard panel uses) outside the cache/plan path
@@ -163,51 +174,65 @@
         quotaLabel = ambientQuotaLabel(trayProvider, snapshots, live, Date.now());
       } catch (error) {
         if (epoch !== trayEpoch) return;
+      if (!valid()) { trayCache.invalidate(); return; }
         console.error('quota tray label refresh failed:', error);
       }
       if (epoch !== trayEpoch) return;
+      if (!valid()) { trayCache.invalidate(); return; }
       const totals = computeScopedTrayTotals(sessionsStore.map.values(), results[0], rateCard, trayProvider, quotaLabel);
       const latest = $ambient?.recent[0];
       await setTrayTotals({ ...totals, provider: trayProvider, recent: latest ? `${latest.provider}: ${ambientLabels[latest.code] ?? "Local alert"}` : "none" });
     } catch (error) {
       if (epoch !== trayEpoch) return;
-      trayCache.invalidate();
+      if (!valid()) { trayCache.invalidate(); return; }
+      trayCache.invalidate(); trayProof = null;
+      let quota = 'unavailable';
+      try { const [snapshots, live] = await Promise.all([getQuotaSnapshots(), getLiveQuotaStatus()]); quota = ambientQuotaLabel(provider, snapshots, live, Date.now()) ?? 'unavailable'; } catch { /* Cached external observations remain independent of accounting. */ }
+      if (!valid()) return;
+      await setTrayTotals({ tokens: 'unavailable', codex_credits: 'unavailable', codex_api_usd: 'unavailable', claude_usd: 'unavailable', gemini_plan: 'unavailable', quota, provider });
       console.error('tray totals refresh failed:', error);
     }
   }
 
   $effect(() => {
+    void historyStore.status;
     trayMutations.observe(sessionsStore.mutationLog);
+    const generation = ++trayJobGeneration;
     const rateCard = $rates;
     void trayRefreshGeneration;
     void trayProvider;
     void $ambient?.recent;
     const ratesChanged = rateCard !== lastTrayRates;
     lastTrayRates = rateCard;
+    let retainRaw = false;
     if (ratesChanged) {
       const previous = trayCache.current();
       trayCache.invalidate();
       trayEpoch += 1;
-      if (previous && rateCard) {
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const ids = [...sessionsStore.map.values()].filter(s => trayProvider === 'all' || s.harness === trayProvider).map(s => s.storage_id).join('|');
+      const rawVerified = trayProof?.mutation === sessionsStore.mutationLog.generation && trayProof.provider === trayProvider && trayProof.day === today.toISOString() && trayProof.ids === ids && trayProof.history === historyStore.status;
+      retainRaw = !!previous && !!rateCard && rawVerified;
+      if (previous && rateCard && retainRaw) {
         const raw = Object.fromEntries(Object.entries(previous[0]).map(([id, totals]) => [id, { ...totals, pricing: undefined }]));
         const epoch = trayEpoch;
         void setTrayTotals(computeScopedTrayTotals(sessionsStore.map.values(), raw, rateCard, trayProvider))
           .catch((error) => { if (epoch === trayEpoch) console.error('tray pricing invalidation failed:', error); });
       }
-      trayJobGeneration += 1;
     }
     if (!rateCard) return;
+    const requestEpoch = trayEpoch;
+    if (!retainRaw) void setTrayTotals({ tokens: 'verifying', codex_credits: 'verifying', codex_api_usd: 'verifying', claude_usd: 'verifying', gemini_plan: 'verifying', quota: '', provider: trayProvider }).catch(() => {});
     if (trayTimer !== null) clearTimeout(trayTimer);
     trayTimer = setTimeout(() => {
       trayTimer = null;
-      const generation = ++trayJobGeneration;
       trayQueue = trayQueue
-        .then(() => runTrayRefresh(generation, trayEpoch, rateCard))
+        .then(() => runTrayRefresh(generation, requestEpoch, rateCard))
         .catch(() => {});
     }, ratesChanged ? 0 : 250);
     const now = new Date(); const next = new Date(now); next.setDate(next.getDate() + 1); next.setHours(0, 0, 1, 0);
     const boundary = setTimeout(() => { trayRefreshGeneration += 1; }, next.getTime() - now.getTime());
-    return () => { clearTimeout(boundary); if (trayTimer !== null) clearTimeout(trayTimer); };
+    return () => { if (generation === trayJobGeneration) trayJobGeneration++; clearTimeout(boundary); if (trayTimer !== null) clearTimeout(trayTimer); };
   });
 
   $effect(() => {

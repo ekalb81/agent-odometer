@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { accountingUnavailable } from '../lib/accountingAvailability';
   import { onMount } from 'svelte';
   import { getWidgetSettings, getWidgetSnapshot, onWidgetSettingsUpdated, onWidgetDataChanged, onRatesUpdated } from '../lib/ipc';
   import { formatCredits } from '../lib/currency';
@@ -26,6 +27,7 @@
   function invalidate(clearPrices = false) {
     if (!alive || !settings?.preferences.visible) return;
     generation++; pending = true;
+    if (!clearPrices && snapshot?.usage) snapshot = null;
     if (clearPrices && snapshot?.usage) snapshot = { ...snapshot, usage: { ...snapshot.usage, plan_amount: null, api_amount_usd: null } };
     if (!settings?.preferences.visible || scheduled) return;
     const wait = Math.max(0, Math.min(5_000, 5_000 - (Date.now() - lastRead)));
@@ -40,7 +42,7 @@
       if (alive && request === generation && next.settings.revision === settings.revision) {
         snapshot = next; error = null; pending = false;
       }
-    } catch { if (alive && request === generation) { error = 'Local snapshot unavailable. Previous observations remain dated.'; pending = false; } }
+    } catch (reason) { if (alive && request === generation) { if (settings.preferences.kind === 'usage') { snapshot = null; error = accountingUnavailable(reason); } else error = 'Local snapshot unavailable. Previous quota observations remain dated.'; pending = false; } }
     finally { busy = false; if (alive && request !== generation && settings?.preferences.visible && !scheduled) invalidate(); }
   }
   onMount(() => {

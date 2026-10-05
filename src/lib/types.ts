@@ -299,8 +299,27 @@ export interface CurrentPricing {
 
 /** Response-only cumulative pricing; never derived from an unbounded event window. */
 export interface SummaryPricing {
+  category_totals: NonNullable<SessionSummary['category_totals']>;
+  /** Cumulative totals proved alongside pricing in the same durable snapshot. */
+  tokens: TokenTotals;
   pricing: RangePricing;
   categories: Record<string, RangePricing>;
+}
+
+export interface SessionSummaryExportRequest {
+  session_ids: string[];
+  from: string | null;
+  to: string | null;
+  format: 'csv' | 'json';
+  include_working_directory: boolean;
+}
+
+export interface PreparedSessionSummaryExport {
+  request: SessionSummaryExportRequest;
+  as_of: string;
+  digest: string;
+  content: string;
+  session_count: number;
 }
 
 export interface TurnPrice {

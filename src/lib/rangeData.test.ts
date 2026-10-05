@@ -144,6 +144,14 @@ describe('RangeDataCache', () => {
     expect((plan as { fetchIds: string[] }).fetchIds).toEqual([]);
   });
 
+  it('drops filtered-out cache contributors before a narrower scope can be published', () => {
+    const cache = new RangeDataCache();
+    cache.applyFull(key, ['a', 'b'], [{ a: totals(10), b: totals(20) }]);
+    expect(cache.plan({ rangesKey: key, ids: ['a'], changedIds: [], removedIds: [] })).toEqual({ mode: 'full' });
+    const narrowed = cache.applyFull(key, ['a'], [{ a: totals(10) }]);
+    expect(Object.keys(narrowed[0])).toEqual(['a']);
+  });
+
   it('covers multiple ranges in one merge', () => {
     const cache = new RangeDataCache();
     const a0 = totals(1);

@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeEach, expect, it, vi } from 'vitest';
+import { sessionsStore } from '../lib/stores/sessions.svelte';
 import WorkflowIntelligence from './WorkflowIntelligence.svelte';
 import type { WorkflowReport, WorkflowWindow } from '../lib/types';
 import { rates } from '../lib/stores/rates';
@@ -28,6 +29,17 @@ function period(): WorkflowWindow {
 function report(count = 3): WorkflowReport {
   return { version: 1, generated_at: '2026-10-04T00:00:00Z', analyzer_version: 3,
     selected_sessions: count, coverage_complete: true, before: period(), after: period(), findings: [], historical_findings: [], setup_health: null, limitations: [] };
+}
+function findingReport(): WorkflowReport {
+  const measured = report();
+  const observation = { sessions: 3, tool_calls: 12, findings: 2, likely_avoidable_calls: 1,
+    analyzer_version: 3, coverage_complete: true, window_duration_ms: 604800000 };
+  measured.findings = [{ id: 'finding:opaque', provider: 'codex', project_id: 'repo:opaque', rule_id: 'repeated-read',
+    before: observation, after: observation, comparison: { version: 1, state: 'improving', comparable: true,
+      before_calls_per_100: 20, after_calls_per_100: 10, observed_change_per_100_calls: -10, limitations: [] },
+    evidence: [], evidence_truncated: false, lifecycle: { first_observed_at: period().from,
+      last_observed_at: period().to, state: 'improving', suppressed: false, revision: 2, analyzer_changed: false } }];
+  return measured;
 }
 async function open(): Promise<void> {
   const details = screen.getByTestId('workflow-panel') as HTMLDetailsElement;
@@ -65,6 +77,7 @@ it('rejects superseded results when selected sessions change', async () => {
   const view = render(WorkflowIntelligence, { sessionIds: ['codex:old'] });
   await open();
   await screen.findByRole('status');
+  await waitFor(() => expect(getWorkflowReport).toHaveBeenCalledTimes(1));
   await view.rerender({ sessionIds: ['codex:new'] });
   await screen.findByText(/3 selected sessions/);
   resolveOld(report(99));
@@ -124,14 +137,7 @@ it('refreshes an open report when project scope is re-resolved', async () => {
 });
 
 it('previews a recorded finding without offering an apply or undo path', async () => {
-  const measured = report();
-  const observation = { sessions: 3, tool_calls: 12, findings: 2, likely_avoidable_calls: 1,
-    analyzer_version: 3, coverage_complete: true, window_duration_ms: 604800000 };
-  measured.findings = [{ id: 'finding:opaque', provider: 'codex', project_id: 'repo:opaque', rule_id: 'repeated-read',
-    before: observation, after: observation, comparison: { version: 1, state: 'improving', comparable: true,
-      before_calls_per_100: 20, after_calls_per_100: 10, observed_change_per_100_calls: -10, limitations: [] },
-    evidence: [], evidence_truncated: false, lifecycle: { first_observed_at: period().from,
-      last_observed_at: period().to, state: 'improving', suppressed: false, revision: 2, analyzer_changed: false } }];
+  const measured = findingReport();
   getWorkflowReport.mockResolvedValue(measured);
   previewControlledAction.mockResolvedValue({ target_type: 'agent_workflow_configuration',
     proposed_change: 'Future reviewed change', backup_requirement: 'Exact backup required',
@@ -147,4 +153,43 @@ it('previews a recorded finding without offering an apply or undo path', async (
   } });
   expect(screen.getByText(/Apply and undo are unavailable/)).toBeTruthy();
   expect(screen.queryByRole('button', { name: /^Apply|^Undo/ })).toBeNull();
+});
+
+it('keeps the disclosure open but clears an old report on same-ID identity changes', async () => {
+  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  await open(); await screen.findByText(/3 selected sessions/);
+  getWorkflowReport.mockRejectedValueOnce('accounting_identity_ambiguous');
+  sessionsStore.remove('outside-scope');
+  await screen.findByText(/ambiguous accounting identities/);
+  expect(screen.queryByText(/3 selected sessions/)).not.toBeInTheDocument();
+  expect(screen.getByTestId('workflow-panel')).toHaveAttribute('open');
+  expect(getWorkflowReport.mock.calls.at(-1)?.[0].session_ids).toEqual(['codex:one']);
+});
+it('rejects a delayed same-scope report after a newer mutation proof', async () => {
+  let finish!: (value: WorkflowReport) => void;
+  getWorkflowReport.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  await open(); await waitFor(() => expect(finish).toBeDefined());
+  sessionsStore.remove('outside-scope');
+  await screen.findByText(/3 selected sessions/);
+  finish(report(99));
+  await waitFor(() => expect(screen.queryByText(/99 selected sessions/)).not.toBeInTheDocument());
+});
+
+it.each(['preview', 'suppression'] as const)('rejects delayed %s results after same-ID mutation', async kind => {
+  getWorkflowReport.mockResolvedValue(findingReport());
+  let finish!: (value: unknown) => void;
+  const pending = new Promise(resolve => { finish = resolve; });
+  if (kind === 'preview') previewControlledAction.mockReturnValueOnce(pending);
+  else setWorkflowFindingSuppression.mockReturnValueOnce(pending);
+  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  await open();
+  const button = await screen.findByRole('button', { name: kind === 'preview' ? 'Preview future action' : 'Suppress finding' });
+  await fireEvent.click(button);
+  sessionsStore.remove('outside-scope');
+  await waitFor(() => expect(getWorkflowReport).toHaveBeenCalledTimes(2));
+  finish({ target_type: 'agent_workflow_configuration', proposed_change: 'OBSOLETE approved action', backup_requirement: 'backup', postcondition_requirement: 'verify' });
+  await waitFor(() => expect(screen.queryByText('OBSOLETE approved action')).not.toBeInTheDocument());
+  expect(getWorkflowReport).toHaveBeenCalledTimes(2);
+  expect(screen.getByTestId('workflow-panel')).toHaveAttribute('open');
 });

@@ -99,6 +99,8 @@ const { ipcMocks, getSessionDetails } = vi.hoisted(() => {
       resolveProjects: vi.fn().mockResolvedValue([]),
       listProviders: vi.fn().mockResolvedValue([]),
       writeExport: vi.fn().mockResolvedValue(undefined),
+      prepareSessionSummaryExport: vi.fn(),
+      publishSessionSummaryExport: vi.fn(),
       onConfigEvent: vi.fn().mockResolvedValue(() => {}),
     },
   };
@@ -299,8 +301,10 @@ describe('SessionsView range pricing refresh orchestration', () => {
     stubLayoutApis();
     rates.set(testRateCard());
     sessionsStore.replaceAll(ids.map((id) => summary(id, id)));
-    ipcMocks.getSessionPricing.mockReset().mockResolvedValue({});
+    ipcMocks.getSessionPricing.mockReset().mockImplementation((fetchIds: string[]) => Promise.resolve(Object.fromEntries(fetchIds.map(id => [id, { tokens: zeroTokens, pricing: { plan: { total: 0, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {} }]))));
     ipcMocks.writeExport.mockClear();
+    ipcMocks.publishSessionSummaryExport.mockReset().mockResolvedValue(true);
+    ipcMocks.prepareSessionSummaryExport.mockReset().mockImplementation((request: unknown) => Promise.resolve({ request, as_of: '2026-10-04T00:00:00Z', digest: 'synthetic', content: '[]', session_count: 2 }));
     ipcMocks.sessionsInRanges.mockReset();
     ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => Promise.resolve(ranges.map(() => ({}))));
   });
@@ -363,6 +367,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     sessionsStore.applyMutations([summary(ids[0], 'Updated title')], []);
     const delta = await expectBothBatches(6);
     expect(delta.slice(-2).every(([, fetchedIds]) => fetchedIds.join() === ids[0])).toBe(true);
+    expect(delta.slice(-2).every(call => (call as unknown as [unknown, string[], string[]])[2].join() === ids.join())).toBe(true);
   });
   it('retains raw totals but hides stale backend prices while rate refresh is pending', async () => {
     const tokens = { ...zeroTokens, input_tokens: 1_000_000, total_tokens: 1_000_000 };
@@ -390,56 +395,61 @@ describe('SessionsView range pricing refresh orchestration', () => {
   });
   it('uses one cumulative batch for all-time prices and never substitutes event-window totals', async () => {
     ipcMocks.getSessionPricing.mockResolvedValue(Object.fromEntries(ids.map((id) => [id, {
-      pricing: { plan: { total: 42.5, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
+      tokens: { ...zeroTokens, total_tokens: 777 }, pricing: { plan: { total: 42.5, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
     }])));
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
     const row = await screen.findByRole('button', { name: `Select session ${ids[0]}` });
     await waitFor(() => expect(row.querySelector('.text-accent-cost')).toHaveTextContent('42.50'));
-    expect(ipcMocks.getSessionPricing).toHaveBeenCalledExactlyOnceWith(ids);
+    expect(ipcMocks.getSessionPricing).toHaveBeenCalledExactlyOnceWith(ids, ids);
     // Only analytics requests events. The all-time table reads cumulative pricing.
     expect(ipcMocks.sessionsInRanges.mock.calls.every(([ranges]) => ranges.length > 1)).toBe(true);
     ipcMocks.getSessionPricing.mockClear();
+    ipcMocks.prepareSessionSummaryExport.mockImplementation(request => Promise.resolve({ request, as_of: '2026-10-04T00:00:00Z', digest: 'synthetic', session_count: 2, content: JSON.stringify([{ codex_credits: 42.5, total_tokens: 777 }, { codex_credits: 42.5, total_tokens: 777 }]) }));
     await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
-    await waitFor(() => expect(ipcMocks.writeExport).toHaveBeenCalledTimes(1));
-    expect(ipcMocks.getSessionPricing).toHaveBeenCalledExactlyOnceWith(ids);
-    const rows = JSON.parse(ipcMocks.writeExport.mock.calls[0][2]);
+    await waitFor(() => expect(ipcMocks.publishSessionSummaryExport).toHaveBeenCalledTimes(1));
+    expect(ipcMocks.getSessionPricing).not.toHaveBeenCalled();
+    expect(ipcMocks.prepareSessionSummaryExport).toHaveBeenCalledExactlyOnceWith({ session_ids: ids, from: null, to: null, format: 'json', include_working_directory: false });
+    const rows = JSON.parse(ipcMocks.publishSessionSummaryExport.mock.calls[0][0].content);
     expect(rows.map((entry: { codex_credits: number }) => entry.codex_credits)).toEqual([42.5, 42.5]);
+    expect(rows.map((entry: { total_tokens: number }) => entry.total_tokens)).toEqual([777, 777]);
   });
   it('rejects an export completed under a superseded saved rate card', async () => {
     const summaries = Object.fromEntries(ids.map((id) => [id, {
-      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
+      tokens: zeroTokens, pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
     }]));
     ipcMocks.getSessionPricing.mockResolvedValue(summaries);
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
     await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(1));
     let finish!: (value: typeof summaries) => void;
-    ipcMocks.getSessionPricing.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    ipcMocks.prepareSessionSummaryExport.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
     await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
     await waitFor(() => expect(finish).toBeDefined());
     rates.set(testRateCard());
-    finish(summaries);
+    finish({ request: {}, as_of: '2026-10-04T00:00:00Z', digest: 'synthetic', content: '[]', session_count: 2 } as unknown as typeof summaries);
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Rates changed during export'));
     expect(ipcMocks.writeExport).not.toHaveBeenCalled();
+    expect(ipcMocks.publishSessionSummaryExport).not.toHaveBeenCalled();
   });
   it('rejects an export when an exported session changes while pricing is pending', async () => {
     const summaries = Object.fromEntries(ids.map((id) => [id, {
-      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
+      tokens: zeroTokens, pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
     }]));
     ipcMocks.getSessionPricing.mockResolvedValue(summaries);
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
     await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(1));
     let finish!: (value: typeof summaries) => void;
-    ipcMocks.getSessionPricing.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    ipcMocks.prepareSessionSummaryExport.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
     await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
     await waitFor(() => expect(finish).toBeDefined());
     sessionsStore.applyMutations([{ ...summary(ids[0], ids[0]), tokens_total: { ...zeroTokens, input_tokens: 100, total_tokens: 100 } }], []);
-    finish(summaries);
+    finish({ request: {}, as_of: '2026-10-04T00:00:00Z', digest: 'synthetic', content: '[]', session_count: 2 } as unknown as typeof summaries);
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Sessions changed during export'));
     expect(ipcMocks.writeExport).not.toHaveBeenCalled();
+    expect(ipcMocks.publishSessionSummaryExport).not.toHaveBeenCalled();
   });
   it('hides previous all-time prices after the latest incremental pricing fetch fails', async () => {
     ipcMocks.getSessionPricing.mockResolvedValue(Object.fromEntries(ids.map((id) => [id, {
-      pricing: { plan: { total: 42.5, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
+      tokens: { ...zeroTokens, total_tokens: 777 }, pricing: { plan: { total: 42.5, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
     }])));
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
@@ -451,12 +461,66 @@ describe('SessionsView range pricing refresh orchestration', () => {
     await waitFor(() => expect(row.querySelector('.text-accent-cost')).toHaveTextContent('unavailable'));
     expect(errors).toHaveBeenCalledWith('sessions_in_ranges failed:', expect.any(Error));
   });
-  it('refuses an export whose backend pricing is missing', async () => {
+
+  it('keeps a valid recent date window available when an older cumulative period is ambiguous', async () => {
+    ipcMocks.getSessionPricing.mockRejectedValue('accounting_identity_ambiguous');
+    const tokens = { ...zeroTokens, total_tokens: 901 };
+    const total = { tokens, buckets: [], tool_metrics: zeroTokens, tool_metrics_by_model: {}, optimization_findings_count: 0,
+      pricing: { plan: { total: 15, by_model: [], missing_models: [], unpriced_models: [] }, api: null } } as unknown as RangeTotals;
+    ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => Promise.resolve(ranges.map(() => ({ [ids[0]]: total }))));
+    mountRangeView();
+    const row = await screen.findByRole('button', { name: `Select session ${ids[0]}` });
+    await waitFor(() => expect(row).toHaveTextContent('901'));
+    expect(row.querySelector('.text-accent-cost')).toHaveTextContent('15.00');
+    expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument();
+  });
+  it('withholds raw footer and row totals after a cached sibling identity failure', async () => {
+    const snapshot = (fetchIds: string[]) => Object.fromEntries(fetchIds.map(id => [id, {
+      tokens: { ...zeroTokens, input_tokens: 901, total_tokens: 901 },
+      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {},
+    }]));
+    ipcMocks.getSessionPricing.mockImplementation((fetchIds: string[]) => Promise.resolve(snapshot(fetchIds)));
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
+    const row = await screen.findByRole('button', { name: `Select session ${ids[0]}` });
+    await waitFor(() => expect(row).toHaveTextContent('901'));
+    ipcMocks.getSessionPricing.mockRejectedValueOnce('accounting_identity_ambiguous');
+    sessionsStore.applyMutations([summary(ids[0], ids[0])], []);
+    await screen.findByText(/ambiguous accounting identities/);
+    expect(row).not.toHaveTextContent('901');
+    expect(row).toHaveTextContent('unavailable');
+    expect(ipcMocks.getSessionPricing.mock.calls.at(-1)).toEqual([[ids[0]], ids]);
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('ambiguous');
+    expect(errors).toHaveBeenCalled();
+  });
+  it('rejects same-epoch mutation results before applying an obsolete cumulative snapshot', async () => {
+    let finish!: (value: unknown) => void;
+    ipcMocks.getSessionPricing.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
+    await waitFor(() => expect(finish).toBeDefined());
+    sessionsStore.applyMutations([summary(ids[0], ids[0])], []);
+    finish(Object.fromEntries(ids.map(id => [id, { tokens: { ...zeroTokens, total_tokens: 998877 }, pricing: { plan: { total: 98989, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {} }])));
+    await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole('button', { name: `Select session ${ids[0]}` })).not.toHaveTextContent('998,877');
+    expect(ipcMocks.getSessionPricing.mock.calls.at(-1)).toEqual([ids, ids]);
+  });
+  it('refuses an export whose backend cumulative snapshot is missing', async () => {
+    ipcMocks.prepareSessionSummaryExport.mockRejectedValue('accounting_identity_unverified');
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
     await screen.findByRole('button', { name: `Select session ${ids[0]}` });
     await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
-    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('Pricing is unavailable'));
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('accounting_identity_unverified'));
     expect(ipcMocks.writeExport).not.toHaveBeenCalled();
+    expect(ipcMocks.publishSessionSummaryExport).not.toHaveBeenCalled();
+  });
+  it('shows a rejected post-picker identity proof without falling back to the generic writer', async () => {
+    ipcMocks.publishSessionSummaryExport.mockRejectedValueOnce('accounting_identity_ambiguous');
+    render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
+    await screen.findByRole('button', { name: `Select session ${ids[0]}` });
+    await fireEvent.click(screen.getAllByText('Export JSON').find(element => !(element as HTMLButtonElement).disabled)!);
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('accounting_identity_ambiguous'));
+    expect(ipcMocks.writeExport).not.toHaveBeenCalled();
+    expect(ipcMocks.publishSessionSummaryExport).toHaveBeenCalledTimes(1);
   });
   it.each(['resolve', 'reject'] as const)('discards obsolete %s after a rate replacement', async (outcome) => {
     const pending: { resolve: (value: Record<string, RangeTotals>[]) => void; reject: (reason: Error) => void; ranges: unknown[] }[] = [];
