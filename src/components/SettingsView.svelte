@@ -1,5 +1,6 @@
 <script lang="ts">
   import AttentionSettings from './AttentionSettings.svelte';
+  import AmbientSettings from './AmbientSettings.svelte';
   import { config } from '../lib/stores/config';
   import { defenderActionStore } from '../lib/stores/defender.svelte';
   import { rates } from '../lib/stores/rates';
@@ -33,8 +34,8 @@
 
   const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
 
-  interface Props { onopeninstructions?: () => void; }
-  let { onopeninstructions = () => {} }: Props = $props();
+  interface Props { onopeninstructions?: () => void; onAmbientEvidence?: (route: import("../lib/types").AmbientRoute) => void; }
+  let { onopeninstructions = () => {}, onAmbientEvidence }: Props = $props();
 
   let appVersion = $state('');
   let releaseNotesError = $state<string | null>(null);
@@ -1946,6 +1947,7 @@
     </div>
   </section>
 
+  <AmbientSettings onOpen={onAmbientEvidence} />
   <ProviderStatus />
   <AttentionSettings />
   <WidgetSettings />

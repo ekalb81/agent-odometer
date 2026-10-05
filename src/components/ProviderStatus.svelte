@@ -52,7 +52,7 @@
   }
 </script>
 
-<section aria-labelledby="provider-status-heading">
+<section id="provider-status-settings" aria-labelledby="provider-status-heading">
   <h2 id="provider-status-heading" class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Provider service status</h2>
   <div class="status-panel">
     <label><input type="checkbox" checked={$config.provider_status_enabled === true} onchange={toggle} disabled={saving} /> Check public provider service status</label>

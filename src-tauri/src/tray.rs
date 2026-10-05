@@ -10,7 +10,9 @@ pub struct TrayState {
     pub codex_credits: MenuItem<tauri::Wry>,
     pub codex_api: MenuItem<tauri::Wry>,
     pub claude_usd: MenuItem<tauri::Wry>,
+    pub gemini_plan: MenuItem<tauri::Wry>,
     pub quota: MenuItem<tauri::Wry>,
+    pub recent: MenuItem<tauri::Wry>,
     _tray: tauri::tray::TrayIcon<tauri::Wry>,
 }
 
@@ -20,6 +22,8 @@ pub struct TrayTotals {
     pub codex_credits: String,
     pub codex_api_usd: String,
     pub claude_usd: String,
+    #[serde(default)]
+    pub gemini_plan: String,
     /// Live-quota headroom label (issue #43), e.g. "codex 5h 37% left".
     /// Empty when nothing is available — the menu item then falls back to
     /// its placeholder text rather than rendering blank. Formatted
@@ -27,6 +31,10 @@ pub struct TrayTotals {
     /// already computed; this module only displays the string.
     #[serde(default)]
     pub quota: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub recent: String,
 }
 
 pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()> {
@@ -58,13 +66,59 @@ pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()>
         false,
         None::<&str>,
     )?;
+    let gemini_plan = MenuItem::with_id(
+        app,
+        "gemini_plan",
+        "Gemini plan estimate · —",
+        false,
+        None::<&str>,
+    )?;
     let quota = MenuItem::with_id(app, "quota", "Quota · —", false, None::<&str>)?;
+    let recent = MenuItem::with_id(
+        app,
+        "recent_alerts",
+        "Recent alerts · none",
+        true,
+        None::<&str>,
+    )?;
+    let all = MenuItem::with_id(
+        app,
+        "provider_all",
+        "Show all providers",
+        true,
+        None::<&str>,
+    )?;
+    let codex = MenuItem::with_id(app, "provider_codex", "Show Codex", true, None::<&str>)?;
+    let claude = MenuItem::with_id(
+        app,
+        "provider_claude_code",
+        "Show Claude Code",
+        true,
+        None::<&str>,
+    )?;
+    let gemini = MenuItem::with_id(
+        app,
+        "provider_gemini_cli",
+        "Show Gemini CLI",
+        true,
+        None::<&str>,
+    )?;
     let show_hide =
         MenuItem::with_id(app, "show_hide", "Show / Hide Odometer", true, None::<&str>)?;
     let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
     let menu = MenuBuilder::new(app)
-        .items(&[&tokens, &codex_credits, &codex_api, &claude_usd, &quota])
+        .items(&[
+            &tokens,
+            &codex_credits,
+            &codex_api,
+            &claude_usd,
+            &gemini_plan,
+            &quota,
+            &recent,
+        ])
+        .separator()
+        .items(&[&all, &codex, &claude, &gemini])
         .separator()
         .items(&[&show_hide, &settings, &quit])
         .build()?;
@@ -92,7 +146,18 @@ pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()>
                         let _ = window.set_focus();
                     }
                 }
-                "settings" => {
+                "provider_all"
+                | "provider_codex"
+                | "provider_claude_code"
+                | "provider_gemini_cli" => {
+                    let provider = event
+                        .id()
+                        .as_ref()
+                        .strip_prefix("provider_")
+                        .unwrap_or("all");
+                    let _ = app.emit("tray-provider-selected", provider);
+                }
+                "settings" | "recent_alerts" => {
                     let _ = window.show();
                     let _ = window.set_focus();
                     let _ = app.emit("open-settings", ());
@@ -106,7 +171,9 @@ pub fn start(app: &tauri::AppHandle, state: &Arc<AppState>) -> tauri::Result<()>
         codex_credits,
         codex_api,
         claude_usd,
+        gemini_plan,
         quota,
+        recent,
         _tray: tray,
     });
     state
@@ -120,23 +187,71 @@ pub fn update(state: &Arc<AppState>, totals: TrayTotals) -> Result<(), String> {
     let Some(tray) = guard.as_ref() else {
         return Ok(());
     };
+    let scope = match totals.provider.as_str() {
+        "codex" => "Codex",
+        "claude_code" => "Claude Code",
+        "gemini_cli" => "Gemini CLI",
+        _ => "All providers",
+    };
+    tray.recent
+        .set_text(format!(
+            "Recent alerts · {}",
+            if totals.recent.is_empty() {
+                "none"
+            } else {
+                &totals.recent
+            }
+        ))
+        .map_err(|error| error.to_string())?;
     tray.tokens
-        .set_text(format!("Today · {} tokens", totals.tokens))
+        .set_text(format!("Today · {scope} · {} tokens", totals.tokens))
+        .map_err(|error| error.to_string())?;
+    let codex_selected = matches!(totals.provider.as_str(), "codex" | "all" | "");
+    let claude_selected = matches!(totals.provider.as_str(), "claude_code" | "all" | "");
+    let gemini_selected = matches!(totals.provider.as_str(), "gemini_cli" | "all" | "");
+    tray.gemini_plan
+        .set_text(format!(
+            "Gemini plan estimate · {}",
+            if gemini_selected {
+                if totals.gemini_plan.is_empty() {
+                    "unavailable"
+                } else {
+                    &totals.gemini_plan
+                }
+            } else {
+                "not selected"
+            }
+        ))
         .map_err(|error| error.to_string())?;
     tray.codex_credits
         .set_text(format!(
             "Codex purchased-credit estimate · {}",
-            totals.codex_credits
+            if codex_selected {
+                &totals.codex_credits
+            } else {
+                "not selected"
+            }
         ))
         .map_err(|error| error.to_string())?;
     tray.codex_api
         .set_text(format!(
             "Codex API base estimate · {}",
-            totals.codex_api_usd
+            if codex_selected {
+                &totals.codex_api_usd
+            } else {
+                "not selected"
+            }
         ))
         .map_err(|error| error.to_string())?;
     tray.claude_usd
-        .set_text(format!("Claude estimate · {}", totals.claude_usd))
+        .set_text(format!(
+            "Claude estimate · {}",
+            if claude_selected {
+                &totals.claude_usd
+            } else {
+                "not selected"
+            }
+        ))
         .map_err(|error| error.to_string())?;
     let quota_text = if totals.quota.is_empty() {
         "Quota · —".to_string()

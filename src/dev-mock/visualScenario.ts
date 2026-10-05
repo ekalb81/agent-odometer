@@ -5,6 +5,7 @@
  */
 export const VISUAL_SCENARIOS = [
   'default',
+  'ambient-recent',
   'sessions-empty',
   'sessions-scanning',
   'sessions-availability-fallback',

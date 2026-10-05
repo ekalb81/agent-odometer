@@ -88,7 +88,7 @@
   }
 </script>
 
-<section class="max-w-3xl" aria-label="History retention and recovery">
+<section id="history-retention-settings" class="max-w-3xl" aria-label="History retention and recovery">
   <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Retention and recovery</h2>
   <p class="text-xs text-ink-faint mb-3">Missing or replaced transcripts keep their local history until you review and confirm a purge. Provider archival status is separate.</p>
   <div class="bg-card border border-edge rounded-lg px-4 py-3 space-y-3">

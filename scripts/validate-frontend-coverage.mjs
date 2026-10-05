@@ -3,6 +3,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/AmbientSettings.svelte',
+  'src/lib/ambientTray.ts',
+  'src/lib/stores/ambient.ts',
   'src/components/LocalWidget.svelte',
   'src/components/WidgetSettings.svelte',
   'src/components/ActivitySummary.svelte',

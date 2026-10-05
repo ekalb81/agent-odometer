@@ -1,0 +1,30 @@
+import { beforeEach, expect, it, vi } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import AmbientSettings from './AmbientSettings.svelte';
+import { ambient } from '../lib/stores/ambient';
+import type { QuotaConfigWire } from '../lib/types';
+const { getQuotaConfig, setQuotaConfig, getAmbientStatus } = vi.hoisted(() => ({ getQuotaConfig: vi.fn(), setQuotaConfig: vi.fn(), getAmbientStatus: vi.fn() }));
+vi.mock('../lib/ipc', () => ({ getQuotaConfig, setQuotaConfig, getAmbientStatus }));
+const config: QuotaConfigWire = { revision: 'r1', budgets: [], notifications: { enabled: true, quiet_hours: null }, max_cache_age_secs: 21600 };
+beforeEach(() => { vi.clearAllMocks(); ambient.set(null); getQuotaConfig.mockResolvedValue(structuredClone(config)); setQuotaConfig.mockImplementation(async value => value); getAmbientStatus.mockResolvedValue({ available: true, as_of: '2026-10-04T12:00:00Z', notifications: config.notifications, alerts: [], recent: [] }); });
+it('preserves existing budget opt-in and shows new categories off, then saves wrapped local quiet policy', async () => {
+  render(AmbientSettings);
+  expect(await screen.findByLabelText('Enable shared alerts')).toBeChecked();
+  expect(screen.getByLabelText(/Transcript attention/)).not.toBeChecked();
+  await fireEvent.click(screen.getByLabelText(/Transcript attention/));
+  await fireEvent.click(screen.getByLabelText(/Quiet hours/));
+  await fireEvent.click(screen.getByRole('button', { name: 'Save shared policy' }));
+  await waitFor(() => expect(setQuotaConfig).toHaveBeenCalledOnce());
+  expect(setQuotaConfig.mock.calls[0][0]).toMatchObject({ revision: 'r1', budgets: [], notifications: { enabled: true, quiet_hours: [22, 7], ambient: { attention: true, provider_incidents: false } } });
+});
+it('does not publish a delayed save after unmount and reports save failures honestly', async () => {
+  let resolve!: (value: QuotaConfigWire) => void;
+  setQuotaConfig.mockImplementationOnce(() => new Promise(done => { resolve = done; }));
+  const view = render(AmbientSettings); await screen.findByLabelText('Enable shared alerts');
+  await fireEvent.click(screen.getByRole('button', { name: 'Save shared policy' }));
+  view.unmount(); resolve(config); await new Promise(done => setTimeout(done, 0));
+  expect(getAmbientStatus).toHaveBeenCalledOnce();
+  setQuotaConfig.mockRejectedValue(new Error('failure')); render(AmbientSettings); await screen.findByLabelText('Enable shared alerts');
+  await fireEvent.click(screen.getByRole('button', { name: 'Save shared policy' }));
+  expect(await screen.findByRole('status')).toHaveTextContent('could not be saved');
+});

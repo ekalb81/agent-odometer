@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeTrayTotals, type TraySessionLike } from './trayTotals';
+import { computeTrayTotals, computeScopedTrayTotals, type TraySessionLike } from './trayTotals';
 import type { PricedSurface, RangeTotals, RateCard, TokenTotals } from './types';
 
 const zero: TokenTotals = {
@@ -56,6 +56,20 @@ function session(id: string, harness: TraySessionLike['harness'], unlimited: boo
 }
 
 describe('computeTrayTotals', () => {
+  it('preserves selected raw tokens while invalidated returned prices become unavailable', () => {
+    const sessions = [session('codex', 'codex'), session('claude', 'claude_code')];
+    const codex = range('codex', 100, 50), claude = range('claude', 20, 10);
+    codex.pricing = undefined; claude.pricing = undefined;
+    const value = computeScopedTrayTotals(sessions, { codex, claude }, rateCard, 'claude_code');
+    expect(value.provider).toBe('claude_code'); expect(value.tokens).toBe('30'); expect(value.claude_usd).toBe('unavailable');
+  });
+  it('keeps Gemini returned prices separate from Claude and preserves raw scope totals', () => {
+    const values = { gemini: range('gemini', 10, 20, 13.5, 27), claude: range('claude', 30, 40, 8, null) };
+    const all = computeTrayTotals([session('gemini', 'gemini_cli'), session('claude', 'claude_code')], values, rateCard);
+    expect(all.tokens).toBe('100'); expect(all.claude_usd).toBe('$8.00'); expect(all.gemini_plan).toBe('$13.50');
+    const selected = computeTrayTotals([session('gemini', 'gemini_cli')], values, rateCard);
+    expect(selected.tokens).toBe('30'); expect(selected.claude_usd).toBe('$0.00'); expect(selected.gemini_plan).toBe('$13.50');
+  });
   it('uses current server credit and API estimates, including unlimited comparison usage', () => {
     const value = range('synthetic', 1, 1, 99, 88);
     value.pricing!.current = { as_of: '2026-10-04T00:00:00Z', purchased_credits: surface(20), included_allowance: surface(25), api_estimate: surface(4) };

@@ -278,3 +278,4 @@ Organization stays in the local history database and is excluded from ordinary e
 Attention alerts are an opt-in local feature with explicit transcript-evidence limits; see [Agent attention](docs/ATTENTION_ALERTS.md).
 
 Optional editor surface: [Odometer Local for VS Code](extensions/vscode/README.md) reads the existing local CLI and ships as a separately built VSIX preview.
+Shared quiet hours, recent alerts, and explicit provider tray scope are documented in [Shared ambient controls](docs/AMBIENT_CONTROLS.md).

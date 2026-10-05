@@ -1136,6 +1136,23 @@ visualTest('attention-narrow', 'attention matching and disabling remain usable a
   expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
 });
 
+visualTest('ambient-shared-policy', 'shared quiet hours and opt-in categories', async (page) => {
+  await visit(page, { view: 'settings' });
+  const section = page.getByRole('region', { name: 'Shared alerts' });
+  await section.getByRole('checkbox', { name: 'Enable shared alerts', exact: true }).check();
+  await section.getByRole('checkbox', { name: /Quiet hours/ }).check();
+  await section.getByRole('button', { name: 'Save shared policy' }).click();
+  await expect(section.getByText(/Shared alert policy saved/)).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+});
+visualTest('ambient-recent-narrow', 'bounded recent alerts and evidence at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 900 });
+  await visit(page, { view: 'settings', scenario: 'ambient-recent', theme: 'dark' });
+  const section = page.getByRole('region', { name: 'Shared alerts' });
+  await expect(section.getByText(/Public provider incident observed/)).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+});
+
 assertManifestCasesAreRegistered();
 
 test('visual manifest covers every registered top-level view in light and dark', () => {

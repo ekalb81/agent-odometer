@@ -29,9 +29,10 @@
   const providerName = (provider: string) => ({ codex: 'Codex', claude_code: 'Claude Code', gemini_cli: 'Gemini CLI' })[provider] ?? 'Other provider';
 </script>
 
-<section aria-labelledby="attention-heading">
+<section id="attention-settings" aria-labelledby="attention-heading">
   <h2 id="attention-heading" class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Agent attention</h2>
   <div class="panel">
+    <p>Transcript categories also require <a href="#ambient-settings">Shared alerts</a> to be enabled. Shared quiet hours suppress both desktop and in-app delivery without replay.</p>
     <p>All alerts start off. Choose recorded events to receive local notices while Odometer is open. This reports transcript evidence, not process visibility or task quality. No hooks or network access are added.</p>
     {#if $attentionError || $attention?.available === false}<p role="status">Attention state is unavailable. Alerts are suppressed until it can be read and saved safely.</p>{/if}
     {#if draft}

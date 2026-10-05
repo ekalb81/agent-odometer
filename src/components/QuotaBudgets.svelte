@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { checkQuotaBudgets, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig } from '../lib/ipc';
+  import { getQuotaBudgetStatuses, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig } from '../lib/ipc';
   import type { BudgetUnit, ControlledActionPreview, ProjectInfo, QuotaAlert, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire } from '../lib/types';
   import type { ViewScope } from '../lib/sessionProjection';
   import { providersStore } from '../lib/stores/providers.svelte';
   import { historyStore } from '../lib/stores/history.svelte';
+  import { invalidateAmbient } from '../lib/stores/ambient';
   import { rates } from '../lib/stores/rates';
 
   interface Props {
@@ -70,7 +71,7 @@
     if (busy) return;
     const requestToken = ++reportGeneration;
     try {
-      const [nextConfig, nextReport] = await Promise.all([getQuotaConfig(), checkQuotaBudgets()]);
+      const [nextConfig, nextReport] = await Promise.all([getQuotaConfig(), getQuotaBudgetStatuses()]);
       if (lifecycleToken !== lifecycleGeneration || requestToken !== reportGeneration) return;
       config = nextConfig;
       report = nextReport;
@@ -168,6 +169,7 @@
 
   async function save(next: QuotaConfigWire): Promise<boolean> {
     if (!config || busy) return false;
+    invalidateAmbient();
     busy = true;
     saveError = null;
     // Invalidate any in-flight report captured before this edit. The next
@@ -274,8 +276,9 @@
     {#if config}
       <label class="flex items-center gap-1.5 text-[11px] text-ink-muted">
         <input type="checkbox" checked={config.notifications.enabled} disabled={busy} onchange={toggleNotifications} />
-        Notify me when a budget is crossed
+        Enable shared alerts (budgets and opted-in categories)
       </label>
+      <p class="text-[10px] text-ink-faint">Quiet hours and other categories are configured in Settings → Shared alerts.</p>
       {#if report?.as_of}<p class="text-[10px] text-ink-faint">Status as of {new Date(report.as_of).toLocaleTimeString()}</p>{/if}
       {#each visibleBudgets as budget (budget.id)}
         {@const status = statusByBudget.get(budget.id)}
