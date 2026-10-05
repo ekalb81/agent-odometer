@@ -7,6 +7,6 @@ it('preserves unknown as unavailable and qualifies identity errors without discl
   expect(hasVerifiedTokens(zeroTotals())).toBe(true);
   expect(accountingUnavailable('accounting_identity_ambiguous: /private/source')).toContain('ambiguous accounting identities');
   expect(accountingUnavailable('accounting_identity_unverified')).toContain('verification is incomplete');
-  expect(accountingUnavailable('accounting_export_changed')).toContain('Rechecking');
+  expect(accountingUnavailable('accounting_export_changed')).toContain('Refresh the preview');
   expect(accountingUnavailable('/private/source')).not.toContain('/private/source');
 });

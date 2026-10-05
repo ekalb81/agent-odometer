@@ -6,8 +6,8 @@ import CalendarActivity from './CalendarActivity.svelte';
 import type { HistoryStatus, RangeTotals } from '../lib/types';
 import { historyStore } from '../lib/stores/history.svelte';
 
-const mocks = vi.hoisted(() => ({ query: vi.fn(), queryHistory: vi.fn(), scan: { complete: true } }));
-vi.mock('../lib/ipc', () => ({ sessionsInRanges: mocks.query, getHistoryStatus: mocks.queryHistory }));
+const mocks = vi.hoisted(() => ({ query: vi.fn(), queryHistory: vi.fn(), publish: vi.fn(), scan: { complete: true } }));
+vi.mock('../lib/ipc', () => ({ sessionsInRanges: mocks.query, getHistoryStatus: mocks.queryHistory, publishActivitySummaryExport: mocks.publish }));
 vi.mock('../lib/stores/scan.svelte', () => ({ scanStore: { get status() { return mocks.scan; } } }));
 const range = { tokens: { total_tokens: 70 }, tool_metrics: { calls: 4 } } as RangeTotals;
 function setHistory(status: HistoryStatus['status'], coverage_complete: boolean): void {
@@ -19,6 +19,7 @@ beforeEach(() => {
   setHistory('ready', true); mocks.scan = { complete: true };
   mocks.query.mockReset().mockImplementation(async (bounds: unknown[]) => bounds.map(() => ({})));
   mocks.queryHistory.mockReset().mockImplementation(async () => historyStore.status);
+  mocks.publish.mockReset().mockResolvedValue(true);
 });
 afterEach(() => vi.unstubAllEnvs());
 const props = { from: '2026-07-28T00:00:00Z', to: '2026-07-29T23:59:59.999Z', sessionIds: ['codex:parent', 'codex:tools'], onbucket: vi.fn() };
@@ -31,6 +32,15 @@ describe('calendar activity', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Preview summary card' }));
     expect(screen.getByRole('dialog')).toBeInTheDocument();
     expect((screen.getByLabelText('Companion Markdown') as HTMLTextAreaElement).value).toContain('70 recorded tokens');
+    await userEvent.click(screen.getByRole('button', { name: 'Save SVG…' }));
+    expect(mocks.publish).toHaveBeenCalledWith(expect.objectContaining({
+      session_ids: props.sessionIds,
+      coverage_complete: true,
+      days: [
+        { from: '2026-07-28T00:00:00.000Z', to: '2026-07-28T23:59:59.999Z', tokens: 70, tool_calls: 4 },
+        { from: '2026-07-29T00:00:00.000Z', to: '2026-07-29T23:59:59.999Z', tokens: 0, tool_calls: 0 },
+      ],
+    }), 'odometer-activity.svg');
     await view.rerender({ ...props, sessionIds: ['claude:other'] });
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     setHistory('unavailable', false);

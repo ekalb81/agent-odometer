@@ -7,7 +7,7 @@
   import { scanStore } from '../lib/stores/scan.svelte';
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
-  import type { RangeTotals } from '../lib/types';
+  import type { ActivitySummaryExportRequest, RangeTotals } from '../lib/types';
   import { activitySummary } from '../lib/activitySummary';
   import ActivitySummary from './ActivitySummary.svelte';
 
@@ -23,7 +23,7 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let retry = $state(0);
-  let summary = $state<{ svg: string; markdown: string } | null>(null);
+  let summary = $state<{ svg: string; markdown: string; request: Omit<ActivitySummaryExportRequest, 'svg'> } | null>(null);
   let summaryError = $state('');
   let epoch = 0;
   let jobGeneration = 0;
@@ -48,7 +48,16 @@
 
   function previewSummary(): void {
     if (loading || error || !days.length || (evidence.state !== 'complete' && evidence.state !== 'partial')) return;
-    try { summary = activitySummary({ days, metric, zone, harness, selectedProject: !!projectKey, coverage: evidence.state }); }
+    try {
+      summary = {
+        ...activitySummary({ days, metric, zone, harness, selectedProject: !!projectKey, coverage: evidence.state }),
+        request: {
+          session_ids: [...selectedIds],
+          days: days.map(({ from, to, tokens, tool_calls }) => ({ from, to, tokens, tool_calls })),
+          coverage_complete: evidence.state === 'complete',
+        },
+      };
+    }
     catch (reason) { summaryError = String(reason).replace(/^Error: /, ''); }
   }
 

@@ -1,9 +1,9 @@
 <script lang="ts">
   import { accountingUnavailable } from '../lib/accountingAvailability';
-  import { compareToolImpact, listToolImpactTargets, writeExport } from '../lib/ipc';
+  import { compareToolImpact, listToolImpactTargets, publishToolDimensionExport } from '../lib/ipc';
   import type { ToolDimensionKind, ToolImpactCohort, ToolImpactResult, ToolImpactTarget } from '../lib/types';
   import { topDimensionValues, type DimensionTotals } from '../lib/toolDimensions';
-  import { dimensionExportRows, rowsToCsv } from '../lib/sessionProjection';
+  import { dimensionExportRows } from '../lib/sessionProjection';
 
   interface Props {
     active?: boolean;
@@ -11,6 +11,9 @@
     from: string | null;
     to: string | null;
     windowLabel: string;
+    /** Exact ledger bounds behind dimensionTotals; comparison bounds can be quantized. */
+    dimensionFrom?: string | null;
+    dimensionTo?: string | null;
     /** Issue #44 open-set dimension totals, already aggregated by the
      *  caller across the sessions in view. */
     dimensionTotals?: DimensionTotals;
@@ -25,6 +28,8 @@
     from,
     to,
     windowLabel,
+    dimensionFrom = null,
+    dimensionTo = null,
     dimensionTotals = {},
     dimensionAvailability = {
       mcp_server: false,
@@ -77,10 +82,9 @@
     dimensionExportError = null;
     try {
       const rows = dimensionExportRows(dimensionTotals);
-      const content = format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows);
-      await writeExport(`odometer-tool-dimensions-${new Date().toISOString().slice(0, 10)}.${format}`, format, content);
+      await publishToolDimensionExport({ session_ids: [...sessionIds], from: dimensionFrom, to: dimensionTo, format, rows }, `odometer-tool-dimensions-${new Date().toISOString().slice(0, 10)}.${format}`);
     } catch (error) {
-      dimensionExportError = String(error);
+      dimensionExportError = accountingUnavailable(error);
     } finally {
       dimensionExportBusy = false;
     }

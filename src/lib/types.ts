@@ -322,6 +322,31 @@ export interface PreparedSessionSummaryExport {
   session_count: number;
 }
 
+export interface ActivitySummaryExportRequest {
+  session_ids: string[];
+  days: { from: string; to: string; tokens: number; tool_calls: number }[];
+  coverage_complete: boolean;
+  svg: string;
+}
+
+export type ToolDimensionExportRow = {
+  dimension_kind: string;
+  dimension_value: string;
+  calls: number;
+  failures: number;
+  output_bytes: number;
+  duration_ms: number;
+  tokens: number;
+};
+
+export interface ToolDimensionExportRequest {
+  session_ids: string[];
+  from: string | null;
+  to: string | null;
+  format: 'csv' | 'json';
+  rows: ToolDimensionExportRow[];
+}
+
 export interface TurnPrice {
   cost: number;
   fallback_used: boolean;

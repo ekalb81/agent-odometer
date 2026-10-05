@@ -8,7 +8,7 @@ export function unavailableTokens(): TokenTotals {
 
 export function accountingUnavailable(reason: unknown): string {
   const message = String(reason);
-  if (message.includes('accounting_export_changed')) return 'Usage changed while choosing the export destination. Rechecking the complete scope.';
+  if (message.includes('accounting_export_changed')) return 'Usage changed while choosing the export destination. Refresh the preview before exporting.';
   if (message.includes('accounting_identity_ambiguous')) {
     return 'Usage unavailable: historical records contain ambiguous accounting identities. Individual records remain available.';
   }

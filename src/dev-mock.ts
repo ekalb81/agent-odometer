@@ -579,6 +579,8 @@ mockIPC((cmd, payload) => {
       return { request, as_of: new Date(now).toISOString(), digest: 'browser-fixture-only', content: request.format === 'json' ? `${JSON.stringify(rows, null, 2)}\n` : rowsToCsv(rows), session_count: sessions.length } satisfies PreparedSessionSummaryExport;
     }
     case 'publish_session_summary_export':
+    case 'publish_activity_summary_export':
+    case 'publish_tool_dimension_export':
       return true; // Synthetic browser fixture performs no file publication.
     case 'get_session_pricing': {
       const { sessionIds } = payload as { sessionIds: string[] };

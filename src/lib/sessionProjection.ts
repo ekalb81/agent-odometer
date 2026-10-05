@@ -491,8 +491,8 @@ export function rowsToCsv(rows: Record<string, string | number | boolean | null>
  */
 export function dimensionExportRows(
   totals: DimensionTotals,
-): Record<string, string | number | boolean | null>[] {
-  const rows: Record<string, string | number | boolean | null>[] = [];
+): import('./types').ToolDimensionExportRow[] {
+  const rows: import('./types').ToolDimensionExportRow[] = [];
   for (const kind of Object.keys(totals).sort()) {
     const values = totals[kind as keyof DimensionTotals];
     if (!values) continue;

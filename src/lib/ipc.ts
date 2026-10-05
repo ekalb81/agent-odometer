@@ -86,6 +86,16 @@ export function publishSessionSummaryExport(prepared: import('./types').Prepared
   return invoke('publish_session_summary_export', { prepared, filename });
 }
 
+/** Rechecks every captured day and archive coverage after the native picker. */
+export function publishActivitySummaryExport(request: import('./types').ActivitySummaryExportRequest, filename: string): Promise<boolean> {
+  return invoke('publish_activity_summary_export', { request, filename });
+}
+
+/** Rechecks the complete dimension scope and serializes verified rows in Rust. */
+export function publishToolDimensionExport(request: import('./types').ToolDimensionExportRequest, filename: string): Promise<boolean> {
+  return invoke('publish_tool_dimension_export', { request, filename });
+}
+
 /** Full session (turns + token history) for the detail drawer. */
 export function getSessionDetails(sessionId: string): Promise<Session | null> {
   return invoke<Session | null>('get_session_details', { sessionId });

@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   TokenTotals,
@@ -9,13 +9,13 @@ import type {
 } from '../lib/types';
 import ToolImpact from './ToolImpact.svelte';
 
-const { compareToolImpact, listToolImpactTargets, writeExport } = vi.hoisted(() => ({
+const { compareToolImpact, listToolImpactTargets, publishToolDimensionExport } = vi.hoisted(() => ({
   compareToolImpact: vi.fn(),
   listToolImpactTargets: vi.fn(),
-  writeExport: vi.fn(),
+  publishToolDimensionExport: vi.fn(),
 }));
 
-vi.mock('../lib/ipc', () => ({ compareToolImpact, listToolImpactTargets, writeExport }));
+vi.mock('../lib/ipc', () => ({ compareToolImpact, listToolImpactTargets, publishToolDimensionExport }));
 
 function tokens(total: number): TokenTotals {
   return {
@@ -92,10 +92,31 @@ const LOADING_COMPARISON = /Comparing observed and baseline turns/;
 beforeEach(() => {
   compareToolImpact.mockReset();
   listToolImpactTargets.mockReset();
-  writeExport.mockReset();
+  publishToolDimensionExport.mockReset();
 });
 
 describe('ToolImpact', () => {
+  it.each(['csv', 'json'] as const)('exports %s dimensions with the full scope and exact ledger bounds, including context tokens', async (format) => {
+    listToolImpactTargets.mockResolvedValue([]);
+    publishToolDimensionExport.mockResolvedValue(true);
+    const dimensions = { context_source: { conversation_cache: { calls: 0, failures: 0, output_bytes: 0, duration_ms: 0, tokens: 321 } } };
+    render(ToolImpact, { ...BASE_PROPS, dimensionFrom: null, dimensionTo: '2026-08-07T00:00:42.999Z', dimensionTotals: dimensions });
+    await fireEvent.click(screen.getByRole('button', { name: `Export ${format.toUpperCase()}` }));
+    expect(publishToolDimensionExport).toHaveBeenCalledWith({
+      session_ids: ['a', 'b'], from: null, to: '2026-08-07T00:00:42.999Z', format,
+      rows: [{ dimension_kind: 'context_source', dimension_value: 'conversation_cache', ...dimensions.context_source.conversation_cache }],
+    }, expect.stringMatching(new RegExp(`^odometer-tool-dimensions-.*\\.${format}$`)));
+  });
+
+  it('shows a safe unavailable state when dimension authority changes during the picker', async () => {
+    listToolImpactTargets.mockResolvedValue([]);
+    publishToolDimensionExport.mockRejectedValue(new Error('accounting_export_changed: private location'));
+    render(ToolImpact, { ...BASE_PROPS, dimensionTotals: { context_source: { conversation_cache: { calls: 0, failures: 0, output_bytes: 0, duration_ms: 0, tokens: 321 } } } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Export CSV' }));
+    await screen.findByText(/Usage changed while choosing the export destination/);
+    expect(screen.queryByText(/private location/)).not.toBeInTheDocument();
+    expect(publishToolDimensionExport).toHaveBeenCalledTimes(1);
+  });
   it('shows loading placeholders only on the first load', async () => {
     listToolImpactTargets.mockResolvedValue([target('grep', 'grep')]);
     compareToolImpact.mockResolvedValue(result('grep', 2_000));
@@ -117,7 +138,7 @@ describe('ToolImpact', () => {
     await rerender({ ...BASE_PROPS, sessionIds: ['a', 'b'] });
     await waitFor(() => expect(listToolImpactTargets).toHaveBeenCalledTimes(2));
     expect(screen.queryByText('Tokens / turn')).toBeNull();
-    expect(screen.queryByText(/grep · 20 turns/)).toBeNull();
+    expect(screen.queryByText(/grep Â· 20 turns/)).toBeNull();
     expect(screen.getByText(LOADING_TARGETS)).toBeTruthy();
     expect(panel.open).toBe(true);
   });
@@ -164,7 +185,7 @@ describe('ToolImpact', () => {
     await rerender({ ...BASE_PROPS, to: '2026-08-07T00:01:00.000Z' });
     await screen.findByText(/accounting identity verification is incomplete/i);
     expect(screen.queryByText('Tokens / turn')).toBeNull();
-    expect(screen.queryByText(/grep · 20 turns/)).toBeNull();
+    expect(screen.queryByText(/grep Â· 20 turns/)).toBeNull();
     expect(screen.queryByText(/private detail/)).toBeNull();
   });
 
