@@ -36,6 +36,10 @@ regex          = "1.12"  # escaped literal Unicode search; bounded compiled patt
 tauri-plugin-updater = "2.12"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
+# Public opt-in service status; same HTTP client already used by updater.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+# Same crypto provider as the updater; status may run before its first check.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 gix = { version = "0.87", default-features = false, features = ["sha1"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "hooks"] }
 tauri-plugin-opener = "2"

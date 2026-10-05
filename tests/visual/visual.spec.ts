@@ -12,6 +12,7 @@ const FIXED_TIME = new Date('2026-07-29T15:30:00.000Z');
 const visualStyles = readFileSync(new URL('./screenshot.css', import.meta.url), 'utf8');
 
 interface VisitOptions {
+  surface?: 'widget';
   scenario?: string;
   theme?: Theme;
   view?: ViewId;
@@ -53,7 +54,14 @@ async function visit(page: Page, options: VisitOptions = {}): Promise<void> {
     else document.addEventListener('DOMContentLoaded', applyVisualCss, { once: true });
   }, { selectedTheme: theme, css: visualStyles });
 
-  await page.goto(visualUrl(scenario), { waitUntil: 'domcontentloaded' });
+  await page.goto(visualUrl(scenario) + (options.surface === 'widget' ? '&surface=widget' : ''), { waitUntil: 'domcontentloaded' });
+  if (options.surface === 'widget') {
+    await expect(page.getByRole('main', { name: 'Local quota and usage widget' })).toBeVisible();
+    await expect(page.getByText('Snapshot computed:', { exact: false })).toBeVisible();
+    await page.evaluate(async () => { await document.fonts.ready; });
+    await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+    return;
+  }
   await page.locator('nav[aria-label="Views"]').waitFor();
   await page.evaluate(async () => { await document.fonts.ready; });
   await expect(page.locator('nav[aria-label="Views"]')).toBeVisible();
@@ -148,6 +156,27 @@ function assertManifestCasesAreRegistered(): void {
     throw new Error(`Manifest snapshots without a visual test: ${unregistered.join(', ')}`);
   }
 }
+
+visualTest('widget-stale-quota', 'local widget stale quota at compact width', async (page) => {
+  await page.setViewportSize({ width: 360, height: 440 });
+  await visit(page, { surface: 'widget', scenario: 'widget-stale' });
+  await expect(page.getByText('Recorded 37% remaining')).toBeVisible();
+});
+visualTest('widget-partial-usage', 'local widget partial usage in dark theme', async (page) => {
+  await page.setViewportSize({ width: 480, height: 640 });
+  await visit(page, { surface: 'widget', scenario: 'widget-usage', theme: 'dark' });
+  await expect(page.getByText(/Partial snapshot/)).toBeVisible();
+});
+visualTest('widget-empty-minimum', 'local widget empty usage at minimum size', async (page) => {
+  await page.setViewportSize({ width: 300, height: 220 });
+  await visit(page, { surface: 'widget', scenario: 'widget-empty' });
+  await expect(page.getByText('0 tokens')).toBeVisible();
+});
+visualTest('widget-settings-opt-in', 'local widget visibility settings remain opt-in', async (page) => {
+  await visit(page, { view: 'settings' });
+  await page.getByRole('heading', { name: 'Compact local widget', exact: true }).scrollIntoViewIfNeeded();
+  await expect(page.getByRole('checkbox', { name: /Show widget now/ })).not.toBeChecked();
+});
 
 visualTest('calendar-activity', 'calendar heatmap and daily trend', async (page) => {
   await visit(page, { view: 'codex' });
@@ -795,6 +824,63 @@ visualTest('handoff-retained-narrow', 'handoff labels missing source and stays u
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
   await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
   await handoff.getByRole('textbox', { name: /Exact handoff Markdown/ }).scrollIntoViewIfNeeded();
+});
+
+visualTest('provider-status-opt-in', 'public provider status keeps incident and unavailable evidence separate', async (page) => {
+  await visit(page, { view: 'settings' });
+  const section = page.getByRole('region', { name: 'Provider service status' });
+  const consent = section.getByRole('checkbox', { name: 'Check public provider service status' });
+  await expect(consent).not.toBeChecked();
+  await consent.check();
+  await expect(section.getByText('Minor incident', { exact: true })).toBeVisible();
+  await expect(section.getByText(/This is not a current reading/)).toBeVisible();
+  await expect(section.getByText('Unavailable · no supported public source')).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+});
+
+visualTest('provider-status-narrow', 'public status opt-out remains usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 900 });
+  await visit(page, { view: 'settings', theme: 'dark' });
+  const section = page.getByRole('region', { name: 'Provider service status' });
+  const consent = section.getByRole('checkbox', { name: 'Check public provider service status' });
+  await consent.check();
+  await expect(section.getByText('Rate limited; waiting before retry.')).toBeVisible();
+  await consent.uncheck();
+  await expect(section.getByText(/Public status checks are off/)).toBeVisible();
+  await expect(section.getByText('Minor incident', { exact: true })).toHaveCount(0);
+  await consent.check();
+  await expect(section.getByText('Minor incident', { exact: true })).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+  const bounds = await section.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
+visualTest('attention-observations', 'attention opt-in preserves unknown and source evidence', async (page) => {
+  await visit(page, { view: 'settings' });
+  const section = page.getByRole('region', { name: 'Agent attention' });
+  await expect(section.getByRole('checkbox', { name: 'Input requested' })).not.toBeChecked();
+  await section.getByRole('checkbox', { name: 'Input requested' }).check();
+  await section.getByRole('button', { name: 'Save attention preferences' }).click();
+  await expect(section.getByText(/Session 01234567 · waiting/)).toBeVisible();
+  await expect(section.getByText(/Session fedcba98 · unknown/)).toBeVisible();
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+});
+
+visualTest('attention-narrow', 'attention matching and disabling remain usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 900 });
+  await visit(page, { view: 'settings', theme: 'dark' });
+  const section = page.getByRole('region', { name: 'Agent attention' });
+  await section.getByRole('checkbox', { name: 'Tool failed' }).check();
+  await section.getByLabel('Tool category').selectOption('command');
+  await section.getByRole('button', { name: 'Save attention preferences' }).click();
+  await expect(section.getByText(/Only new observations can notify/)).toBeVisible();
+  await section.getByRole('checkbox', { name: 'Tool failed' }).uncheck();
+  await section.getByRole('button', { name: 'Save attention preferences' }).click();
+  await expect(section.getByText('Most recent transcript evidence')).toHaveCount(0);
+  await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
+  const bounds = await section.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0); expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
 });
 
 assertManifestCasesAreRegistered();

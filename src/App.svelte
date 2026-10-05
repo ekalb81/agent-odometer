@@ -2,6 +2,7 @@
   import { onMount, untrack } from 'svelte';
   import SessionsView from './components/SessionsView.svelte';
   import SettingsView from './components/SettingsView.svelte';
+  import AttentionMonitor from './components/AttentionMonitor.svelte';
   import InstructionsView from './components/InstructionsView.svelte';
   import Filters from './components/Filters.svelte';
   import OrganizationToolbar from './components/OrganizationToolbar.svelte';
@@ -664,6 +665,8 @@
       </div>
     {/if}
   </header>
+
+  <AttentionMonitor />
 
   <!-- Main content. Harness views stay mounted so filters/sort survive tab switches. -->
   <main class="flex-1 overflow-hidden">

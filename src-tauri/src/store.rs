@@ -502,7 +502,9 @@ pub struct AppState {
     /// Cached `get_quota_snapshots` output; see [`crate::quota::QuotaSnapshotCache`]
     /// (issue #128).
     quota_snapshot_cache: crate::quota::QuotaSnapshotCache,
+    pub attention: crate::attention::AttentionService,
     pub live_quota: Arc<crate::quota_accounts::LiveQuotaService>,
+    pub provider_status: Arc<crate::provider_status::ProviderStatusService>,
     pub(crate) quota_evaluation: Mutex<()>,
     /// Incrementally maintained per-provider rate-limit points/credit
     /// observations feeding [`Self::quota_snapshots`]'s recompute path
@@ -560,7 +562,9 @@ impl AppState {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            attention: crate::attention::AttentionService::open_default(),
             live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
+            provider_status: Arc::new(crate::provider_status::ProviderStatusService::default()),
             quota_evaluation: Mutex::new(()),
             quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
@@ -1904,6 +1908,7 @@ impl AppState {
             watcher_touched: false,
             removed: false,
         };
+        self.attention.observe(&session, Utc::now(), false);
         self.quota_points_index
             .update_session(&storage_id, &session);
         self.sessions
@@ -1940,6 +1945,7 @@ impl AppState {
             watcher_touched: true,
             removed: false,
         };
+        self.attention.observe(&session, Utc::now(), true);
         self.quota_points_index
             .update_session(&storage_id, &session);
         self.sessions
@@ -2354,7 +2360,9 @@ mod tests {
             sessions_generation: AtomicU64::new(0),
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+            attention: crate::attention::AttentionService::default(),
             live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
+            provider_status: Arc::new(crate::provider_status::ProviderStatusService::default()),
             quota_evaluation: Mutex::new(()),
             quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }

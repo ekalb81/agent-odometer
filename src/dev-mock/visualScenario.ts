@@ -25,6 +25,9 @@ export const VISUAL_SCENARIOS = [
   'updater-available',
   'updater-installing',
   'updater-error',
+  'widget-stale',
+  'widget-usage',
+  'widget-empty',
 ] as const;
 
 export type VisualScenario = (typeof VISUAL_SCENARIOS)[number];

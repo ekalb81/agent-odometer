@@ -1,5 +1,13 @@
 {
   "snapshots": [
+    "provider-status-opt-in",
+    "provider-status-narrow",
+    "attention-observations",
+    "attention-narrow",
+    "widget-stale-quota",
+    "widget-partial-usage",
+    "widget-empty-minimum",
+    "widget-settings-opt-in",
     "handoff-reviewed-source",
     "handoff-retained-narrow",
     "organization-saved-search",

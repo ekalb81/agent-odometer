@@ -616,6 +616,52 @@ pub async fn list_sessions(state: State<'_, Arc<AppState>>) -> Result<Vec<Sessio
     result
 }
 
+#[tauri::command]
+pub fn get_widget_settings() -> Result<crate::widget::WidgetSettings, String> {
+    crate::widget::load()
+}
+
+#[tauri::command]
+pub async fn set_widget_settings(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    revision: u64,
+    preferences: crate::widget::WidgetPreferences,
+) -> Result<crate::widget::WidgetSettings, String> {
+    if window.label() != "main" {
+        return Err("Configure the widget in the main Settings window".into());
+    }
+    let settings =
+        tauri::async_runtime::spawn_blocking(move || crate::widget::save(revision, preferences))
+            .await
+            .map_err(|_| "Widget settings could not be saved")??;
+    let _ = app.emit("widget-settings-updated", &settings);
+    crate::widget::apply_window(&app, &settings.preferences)?;
+    Ok(settings)
+}
+
+#[tauri::command]
+pub async fn get_widget_snapshot(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::widget::WidgetSnapshot, String> {
+    let settings = crate::widget::load()?;
+    if !settings.preferences.visible {
+        return Err("Widget is disabled".into());
+    }
+    let rates = get_rates();
+    let app_state = state.inner().clone();
+    let approved_revision = settings.revision;
+    let snapshot = tauri::async_runtime::spawn_blocking(move || {
+        crate::widget::snapshot(&app_state, settings, &rates, Utc::now())
+    })
+    .await
+    .map_err(|_| "Local widget snapshot unavailable")??;
+    if crate::widget::load()?.revision != approved_revision {
+        return Err("Widget settings changed; refresh again".into());
+    }
+    Ok(snapshot)
+}
+
 /// Returns one full session (turns and token history included), for the
 /// detail drawer. Issue #139: `state.sessions` holds only a resident summary,
 /// so this now loads full content on demand — from the ledger, or from the
@@ -1258,6 +1304,9 @@ pub fn set_config(
         let integration_error = integration
             .and_then(|transaction| transaction.commit().err())
             .map(|error| error.to_string());
+        state
+            .provider_status
+            .configure(config.provider_status_enabled);
         state.performance.configure(
             config.performance_tracking_enabled,
             config.performance_log_max_mb,
@@ -1325,6 +1374,9 @@ pub fn set_config(
     let integration_error = integration
         .and_then(|transaction| transaction.commit().err())
         .map(|error| error.to_string());
+    state
+        .provider_status
+        .configure(config.provider_status_enabled);
     state.performance.configure(
         config.performance_tracking_enabled,
         config.performance_log_max_mb,
@@ -5114,4 +5166,57 @@ pub async fn delete_saved_search(
     })
     .await
     .map_err(|_| "Private organization operation failed".to_owned())?
+}
+
+/// Updates only the explicitly selected flag under the existing config transition
+/// lock. Frontend startup defaults must never become a replacement configuration.
+#[tauri::command]
+pub fn set_provider_status_enabled(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    enabled: bool,
+) -> Result<Config, String> {
+    let _transition = state.config_transition.lock().unwrap();
+    let mut config = Config::load_read_only().map_err(|_| "Configuration unavailable")?;
+    config.provider_status_enabled = enabled;
+    config
+        .save()
+        .map_err(|_| "Service-status setting could not be saved")?;
+    state.provider_status.configure(enabled);
+    // A committed setting remains authoritative even if a listener notification
+    // cannot be delivered; the requester receives the saved configuration.
+    let _ = app.emit("config-updated", &config);
+    Ok(config)
+}
+
+/// Reads isolated public-status observations; this service has no ledger access.
+#[tauri::command]
+pub fn get_provider_service_status(
+    state: State<'_, Arc<AppState>>,
+) -> crate::provider_status::StatusSnapshot {
+    state.provider_status.refresh_due();
+    state.provider_status.snapshot(Utc::now())
+}
+
+/// Body-free observations and alerts; a missing/purged source is not live evidence.
+#[tauri::command]
+pub fn get_attention_status(state: State<'_, Arc<AppState>>) -> crate::attention::Snapshot {
+    state.attention.snapshot(Utc::now(), |id| {
+        state.sessions.get(id).is_some_and(|entry| {
+            entry.summary.source_availability == crate::model::SourceAvailability::Present
+                && entry.summary.lifecycle == crate::model::SessionLifecycle::Present
+                && !entry.summary.archived
+        })
+    })
+}
+
+#[tauri::command]
+pub fn set_attention_preferences(
+    state: State<'_, Arc<AppState>>,
+    preferences: crate::attention::Preferences,
+) -> Result<crate::attention::Preferences, String> {
+    state
+        .attention
+        .preferences(preferences, Utc::now())
+        .map_err(str::to_owned)
 }
