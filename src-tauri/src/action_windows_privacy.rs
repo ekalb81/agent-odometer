@@ -247,7 +247,7 @@ impl PrivateJournal {
             return Err(PrivacyError::Unsafe);
         }
         wide_path(path)?;
-        Ok(())
+        self.verify_binding()
     }
 }
 
@@ -662,6 +662,39 @@ mod tests {
                     || error.raw_os_error() == Some(1314) => {}
             Err(error) => panic!("synthetic symlink creation failed: {error}"),
         }
+    }
+
+    #[test]
+    fn rejects_junction_journal_without_touching_its_referent() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("destination");
+        let journal = root.path().join("private-action-journal");
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("synthetic-sentinel"), b"unchanged").unwrap();
+        // Static test-only command; paths are data in environment variables,
+        // never interpolated into PowerShell source or production behavior.
+        let status = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$ErrorActionPreference = 'Stop'; New-Item -ItemType Junction -Path $env:ODOMETER_TEST_JUNCTION -Value $env:ODOMETER_TEST_DESTINATION | Out-Null",
+            ])
+            .env("ODOMETER_TEST_JUNCTION", &journal)
+            .env("ODOMETER_TEST_DESTINATION", &destination)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(PrivateJournal::open_or_create(root.path(), &journal).is_err());
+        assert_eq!(
+            fs::read(destination.join("synthetic-sentinel")).unwrap(),
+            b"unchanged"
+        );
+        fs::remove_dir(&journal).unwrap();
+        assert_eq!(
+            fs::read(destination.join("synthetic-sentinel")).unwrap(),
+            b"unchanged"
+        );
     }
 
     #[test]

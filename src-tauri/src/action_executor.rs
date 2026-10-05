@@ -400,6 +400,8 @@ fn write_event(
     let mut staged = tempfile::NamedTempFile::new_in(&target.journal)?;
     staged.write_all(&bytes)?;
     staged.as_file().sync_all()?;
+    #[cfg(windows)]
+    journal.verify_binding()?;
     staged
         .persist_noclobber(&path)
         .map_err(|_| ActionError::Io)?;
@@ -845,7 +847,7 @@ mod tests {
         target
     }
 
-    fn write_new_journal_fixture(target: &ResolvedTarget, path: &PathBuf, bytes: &[u8]) {
+    fn write_new_journal_fixture(target: &ResolvedTarget, path: &std::path::Path, bytes: &[u8]) {
         #[cfg(windows)]
         {
             let journal = open_private_journal(target).unwrap();
