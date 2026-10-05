@@ -130,6 +130,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "claude-fable-5",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 307369,
+                  "cached_input_tokens": 922106,
+                  "input_tokens": 2382108,
+                  "output_tokens": 1460002,
+                  "reasoning_output_tokens": 438001,
+                  "total_tokens": 3842110
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 307369,
+              "cached_input_tokens": 922106,
+              "input_tokens": 2382108,
+              "output_tokens": 1460002,
+              "reasoning_output_tokens": 438001,
+              "total_tokens": 3842110
+            },
+            "tool_calls": 21,
+            "turns": 7
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -145,6 +173,14 @@
             "total": 21.42975564,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 307369,
+          "cached_input_tokens": 922106,
+          "input_tokens": 2382108,
+          "output_tokens": 1460002,
+          "reasoning_output_tokens": 438001,
+          "total_tokens": 3842110
         }
       }
     },
@@ -287,6 +323,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "claude-opus-4-8",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 414299,
+                  "cached_input_tokens": 1242897,
+                  "input_tokens": 3210816,
+                  "output_tokens": 1967920,
+                  "reasoning_output_tokens": 590376,
+                  "total_tokens": 5178736
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 414299,
+              "cached_input_tokens": 1242897,
+              "input_tokens": 3210816,
+              "output_tokens": 1967920,
+              "reasoning_output_tokens": 590376,
+              "total_tokens": 5178736
+            },
+            "tool_calls": 24,
+            "turns": 8
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -302,6 +366,14 @@
             "total": 38.51322704,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 414299,
+          "cached_input_tokens": 1242897,
+          "input_tokens": 3210816,
+          "output_tokens": 1967920,
+          "reasoning_output_tokens": 590376,
+          "total_tokens": 5178736
         }
       }
     },
@@ -381,6 +453,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "claude-haiku-4-5",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 18516,
+                  "cached_input_tokens": 55547,
+                  "input_tokens": 143497,
+                  "output_tokens": 87950,
+                  "reasoning_output_tokens": 26385,
+                  "total_tokens": 231447
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 18516,
+              "cached_input_tokens": 55547,
+              "input_tokens": 143497,
+              "output_tokens": 87950,
+              "reasoning_output_tokens": 26385,
+              "total_tokens": 231447
+            },
+            "tool_calls": 3,
+            "turns": 1
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -396,6 +496,14 @@
             "total": 0.188259295,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 18516,
+          "cached_input_tokens": 55547,
+          "input_tokens": 143497,
+          "output_tokens": 87950,
+          "reasoning_output_tokens": 26385,
+          "total_tokens": 231447
         }
       }
     },
@@ -502,6 +610,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "claude-sonnet-5",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 38954,
+                  "cached_input_tokens": 116861,
+                  "input_tokens": 301891,
+                  "output_tokens": 185030,
+                  "reasoning_output_tokens": 55509,
+                  "total_tokens": 486921
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 38954,
+              "cached_input_tokens": 116861,
+              "input_tokens": 301891,
+              "output_tokens": 185030,
+              "reasoning_output_tokens": 55509,
+              "total_tokens": 486921
+            },
+            "tool_calls": 12,
+            "turns": 4
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -517,6 +653,14 @@
             "total": 1.35792552,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 38954,
+          "cached_input_tokens": 116861,
+          "input_tokens": 301891,
+          "output_tokens": 185030,
+          "reasoning_output_tokens": 55509,
+          "total_tokens": 486921
         }
       }
     },
@@ -641,6 +785,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "claude-opus-4-8",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 152364,
+                  "cached_input_tokens": 457093,
+                  "input_tokens": 1180823,
+                  "output_tokens": 723730,
+                  "reasoning_output_tokens": 217119,
+                  "total_tokens": 1904553
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 152364,
+              "cached_input_tokens": 457093,
+              "input_tokens": 1180823,
+              "output_tokens": 723730,
+              "reasoning_output_tokens": 217119,
+              "total_tokens": 1904553
+            },
+            "tool_calls": 18,
+            "turns": 6
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -656,6 +828,14 @@
             "total": 14.163776960000002,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 152364,
+          "cached_input_tokens": 457093,
+          "input_tokens": 1180823,
+          "output_tokens": 723730,
+          "reasoning_output_tokens": 217119,
+          "total_tokens": 1904553
         }
       }
     },
@@ -807,6 +987,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "claude-fable-5",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 153785,
+                  "cached_input_tokens": 461354,
+                  "input_tokens": 1191831,
+                  "output_tokens": 730477,
+                  "reasoning_output_tokens": 219143,
+                  "total_tokens": 1922308
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 153785,
+              "cached_input_tokens": 461354,
+              "input_tokens": 1191831,
+              "output_tokens": 730477,
+              "reasoning_output_tokens": 219143,
+              "total_tokens": 1922308
+            },
+            "tool_calls": 27,
+            "turns": 9
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -822,6 +1030,14 @@
             "total": 10.721864759999999,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 153785,
+          "cached_input_tokens": 461354,
+          "input_tokens": 1191831,
+          "output_tokens": 730477,
+          "reasoning_output_tokens": 219143,
+          "total_tokens": 1922308
         }
       }
     },
@@ -919,6 +1135,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "claude-sonnet-5",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 46833,
+                  "cached_input_tokens": 140498,
+                  "input_tokens": 362954,
+                  "output_tokens": 222456,
+                  "reasoning_output_tokens": 66737,
+                  "total_tokens": 585410
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 46833,
+              "cached_input_tokens": 140498,
+              "input_tokens": 362954,
+              "output_tokens": 222456,
+              "reasoning_output_tokens": 66737,
+              "total_tokens": 585410
+            },
+            "tool_calls": 9,
+            "turns": 3
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -934,6 +1178,14 @@
             "total": 1.63259286,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 46833,
+          "cached_input_tokens": 140498,
+          "input_tokens": 362954,
+          "output_tokens": 222456,
+          "reasoning_output_tokens": 66737,
+          "total_tokens": 585410
         }
       }
     },
@@ -1039,6 +1291,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gemini-2.5-pro",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 194988,
+                  "input_tokens": 503719,
+                  "output_tokens": 308731,
+                  "reasoning_output_tokens": 92619,
+                  "total_tokens": 812450
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 194988,
+              "input_tokens": 503719,
+              "output_tokens": 308731,
+              "reasoning_output_tokens": 92619,
+              "total_tokens": 812450
+            },
+            "tool_calls": 9,
+            "turns": 3
+          }
+        },
         "pricing": {
           "api": null,
           "plan": {
@@ -1056,6 +1336,14 @@
             "total": 3.0778855800000002,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 194988,
+          "input_tokens": 503719,
+          "output_tokens": 308731,
+          "reasoning_output_tokens": 92619,
+          "total_tokens": 812450
         }
       }
     },
@@ -1483,6 +1771,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-sol",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 761814,
+                  "input_tokens": 1968020,
+                  "output_tokens": 1206205,
+                  "reasoning_output_tokens": 361862,
+                  "total_tokens": 3174225
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 761814,
+              "input_tokens": 1968020,
+              "output_tokens": 1206205,
+              "reasoning_output_tokens": 361862,
+              "total_tokens": 3174225
+            },
+            "tool_calls": 18,
+            "turns": 6
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -1553,6 +1869,14 @@
             "total": 12.025230140000001,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 761814,
+          "input_tokens": 1968020,
+          "output_tokens": 1206205,
+          "reasoning_output_tokens": 361862,
+          "total_tokens": 3174225
         }
       }
     },
@@ -2010,6 +2334,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.7-visual-preview",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 761814,
+                  "input_tokens": 1968020,
+                  "output_tokens": 1206205,
+                  "reasoning_output_tokens": 361862,
+                  "total_tokens": 3174225
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 761814,
+              "input_tokens": 1968020,
+              "output_tokens": 1206205,
+              "reasoning_output_tokens": 361862,
+              "total_tokens": 3174225
+            },
+            "tool_calls": 18,
+            "turns": 6
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -2090,6 +2442,14 @@
             "total": 12.025230140000001,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 761814,
+          "input_tokens": 1968020,
+          "output_tokens": 1206205,
+          "reasoning_output_tokens": 361862,
+          "total_tokens": 3174225
         }
       }
     },
@@ -2381,6 +2741,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-luna",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 32046,
+                  "input_tokens": 82787,
+                  "output_tokens": 50740,
+                  "reasoning_output_tokens": 15222,
+                  "total_tokens": 133527
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 32046,
+              "input_tokens": 82787,
+              "output_tokens": 50740,
+              "reasoning_output_tokens": 15222,
+              "total_tokens": 133527
+            },
+            "tool_calls": 6,
+            "turns": 2
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -2451,6 +2839,14 @@
             "total": 0.06897984,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 32046,
+          "input_tokens": 82787,
+          "output_tokens": 50740,
+          "reasoning_output_tokens": 15222,
+          "total_tokens": 133527
         }
       }
     },
@@ -2980,6 +3376,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-sol",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 1445110,
+                  "input_tokens": 3733200,
+                  "output_tokens": 2288090,
+                  "reasoning_output_tokens": 686427,
+                  "total_tokens": 6021290
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 1445110,
+              "input_tokens": 3733200,
+              "output_tokens": 2288090,
+              "reasoning_output_tokens": 686427,
+              "total_tokens": 6021290
+            },
+            "tool_calls": 27,
+            "turns": 9
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -3050,6 +3474,14 @@
             "total": 22.811053100000002,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 1445110,
+          "input_tokens": 3733200,
+          "output_tokens": 2288090,
+          "reasoning_output_tokens": 686427,
+          "total_tokens": 6021290
         }
       }
     },
@@ -3409,6 +3841,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-terra",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 119612,
+                  "input_tokens": 308997,
+                  "output_tokens": 189386,
+                  "reasoning_output_tokens": 56816,
+                  "total_tokens": 498383
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 119612,
+              "input_tokens": 308997,
+              "output_tokens": 189386,
+              "reasoning_output_tokens": 56816,
+              "total_tokens": 498383
+            },
+            "tool_calls": 12,
+            "turns": 4
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -3479,6 +3939,14 @@
             "total": 0.8582171,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 119612,
+          "input_tokens": 308997,
+          "output_tokens": 189386,
+          "reasoning_output_tokens": 56816,
+          "total_tokens": 498383
         }
       }
     },
@@ -3868,6 +4336,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.3-codex-spark",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 119612,
+                  "input_tokens": 308997,
+                  "output_tokens": 189386,
+                  "reasoning_output_tokens": 56816,
+                  "total_tokens": 498383
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 119612,
+              "input_tokens": 308997,
+              "output_tokens": 189386,
+              "reasoning_output_tokens": 56816,
+              "total_tokens": 498383
+            },
+            "tool_calls": 12,
+            "turns": 4
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -3948,6 +4444,14 @@
               "gpt-5.3-codex-spark"
             ]
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 119612,
+          "input_tokens": 308997,
+          "output_tokens": 189386,
+          "reasoning_output_tokens": 56816,
+          "total_tokens": 498383
         }
       }
     },
@@ -4341,6 +4845,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-terra",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 267565,
+                  "input_tokens": 691211,
+                  "output_tokens": 423645,
+                  "reasoning_output_tokens": 127094,
+                  "total_tokens": 1114856
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 267565,
+              "input_tokens": 691211,
+              "output_tokens": 423645,
+              "reasoning_output_tokens": 127094,
+              "total_tokens": 1114856
+            },
+            "tool_calls": 15,
+            "turns": 5
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -4411,6 +4943,14 @@
             "total": 1.91978125,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 267565,
+          "input_tokens": 691211,
+          "output_tokens": 423645,
+          "reasoning_output_tokens": 127094,
+          "total_tokens": 1114856
         }
       }
     },
@@ -5008,6 +5548,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-sol",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 1047916,
+                  "input_tokens": 2707117,
+                  "output_tokens": 1659201,
+                  "reasoning_output_tokens": 497760,
+                  "total_tokens": 4366318
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 1047916,
+              "input_tokens": 2707117,
+              "output_tokens": 1659201,
+              "reasoning_output_tokens": 497760,
+              "total_tokens": 4366318
+            },
+            "tool_calls": 33,
+            "turns": 11
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -5078,6 +5646,14 @@
             "total": 16.54136066,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 1047916,
+          "input_tokens": 2707117,
+          "output_tokens": 1659201,
+          "reasoning_output_tokens": 497760,
+          "total_tokens": 4366318
         }
       }
     },
@@ -5539,6 +6115,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-sol",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 331212,
+                  "input_tokens": 855630,
+                  "output_tokens": 524419,
+                  "reasoning_output_tokens": 157326,
+                  "total_tokens": 1380049
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 331212,
+              "input_tokens": 855630,
+              "output_tokens": 524419,
+              "reasoning_output_tokens": 157326,
+              "total_tokens": 1380049
+            },
+            "tool_calls": 21,
+            "turns": 7
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -5609,6 +6213,14 @@
             "total": 5.22818032,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 331212,
+          "input_tokens": 855630,
+          "output_tokens": 524419,
+          "reasoning_output_tokens": 157326,
+          "total_tokens": 1380049
         }
       }
     },
@@ -5934,6 +6546,34 @@
             }
           }
         },
+        "category_totals": {
+          "coding": {
+            "buckets": [
+              {
+                "model": "gpt-5.6-luna",
+                "service_tier": null,
+                "tokens": {
+                  "cache_creation_input_tokens": 0,
+                  "cached_input_tokens": 118266,
+                  "input_tokens": 305521,
+                  "output_tokens": 187255,
+                  "reasoning_output_tokens": 56177,
+                  "total_tokens": 492776
+                }
+              }
+            ],
+            "tokens": {
+              "cache_creation_input_tokens": 0,
+              "cached_input_tokens": 118266,
+              "input_tokens": 305521,
+              "output_tokens": 187255,
+              "reasoning_output_tokens": 56177,
+              "total_tokens": 492776
+            },
+            "tool_calls": 9,
+            "turns": 3
+          }
+        },
         "pricing": {
           "api": {
             "by_model": [
@@ -6004,6 +6644,14 @@
             "total": 0.25456824,
             "unpriced_models": []
           }
+        },
+        "tokens": {
+          "cache_creation_input_tokens": 0,
+          "cached_input_tokens": 118266,
+          "input_tokens": 305521,
+          "output_tokens": 187255,
+          "reasoning_output_tokens": 56177,
+          "total_tokens": 492776
         }
       }
     }

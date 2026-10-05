@@ -1,3 +1,12 @@
+// Serializes application rate replacements with reviewed accounting publication.
+// No lock is held across a native picker or network work.
+pub(crate) static ACCOUNTING_RATE_PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ACCOUNTING_RATE_REVISION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) fn accounting_rate_revision() -> u64 {
+    ACCOUNTING_RATE_REVISION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -929,6 +938,9 @@ impl RateCard {
     }
 
     fn save_at(&self, path: &std::path::Path) -> anyhow::Result<Self> {
+        let _publication = ACCOUNTING_RATE_PUBLICATION
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Rate publication unavailable"))?;
         self.validate()?;
         let mut persisted = self.clone();
         persisted.delivery = None;
@@ -954,6 +966,7 @@ impl RateCard {
             }
         }
         atomic_rate_write(path, &bytes)?;
+        ACCOUNTING_RATE_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Backup failure cannot invalidate an already committed valid save.
         // Reads still fail closed to an older valid backup or the embedded card.
         let backup_failed =

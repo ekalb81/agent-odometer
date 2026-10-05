@@ -14,6 +14,9 @@ use crate::rates::{PricingBasis, PricingProvenance, PricingSurface, RateCard};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SummaryPricing {
+    /// Authoritative cumulative totals from the same proved snapshot as pricing.
+    pub tokens: TokenTotals,
+    pub category_totals: BTreeMap<crate::model::TaskCategory, crate::model::CategoryMetric>,
     pub pricing: RangePricing,
     pub categories: BTreeMap<String, RangePricing>,
 }
@@ -140,6 +143,8 @@ pub fn price_summary(
     now: DateTime<Utc>,
 ) -> SummaryPricing {
     SummaryPricing {
+        tokens: summary.tokens_total.clone(),
+        category_totals: summary.category_totals.clone(),
         pricing: price_surfaces(&summary.buckets, summary.harness.as_str(), rates, now),
         categories: summary
             .category_totals

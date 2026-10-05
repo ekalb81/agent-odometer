@@ -555,10 +555,26 @@ pub async fn correlate_events(
                 .map(|(key, summary)| (key.as_str(), summary)),
             &query,
         );
-        let sessions = blocking_state.full_sessions(&candidate_ids)?;
-        let mut correlation = crate::correlation::correlate(&sessions, query);
+        if candidate_ids
+            .iter()
+            .any(|key| blocking_state.ledger_is_stale(key))
+        {
+            return Err(crate::history_store::AccountingIntegrityError::Unverified.to_string());
+        }
+        let history = blocking_state.history_ready().ok_or_else(|| {
+            crate::history_store::AccountingIntegrityError::Unverified.to_string()
+        })?;
+        let mut correlation = history
+            .accounting_correlation(&candidate_ids, query)
+            .map_err(|error| error.to_string())?;
+        if candidate_ids
+            .iter()
+            .any(|key| blocking_state.ledger_is_stale(key))
+        {
+            return Err(crate::history_store::AccountingIntegrityError::Unverified.to_string());
+        }
         crate::query::enrich_correlation_pricing(&mut correlation, &get_rates(), Utc::now());
-        Ok::<_, String>((sessions.len(), correlation))
+        Ok::<_, String>((candidate_ids.len(), correlation))
     })
     .await
     .map_err(|error| error.to_string())
@@ -871,10 +887,11 @@ pub async fn resolve_retained_search_target(
 pub async fn get_session_pricing(
     state: State<'_, Arc<AppState>>,
     session_ids: Vec<String>,
+    aggregate_session_ids: Option<Vec<String>>,
 ) -> Result<HashMap<String, crate::query::SummaryPricing>, String> {
     let started = Instant::now();
     let app_state = state.inner().clone();
-    let session_ids: std::collections::HashSet<_> = session_ids.into_iter().collect();
+    let aggregate_keys = aggregate_session_ids.unwrap_or_else(|| session_ids.clone());
     let session_count = session_ids.len();
     if matches!(app_state.history_readiness(), HistoryReadinessKind::Pending) {
         app_state.performance.record_backend(
@@ -893,14 +910,23 @@ pub async fn get_session_pricing(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let rates = get_rates();
         let now = Utc::now();
-        let mut prices = HashMap::new();
-        for summary in blocking_state.session_summaries()? {
-            if session_ids.contains(&summary.storage_id) {
-                prices.insert(
-                    summary.storage_id.clone(),
-                    crate::query::price_summary(&summary, &rates, now),
-                );
-            }
+        if aggregate_keys
+            .iter()
+            .any(|key| blocking_state.ledger_is_stale(key))
+        {
+            return Err(crate::history_store::AccountingIntegrityError::Unverified.to_string());
+        }
+        let history = blocking_state.history_ready().ok_or_else(|| {
+            crate::history_store::AccountingIntegrityError::Unverified.to_string()
+        })?;
+        let prices = history
+            .accounting_summary_prices(&session_ids, &aggregate_keys, &rates, now)
+            .map_err(|error| error.to_string())?;
+        if aggregate_keys
+            .iter()
+            .any(|key| blocking_state.ledger_is_stale(key))
+        {
+            return Err(crate::history_store::AccountingIntegrityError::Unverified.to_string());
         }
         Ok::<_, String>(prices)
     })
@@ -1018,6 +1044,7 @@ pub async fn sessions_in_ranges(
     state: State<'_, Arc<AppState>>,
     ranges: Vec<RangeBounds>,
     session_ids: Option<Vec<String>>,
+    aggregate_session_ids: Option<Vec<String>>,
 ) -> Result<Vec<HashMap<String, RangeTotals>>, String> {
     let started = Instant::now();
     if ranges.len() > 64 {
@@ -1041,18 +1068,13 @@ pub async fn sessions_in_ranges(
             .map(|summary| summary.storage_id)
             .collect(),
     };
+    let aggregate_keys = aggregate_session_ids.unwrap_or_else(|| keys.clone());
     let session_count = keys.len();
     let range_count = bounds.len();
-    // The ledger is the accounting authority for this endpoint (AGENTS.md).
-    // While it is still opening/migrating (#116), the in-memory fallback
-    // below would only cover whatever the bulk scan has managed to observe
-    // so far — itself gated behind this same readiness signal, see
-    // `spawn_scan` — and a partial-looking-complete answer is worse than an
-    // honest "not ready yet". Callers already treat a failure here as "leave
-    // the cache as-is and retry on the next mutation" (see
-    // `SessionsView.svelte`'s `sessions_in_ranges` call sites), which
-    // self-heals automatically once the scan resumes after the ledger opens
-    // and its `session-updated` events retrigger the fetch.
+    // Aggregate authority is durable and covers the complete caller scope.
+    // Pending, unavailable, or refused proof clears numeric presentation;
+    // callers retry after readiness or mutation invalidation. Resident data
+    // never supplies a partial accounting fallback.
     if matches!(app_state.history_readiness(), HistoryReadinessKind::Pending) {
         app_state.performance.record_backend(
             "ipc.sessions_in_ranges",
@@ -1068,7 +1090,14 @@ pub async fn sessions_in_ranges(
     }
     let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        range_totals_for_sessions(&blocking_state, keys, &bounds, &get_rates(), Utc::now())
+        range_totals_for_sessions(
+            &blocking_state,
+            keys,
+            aggregate_keys,
+            &bounds,
+            &get_rates(),
+            Utc::now(),
+        )
     })
     .await
     .map_err(|e| e.to_string())
@@ -1097,6 +1126,7 @@ type PricedRangeMaps = Vec<HashMap<String, RangeTotals>>;
 pub(crate) fn range_totals_for_sessions(
     state: &AppState,
     keys: Vec<String>,
+    aggregate_keys: Vec<String>,
     bounds: &[crate::model::RangeWindow],
     rates: &RateCard,
     now: DateTime<Utc>,
@@ -1104,60 +1134,18 @@ pub(crate) fn range_totals_for_sessions(
     if matches!(state.history_readiness(), HistoryReadinessKind::Pending) {
         return Err("durable history is still preparing; retry shortly".into());
     }
-    // The ledger is authoritative when available; sessions whose latest
-    // persist failed (plus everything, when the store never opened) fall
-    // back to walking in-memory history, keeping answers complete.
-    let (ledger_keys, memory_keys): (Vec<String>, Vec<String>) = match state.history_ready() {
-        Some(_) => keys
-            .into_iter()
-            .partition(|key| !state.ledger_is_stale(key)),
-        None => (Vec::new(), keys),
-    };
-    let mut source = "memory";
-    let mut out: Vec<HashMap<String, RangeTotals>> = vec![HashMap::new(); bounds.len()];
-    let mut memory_keys = memory_keys;
-    if let Some(history) = state.history_ready() {
-        match history.range_totals_multi(&ledger_keys, bounds) {
-            Ok(maps) => {
-                source = if memory_keys.is_empty() {
-                    "ledger"
-                } else {
-                    "mixed"
-                };
-                out = maps;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "ledger range aggregation failed; recomputing in memory: {}",
-                    error
-                );
-                // Distinct from store-absent "memory" so recordings can
-                // spot ledger regressions rather than configuration.
-                source = "fallback";
-                memory_keys.extend(ledger_keys);
-            }
-        }
+    let unverified = || crate::history_store::AccountingIntegrityError::Unverified.to_string();
+    // A proof of durable facts cannot authorize a mixed resident fallback.
+    // Missing, stale, or exhausted authority is unavailable rather than zero.
+    if aggregate_keys.iter().any(|key| state.ledger_is_stale(key)) {
+        return Err(unverified());
     }
-    if !memory_keys.is_empty() {
-        // Issue #139: `state.sessions` no longer carries full
-        // `tokens_history`, so the in-memory fallback for exactly these
-        // (expected-rare) sessions resolves full content on demand —
-        // from the resident full-content fallback for a genuinely
-        // ledger-stale session, or a ledger read for a session whose
-        // facts are correct but rollups lag. A failure here is a hard
-        // error for the whole call rather than a silent partial: a
-        // window with no entry for one of these sessions reads as zero
-        // to the frontend, which would be exactly #116's silent
-        // undercount if the miss were swallowed instead.
-        let sessions = state.full_sessions(&memory_keys)?;
-        for session in sessions {
-            let key = session.effective_storage_id();
-            for (i, rt) in session.range_totals_multi(bounds).into_iter().enumerate() {
-                if range_has_data(&rt) {
-                    out[i].insert(key.clone(), rt);
-                }
-            }
-        }
+    let history = state.history_ready().ok_or_else(unverified)?;
+    let mut out = history
+        .range_totals_multi_for_scope(&keys, &aggregate_keys, bounds)
+        .map_err(|error| error.to_string())?;
+    if aggregate_keys.iter().any(|key| state.ledger_is_stale(key)) {
+        return Err(unverified());
     }
     crate::query::enrich_range_pricing(&mut out, rates, now, |key| {
         state
@@ -1165,7 +1153,7 @@ pub(crate) fn range_totals_for_sessions(
             .get(key)
             .map(|entry| entry.summary.harness.clone())
     });
-    Ok((out, source))
+    Ok((out, "ledger"))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1300,14 +1288,19 @@ pub async fn compare_tool_impact(
     let target_kind = query.target_kind;
     let blocking_state = app_state.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let sessions = blocking_state.full_sessions(&ids)?;
-        Ok::<_, String>(crate::tool_impact::compare(
-            &sessions,
-            target_kind,
-            &target_key,
-            from,
-            to,
-        ))
+        if ids.iter().any(|key| blocking_state.ledger_is_stale(key)) {
+            return Err(crate::history_store::AccountingIntegrityError::Unverified.to_string());
+        }
+        let history = blocking_state.history_ready().ok_or_else(|| {
+            crate::history_store::AccountingIntegrityError::Unverified.to_string()
+        })?;
+        let result = history
+            .accounting_tool_comparison(&ids, target_kind, &target_key, from, to)
+            .map_err(|error| error.to_string())?;
+        if ids.iter().any(|key| blocking_state.ledger_is_stale(key)) {
+            return Err(crate::history_store::AccountingIntegrityError::Unverified.to_string());
+        }
+        Ok::<_, String>(result)
     })
     .await
     .map_err(|error| error.to_string())
@@ -4906,7 +4899,11 @@ pub(crate) fn quota_budget_statuses(
                 };
                 identity_proof()?;
                 let mut ranges = history
-                    .range_totals_multi(&keys, &[(Some(since), Some(now))])
+                    .range_totals_multi_with_control(
+                        &keys,
+                        &[(Some(since), Some(now))],
+                        &identity_control,
+                    )
                     .map_err(|_| "history_unavailable")?;
                 identity_proof()?;
                 crate::query::enrich_range_pricing(&mut ranges, rates, now, |key| {
@@ -5502,6 +5499,274 @@ pub fn change_quota_account(
         .map_err(str::to_owned);
     let _ = app.emit("live-quota-updated", ());
     result
+}
+
+/// Backend reviewed accounting output; frontend rows never establish authority.
+#[tauri::command]
+pub async fn prepare_session_summary_export(
+    state: State<'_, Arc<AppState>>,
+    request: crate::history_store::accounting_export::SessionSummaryExportRequest,
+) -> Result<crate::history_store::accounting_export::PreparedSessionSummaryExport, String> {
+    let history = state
+        .history_ready()
+        .ok_or("accounting_identity_unverified: durable history unavailable")?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if request
+            .session_ids
+            .iter()
+            .any(|key| state.ledger_is_stale(key))
+        {
+            return Err(
+                "accounting_identity_unverified: accounting reconciliation pending".to_owned(),
+            );
+        }
+        let _rates = crate::rates::ACCOUNTING_RATE_PUBLICATION
+            .lock()
+            .map_err(|_| "accounting_identity_unverified: rate authority unavailable".to_owned())?;
+        let prepared = history
+            .prepare_session_summary_export(
+                request,
+                &get_rates(),
+                Utc::now(),
+                crate::rates::accounting_rate_revision(),
+            )
+            .map_err(|error| error.to_string())?;
+        if prepared
+            .request
+            .session_ids
+            .iter()
+            .any(|key| state.ledger_is_stale(key))
+        {
+            return Err(
+                "accounting_identity_unverified: accounting reconciliation pending".to_owned(),
+            );
+        }
+        Ok(prepared)
+    })
+    .await
+    .map_err(|_| "Accounting export unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn publish_session_summary_export(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    prepared: crate::history_store::accounting_export::PreparedSessionSummaryExport,
+    filename: String,
+) -> Result<bool, String> {
+    if !matches!(prepared.request.format.as_str(), "csv" | "json")
+        || filename.is_empty()
+        || filename.len() > 255
+        || filename.contains(['/', '\\', '\r', '\n'])
+        || prepared.content.len() > 8 * 1024 * 1024
+        || prepared.digest.len() != 64
+        || prepared.request.session_ids.len() > 50_000
+    {
+        return Err("accounting_identity_unverified: invalid accounting export".into());
+    }
+    let Some(path) = app
+        .dialog()
+        .file()
+        .set_title("Export reviewed Odometer sessions")
+        .set_file_name(&filename)
+        .add_filter(
+            prepared.request.format.to_uppercase(),
+            &[prepared.request.format.as_str()],
+        )
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "Export destination unavailable".to_owned())?;
+    if !path
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case(&prepared.request.format))
+    {
+        return Err("Export filename must use the reviewed format extension".into());
+    }
+    let history = state
+        .history_ready()
+        .ok_or("accounting_identity_unverified: durable history unavailable")?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if prepared
+            .request
+            .session_ids
+            .iter()
+            .any(|key| state.ledger_is_stale(key))
+        {
+            return Err(
+                "accounting_identity_unverified: accounting reconciliation pending".to_owned(),
+            );
+        }
+        // Lock order: rates then history. Rate writers never acquire history;
+        // no publication lock spans the user-controlled native picker.
+        let _rates = crate::rates::ACCOUNTING_RATE_PUBLICATION
+            .lock()
+            .map_err(|_| "accounting_identity_unverified: rate authority unavailable".to_owned())?;
+        history
+            .publish_session_summary_export(
+                &prepared,
+                &get_rates(),
+                Utc::now(),
+                crate::rates::accounting_rate_revision(),
+                |content| {
+                    if prepared
+                        .request
+                        .session_ids
+                        .iter()
+                        .any(|key| state.ledger_is_stale(key))
+                    {
+                        anyhow::bail!(
+                            "accounting_identity_unverified: accounting reconciliation pending"
+                        );
+                    }
+                    publish_atomic_accounting_export(&path, content)
+                },
+            )
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Accounting export unavailable".to_owned())??;
+    Ok(true)
+}
+#[tauri::command]
+pub async fn publish_activity_summary_export(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    request: crate::history_store::accounting_export::ActivitySummaryExportRequest,
+    filename: String,
+) -> Result<bool, String> {
+    if request.svg.is_empty()
+        || request.svg.len() > 1024 * 1024
+        || request.days.is_empty()
+        || request.days.len() > 366
+        || request.session_ids.len() > 50_000
+        || filename.is_empty()
+        || filename.len() > 255
+        || filename.contains(['/', '\\', '\r', '\n'])
+    {
+        return Err("accounting_identity_unverified: invalid activity export".into());
+    }
+    let Some(path) = app
+        .dialog()
+        .file()
+        .set_title("Export reviewed activity summary")
+        .set_file_name(&filename)
+        .add_filter("SVG", &["svg"])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "Export destination unavailable".to_owned())?;
+    if !path
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case("svg"))
+    {
+        return Err("Export filename must end in .svg".into());
+    }
+    let history = state
+        .history_ready()
+        .ok_or("accounting_identity_unverified: durable history unavailable")?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if request.session_ids.iter().any(|key|state.ledger_is_stale(key)) {return Err("accounting_identity_unverified: accounting reconciliation pending".to_owned());}
+        let scan_complete=state.scanned.load(std::sync::atomic::Ordering::Acquire);
+        history.publish_activity_summary_export(&request,scan_complete,|content| {
+            if state.scanned.load(std::sync::atomic::Ordering::Acquire)!=scan_complete {anyhow::bail!("accounting_export_changed: activity coverage changed; reload before exporting");}
+            if request.session_ids.iter().any(|key|state.ledger_is_stale(key)) {anyhow::bail!("accounting_identity_unverified: accounting reconciliation pending");}
+            publish_atomic_accounting_export(&path,content)
+        }).map_err(|error|error.to_string())
+    }).await.map_err(|_|"Activity export unavailable".to_owned())??;
+    Ok(true)
+}
+#[tauri::command]
+pub async fn publish_tool_dimension_export(
+    app: AppHandle,
+    state: State<'_, Arc<AppState>>,
+    request: crate::history_store::accounting_export::ToolDimensionExportRequest,
+    filename: String,
+) -> Result<bool, String> {
+    if !matches!(request.format.as_str(), "csv" | "json")
+        || request.rows.len() > 10_000
+        || request.session_ids.len() > 50_000
+        || serde_json::to_vec(&request).map_or(true, |value| value.len() > 8 * 1024 * 1024)
+        || filename.is_empty()
+        || filename.len() > 255
+        || filename.contains(['/', '\\', '\r', '\n'])
+    {
+        return Err("accounting_identity_unverified: invalid dimension export".into());
+    }
+    let Some(path) = app
+        .dialog()
+        .file()
+        .set_title("Export reviewed tool dimensions")
+        .set_file_name(&filename)
+        .add_filter(request.format.to_uppercase(), &[request.format.as_str()])
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    let path = path
+        .into_path()
+        .map_err(|_| "Export destination unavailable".to_owned())?;
+    if !path
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| v.eq_ignore_ascii_case(&request.format))
+    {
+        return Err("Export filename must use the reviewed format extension".into());
+    }
+    let history = state
+        .history_ready()
+        .ok_or("accounting_identity_unverified: durable history unavailable")?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if request
+            .session_ids
+            .iter()
+            .any(|key| state.ledger_is_stale(key))
+        {
+            return Err(
+                "accounting_identity_unverified: accounting reconciliation pending".to_owned(),
+            );
+        }
+        history
+            .publish_tool_dimension_export(&request, |content| {
+                if request
+                    .session_ids
+                    .iter()
+                    .any(|key| state.ledger_is_stale(key))
+                {
+                    anyhow::bail!(
+                        "accounting_identity_unverified: accounting reconciliation pending"
+                    );
+                }
+                publish_atomic_accounting_export(&path, content)
+            })
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|_| "Dimension export unavailable".to_owned())??;
+    Ok(true)
+}
+
+fn publish_atomic_accounting_export(path: &std::path::Path, content: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new_in(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("Export destination unavailable"))?,
+    )?;
+    file.write_all(content.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
 }
 
 // Private desktop organization: never exposed by headless/MCP projections.
