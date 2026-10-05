@@ -18,14 +18,12 @@ use windows_sys::Win32::Foundation::{
     INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SE_FILE_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-    GetTokenInformation, IsValidSid, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL,
-    ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, IsValidSid, TokenUser, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileIdInfo, GetDriveTypeW,
@@ -465,92 +463,42 @@ fn verify_security(
     if sid_string(owner)? != user_sid || dacl.is_null() {
         return Err(PrivacyError::Unsafe);
     }
-    let mut control = 0u16;
-    let mut revision = 0u32;
-    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
-        return Err(PrivacyError::Io);
-    }
-    if control & SE_DACL_PROTECTED == 0 {
-        return Err(PrivacyError::Unsafe);
-    }
-    let mut size = MaybeUninit::<ACL_SIZE_INFORMATION>::uninit();
+    // Let Windows parse and format ACEs, then require the entire canonical
+    // owner/DACL string to match one of the two permitted ACE orders. This
+    // rejects inherited, NULL, deny, conditional, extra, or weaker entries
+    // without dereferencing GetAce's variable-length raw pointers.
+    let mut text = null_mut();
+    let mut length = 0u32;
     if unsafe {
-        GetAclInformation(
-            dacl,
-            size.as_mut_ptr().cast(),
-            size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut text,
+            &mut length,
         )
     } == 0
+        || text.is_null()
     {
-        return Err(PrivacyError::Io);
-    }
-    let size = unsafe { size.assume_init() };
-    if size.AceCount != 2 {
         return Err(PrivacyError::Unsafe);
     }
-    let mut user_seen = false;
-    let mut system_seen = false;
-    let acl_start = dacl as usize;
-    let acl_end = acl_start
-        .checked_add(size.AclBytesInUse as usize)
-        .ok_or(PrivacyError::Unsafe)?;
-    if size.AclBytesInUse as usize <= size_of::<ACL>() {
+    let _text = LocalMemory(text.cast());
+    if length == 0 || length > 2048 {
         return Err(PrivacyError::Unsafe);
     }
-    for index in 0..2 {
-        let mut raw = null_mut();
-        if unsafe { GetAce(dacl, index, &mut raw) } == 0 || raw.is_null() {
-            return Err(PrivacyError::Unsafe);
-        }
-        let start = raw as usize;
-        let header_end = start
-            .checked_add(size_of::<ACE_HEADER>())
-            .ok_or(PrivacyError::Unsafe)?;
-        if start < acl_start + size_of::<ACL>() || header_end > acl_end {
-            return Err(PrivacyError::Unsafe);
-        }
-        let header = unsafe { std::ptr::read_unaligned(raw.cast::<ACE_HEADER>()) };
-        let end = start
-            .checked_add(header.AceSize as usize)
-            .ok_or(PrivacyError::Unsafe)?;
-        if end > acl_end || (header.AceSize as usize) < size_of::<ACCESS_ALLOWED_ACE>() + 4 {
-            return Err(PrivacyError::Unsafe);
-        }
-        let ace = unsafe { std::ptr::read_unaligned(raw.cast::<ACCESS_ALLOWED_ACE>()) };
-        let wanted_flags = if directory {
-            (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE) as u8
-        } else {
-            0
-        };
-        if ace.Header.AceType != 0
-            || ace.Header.AceFlags != wanted_flags
-            || ace.Mask != FILE_ALL_ACCESS
-        {
-            return Err(PrivacyError::Unsafe);
-        }
-        let sid_offset = size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>();
-        let sid_available = header.AceSize as usize - sid_offset;
-        let sid_bytes = unsafe { raw.cast::<u8>().add(sid_offset) };
-        let subauthority_count = unsafe { *sid_bytes.add(1) } as usize;
-        let sid_length = 8usize
-            .checked_add(subauthority_count.saturating_mul(4))
-            .ok_or(PrivacyError::Unsafe)?;
-        if subauthority_count > 15 || sid_length > sid_available {
-            return Err(PrivacyError::Unsafe);
-        }
-        let sid = sid_bytes.cast::<c_void>();
-        if unsafe { IsValidSid(sid) } == 0 || unsafe { GetLengthSid(sid) } as usize > sid_available
-        {
-            return Err(PrivacyError::Unsafe);
-        }
-        match sid_string(sid)?.as_str() {
-            value if value == user_sid && !user_seen => user_seen = true,
-            SYSTEM_SID if !system_seen => system_seen = true,
-            _ => return Err(PrivacyError::Unsafe),
-        }
-    }
-    if user_seen && system_seen {
+    let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    let actual = String::from_utf16(&units[..end]).map_err(|_| PrivacyError::Unsafe)?;
+    let flags = if directory { "OICI" } else { "" };
+    let user_ace = format!("(A;{flags};FA;;;{user_sid})");
+    let system_ace = format!("(A;{flags};FA;;;SY)");
+    let prefix = format!("O:{user_sid}D:P");
+    if actual == format!("{prefix}{user_ace}{system_ace}")
+        || actual == format!("{prefix}{system_ace}{user_ace}")
+    {
         Ok(())
     } else {
         Err(PrivacyError::Unsafe)
