@@ -19,6 +19,35 @@ async function open() {
   await userEvent.click(await screen.findByRole('button',{name:'Edit organization'}));return view;
 }
 describe('private session editing', () => {
+  it('saves explicit outcomes and optional effort with private repair notes', async () => {
+    await open();
+    expect(screen.getByLabelText('Task outcome')).toHaveValue('not_rated');
+    await userEvent.selectOptions(screen.getByLabelText('Task outcome'),'accepted');
+    await userEvent.type(screen.getByLabelText('User-reported repair minutes (optional)'),'0');
+    await userEvent.selectOptions(screen.getByLabelText('Accepted on first pass (explicit report)'),'true');
+    await userEvent.type(screen.getByLabelText('Private note'),'PRIVATE_REPAIR_268');
+    mocks.editSessionAnnotation.mockImplementation(async edit => ({ summary: { ...annotation.summary, revision:edit.revision + 1, outcome:edit.outcome }, note:edit.note }));
+    await userEvent.click(screen.getByRole('button',{name:'Save organization'}));
+    await waitFor(() => expect(mocks.editSessionAnnotation).toHaveBeenCalledWith(expect.objectContaining({
+      outcome:{label:'accepted',repair_minutes:0,first_pass_accepted:true},note:'PRIVATE_REPAIR_268',
+    })));
+    expect(JSON.stringify(organizationStore.summaries)).not.toContain('PRIVATE_REPAIR_268');
+    await screen.findByRole('button',{name:'Edit organization'});
+    await userEvent.click(screen.getByRole('button',{name:'Edit organization'}));
+    await userEvent.selectOptions(screen.getByLabelText('Task outcome'),'rejected');
+    expect(screen.getByLabelText('Accepted on first pass (explicit report)')).toHaveValue('');
+    await userEvent.click(screen.getByRole('button',{name:'Discard changes'}));
+    expect(organizationStore.summaries[annotation.summary.identity.session_key].outcome?.label).toBe('accepted');
+    await userEvent.click(screen.getByRole('button',{name:'Edit organization'}));
+    expect(screen.getByLabelText('Task outcome')).toHaveValue('accepted');
+    expect(screen.getByLabelText('User-reported repair minutes (optional)')).toHaveValue(0);
+    await userEvent.selectOptions(screen.getByLabelText('Accepted on first pass (explicit report)'),'false');
+    await userEvent.selectOptions(screen.getByLabelText('Task outcome'),'unresolved');
+    expect(screen.getByLabelText('Accepted on first pass (explicit report)')).toHaveValue('false');
+    await userEvent.selectOptions(screen.getByLabelText('Task outcome'),'not_rated');
+    expect(screen.getByLabelText('Accepted on first pass (explicit report)')).toHaveValue('');
+    expect(screen.getByLabelText('Accepted on first pass (explicit report)')).toBeDisabled();
+  });
   it.each(['invalidate', 'replace', 'destroy'] as const)('does not publish a delayed successful save after %s', async action => {
     const view = await open();
     let finish!: (value: SessionAnnotation) => void;

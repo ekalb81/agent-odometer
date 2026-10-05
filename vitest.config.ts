@@ -13,6 +13,8 @@ export default defineConfig({
       reporter: ['json'],
       reportsDirectory: './coverage/frontend',
       include: [
+        'src/components/CuratedDataset.svelte',
+        'src/components/OfflineComparisons.svelte',
         'src/components/LocalWidget.svelte',
         'src/components/WidgetSettings.svelte',
         'src/components/ActivitySummary.svelte',
@@ -31,6 +33,8 @@ export default defineConfig({
         'src/components/TranscriptHandoff.svelte',
         'src/components/SessionOrganizationEditor.svelte',
         'src/components/OrganizationToolbar.svelte',
+        'src/components/HumanOutcomes.svelte',
+        'src/lib/humanOutcomes.ts',
         'src/lib/organization.ts',
         'src/lib/stores/organization.svelte.ts',
         'src/components/TranscriptSearch.svelte',

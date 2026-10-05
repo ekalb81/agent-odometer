@@ -36,7 +36,9 @@
   import DetailPane from './DetailPane.svelte';
   import ConfigTimeline from './ConfigTimeline.svelte';
   import GitOutcomes from './GitOutcomes.svelte';
+  import HumanOutcomes from './HumanOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
+  import WorkflowIntelligence from './WorkflowIntelligence.svelte';
   import SpeedMonitor from './SpeedMonitor.svelte';
   import CalendarActivity from './CalendarActivity.svelte';
   import { calendarFilterValue, type ActivityDay } from '../lib/calendarActivity';
@@ -1969,6 +1971,8 @@
         {dimensionAvailability}
       />
 
+      <WorkflowIntelligence active={active && analyticsOpen} sessionIds={analyticsSessionIds} onReview={reviewFindingSession} />
+
       {#if harness === 'codex'}
         <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={speedOpen} data-testid="speed-panel">
           <summary class="cursor-pointer text-xs font-semibold text-ink">Codex speed</summary>
@@ -2035,6 +2039,7 @@
       </details>
 
       <ConfigTimeline active={active && analyticsOpen} events={configEvents} />
+      <HumanOutcomes sessions={filtered} />
       <GitOutcomes />
 
       <div class="flex items-center gap-2 text-xs">

@@ -1517,6 +1517,45 @@ fn metrics_carry_their_definition_version() {
 }
 
 #[test]
+fn tool_only_sessions_contribute_to_workflow_failure_denominators() {
+    use odometer_lib::model::ToolOutcome;
+    use odometer_lib::telemetry::{observe_call, ToolCallInput};
+    let directory = tempfile::tempdir().unwrap();
+    let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();
+    let mut session = session_at("tool-only", "real-model", when.timestamp_millis(), 0, 0);
+    session.tokens_history.clear();
+    session.tokens_by_model.clear();
+    session.tool_observations.clear();
+    for (id, outcome) in [
+        ("success", ToolOutcome::Success),
+        ("failure", ToolOutcome::Failure),
+    ] {
+        observe_call(
+            &mut session.tool_observations,
+            ToolCallInput {
+                call_id: id.into(),
+                turn_id: Some("turn".into()),
+                harness: codex_provider_id(),
+                model: Some("real-model".into()),
+                timestamp: when,
+                name: "read_file".into(),
+                arguments: &serde_json::json!({"path":"synthetic.txt"}),
+            },
+        );
+        session.tool_observations.last_mut().unwrap().outcome = outcome;
+    }
+    odometer_lib::telemetry::refresh_session(&mut session);
+    let store = ledger(directory.path(), &[session]);
+    let report = metrics_for(&store, &card());
+    assert_eq!(report.sessions, 1);
+    let failure = metric(&report, "tool_failure_rate");
+    assert_eq!(failure.numerator, 1.0);
+    assert_eq!(failure.denominator, 2.0);
+    assert_eq!(failure.value, Some(0.5));
+    assert_eq!(metric(&report, "context_to_output_ratio").value, None);
+}
+
+#[test]
 fn context_to_output_ratio_divides_input_by_output() {
     let directory = tempfile::tempdir().unwrap();
     let when = Utc.with_ymd_and_hms(2026, 8, 10, 12, 0, 0).unwrap();

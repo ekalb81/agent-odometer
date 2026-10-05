@@ -58,6 +58,7 @@ pub mod turn_receipts;
 pub mod verify;
 pub mod watcher;
 mod widget;
+pub mod workflow;
 
 use commands::{
     add_defender_exclusions, apply_integration_change, approve_quota_account,
@@ -71,17 +72,18 @@ use commands::{
     get_rates, get_record_bookmarks, get_retention_status, get_scan_status, get_session_annotation,
     get_session_details, get_session_pricing, get_speed_report, get_subscription_usage,
     get_transcript_page, get_turn_receipt_status, get_widget_settings, get_widget_snapshot,
-    identify_quota_account, list_external_events, list_instruction_files, list_organization_tags,
-    list_providers, list_saved_searches, list_sessions, list_tool_impact_targets, merge_projects,
-    open_instruction_file, open_integration_configuration, open_task_in_chatgpt,
-    preview_history_purge, preview_integration_change, purge_retained_history,
-    read_instruction_file, reassign_session_project, rebuild_history, record_frontend_performance,
-    recover_history, repair_turn_receipt_integrations, resolve_projects,
-    resolve_retained_search_target, resolve_working_directories, retry_history_open,
-    reveal_in_file_manager, save_search, scan_git_outcomes, search_session_content,
-    sessions_in_ranges, set_config, set_project_alias, set_quota_config, set_rates,
-    set_retention_policy, set_tray_totals, set_widget_settings, test_integration_client,
-    unmerge_project, write_export,
+    get_workflow_report, identify_quota_account, list_external_events, list_instruction_files,
+    list_organization_tags, list_providers, list_saved_searches, list_sessions,
+    list_tool_impact_targets, merge_projects, open_instruction_file,
+    open_integration_configuration, open_task_in_chatgpt, preview_history_purge,
+    preview_integration_change, purge_retained_history, read_instruction_file,
+    reassign_session_project, rebuild_history, record_frontend_performance,
+    record_workflow_measurement, recover_history, repair_turn_receipt_integrations,
+    resolve_projects, resolve_retained_search_target, resolve_working_directories,
+    retry_history_open, reveal_in_file_manager, save_search, scan_git_outcomes,
+    search_session_content, sessions_in_ranges, set_config, set_project_alias, set_quota_config,
+    set_rates, set_retention_policy, set_tray_totals, set_widget_settings,
+    set_workflow_finding_suppression, test_integration_client, unmerge_project, write_export,
 };
 use config::Config;
 use std::sync::Arc;
@@ -134,6 +136,20 @@ pub fn run() {
             list_saved_searches,
             save_search,
             delete_saved_search,
+            commands::get_curated_dataset,
+            commands::export_curated_dataset,
+            commands::export_offline_experiment,
+            commands::get_offline_experiments,
+            commands::get_offline_experiment,
+            commands::preview_offline_experiment,
+            commands::commit_offline_experiment,
+            commands::preview_offline_import,
+            commands::commit_offline_import,
+            commands::remove_offline_experiment,
+            commands::get_curated_candidates,
+            commands::preview_curated_case,
+            commands::commit_curated_case,
+            commands::remove_curated_case,
             list_sessions,
             get_widget_settings,
             set_widget_settings,
@@ -174,6 +190,9 @@ pub fn run() {
             add_defender_exclusions,
             write_export,
             list_external_events,
+            get_workflow_report,
+            record_workflow_measurement,
+            set_workflow_finding_suppression,
             list_instruction_files,
             cancel_instruction_scan,
             read_instruction_file,
