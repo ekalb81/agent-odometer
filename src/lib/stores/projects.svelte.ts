@@ -19,6 +19,7 @@ export function createProjectStore() {
   let error = $state<string | null>(null);
   let inFlight: Promise<void> | null = null;
   let epoch = 0;
+  let revision = $state(0);
   let scanComplete = false;
 
   function load(): Promise<void> {
@@ -29,6 +30,7 @@ export function createProjectStore() {
 
   function fetchProjects(): Promise<void> {
     const request = ++epoch;
+    revision = request;
     loaded = false;
     error = null;
     const pending = resolveProjects()
@@ -71,6 +73,7 @@ export function createProjectStore() {
   }
 
   return {
+    get revision() { return revision; },
     get loaded() {
       return loaded;
     },

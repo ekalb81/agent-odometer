@@ -556,6 +556,8 @@ export interface ProviderSourceConfig {
 }
 
 export interface Config {
+  /** Public, unauthenticated service status; disabled unless explicitly enabled. */
+  provider_status_enabled?: boolean;
   /** 0 = legacy flat-field layout; 1 = `providers` is authoritative and the
    *  flat fields mirror its builtin entries. The Settings UI still edits the
    *  flat fields; the backend treats submitted payloads as legacy-authoritative. */
@@ -1274,6 +1276,15 @@ export interface QuotaSnapshot {
   unavailable: QuotaUnavailableReason | null;
 }
 
+export interface WidgetPreferences { visible: boolean; provider: 'codex' | 'claude_code' | 'gemini_cli'; kind: 'quota' | 'usage'; always_on_top: boolean; }
+export interface WidgetSettings { version: number; revision: number; preferences: WidgetPreferences; }
+export interface WidgetQuotaWindow { kind: QuotaWindowKind; unit: QuotaUnit; used: number | null; remaining: number | null; unlimited: boolean; observed_at: string; resets_at: string | null; stale: boolean; unavailable: QuotaUnavailableReason | null; }
+export interface WidgetSnapshot {
+  settings: WidgetSettings; computed_at: string;
+  quota: { provenance: 'transcript_derived' | 'live_provider'; unavailable: QuotaUnavailableReason | null; windows: WidgetQuotaWindow[]; windows_omitted: number } | null;
+  usage: { session_count: number; total_tokens: number; latest_activity_at: string | null; plan_amount: number | null; plan_currency: string; api_amount_usd: number | null; estimate_partial: boolean; scan_complete: boolean } | null;
+}
+
 export type BudgetUnit = 'percent_of_window' | 'tokens' | 'usd';
 
 export interface QuotaBudget {
@@ -1473,16 +1484,118 @@ export interface TranscriptPage {
   next_cursor: TranscriptCursor | null;
   source_complete: boolean;
 }
+export type FindingState = 'new' | 'persistent' | 'improving' | 'resolved' | 'suppressed' | 'not_applicable';
+export interface WorkflowRequest {
+  session_ids: string[];
+  from: string | null;
+  to: string | null;
+}
+export interface WorkflowMetric {
+  id: string;
+  denominator_is: string;
+  value: number | null;
+  numerator: number;
+  denominator: number;
+}
+export interface WorkflowMeasure extends WorkflowMetric {
+  unit: string;
+  coverage_is: string;
+  covered_samples: number;
+  eligible_samples: number;
+  missing_data: string | null;
+}
+export interface WorkflowWindow {
+  from: string;
+  to: string;
+  ledger_metrics: {
+    schema_version: number;
+    from: string | null;
+    to: string | null;
+    sessions: number;
+    metrics: WorkflowMetric[];
+  };
+  additional_metrics: WorkflowMeasure[];
+  analyzed_sessions: number;
+  unavailable_sessions: number;
+  drilldowns: { dimension: 'project' | 'model' | 'category'; value: string;
+    sessions: number; tool_calls: number; classified_turns: number }[];
+}
+export interface FindingObservation {
+  sessions: number;
+  tool_calls: number;
+  findings: number;
+  likely_avoidable_calls: number;
+  analyzer_version: number | null;
+  coverage_complete: boolean;
+  window_duration_ms: number;
+}
+export interface FindingLifecycle {
+  first_observed_at: string; last_observed_at: string; state: FindingState;
+  suppressed: boolean; revision: number; analyzer_changed: boolean;
+}
+export interface FindingSuppressionEdit {
+  provider: string; project_id: string | null; rule_id: string;
+  expected_revision: number; suppressed: boolean;
+}
+export interface WorkflowFinding {
+  lifecycle: FindingLifecycle | null;
+  id: string;
+  provider: string;
+  project_id: string | null;
+  rule_id: string;
+  before: FindingObservation;
+  after: FindingObservation;
+  comparison: {
+    version: number;
+    state: FindingState;
+    comparable: boolean;
+    before_calls_per_100: number | null;
+    after_calls_per_100: number | null;
+    observed_change_per_100_calls: number | null;
+    limitations: string[];
+  };
+  evidence: { session_id: string; turn_id: string | null; timestamp: string | null }[];
+  evidence_truncated: boolean;
+}
+export interface WorkflowReport {
+  historical_findings: { id: string; provider: string; project_id: string | null;
+    rule_id: string; lifecycle: FindingLifecycle }[];
+  version: number;
+  generated_at: string;
+  analyzer_version: number;
+  selected_sessions: number;
+  coverage_complete: boolean;
+  before: WorkflowWindow;
+  after: WorkflowWindow;
+  findings: WorkflowFinding[];
+  setup_health: {
+    source_configuration_valid: boolean;
+    generated_at: string;
+    last_scan_at: string | null;
+    providers: { provider: string; state: ProviderHealthState; configured_roots: number;
+      available_roots: number; parsed_files: number; parse_failures: number;
+      durable_sessions: number; fallback_pricing_used: boolean; reasons: string[] }[];
+  } | null;
+  limitations: string[];
+}
 /** Private desktop organization; never part of SessionSummary or exports. */
 export interface AnnotationIdentity { session_key: string; fingerprint: string; anchor: string }
 export interface RecordBookmark { identity: AnnotationIdentity; revision: number; bookmarked: boolean }
 export interface RecordBookmarkList { identity: AnnotationIdentity; bookmarks: RecordBookmark[]; recovery_backup_unrestored: boolean }
+export interface HumanOutcome {
+  label: 'not_rated' | 'accepted' | 'rejected' | 'unresolved';
+  repair_minutes: number | null;
+  first_pass_accepted: boolean | null;
+}
 export interface OrganizationSummary {
   identity: AnnotationIdentity; revision: number; pinned: boolean; has_note: boolean; tags: string[];
+  outcome?: HumanOutcome;
 }
 export interface SessionAnnotation { summary: OrganizationSummary; note: string; recovery_backup_unrestored?: boolean }
 export interface AnnotationEdit {
   identity: AnnotationIdentity; revision: number; pinned: boolean; note: string; tags: string[];
+  /** Omitted by older editors: preserve the existing human outcome. */
+  outcome?: HumanOutcome;
 }
 export interface SavedSearchDefinition {
   name: string; query: string; scope: string;
@@ -1494,3 +1607,69 @@ export interface SavedSearchDefinition {
   pinned_only: boolean; tags: string[];
 }
 export interface SavedSearch { id: number; revision: number; definition: SavedSearchDefinition }
+
+export interface CuratedContent {
+  name: string; rubric: string; expected_outcome: string; source_provider: string;
+  source_fingerprint_at_capture: string; source_records: string[]; captured_at: string;
+  blocks: { role: string; text: string; truncated: boolean }[]; redactions: number;
+}
+export interface CuratedCase {
+  id: number; version: number; session_key: string; fingerprint: string; content_hash: string; content: CuratedContent;
+}
+export interface CuratedDataset {
+  export_digest?: string;
+  format_version: number; revision: number; earliest_change_revision: number | null;
+  cases: CuratedCase[];
+  changes: { revision: number; case_id: number; change: string; content_hash: string }[];
+  recovery_backup_unrestored: boolean;
+}
+export interface CuratedRequest {
+  identity: AnnotationIdentity; outcome_revision: number; dataset_revision: number;
+  case_id: number | null; record_ids: string[]; name: string; rubric: string; redact_phrases: string[];
+}
+export interface CuratedPreview { token: string; content: CuratedContent; replacing_case: number | null }
+export interface CuratedCandidates {
+  records: { record_id: string; role: string; excerpt: string }[];
+  next_cursor: TranscriptCursor | null; availability: string;
+}
+
+export interface PromptVariant { id: string; prompt_id: string; prompt_version: string; prompt: string; provider: string; model: string; service_tier: string }
+export interface FrozenRate { configured_version: number; currency: string; table: string; quoted_at: string; resolved_model: string; basis: PricingBasis; cache_creation_basis: PricingBasis; effective_per_million: ModelRate | null; applied_tier_multiplier: number | null; modifier: { id: string; surface: string; effective_from: string; effective_to: string | null; evidence: string; verified_at: string } | null }
+export interface FrozenVariant { conditions: PromptVariant; prompt_hash: string; rate: FrozenRate }
+export interface ExperimentMember { case_id: number; dataset_case_version: number; dataset_content_hash: string; input_hash: string; expected_outcome: string }
+export interface ExperimentManifest { format_version: number; mode: string; active_replay: string; name: string; rubric: string; dataset_revision: number; captured_at: string; rate_snapshot_hash: string; variants: FrozenVariant[]; members: ExperimentMember[] }
+export interface FreezeRequest { dataset_revision: number; name: string; rubric: string; variants: PromptVariant[]; redact_phrases: string[] }
+export interface FreezePreview { token: string; manifest: ExperimentManifest; inputs: [number, CuratedContent][] }
+export interface ImportedRun { case_id: number; variant: string; status: string; output?: string; elapsed_ms: number | null; actual_cost_usd: number | null; tokens: TokenTotals | null; quality: string | null; observed_input_hash?: string; observed_model?: string; observed_provider?: string; observed_service_tier?: string; observed_prompt_id?: string; observed_prompt_version?: string; observed_prompt_hash?: string; observed_rate_hash?: string }
+export interface FrozenRun { record: ImportedRun; output_truncated: boolean; estimated_api_usd: number | null; estimate_basis: PricingBasis; condition_notes: string[] }
+export interface ImportRequest { experiment_id: number; revision: number; rows: ImportedRun[]; redact_phrases: string[] }
+export interface ImportPreview { token: string; experiment_id: number; revision: number; rows: FrozenRun[] }
+export interface ExperimentHeader { id: number; revision: number; name: string; dataset_revision: number; expected_cases: number; captured_at: string }
+export interface ComparisonMeasure { count: number; mean: number | null; minimum: number | null; maximum: number | null }
+export interface VariantSummary { variant: string; expected_cases: number; completed: number; failed: number; missing: number; missing_output: number; accepted: number; rejected: number; unresolved: number; not_rated: number; quality_missing: number; conditions_unverified: number; elapsed_ms: ComparisonMeasure; actual_cost_usd: ComparisonMeasure; estimated_api_usd: ComparisonMeasure }
+export interface ExperimentReport { export_digest: string; id: number; revision: number; manifest: ExperimentManifest; cases: { member: ExperimentMember; input: CuratedContent | null; a: FrozenRun | null; b: FrozenRun | null }[]; summaries: VariantSummary[]; removed_cases: number; current_dataset_revision: number; current_selected_pricing_differs: boolean; changed_conditions: string[]; paired_elapsed_delta_ms: ComparisonMeasure; paired_actual_cost_delta_usd: ComparisonMeasure; paired_estimated_cost_delta_usd: ComparisonMeasure; recovery_backup_unrestored: boolean }
+
+export type ProviderStatusIndicator = 'operational' | 'minor' | 'major' | 'critical' | 'maintenance';
+export interface ProviderServiceStatus {
+  provider: string;
+  source_url: string | null;
+  state: 'disabled' | 'unsupported' | 'pending' | 'current' | 'stale' | 'unavailable';
+  current_indicator: ProviderStatusIndicator | null;
+  last_known_indicator: ProviderStatusIndicator | null;
+  checked_at: string | null;
+  source_updated_at: string | null;
+  last_attempt_at: string | null;
+  next_attempt_at: string | null;
+  failure: 'offline_or_timeout' | 'rate_limited' | 'http_error' | 'invalid_response' | null;
+}
+export interface ProviderServiceStatusSnapshot {
+  enabled: boolean;
+  providers: ProviderServiceStatus[];
+}
+// Local transcript evidence, separate from quota and accounting authorities.
+export type AttentionEventKind = 'turn_started' | 'input_requested' | 'tool_completed' | 'tool_failed' | 'turn_completed' | 'turn_interrupted';
+export type AttentionState = 'working' | 'waiting' | 'idle' | 'error' | 'unknown';
+export interface AttentionPreferences { revision: number; categories: AttentionEventKind[]; providers: string[]; tool_kind: 'read' | 'search' | 'mutation' | 'command' | 'other' | null; stale_after_seconds: number; }
+export interface AttentionObservation { session_ref: string; provider: string; state: AttentionState; observed_state: AttentionState; observed_at: string; source: string; stale: boolean; partial: boolean; }
+export interface AttentionAlert { id: string; session_ref: string; provider_label: string; category: AttentionEventKind; observed_at: string; source: string; }
+export interface AttentionSnapshot { preferences: AttentionPreferences; available: boolean; observations: AttentionObservation[]; alerts: AttentionAlert[]; }

@@ -1,0 +1,77 @@
+{
+  "policy_version": 1,
+  "vectors": [
+    {
+      "name": "credential fields",
+      "input": "api_key=\"synthetic secret\" password=synthetic token:synthetic",
+      "phrases": [],
+      "text": "[credential field redacted] [credential field redacted] [credential field redacted]",
+      "count": 3
+    },
+    {
+      "name": "authorization",
+      "input": "Bearer synthetic-bearer sk-proj-syntheticABCDEFG github_pat_syntheticABCDEFG AKIAABCDEFGHIJKLMNOP",
+      "phrases": [],
+      "text": "[authorization redacted] [credential redacted] [credential redacted] [credential redacted]",
+      "count": 4
+    },
+    {
+      "name": "private key",
+      "input": "before -----BEGIN PRIVATE KEY-----\nsynthetic\n-----END PRIVATE KEY----- after",
+      "phrases": [],
+      "text": "before [private key redacted] after",
+      "count": 1
+    },
+    {
+      "name": "unterminated key",
+      "input": "before -----BEGIN RSA PRIVATE KEY-----\nsynthetic",
+      "phrases": [],
+      "text": "before [private key redacted]",
+      "count": 1
+    },
+    {
+      "name": "Windows path",
+      "input": "C:\\Users\\Synthetic\\secret.txt",
+      "phrases": [],
+      "text": "[local path redacted]",
+      "count": 1
+    },
+    {
+      "name": "Unix paths",
+      "input": "/home/synthetic/a /tmp/synthetic/b\n(/opt/synthetic/c)",
+      "phrases": [],
+      "text": "[local path redacted] [local path redacted]\n([local path redacted])",
+      "count": 3
+    },
+    {
+      "name": "URLs",
+      "input": "https://example.invalid/private file:///synthetic/private",
+      "phrases": [],
+      "text": "[URL redacted] [URL redacted]",
+      "count": 2
+    },
+    {
+      "name": "attachments",
+      "input": "data:image/png;base64,SYNTHETIC \"base64\":\"SYNTHETIC\" xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "phrases": [],
+      "text": "[attachment redacted] [attachment field redacted] [encoded content redacted]",
+      "count": 3
+    },
+    {
+      "name": "review phrases",
+      "input": "Synthetic Person alpha Synthetic Person",
+      "phrases": [
+        "Synthetic Person"
+      ],
+      "text": "[review phrase redacted] alpha [review phrase redacted]",
+      "count": 2
+    },
+    {
+      "name": "Unicode",
+      "input": "こんにちは /tmp/秘密.txt 😀 password=\"秘密\"",
+      "phrases": [],
+      "text": "こんにちは [local path redacted] 😀 [credential field redacted]",
+      "count": 2
+    }
+  ]
+}

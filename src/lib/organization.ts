@@ -39,4 +39,3 @@ export function matchesOrganization(
   if (!pinnedOnly && tags.length === 0) return true;
   return !!summary && (!pinnedOnly || summary.pinned) && tags.every(tag => summary.tags.includes(tag));
 }
-

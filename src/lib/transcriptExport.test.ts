@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { previewTranscriptExport, redactTranscriptText, type TranscriptExportOptions } from './transcriptExport';
 import type { TranscriptBlock, TranscriptCursor, TranscriptPage, TranscriptRecord } from './types';
+import redactionPolicy from './fixtures/transcriptRedaction.json';
 const options: TranscriptExportOptions = { toolCalls: false, toolResults: false, reasoning: false, redactPhrases: [] };
 const block = (kind: string, text: string, call_id: string | null = null): TranscriptBlock => ({ kind, text, call_id, name: null, edit: null });
 const record = (id: string, blocks: TranscriptBlock[], role: string | null = 'assistant'): TranscriptRecord => ({ id, byte_offset: 0, byte_length: 20, raw_json: 'PRIVATE RAW RECORD', kind: 'response_item', message_id: null, issue: null, presentation: { role, timestamp: null, blocks } });
@@ -9,6 +10,9 @@ const page = (records: TranscriptRecord[], next_cursor: TranscriptCursor | null 
 function doc(html: string) { return new DOMParser().parseFromString(html, 'text/html'); }
 
 describe('sanitized offline transcript export', () => {
+  it('matches the shared synthetic redaction policy used before dataset persistence', () => {
+    for (const { input, phrases, text, count } of redactionPolicy.vectors) expect(redactTranscriptText(input, phrases)).toEqual({ text, count });
+  });
   it('defaults to escaped conversation only and never includes raw, tool, reasoning, or unknown content', async () => {
     const read = vi.fn().mockResolvedValue(page([record('one', [block('text', '<img src="https://example.invalid/leak" onerror="alert(1)">Hello & bye'), block('tool_call', 'private command'), block('tool_result', 'private output'), block('reasoning', 'private reasoning'), block('source_block', 'binary attachment')]), record('reasoning', [block('text', 'unclassified reasoning')], null)]));
     const preview = await previewTranscriptExport('synthetic', options, read);

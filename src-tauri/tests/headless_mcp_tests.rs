@@ -154,7 +154,12 @@ fn every_mcp_report_matches_shared_dispatch_for_identical_facts_and_clock() {
         .unwrap();
         assert_eq!(actual, expected, "{name}");
         if name != "quota_status" {
-            assert_eq!(actual["schema_version"], 1, "{name}");
+            let version = if name == "workflow_metrics" {
+                odometer_lib::query::WORKFLOW_METRICS_VERSION
+            } else {
+                1
+            };
+            assert_eq!(actual["schema_version"], version, "{name}");
         }
     }
 }

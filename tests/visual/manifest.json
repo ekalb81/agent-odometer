@@ -1,7 +1,17 @@
 {
   "snapshots": [
+    "provider-status-opt-in",
+    "provider-status-narrow",
+    "attention-observations",
+    "attention-narrow",
+    "widget-stale-quota",
+    "widget-partial-usage",
+    "widget-empty-minimum",
+    "widget-settings-opt-in",
     "handoff-reviewed-source",
     "handoff-retained-narrow",
+    "human-outcomes-summary",
+    "human-outcomes-recovery",
     "organization-saved-search",
     "organization-editor-narrow",
     "organization-recovery-unavailable",
@@ -60,6 +70,12 @@
     "transcript-export-preview",
     "transcript-export-narrow",
     "content-search-scopes",
-    "content-search-retained-narrow"
+    "content-search-retained-narrow",
+    "workflow-measurement-desktop",
+    "workflow-lifecycle-narrow",
+    "curated-example-preview",
+    "curated-example-removal-narrow",
+    "offline-comparison-freeze-preview",
+    "offline-comparison-report-narrow"
   ]
 }

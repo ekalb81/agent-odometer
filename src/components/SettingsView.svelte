@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AttentionSettings from './AttentionSettings.svelte';
   import { config } from '../lib/stores/config';
   import { defenderActionStore } from '../lib/stores/defender.svelte';
   import { rates } from '../lib/stores/rates';
@@ -10,6 +11,8 @@
   import ProjectManagement from './ProjectManagement.svelte';
   import HistoryManagement from './HistoryManagement.svelte';
   import IntegrationCenter from './IntegrationCenter.svelte';
+  import ProviderStatus from './ProviderStatus.svelte';
+  import WidgetSettings from './WidgetSettings.svelte';
 
   /**
    * Matches `provider::gemini_cli_provider_id()`. Gemini CLI's roots live in
@@ -1942,6 +1945,10 @@
       {/if}
     </div>
   </section>
+
+  <ProviderStatus />
+  <AttentionSettings />
+  <WidgetSettings />
 
   <DiagnosticsPanel />
 
