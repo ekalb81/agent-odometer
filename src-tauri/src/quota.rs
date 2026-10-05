@@ -66,8 +66,8 @@ const RETAINED_POINTS_PER_PROVIDER: usize = 4 * MAX_POINTS_PER_PROVIDER;
 const _: () = assert!(RETAINED_POINTS_PER_PROVIDER > MAX_POINTS_PER_PROVIDER);
 
 /// A within-window used-percent drop at least this large between two
-/// consecutive observations is treated as an *observed* window rollover
-/// (the provider's counter visibly reset) rather than ordinary usage.
+/// consecutive observations is an observed counter decrease. A rolling
+/// window can decay this way; it does not establish an actual reset instant.
 const ROLLOVER_DROP_THRESHOLD_PERCENT: f64 = 15.0;
 
 /// Minimum number of in-window observations before a forecast is produced.
@@ -222,6 +222,16 @@ pub struct QuotaForecast {
     pub evidence_points: usize,
 }
 
+/// Evidence for a forecast anchor, never proof of a provider reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaWindowStartBasis {
+    #[default]
+    Unknown,
+    CounterDecrease,
+    ResetScheduleEstimate,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct QuotaWindow {
     pub kind: QuotaWindowKind,
@@ -240,15 +250,10 @@ pub struct QuotaWindow {
     pub unlimited: bool,
     pub resets_at: Option<DateTime<Utc>>,
     pub window_started_at: Option<DateTime<Utc>>,
-    /// True when `window_started_at` was inferred by subtracting
-    /// `window_minutes` from `resets_at` rather than observed directly as a
-    /// used-percent rollover in the data. Per issue #43's carried-over
-    /// #92 comment: that subtraction is correct for a fixed window and
-    /// wrong for a rolling one, and Odometer cannot tell which kind a given
-    /// provider window is from the data alone — so an estimated value is
-    /// flagged rather than presented with the same confidence as an
-    /// observed one.
+    /// The forecast anchor is inferred from a counter decrease or a reset
+    /// schedule. Neither establishes the actual last reset of a rolling window.
     pub window_started_at_estimated: bool,
+    pub window_start_basis: QuotaWindowStartBasis,
     /// Timestamp of the observation this window's numbers came from.
     pub observed_at: DateTime<Utc>,
     pub confidence: QuotaConfidence,
@@ -317,7 +322,7 @@ fn window_series(
         .collect()
 }
 
-fn detect_observed_rollover(series: &[WindowObservation]) -> Option<DateTime<Utc>> {
+fn detect_counter_decrease(series: &[WindowObservation]) -> Option<DateTime<Utc>> {
     for pair in series.windows(2).rev() {
         let prev = &pair[0];
         let cur = &pair[1];
@@ -435,6 +440,7 @@ fn build_percent_window(
         resets_at: latest.resets_at,
         window_started_at: None,
         window_started_at_estimated: false,
+        window_start_basis: QuotaWindowStartBasis::Unknown,
         observed_at: latest_ts,
         confidence: QuotaConfidence::High,
         stale: false,
@@ -457,12 +463,15 @@ fn build_percent_window(
     window.used = Some(latest.used_percent.clamp(0.0, 100.0));
     window.remaining = Some((100.0 - latest.used_percent).clamp(0.0, 100.0));
 
-    if let Some(rollover_at) = detect_observed_rollover(series) {
+    if let Some(rollover_at) = detect_counter_decrease(series) {
         window.window_started_at = Some(rollover_at);
-        window.window_started_at_estimated = false;
+        window.window_started_at_estimated = true;
+        window.window_start_basis = QuotaWindowStartBasis::CounterDecrease;
+        window.confidence = downgrade(window.confidence, QuotaConfidence::Medium);
     } else if let (Some(resets_at), Some(minutes)) = (latest.resets_at, latest.window_minutes) {
         window.window_started_at = Some(resets_at - Duration::minutes(minutes as i64));
         window.window_started_at_estimated = true;
+        window.window_start_basis = QuotaWindowStartBasis::ResetScheduleEstimate;
         window.confidence = downgrade(window.confidence, QuotaConfidence::Medium);
     }
 
@@ -506,6 +515,7 @@ fn build_credit_window(
         resets_at: None,
         window_started_at: None,
         window_started_at_estimated: false,
+        window_start_basis: QuotaWindowStartBasis::Unknown,
         observed_at,
         confidence: QuotaConfidence::High,
         stale: false,
@@ -551,6 +561,7 @@ pub fn live_bucket_snapshot(
         if let Some(mut window) = build_percent_window(&series, now, Duration::minutes(10)) {
             window.window_started_at = None;
             window.window_started_at_estimated = false;
+            window.window_start_basis = QuotaWindowStartBasis::Unknown;
             windows.push(window);
         }
     }
@@ -1552,6 +1563,7 @@ mod tests {
                 resets_at: None,
                 window_started_at: None,
                 window_started_at_estimated: false,
+                window_start_basis: QuotaWindowStartBasis::Unknown,
                 observed_at: Utc::now(),
                 confidence: QuotaConfidence::Low,
                 stale: false,
@@ -1767,6 +1779,10 @@ mod tests {
         assert_eq!(after_reset.windows[0].used, Some(70.0));
         assert!(after_reset.windows[0].forecast.is_none());
         assert!(after_reset.windows[0].window_started_at.is_none());
+        assert_eq!(
+            after_reset.windows[0].window_start_basis,
+            QuotaWindowStartBasis::Unknown
+        );
         let after_sleep = live_bucket_snapshot(&bucket, observed, observed + Duration::hours(2));
         assert!(after_sleep.windows.iter().all(|window| window.stale));
     }
@@ -1830,10 +1846,10 @@ mod tests {
     // -- Observed vs. estimated window start ---------------------------------
 
     #[test]
-    fn an_observed_rollover_is_high_confidence_not_estimated() {
+    fn a_counter_decrease_does_not_establish_a_reset_even_when_schedule_advances() {
         let points = [
             point("2026-01-01T00:00:00Z", 95.0, 300, "2026-01-01T00:05:00Z"),
-            // Rolled over: used_percent dropped sharply.
+            // The reset schedule advanced and used_percent dropped sharply.
             point("2026-01-01T00:10:00Z", 5.0, 300, "2026-01-01T05:10:00Z"),
         ];
         let now = ts("2026-01-01T00:10:00Z");
@@ -1846,12 +1862,45 @@ mod tests {
             MAX_AGE(),
         );
         let window = &snapshot.windows[0];
-        assert!(!window.window_started_at_estimated);
+        assert!(window.window_started_at_estimated);
+        assert_eq!(window.confidence, QuotaConfidence::Medium);
+        assert_eq!(
+            window.window_start_basis,
+            QuotaWindowStartBasis::CounterDecrease
+        );
         assert_eq!(window.window_started_at, Some(ts("2026-01-01T00:10:00Z")));
     }
 
     #[test]
-    fn without_an_observed_rollover_window_start_is_estimated_and_capped_at_medium() {
+    fn rolling_decay_preserves_usage_without_claiming_an_actual_reset() {
+        let points = [
+            point("2026-01-01T00:00:00Z", 65.0, 300, "2026-01-01T05:00:00Z"),
+            point("2026-01-01T00:10:00Z", 40.0, 300, "2026-01-01T05:00:00Z"),
+        ];
+        let snapshot = build_quota_snapshot(
+            codex_provider_id(),
+            true,
+            &points,
+            QuotaAccountInfo::default(),
+            ts("2026-01-01T00:10:00Z"),
+            MAX_AGE(),
+        );
+        let window = &snapshot.windows[0];
+        assert_eq!(window.used, Some(40.0));
+        assert_eq!(window.remaining, Some(60.0));
+        assert_eq!(window.resets_at, Some(ts("2026-01-01T05:00:00Z")));
+        assert!(window.window_started_at_estimated);
+        assert_eq!(window.confidence, QuotaConfidence::Medium);
+        assert_eq!(
+            window.window_start_basis,
+            QuotaWindowStartBasis::CounterDecrease
+        );
+        let wire = serde_json::to_value(window).unwrap();
+        assert_eq!(wire["window_start_basis"], "counter_decrease");
+    }
+
+    #[test]
+    fn reset_schedule_only_provides_an_estimated_forecast_anchor() {
         let points = [point(
             "2026-01-01T00:00:00Z",
             40.0,
@@ -1870,6 +1919,10 @@ mod tests {
         let window = &snapshot.windows[0];
         assert!(window.window_started_at_estimated);
         assert_eq!(window.confidence, QuotaConfidence::Medium);
+        assert_eq!(
+            window.window_start_basis,
+            QuotaWindowStartBasis::ResetScheduleEstimate
+        );
     }
 
     // -- Multi-provider aggregation -----------------------------------------
@@ -3077,7 +3130,11 @@ mod tests {
             raw_snapshot.windows[0].window_started_at,
             Some(expected_rollover_at)
         );
-        assert!(!raw_snapshot.windows[0].window_started_at_estimated);
+        assert!(raw_snapshot.windows[0].window_started_at_estimated);
+        assert_eq!(
+            raw_snapshot.windows[0].window_start_basis,
+            QuotaWindowStartBasis::CounterDecrease
+        );
 
         let (raw_len, collapsed_len) = assert_collapse_is_lossless(raw, now);
         assert_eq!(raw_len, 10);

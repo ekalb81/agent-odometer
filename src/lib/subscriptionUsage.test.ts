@@ -5,6 +5,7 @@ import {
   quotaTrayLabel,
   quotaUnavailableLabel,
   quotaWindowLabel,
+  quotaResetEvidence,
   remainingPercent,
   reserveDeficitLabel,
   resetCountdown,
@@ -221,5 +222,32 @@ describe('quotaTrayLabel', () => {
       snapshot({ provider: 'gemini_cli', windows: [quotaWindow({ used: 10, remaining: 90 })] }),
     ]);
     expect(label).toBe('gemini_cli 5h 90% left');
+  });
+});
+
+
+describe('quotaResetEvidence', () => {
+  const now = Date.parse('2026-07-29T12:00:00Z');
+  const observed = '2026-07-29T11:55:00Z';
+
+  it('reports a counter decrease separately from an unknown reset', () => {
+    const label = quotaResetEvidence(quotaWindow({ window_started_at: observed,
+      window_start_basis: 'counter_decrease', window_started_at_estimated: true }), now);
+    expect(label).toBe(`Last reset not reported. Usage decrease observed at ${new Date(observed).toLocaleString()}.`);
+    expect(label).not.toMatch(/Reset observed/);
+  });
+
+  it.each(['reset_schedule_estimate', 'unknown', undefined] as const)('does not infer a reset from %s evidence or older responses', (basis) => {
+    expect(quotaResetEvidence(quotaWindow({ window_started_at: observed,
+      window_start_basis: basis, window_started_at_estimated: false }), now)).toBe('Last reset not reported.');
+  });
+
+  it.each([null, 'invalid', '2026-07-29T12:01:00Z'])('does not present missing, malformed or future decrease timestamps as observed: %s', (time) => {
+    expect(quotaResetEvidence(quotaWindow({ window_started_at: time,
+      window_start_basis: 'counter_decrease' }), now)).toBe('Last reset not reported.');
+  });
+
+  it('does not imply that purchased credit balances have rolling reset windows', () => {
+    expect(quotaResetEvidence(quotaWindow({ unit: 'credits' }), now)).toBeNull();
   });
 });

@@ -1255,9 +1255,11 @@ export interface QuotaWindow {
   unlimited: boolean;
   resets_at: string | null;
   window_started_at: string | null;
-  /** True when `window_started_at` was inferred (resets_at - window_minutes)
-   *  rather than observed as an actual used-percent rollover in the data. */
+  /** True when the forecast anchor was inferred (counter decrease or reset schedule)
+   *  rather than a provider-reported actual reset. */
   window_started_at_estimated: boolean;
+  /** Optional for older headless/mock responses; none of these prove a last reset. */
+  window_start_basis?: 'unknown' | 'counter_decrease' | 'reset_schedule_estimate';
   observed_at: string;
   confidence: QuotaConfidence;
   /** Numbers are still populated when stale — see QuotaSnapshot's honesty
