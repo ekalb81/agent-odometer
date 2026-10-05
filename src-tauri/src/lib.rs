@@ -5,9 +5,9 @@
 #[unsafe(link_section = ".drectve")]
 static TEST_COMMON_CONTROLS: [u8; 168] = *b" \"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\" ";
 
-mod ambient;
 pub mod action_contract;
 mod action_executor;
+mod ambient;
 pub mod attention;
 pub mod claude_parser;
 pub mod commands;
