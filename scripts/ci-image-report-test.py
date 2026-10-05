@@ -95,6 +95,17 @@ class MeasurementProof(unittest.TestCase):
             self.assertIn("missing/skipped", output)
             self.assertIn("inconclusive", output)
 
+    def test_failed_command_cannot_qualify_with_success_metadata_and_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); jobs, _ = self.fixture(root)
+            commands = root / "check-image-3" / "commands.tsv"
+            commands.write_text(commands.read_text(encoding="utf-8").replace(
+                "rust-tests\t1\t0", "rust-tests\t1\t101"), encoding="utf-8")
+            output = self.render(root, jobs)
+            self.assertIn("inconclusive", output)
+            self.assertIn("Incomplete or failing command list", output)
+            self.assertNotIn("meets the sample adoption criteria", output)
+
     def test_n5_nearest_rank_p95_is_maximum(self):
         self.assertEqual(report.percentile95([1, 2, 3, 4, 50]), 50)
 

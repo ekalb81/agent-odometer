@@ -97,6 +97,7 @@ runs:
         PROBE_TOKEN: ${{ github.token }}
       run: printf '%s' "$PROBE_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
     - name: Run complete lane
+      id: measure_lane
       shell: bash
       env:
         IMAGE: ${{ inputs.image }}
@@ -111,6 +112,7 @@ runs:
       shell: bash
       run: bash scripts/ci-image-snapshot.sh pack
     - name: Save snapshot outside production cache store
+      id: save_snapshot
       if: inputs.seed == 'true'
       uses: actions/upload-artifact@v7
       with:
@@ -122,7 +124,7 @@ runs:
       if: always()
       shell: bash
       env:
-        OBSERVATION_STATUS: ${{ job.status }}
+        OBSERVATION_STATUS: ${{ inputs.seed == 'true' && steps.save_snapshot.outcome || steps.measure_lane.outcome }}
       run: python3 scripts/ci-image-report.py finish
     - name: Remove registry authentication
       if: always() && inputs.arm == 'image'
