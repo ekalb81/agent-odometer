@@ -39,3 +39,9 @@ No outcome is recorded as realized savings when a preview is generated or a futu
 | Full uninstall | Remove only owned artifacts and verify provider state. |
 
 The internal engine's synthetic fixture tests cover atomic replacement, exact backup/undo, interrupted-stage recovery, symlink rejection on Unix, stale edits, and batch rollback. Each proposed provider adapter needs its own tests and security review before production writes can be enabled.
+
+## Windows journal privacy boundary
+
+The disabled engine's Windows journal helper creates its directory, backup, and staged event files with a protected DACL granting access only to the current user and SYSTEM. It checks owner, DACL, file type, reparse status, and a local volume's persistent-ACL support through open handles. Existing journal objects with an unknown or broader ACL are rejected without modifying their permissions. The root and journal handles remain open without delete sharing while journal paths are used. This protects synthetic journal bytes from other ordinary Windows users; it does not protect against another process running as the same user or a privileged administrator.
+
+This is not permission to enable writes. The provider-target replacement still needs a reviewed file-ACL preservation policy and a final compare-and-swap or lock strategy. Startup recovery, journal retention, and provider-specific rollback also remain separate review gates. No real provider file is used by the Windows privacy tests.
