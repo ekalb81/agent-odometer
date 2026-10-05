@@ -608,11 +608,16 @@ mockIPC((cmd, payload) => {
       }
       return result;
     }
+    case 'get_ambient_status':
+    case 'check_ambient_alerts':
+      return { available: true, as_of: new Date(now).toISOString(), notifications: structuredClone(quotaConfigMock.notifications), alerts: [], recent: visualScenario === 'ambient-recent' ? [{ id: 'ambient-synthetic-edge', route: 'provider_status', provider: 'Codex', code: 'provider_incident', observed_at: new Date(now - 60000).toISOString(), delivered_at: new Date(now).toISOString() }] : [] };
+    case 'get_quota_budget_statuses':
+      return { ...checkQuotaBudgets(), alerts: [] };
     case 'get_quota_config':
-      return quotaConfigMock;
+      return structuredClone(quotaConfigMock);
     case 'set_quota_config':
-      quotaConfigMock = (payload as { config: QuotaConfigWire }).config;
-      return quotaConfigMock;
+      quotaConfigMock = JSON.parse(JSON.stringify((payload as { config: QuotaConfigWire }).config)) as QuotaConfigWire;
+      return structuredClone(quotaConfigMock);
     case 'check_quota_alerts':
       return checkQuotaAlerts();
     case 'check_quota_budgets':

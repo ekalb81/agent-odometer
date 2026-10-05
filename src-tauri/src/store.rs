@@ -503,6 +503,7 @@ pub struct AppState {
     /// (issue #128).
     quota_snapshot_cache: crate::quota::QuotaSnapshotCache,
     pub attention: crate::attention::AttentionService,
+    pub ambient: Mutex<crate::ambient::Runtime>,
     pub live_quota: Arc<crate::quota_accounts::LiveQuotaService>,
     pub provider_status: Arc<crate::provider_status::ProviderStatusService>,
     pub(crate) quota_evaluation: Mutex<()>,
@@ -563,6 +564,7 @@ impl AppState {
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
             attention: crate::attention::AttentionService::open_default(),
+            ambient: Mutex::new(crate::ambient::Runtime::default()),
             live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
             provider_status: Arc::new(crate::provider_status::ProviderStatusService::default()),
             quota_evaluation: Mutex::new(()),
@@ -2134,10 +2136,15 @@ impl AppState {
         config: crate::quota_store::QuotaConfigWire,
     ) -> Result<crate::quota_store::QuotaConfigWire, String> {
         crate::quota_store::validate_quota_config(&config)?;
+        let _evaluation = self.quota_evaluation.lock().unwrap();
         let mut cache = self.quota_store_cache.lock().unwrap();
         let mut store = crate::quota_store::QuotaStoreFile::load_checked()?;
         store.check_revision(config.revision.as_deref())?;
+        let policy_changed = store.notifications != config.notifications;
         store.notification_log.retain(|entry| {
+            if entry.dedup_key.starts_with(crate::ambient::PREFIX) {
+                return true;
+            }
             store
                 .budgets
                 .iter()
@@ -2159,6 +2166,13 @@ impl AppState {
             .map_err(|_| "quota configuration could not be saved".to_string())?;
         let wire = crate::quota_store::QuotaConfigWire::from(&store);
         *cache = Some(Arc::new(store));
+        if policy_changed {
+            let mut runtime = self.ambient.lock().unwrap();
+            runtime.initialized = false;
+            runtime.policy_baseline = true;
+            runtime.budget_checked_at = None;
+            runtime.retention = None;
+        }
         self.quota_snapshot_cache.invalidate();
         Ok(wire)
     }
@@ -2361,6 +2375,7 @@ mod tests {
             quota_store_cache: Mutex::new(None),
             quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
             attention: crate::attention::AttentionService::default(),
+            ambient: Mutex::new(crate::ambient::Runtime::default()),
             live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
             provider_status: Arc::new(crate::provider_status::ProviderStatusService::default()),
             quota_evaluation: Mutex::new(()),
@@ -3452,12 +3467,14 @@ mod tests {
         let log = vec![crate::quota_store::NotificationLogEntry {
             dedup_key: "tokens".into(),
             fired_at: now,
+            notice: None,
         }];
         let (alerts, next_log) = crate::quota::evaluate_alerts(
             &evaluations,
             &crate::quota_store::NotificationSettings {
                 enabled: true,
                 quiet_hours: None,
+                ambient: Default::default(),
             },
             &log,
             now,

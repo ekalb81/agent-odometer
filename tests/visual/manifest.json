@@ -1,5 +1,7 @@
 {
   "snapshots": [
+    "ambient-shared-policy",
+    "ambient-recent-narrow",
     "provider-status-opt-in",
     "provider-status-narrow",
     "attention-observations",

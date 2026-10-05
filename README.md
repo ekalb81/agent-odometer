@@ -270,3 +270,5 @@ Use **Edit organization** in a session’s detail pane to pin it, add tags, or e
 Organization stays in the local history database and is excluded from ordinary exports, diagnostics, accounting, MCP, and provider files. Missing sources keep it. Confirmed history purge removes the selected sessions’ pins, tag assignments, and notes; global tag definitions and saved searches remain. A corrupt-database recovery preserves the original database backup and rebuilds source history, but does not reconstruct private organization from transcripts. The UI identifies those unrestored records and keeps dependent pin/tag results unavailable.
 
 Attention alerts are an opt-in local feature with explicit transcript-evidence limits; see [Agent attention](docs/ATTENTION_ALERTS.md).
+
+Shared quiet hours, recent alerts, and explicit provider tray scope are documented in [Shared ambient controls](docs/AMBIENT_CONTROLS.md).

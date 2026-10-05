@@ -4558,10 +4558,13 @@ pub fn get_quota_config() -> Result<crate::quota_store::QuotaConfigWire, String>
 /// is internal bookkeeping the caller never sees or supplies.
 #[tauri::command]
 pub fn set_quota_config(
+    app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
     config: crate::quota_store::QuotaConfigWire,
 ) -> Result<crate::quota_store::QuotaConfigWire, String> {
-    state.save_quota_config(config)
+    let saved = state.save_quota_config(config)?;
+    let _ = app.emit("quota-policy-updated", &saved.notifications);
+    Ok(saved)
 }
 
 /// Durable project assignments shared across one alert-evaluation batch.
@@ -4942,6 +4945,255 @@ pub(crate) fn check_quota_budgets_impl(state: &AppState) -> crate::quota::QuotaB
         as_of: now,
         statuses,
         alerts,
+    }
+}
+
+/// Presentation reads never consume a notification edge. Delivery belongs to
+/// the single main-window ambient monitor, independently of the active tab.
+#[tauri::command]
+pub async fn get_quota_budget_statuses(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::quota::QuotaBudgetCheck, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let store = state.quota_store();
+        let now = Utc::now();
+        crate::quota::QuotaBudgetCheck {
+            as_of: now,
+            statuses: quota_budget_statuses(
+                &state,
+                &store.budgets,
+                now,
+                chrono::Duration::seconds(store.max_cache_age_secs),
+            ),
+            alerts: Vec::new(),
+        }
+    })
+    .await
+    .map_err(|_| "budget status unavailable".into())
+}
+
+#[tauri::command]
+pub async fn check_ambient_alerts(
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::ambient::Snapshot, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || check_ambient_impl(&state))
+        .await
+        .map_err(|_| "ambient notification status unavailable".into())
+}
+
+/// Settings/history presentation never evaluates or consumes a delivery edge.
+#[tauri::command]
+pub fn get_ambient_status(state: State<'_, Arc<AppState>>) -> crate::ambient::Snapshot {
+    let now = Utc::now();
+    let loaded = crate::quota_store::QuotaStoreFile::load_checked();
+    let readable = loaded.is_ok();
+    let store = loaded.unwrap_or_default();
+    crate::ambient::Snapshot {
+        available: readable && state.ambient.lock().unwrap().failed.is_empty(),
+        as_of: now,
+        notifications: store.notifications.clone(),
+        alerts: Vec::new(),
+        recent: crate::ambient::recent(&store.notification_log, now),
+    }
+}
+
+fn check_ambient_impl(state: &AppState) -> crate::ambient::Snapshot {
+    use crate::ambient::{Candidate, Route};
+    let _evaluation = state.quota_evaluation.lock().unwrap();
+    let mut runtime = state.ambient.lock().unwrap();
+    let store = state.quota_store();
+    let now = Utc::now();
+    let quiet =
+        crate::quota::in_quiet_hours(store.notifications.quiet_hours, Local::now().hour() as u8);
+    if runtime
+        .last_check
+        .is_some_and(|at| now < at || now - at > chrono::Duration::seconds(60))
+        || (runtime.was_quiet && !quiet)
+    {
+        runtime.initialized = false;
+    }
+    runtime.last_check = Some(now);
+    runtime.was_quiet = quiet;
+    let budgets_due = runtime
+        .budget_checked_at
+        .is_none_or(|at| now < at || now - at >= chrono::Duration::seconds(60))
+        || !runtime.failed.is_empty();
+    let statuses = if budgets_due {
+        runtime.budget_checked_at = Some(now);
+        quota_budget_statuses(
+            state,
+            &store.budgets,
+            now,
+            chrono::Duration::seconds(store.max_cache_age_secs),
+        )
+    } else {
+        Vec::new()
+    };
+    let evaluations: Vec<_> = store
+        .budgets
+        .iter()
+        .zip(&statuses)
+        .map(|(budget, status)| crate::quota::BudgetEvaluation {
+            budget,
+            current_value: status.current_value,
+        })
+        .collect();
+    let (budget_alerts, budget_log) = crate::quota::evaluate_alerts(
+        &evaluations,
+        &store.notifications,
+        &store.notification_log,
+        now,
+        Local::now().hour() as u8,
+    );
+    let mut candidates = Vec::new();
+    let mut resolved = Vec::new();
+    let attention = state.attention.snapshot(now, |id| {
+        state.sessions.get(id).is_some_and(|entry| {
+            entry.summary.source_availability == crate::model::SourceAvailability::Present
+                && entry.summary.lifecycle == crate::model::SessionLifecycle::Present
+                && !entry.summary.archived
+        })
+    });
+    for alert in attention.alerts {
+        candidates.push(Candidate {
+            key: format!("attention:{}", alert.id),
+            route: Route::Attention,
+            provider: alert.provider_label.into(),
+            code: serde_json::to_value(alert.category)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "attention".into()),
+            observed_at: alert.observed_at,
+            enabled: store.notifications.ambient.attention,
+            fresh: attention.available && now - alert.observed_at <= chrono::Duration::seconds(60),
+        });
+    }
+    // Cached observations only: this command never polls a provider or uses auth.
+    let status = state.provider_status.snapshot(now);
+    for row in status.providers {
+        let identity = format!("incident:{}", row.provider);
+        if row.state == "current"
+            && row.current_indicator.is_some_and(|indicator| {
+                indicator != crate::provider_status::Indicator::Operational
+            })
+        {
+            candidates.push(Candidate {
+                key: identity,
+                route: Route::ProviderStatus,
+                provider: crate::ambient::provider_label(&row.provider),
+                code: "provider_incident".into(),
+                observed_at: row.checked_at.unwrap_or(now),
+                enabled: store.notifications.ambient.provider_incidents,
+                fresh: status.enabled,
+            });
+        } else if row.state == "current"
+            && row.current_indicator == Some(crate::provider_status::Indicator::Operational)
+        {
+            resolved.push(crate::ambient::key(&identity));
+        }
+    }
+    for snapshot in state.quota_snapshots(chrono::Duration::seconds(store.max_cache_age_secs), now)
+    {
+        let identity = format!("stale:{}", snapshot.provider);
+        let observed = snapshot.windows.iter().any(|window| window.used.is_some());
+        if observed
+            && snapshot
+                .windows
+                .iter()
+                .any(|window| window.stale && window.used.is_some())
+        {
+            candidates.push(Candidate {
+                key: identity,
+                route: Route::Quota,
+                provider: crate::ambient::provider_label(snapshot.provider.as_str()),
+                code: "stale_quota".into(),
+                observed_at: now,
+                enabled: store.notifications.ambient.stale_quota,
+                fresh: true,
+            });
+        } else if observed {
+            resolved.push(crate::ambient::key(&identity));
+        }
+    }
+    if let Some(history) = state.history_ready() {
+        if runtime
+            .retention
+            .is_none_or(|(at, _, _)| now < at || now - at >= chrono::Duration::seconds(60))
+        {
+            runtime.retention = history
+                .retention_status()
+                .ok()
+                .map(|value| (now, value.retained_sessions > 0, value.coverage_complete));
+        }
+        if let Some((observed_at, risk, complete)) = runtime.retention {
+            if risk {
+                candidates.push(Candidate {
+                    key: "retention:missing_sources".into(),
+                    route: Route::Retention,
+                    provider: "Local history".into(),
+                    code: "retained_sources_missing".into(),
+                    observed_at,
+                    enabled: store.notifications.ambient.retention_risk,
+                    fresh: complete,
+                });
+            } else if complete {
+                resolved.push(crate::ambient::key("retention:missing_sources"));
+            }
+        }
+    }
+    let (mut alerts, mut log) = crate::ambient::evaluate(
+        &candidates,
+        &resolved,
+        &store.notifications,
+        &budget_log,
+        &runtime,
+        now,
+        Local::now().hour() as u8,
+    );
+    // Budget decisions retain their established edge/quiet/master semantics.
+    for budget in budget_alerts
+        .into_iter()
+        .filter(|_| runtime.failed.is_empty() && !runtime.policy_baseline)
+    {
+        let notice = crate::ambient::Notice {
+            id: crate::ambient::key(&format!("budget:{}:{}", budget.budget_id, budget.fired_at)),
+            route: Route::Budgets,
+            provider: crate::ambient::provider_label(budget.provider.as_str()),
+            code: "budget_crossed".into(),
+            observed_at: budget.fired_at,
+            delivered_at: now,
+        };
+        log.push(crate::quota_store::NotificationLogEntry {
+            dedup_key: format!("{}recent/{}", crate::ambient::PREFIX, notice.id),
+            fired_at: now,
+            notice: Some(notice.clone()),
+        });
+        alerts.push(notice);
+    }
+    runtime.initialized = true;
+    let available = state
+        .persist_quota_notification_log(log, now, &store.config_revision())
+        .is_ok();
+    if !available {
+        runtime.failed.insert("persistence".into());
+        alerts.clear();
+    } else {
+        runtime.failed.clear();
+        runtime.policy_baseline = false;
+    }
+    let recent = if available {
+        crate::ambient::recent(&state.quota_store().notification_log, now)
+    } else {
+        Vec::new()
+    };
+    crate::ambient::Snapshot {
+        available,
+        as_of: now,
+        notifications: store.notifications.clone(),
+        alerts,
+        recent,
     }
 }
 

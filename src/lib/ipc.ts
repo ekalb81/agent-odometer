@@ -358,6 +358,9 @@ export function scanGitOutcomes(postWindowHours = 24): Promise<GitOutcome[]> {
 }
 
 export interface TrayTotals {
+  gemini_plan?: string;
+  provider?: string;
+  recent?: string;
   tokens: string;
   codex_credits: string;
   codex_api_usd: string;
@@ -462,3 +465,11 @@ export function setProviderStatusEnabled(enabled: boolean): Promise<Config> {
 }
 export function getAttentionStatus(): Promise<import('./types').AttentionSnapshot> { return invoke('get_attention_status'); }
 export function setAttentionPreferences(preferences: import('./types').AttentionPreferences): Promise<import('./types').AttentionPreferences> { return invoke('set_attention_preferences', { preferences }); }
+
+export function checkAmbientAlerts(): Promise<import("./types").AmbientSnapshot> { return invoke("check_ambient_alerts"); }
+export function getQuotaBudgetStatuses(): Promise<import("./types").QuotaBudgetCheck> { return invoke("get_quota_budget_statuses"); }
+
+export function onTrayProviderSelected(cb: (provider: string) => void): Promise<UnlistenFn> { return listen<string>("tray-provider-selected", event => cb(event.payload)); }
+
+export function getAmbientStatus(): Promise<import("./types").AmbientSnapshot> { return invoke("get_ambient_status"); }
+export function onQuotaPolicyUpdated(cb: () => void): Promise<UnlistenFn> { return listen("quota-policy-updated", cb); }

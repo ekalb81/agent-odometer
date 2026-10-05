@@ -82,6 +82,9 @@ pub struct NotificationSettings {
     /// tracked but not surfaced. `start > end` wraps past midnight.
     #[serde(default)]
     pub quiet_hours: Option<(u8, u8)>,
+    /// New categories are off by default; the existing master gates all delivery.
+    #[serde(default)]
+    pub ambient: crate::ambient::Categories,
 }
 
 /// One armed budget crossing. Existence of an entry means "already
@@ -92,6 +95,8 @@ pub struct NotificationSettings {
 pub struct NotificationLogEntry {
     pub dedup_key: String,
     pub fired_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<crate::ambient::Notice>,
 }
 
 fn quota_store_version() -> u32 {
@@ -209,6 +214,7 @@ impl QuotaStoreFile {
     pub fn prune_log(&mut self, now: DateTime<Utc>, retention: chrono::Duration) {
         self.notification_log
             .retain(|entry| now.signed_duration_since(entry.fired_at) <= retention);
+        self.notification_log.sort_by_key(|entry| entry.fired_at);
         if self.notification_log.len() > MAX_LOG_ENTRIES {
             let excess = self.notification_log.len() - MAX_LOG_ENTRIES;
             self.notification_log.drain(0..excess);
@@ -285,7 +291,10 @@ pub fn validate_quota_config(config: &QuotaConfigWire) -> Result<(), String> {
         }) {
             return Err("budget project key is invalid".into());
         }
-        if budget.id.trim().is_empty() || budget.id.len() > 128 {
+        if budget.id.trim().is_empty()
+            || budget.id.len() > 128
+            || budget.id.starts_with(crate::ambient::PREFIX)
+        {
             return Err("budget id must contain 1 to 128 bytes".to_string());
         }
         if !seen_ids.insert(budget.id.as_str()) {
@@ -386,6 +395,7 @@ mod tests {
         store.notification_log.push(NotificationLogEntry {
             dedup_key: "b1".into(),
             fired_at: Utc::now(),
+            notice: None,
         });
         assert!(store.check_revision(Some(&revision)).is_ok());
         store.budgets.push(percent_budget());
@@ -464,6 +474,7 @@ mod tests {
         store.notification_log.push(NotificationLogEntry {
             dedup_key: "b1".into(),
             fired_at: Utc::now(),
+            notice: None,
         });
 
         let serialized = serde_json::to_string_pretty(&store).unwrap();
@@ -489,11 +500,13 @@ mod tests {
             store.notification_log.push(NotificationLogEntry {
                 dedup_key: format!("k{i}"),
                 fired_at: now,
+                notice: None,
             });
         }
         store.notification_log.push(NotificationLogEntry {
             dedup_key: "ancient".into(),
             fired_at: now - chrono::Duration::days(60),
+            notice: None,
         });
         store.prune_log(now, chrono::Duration::days(30));
         assert!(store.notification_log.len() <= MAX_LOG_ENTRIES);

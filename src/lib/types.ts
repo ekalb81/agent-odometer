@@ -1303,7 +1303,12 @@ export interface QuotaBudget {
   enabled: boolean;
 }
 
+export interface AmbientCategories { attention: boolean; provider_incidents: boolean; stale_quota: boolean; retention_risk: boolean }
+export type AmbientRoute = "budgets" | "attention" | "provider_status" | "retention" | "quota";
+export interface AmbientNotice { id: string; route: AmbientRoute; provider: string; code: string; observed_at: string; delivered_at: string }
+export interface AmbientSnapshot { available: boolean; as_of: string; notifications: NotificationSettings; alerts: AmbientNotice[]; recent: AmbientNotice[] }
 export interface NotificationSettings {
+  ambient?: AmbientCategories;
   /** Opt-in: no alert is ever surfaced while this is false. */
   enabled: boolean;
   /** Local-hour [start, end) range during which alerts are tracked but not shown. */

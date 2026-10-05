@@ -5,6 +5,7 @@
 #[unsafe(link_section = ".drectve")]
 static TEST_COMMON_CONTROLS: [u8; 168] = *b" \"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\" ";
 
+mod ambient;
 pub mod attention;
 pub mod claude_parser;
 pub mod commands;
@@ -191,6 +192,9 @@ pub fn run() {
             set_quota_config,
             check_quota_alerts,
             commands::get_attention_status,
+            commands::check_ambient_alerts,
+            commands::get_ambient_status,
+            commands::get_quota_budget_statuses,
             commands::set_attention_preferences,
             check_quota_budgets,
             get_live_quota_status,

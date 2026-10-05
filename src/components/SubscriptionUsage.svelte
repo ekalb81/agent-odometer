@@ -75,17 +75,6 @@
     return total;
   }
 
-  function notifyIfPermitted(alert: QuotaAlert): void {
-    if (typeof Notification === 'undefined') return;
-    if (Notification.permission !== 'granted') return;
-    try {
-      new Notification('Odometer quota alert', { body: alert.message });
-    } catch {
-      // Notification construction can throw in restricted webview contexts;
-      // the in-panel alert list below still shows it either way.
-    }
-  }
-
   async function refresh(): Promise<void> {
     try {
       const [usage, ranges, snapshots] = await Promise.all([
@@ -113,7 +102,7 @@
   }
 
   function handleBudgetAlerts(fired: QuotaAlert[]): void {
-    for (const alert of fired) notifyIfPermitted(alert);
+    void fired; // Desktop delivery is owned by the shared main-window monitor.
   }
 
   $effect(() => {

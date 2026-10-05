@@ -12,6 +12,7 @@ import type { RateCard, RangeTotals, SessionSummary } from './lib/types';
 const mocks = vi.hoisted(() => ({
   ranges: vi.fn(), quota: vi.fn(), tray: vi.fn(), compute: vi.fn(),
   ratesUpdated: null as null | ((card: RateCard) => void),
+  trayProvider: null as null | ((provider: string) => void),
 }));
 
 // Keep the real App lifecycle, effects, queue and cache; child views and
@@ -21,7 +22,7 @@ vi.mock('./components/SettingsView.svelte', () => ({ default: () => {} }));
 vi.mock('./components/InstructionsView.svelte', () => ({ default: () => {} }));
 vi.mock('./components/Filters.svelte', () => ({ default: () => {} }));
 vi.mock('./lib/stores/theme.svelte', () => ({}));
-vi.mock('./lib/trayTotals', () => ({ computeTrayTotals: mocks.compute }));
+vi.mock('./lib/trayTotals', () => ({ computeScopedTrayTotals: mocks.compute }));
 vi.mock('./lib/ipc', async (importOriginal) => ({
   ...await importOriginal<typeof import('./lib/ipc')>(),
   getConfig: () => new Promise(() => {}),
@@ -32,6 +33,8 @@ vi.mock('./lib/ipc', async (importOriginal) => ({
   onInstructionScanProgress: async () => () => {},
   onConfigUpdated: async () => () => {},
   onOpenSettings: async () => () => {},
+  onQuotaPolicyUpdated: async () => () => {},
+  onTrayProviderSelected: async (callback: (provider: string) => void) => { mocks.trayProvider = callback; return () => { mocks.trayProvider = null; }; },
   onRatesUpdated: async (callback: (card: RateCard) => void) => {
     mocks.ratesUpdated = callback;
     return () => { mocks.ratesUpdated = null; };
@@ -86,9 +89,22 @@ afterEach(() => {
 });
 
 describe('App tray pricing refresh', () => {
+  it('rejects an in-flight prior provider and publishes the explicit native tray selection', async () => {
+    const pending = deferred<[]>();
+    mocks.quota.mockReturnValueOnce(pending.promise);
+    render(App); await flush();
+    mocks.trayProvider!('claude_code'); await flush();
+    await vi.advanceTimersByTimeAsync(250);
+    pending.resolve([]); await flush();
+    expect(mocks.compute.mock.lastCall?.[3]).toBe('claude_code');
+    expect(mocks.tray.mock.lastCall?.[0]).toMatchObject({ provider: 'claude_code' });
+    const calls = mocks.tray.mock.calls.length;
+    mocks.trayProvider!('arbitrary-provider'); await flush();
+    expect(mocks.tray).toHaveBeenCalledTimes(calls);
+  });
   it('clears obsolete money while retaining tokens until replacement server prices return', async () => {
     const actual = await vi.importActual<typeof import('./lib/trayTotals')>('./lib/trayTotals');
-    mocks.compute.mockImplementation(actual.computeTrayTotals);
+    mocks.compute.mockImplementation(actual.computeScopedTrayTotals);
     const result = (cost: number): Record<string, RangeTotals>[] => [{ synthetic: {
       tokens: { input_tokens: 100, cached_input_tokens: 0, cache_creation_input_tokens: 0,
         output_tokens: 0, reasoning_output_tokens: 0, total_tokens: 100 },

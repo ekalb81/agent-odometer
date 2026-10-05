@@ -11,12 +11,15 @@ export interface TrayTotals {
   codex_credits: string;
   codex_api_usd: string;
   claude_usd: string;
+  gemini_plan?: string;
   /** Live-quota headroom label (issue #43), e.g. "codex 5h 37% left". Empty
    *  string when nothing is available to show — the tray keeps its
    *  placeholder text rather than rendering a blank menu item. The label
    *  itself is formatted by `quotaTrayLabel` (lib/subscriptionUsage.ts) from
    *  already-backend-computed numbers; this module never re-derives one. */
   quota: string;
+  provider?: string;
+  recent?: string;
 }
 
 export interface TraySessionLike {
@@ -25,13 +28,21 @@ export interface TraySessionLike {
   credits_unlimited: boolean | null;
 }
 
+export function computeScopedTrayTotals(
+  sessions: Iterable<TraySessionLike>, ranges: Record<string, RangeTotals>,
+  rateCard: RateCard, provider: string, quotaLabel: string | null = null,
+): TrayTotals {
+  const selected = [...sessions].filter(session => provider === 'all' || session.harness === provider);
+  return { ...computeTrayTotals(selected, ranges, rateCard, quotaLabel), provider };
+}
+
 export function computeTrayTotals(
   sessions: Iterable<TraySessionLike>,
   ranges: Record<string, RangeTotals>,
   _rateCard: RateCard,
   quotaLabel: string | null = null,
 ): TrayTotals {
-  let tokens = 0; let codexCredits = 0; let codexApi = 0; let claudeUsd = 0;
+  let tokens = 0; let codexCredits = 0; let codexApi = 0; let claudeUsd = 0; let geminiUsd = 0; let missingGemini = false; let unpricedGemini = false;
   let unlimited = 0; let missingCredits = false; let missingApi = false; let missingClaude = false;
   let unpricedCredits = false; let unpricedApi = false; let unpricedClaude = false;
   for (const session of sessions) {
@@ -44,9 +55,12 @@ export function computeTrayTotals(
       unpricedCredits ||= (plan?.unpriced_models.length ?? 0) > 0;
       codexApi += api?.total ?? 0; missingApi ||= !api || api.missing_models.length > 0;
       unpricedApi ||= (api?.unpriced_models.length ?? 0) > 0;
-    } else {
+    } else if (session.harness === "claude_code") {
       claudeUsd += (plan?.total ?? Number.NaN); missingClaude ||= (plan?.missing_models.length ?? 0) > 0;
       unpricedClaude ||= (plan?.unpriced_models.length ?? 0) > 0;
+    } else if (session.harness === 'gemini_cli') {
+      geminiUsd += plan?.total ?? Number.NaN; missingGemini ||= (plan?.missing_models.length ?? 0) > 0;
+      unpricedGemini ||= (plan?.unpriced_models.length ?? 0) > 0;
     }
   }
   const creditText = unlimited > 0 && codexCredits === 0 ? `unlimited (${unlimited})` : `${codexCredits.toFixed(2)}${unlimited ? ` + ${unlimited} unlimited` : ''}${unpricedCredits ? ' · excludes unpriced' : missingCredits ? ' · fallback' : ''}`;
@@ -55,6 +69,7 @@ export function computeTrayTotals(
     codex_credits: !Number.isFinite(codexCredits) || (unpricedCredits && codexCredits === 0 && unlimited === 0) ? 'unavailable' : creditText,
     codex_api_usd: missingApi ? 'unavailable · missing direct rate' : unpricedApi && codexApi === 0 ? 'unavailable · unpriced models' : `${formatCredits(codexApi, 'USD')}${unpricedApi ? ' · excludes unpriced' : ''}`,
     claude_usd: !Number.isFinite(claudeUsd) || (unpricedClaude && claudeUsd === 0) ? 'unavailable' : `${formatCredits(claudeUsd, 'USD')}${unpricedClaude ? ' · excludes unpriced' : missingClaude ? ' · fallback' : ''}`,
+    gemini_plan: !Number.isFinite(geminiUsd) || (unpricedGemini && geminiUsd === 0) ? 'unavailable' : `${formatCredits(geminiUsd, _rateCard.currencies?.gemini_cli ?? "USD")}${unpricedGemini ? ' · excludes unpriced' : missingGemini ? ' · fallback' : ''}`,
     quota: quotaLabel ?? '',
   };
 }
