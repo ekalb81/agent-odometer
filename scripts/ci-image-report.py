@@ -168,7 +168,7 @@ def summarize(root, job_file):
         print(f"| {lane} | {arm} | {len(values)}/5 | {values_text} |")
     print("\nNearest-rank p95 with n=5 is the sample maximum. It is not a stable population-tail estimate. Failed/time-out/skipped cases remain in the planned denominator; successful-only timing cannot justify adoption when any case is missing.\n")
     completed = [seconds(job) for job in jobs if seconds(job) is not None]
-    print(f"All completed experiment jobs consumed {sum(completed)/60:.2f} observed runner-minutes, including failed jobs, seeds and publisher. Sum of per-job rounded-up minutes is {sum(math.ceil(value/60) for value in completed)} (an estimate, not billing data). The reporting job is still running and adds at most 5 minutes. Hard cap: 525 runner-minutes, six measured jobs concurrently.\n")
+    print(f"All completed experiment jobs consumed {sum(completed)/60:.2f} observed runner-minutes, including failed jobs, seeds and publisher. Sum of per-job rounded-up minutes is {sum(math.ceil(value/60) for value in completed)} (an estimate, not billing data). The reporting job is still running and adds at most 5 minutes. Hard cap: 540 runner-minutes, six measured jobs concurrently.\n")
     print("| Lane | Repetition | First registry pull seconds | Immediate cached pull seconds |\n|---|---:|---:|---:|")
     for lane, repetition, cold, warm in pulls:
         print(f"| {lane} | {repetition} | {cold:.3f} | {warm:.3f} |")

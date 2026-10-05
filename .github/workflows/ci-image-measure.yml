@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       confirm_probe:
-        description: 'Publish one experimental GHCR image and run the bounded 525 runner-minute worst-case comparison.'
+        description: 'Publish one experimental GHCR image and run the bounded 540 runner-minute worst-case comparison.'
         type: boolean
         required: true
         default: false
@@ -83,7 +83,7 @@ jobs:
   seed:
     needs: publish
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       max-parallel: 3
