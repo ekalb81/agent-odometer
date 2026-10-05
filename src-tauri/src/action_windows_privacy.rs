@@ -436,6 +436,50 @@ fn file_id(handle: &impl AsRawHandle) -> Result<(u64, [u8; 16]), PrivacyError> {
     Ok((info.VolumeSerialNumber, info.FileId.Identifier))
 }
 
+fn canonical_owner_dacl(descriptor: *mut c_void) -> Result<String, PrivacyError> {
+    if descriptor.is_null() {
+        return Err(PrivacyError::Unsafe);
+    }
+    let mut text = null_mut();
+    let mut length = 0u32;
+    if unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut text,
+            &mut length,
+        )
+    } == 0
+        || text.is_null()
+    {
+        return Err(PrivacyError::Unsafe);
+    }
+    let _text = LocalMemory(text.cast());
+    if length == 0 || length > 2048 {
+        return Err(PrivacyError::Unsafe);
+    }
+    let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
+    String::from_utf16(&units[..end]).map_err(|_| PrivacyError::Unsafe)
+}
+
+fn permitted_owner_dacl(user_sid: &str, directory: bool) -> Result<[String; 2], PrivacyError> {
+    let flags = if directory { "OICI" } else { "" };
+    let user_ace = format!("(A;{flags};FA;;;{user_sid})");
+    let system_ace = format!("(A;{flags};FA;;;SY)");
+    let prefix = format!("O:{user_sid}D:P");
+    let first = descriptor(&format!("{prefix}{user_ace}{system_ace}"))?;
+    let second = descriptor(&format!("{prefix}{system_ace}{user_ace}"))?;
+    Ok([
+        canonical_owner_dacl(first.0)?,
+        canonical_owner_dacl(second.0)?,
+    ])
+}
+
 fn verify_security(
     handle: &impl AsRawHandle,
     user_sid: &str,
@@ -463,42 +507,14 @@ fn verify_security(
     if sid_string(owner)? != user_sid || dacl.is_null() {
         return Err(PrivacyError::Unsafe);
     }
-    // Let Windows parse and format ACEs, then require the entire canonical
-    // owner/DACL string to match one of the two permitted ACE orders. This
-    // rejects inherited, NULL, deny, conditional, extra, or weaker entries
-    // without dereferencing GetAce's variable-length raw pointers.
-    let mut text = null_mut();
-    let mut length = 0u32;
-    if unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor,
-            SDDL_REVISION_1,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut text,
-            &mut length,
-        )
-    } == 0
-        || text.is_null()
-    {
-        return Err(PrivacyError::Unsafe);
-    }
-    let _text = LocalMemory(text.cast());
-    if length == 0 || length > 2048 {
-        return Err(PrivacyError::Unsafe);
-    }
-    let units = unsafe { std::slice::from_raw_parts(text, length as usize) };
-    let end = units
-        .iter()
-        .position(|unit| *unit == 0)
-        .unwrap_or(units.len());
-    let actual = String::from_utf16(&units[..end]).map_err(|_| PrivacyError::Unsafe)?;
-    let flags = if directory { "OICI" } else { "" };
-    let user_ace = format!("(A;{flags};FA;;;{user_sid})");
-    let system_ace = format!("(A;{flags};FA;;;SY)");
-    let prefix = format!("O:{user_sid}D:P");
-    if actual == format!("{prefix}{user_ace}{system_ace}")
-        || actual == format!("{prefix}{system_ace}{user_ace}")
-    {
+    // Compare semantic owner/DACL policies through the same native formatter.
+    // Windows may abbreviate a built-in SID (for example RID 500 as LA), so
+    // comparing the observed string to a raw SID spelling rejects a safe ACL.
+    // Native SDDL normalization may omit audit-only ACE flag bits; this is an
+    // access-policy check, not a binary ACL identity check.
+    let actual = canonical_owner_dacl(descriptor)?;
+    let expected = permitted_owner_dacl(user_sid, directory)?;
+    if expected.contains(&actual) {
         Ok(())
     } else {
         Err(PrivacyError::Unsafe)
@@ -666,5 +682,22 @@ mod tests {
         );
         assert!(!volume_allowed(DRIVE_FIXED, 0));
         assert!(!volume_allowed(4, FS_PERSISTENT_ACLS));
+    }
+
+    #[test]
+    fn canonicalizes_same_machine_administrator_sid_before_policy_comparison() {
+        let current = current_user_sid().unwrap();
+        let (machine_prefix, _) = current.rsplit_once('-').unwrap();
+        let administrator = format!("{machine_prefix}-500");
+        let raw = format!("O:{administrator}D:P(A;OICI;FA;;;{administrator})(A;OICI;FA;;;SY)");
+        let policy = descriptor(&raw).unwrap();
+        let canonical = canonical_owner_dacl(policy.0).unwrap();
+        // On this host the native formatter uses LA for the built-in account.
+        // The old comparison to `raw` would reject this valid policy.
+        assert_ne!(canonical, raw);
+        assert_eq!(
+            canonical,
+            permitted_owner_dacl(&administrator, true).unwrap()[0]
+        );
     }
 }
