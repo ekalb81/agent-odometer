@@ -262,12 +262,8 @@ mod tests {
         changed.accounts[0].buckets[0].snapshot.provenance = QuotaProvenance::TranscriptDerived;
         assert_unavailable(&changed);
         changed.accounts[0].buckets[0].snapshot.provenance = QuotaProvenance::LiveProvider;
-        let (_, mut duplicate, _) = fixture(now, 90.0);
         let original_bucket = changed.accounts[0].buckets[0].clone();
-        changed.accounts[0].buckets = vec![
-            original_bucket.clone(),
-            duplicate.accounts[0].buckets.remove(0),
-        ];
+        changed.accounts[0].buckets = vec![original_bucket.clone(), original_bucket.clone()];
         assert_unavailable(&changed);
         changed.accounts[0].buckets = vec![original_bucket];
         changed.accounts[0].observed_at = Some(now - chrono::Duration::minutes(11));
