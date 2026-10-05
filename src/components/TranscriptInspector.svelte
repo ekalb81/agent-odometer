@@ -3,8 +3,8 @@
   import { getTranscriptPage, getRecordBookmarks, editRecordBookmark } from '../lib/ipc';
   import { organizationStore } from '../lib/stores/organization.svelte';
   import type { TranscriptCursor, TranscriptPage, TranscriptRecord, RecordBookmark, RecordBookmarkList } from '../lib/types';
-  let { sessionId, recordId = null, blockIndex = null, onclose }: { sessionId: string; recordId?: string | null; blockIndex?: number | null; onclose: () => void } = $props();
-  let dialog: HTMLDialogElement;
+  let { sessionId, recordId = null, blockIndex = null, embedded = false, onclose }: { sessionId: string; recordId?: string | null; blockIndex?: number | null; embedded?: boolean; onclose: () => void } = $props();
+  let dialog: HTMLElement;
   let page = $state<TranscriptPage | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
@@ -56,7 +56,7 @@
     } catch { if (request === generation) { error = 'The transcript could not be read. Retry or reopen it.'; page = null; } }
     finally { if (request === generation) loading = false; }
   }
-  onMount(() => { dialog.showModal(); return () => { generation++; bookmarkGeneration++; }; });
+  onMount(() => { if (!embedded) (dialog as HTMLDialogElement).showModal(); return () => { generation++; bookmarkGeneration++; }; });
   $effect(() => {
     const key = sessionId;
     const epoch = organizationStore.epoch;
@@ -76,7 +76,7 @@
     finally { if (request === bookmarkGeneration) bookmarkLoading = false; }
   }
   async function setBookmark(id: string, bookmarked: boolean): Promise<void> {
-    if (!bookmarks || bookmarkBusy || bookmarkLoading) return;
+    if (embedded || !bookmarks || bookmarkBusy || bookmarkLoading) return;
     const request = bookmarkGeneration;
     const epoch = organizationStore.epoch;
     const existing = bookmarks.bookmarks.find(row => row.identity.anchor === id);
@@ -125,11 +125,11 @@
   function issueLabel(value: string): string { return value.replaceAll('_', ' '); }
 </script>
 
-<dialog bind:this={dialog} onclose={onclose} onkeydown={(event) => { if (event.key === 'Escape') event.stopPropagation(); }} aria-labelledby="transcript-heading">
+<svelte:element this={embedded ? 'section' : 'dialog'} role={embedded ? 'group' : 'dialog'} class="inspector-surface" class:embedded bind:this={dialog} onclose={onclose} onkeydown={(event: KeyboardEvent) => { if (event.key === 'Escape') { event.stopPropagation(); if (embedded) { event.preventDefault(); onclose(); } } }} aria-labelledby={`transcript-heading-${sessionId}`}>
   <div class="inspector">
     <header>
-      <div><h2 id="transcript-heading">Transcript inspector</h2><p>Source order · loaded only while this inspector is open</p></div>
-      <button type="button" onclick={() => dialog.close()}>Close inspector</button>
+      <div><h2 id={`transcript-heading-${sessionId}`}>Transcript inspector</h2><p>Source order · loaded only while this inspector is open</p></div>
+      <button type="button" onclick={() => embedded ? onclose() : (dialog as HTMLDialogElement).close()}>Close inspector</button>
     </header>
     <form onsubmit={(event) => { event.preventDefault(); void jump(anchor); }}>
       <label>Record anchor <input bind:value={anchor} placeholder="Paste a record anchor" maxlength="1024" /></label>
@@ -154,7 +154,7 @@
         {#each savedBookmarks as bookmark, index (bookmark.identity.anchor)}
           <li>
             <button type="button" disabled={loading} onclick={() => jump(bookmark.identity.anchor)}>Open bookmarked record {index + 1}</button>
-            <button type="button" disabled={bookmarkBusy || bookmarkLoading} onclick={() => void setBookmark(bookmark.identity.anchor, false)}>Remove bookmark {index + 1}</button>
+            {#if !embedded}<button type="button" disabled={bookmarkBusy || bookmarkLoading} onclick={() => void setBookmark(bookmark.identity.anchor, false)}>Remove bookmark {index + 1}</button>{/if}
             <code>{bookmark.identity.anchor}</code>
           </li>
         {/each}
@@ -174,7 +174,7 @@
             <span>{record.presentation?.timestamp ?? 'Timestamp not recorded'}</span>
           </div>
           <p class="anchor"><button type="button" onclick={() => { selected = record.id; anchor = record.id; }}>Select anchor</button> <code>{record.id}</code></p>
-          <button type="button" disabled={!bookmarks || bookmarkLoading || bookmarkBusy || loading || !record.raw_json} onclick={() => void setBookmark(record.id, !savedBookmarks.some(row => row.identity.anchor === record.id))}>{savedBookmarks.some(row => row.identity.anchor === record.id) ? 'Remove record bookmark' : 'Bookmark record'}</button>
+          {#if !embedded}<button type="button" disabled={!bookmarks || bookmarkLoading || bookmarkBusy || loading || !record.raw_json} onclick={() => void setBookmark(record.id, !savedBookmarks.some(row => row.identity.anchor === record.id))}>{savedBookmarks.some(row => row.identity.anchor === record.id) ? 'Remove record bookmark' : 'Bookmark record'}</button>{/if}
           {#if record.issue}<p role="status">{issueLabel(record.issue)} · payload unavailable</p>{/if}
           {#if expanded.has(record.id)}
             {#each record.presentation?.blocks ?? [] as block, index (index)}
@@ -201,11 +201,12 @@
       {:else if page?.next_cursor}<p>More source records are available. Tool pairing is limited to pages visited.</p>{/if}
     </div>
   </div>
-</dialog>
+</svelte:element>
 
 <style>
-  dialog { width: min(960px, calc(100vw - 24px)); height: min(820px, calc(100vh - 24px)); max-width: none; max-height: none; margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text); }
-  dialog::backdrop { background: #0008; }
+  .inspector-surface:not(.embedded) { width: min(960px, calc(100vw - 24px)); height: min(820px, calc(100vh - 24px)); max-width: none; max-height: none; margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); color: var(--text); }
+  .inspector-surface::backdrop { background: #0008; }
+  .embedded { height: 560px; min-width: 0; border: 1px solid var(--border); border-radius: 6px; }
   .inspector { display: flex; flex-direction: column; height: 100%; min-width: 0; font-size: 12px; }
   header, form, .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
   header { justify-content: space-between; }

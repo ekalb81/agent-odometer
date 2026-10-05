@@ -5,6 +5,10 @@
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { transcriptFixture } from './dev-mock/transcript';
 import { mockOrganization } from './dev-mock/organization';
+import { actionPreviewFixture } from './dev-mock/action';
+import { mockCurated } from './dev-mock/curated';
+import { mockExperiments } from './dev-mock/experiments';
+import { workflowFixture } from './dev-mock/workflow';
 import { contentSearchFixture, retainedLandingFixture } from './dev-mock/contentSearch';
 import type { TranscriptSearchRequest, TranscriptSearchTarget } from './lib/types';
 import type { TranscriptRequest } from './lib/types';
@@ -503,6 +507,28 @@ function publicStatusConfig() {
 
 mockIPC((cmd, payload) => {
   switch (cmd) {
+    case 'export_curated_dataset':
+    case 'export_offline_experiment': return true;
+    case 'get_offline_experiments':
+    case 'get_offline_experiment':
+    case 'preview_offline_experiment':
+    case 'commit_offline_experiment':
+    case 'preview_offline_import':
+    case 'commit_offline_import':
+    case 'remove_offline_experiment':
+      return mockExperiments(cmd, (payload ?? {}) as Record<string, unknown>, mockCurated('get_curated_dataset', {}) as import('./lib/types').CuratedDataset);
+    case 'get_curated_dataset':
+    case 'get_curated_candidates':
+    case 'preview_curated_case':
+    case 'commit_curated_case':
+    case 'remove_curated_case':
+      return mockCurated(cmd,(payload??{}) as Record<string,unknown>,visualScenario==='organization-recovered');
+    case 'get_workflow_report':
+    case 'record_workflow_measurement':
+    case 'set_workflow_finding_suppression':
+      return workflowFixture(cmd, (payload ?? {}) as Record<string, unknown>);
+    case 'preview_controlled_action':
+      return actionPreviewFixture((payload as { request: { action: import('./lib/types').ControlledActionDraft } }).request.action);
     case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
     case 'get_organization_summaries':
     case 'get_record_bookmarks':
@@ -549,6 +575,15 @@ mockIPC((cmd, payload) => {
       return visualScenario === 'content-search-retained'
         ? { ...page, availability: 'missing', source_complete: false, records: [], next_cursor: null }
         : page;
+    }
+    case 'get_execution_page': {
+      const page = transcriptFixture((payload as { request: TranscriptRequest }).request);
+      if (visualScenario === 'content-search-retained') return { availability: 'missing', issues: [], source_complete: false, records: [], next_cursor: null };
+      return { availability: page.availability, issues: page.issues,
+        next_cursor: page.next_cursor, source_complete: page.source_complete,
+        records: page.records.map(record => ({ record_id: record.id,
+          timestamp: record.presentation?.timestamp ?? null, role: record.presentation?.role ?? null,
+          issue: record.issue, blocks: (record.presentation?.blocks ?? []).map(block => ({ kind: block.kind, call_id: block.call_id, name: block.name })) })) };
     }
     case 'search_session_content':
       return contentSearchFixture((payload as { request: TranscriptSearchRequest }).request, visualScenario === 'content-search-retained');

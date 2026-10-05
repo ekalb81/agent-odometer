@@ -1,4 +1,4 @@
-import { expect, test, type Page, type TestInfo } from '@playwright/test';
+import { expect, test, type Locator, type Page, type TestInfo } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -150,6 +150,34 @@ function visualTest(
   });
 }
 
+function visualPanelTest(id: string, title: string, body: (page: Page) => Promise<Locator>): void {
+  if (!declaredSnapshotIds.has(id) || registeredSnapshotIds.has(id)) {
+    throw new Error(`Visual panel snapshot ID missing or duplicate: ${id}`);
+  }
+  registeredSnapshotIds.add(id);
+  test(title, async ({ page }, testInfo) => {
+    const sourcePanel = await body(page);
+    await expectVisualReady(page);
+    await sourcePanel.evaluate((element, snapshotId) => {
+      const clone = element.cloneNode(true) as HTMLElement;
+      clone.dataset.visualPanelCapture = snapshotId;
+      clone.style.position = 'absolute';
+      clone.style.top = '0';
+      clone.style.left = '0';
+      clone.style.width = `${element.getBoundingClientRect().width}px`;
+      clone.style.zIndex = '2147483647';
+      document.body.appendChild(clone);
+    }, id);
+    const panel = page.locator(`[data-visual-panel-capture="${id}"]`);
+    const currentDir = join(process.cwd(), 'output', 'playwright', 'current');
+    await mkdir(currentDir, { recursive: true });
+    const currentPath = join(currentDir, `${id}.png`);
+    await panel.screenshot({ path: currentPath, animations: 'disabled', caret: 'hide' });
+    await testInfo.attach(`current-${id}`, { path: currentPath, contentType: 'image/png' });
+    await expect(panel).toHaveScreenshot(`${id}.png`, { animations: 'disabled', caret: 'hide' });
+  });
+}
+
 function assertManifestCasesAreRegistered(): void {
   const unregistered = visualManifest.snapshots.filter((id) => !registeredSnapshotIds.has(id));
   if (unregistered.length > 0) {
@@ -275,6 +303,58 @@ visualTest('session-context-menu', 'session context menu', async (page) => {
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click({ button: 'right' });
   await expect(page.getByRole('menu', { name: /Export Add dark mode toggle/ })).toBeVisible();
   await expectSessionRollup(page, 8);
+});
+
+async function openExecutionBoard(page: Page) {
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click({ button: 'right' });
+  await page.getByRole('menuitem', { name: 'Compare execution' }).click();
+  const board = page.getByRole('dialog', { name: 'Execution board' });
+  await expect(board.getByText(/2 visited records/)).toBeVisible();
+  return board;
+}
+
+visualTest('execution-board-overlap', 'execution board shows bounded overlapping parent and child activity', async (page) => {
+  await visit(page, { view: 'codex' });
+  const board = await openExecutionBoard(page);
+  await board.getByText('Select sessions (1/8)').click();
+  await board.getByRole('checkbox', { name: /Search cookbook/ }).check();
+  await expect(board.getByText(/Recorded parent: Add dark mode toggle/)).toBeVisible();
+  await board.getByText('Select sessions (2/8)').click();
+  const parent = board.getByRole('region', { name: 'Execution of Add dark mode toggle' });
+  await parent.getByRole('button', { name: 'Load next bounded page' }).click();
+  await expect(parent.getByText(/4 visited records/)).toBeVisible();
+  await expect(board.getByText(/partial coverage; unvisited records/)).toBeVisible();
+  await expect(board.getByRole('group', { name: 'Transcript inspector' })).toHaveCount(0);
+});
+
+visualTest('execution-board-comparison', 'execution board lazily compares two exact bounded source panes', async (page) => {
+  await visit(page, { view: 'codex' });
+  const board = await openExecutionBoard(page);
+  await board.getByText('Select sessions (1/8)').click();
+  await board.getByRole('checkbox', { name: /Search cookbook/ }).check();
+  await board.getByText('Select sessions (2/8)').click();
+  await board.getByRole('region', { name: 'Execution of Add dark mode toggle' }).getByRole('button', { name: 'Inspect / compare' }).click();
+  await board.getByRole('region', { name: /Execution of Search cookbook/ }).getByRole('button', { name: 'Inspect / compare' }).click();
+  await expect(board.getByRole('group', { name: 'Transcript inspector' })).toHaveCount(2);
+  await expect(board.getByRole('button', { name: 'Collapse user' })).toHaveCount(2);
+  await expect(board.getByRole('button', { name: 'Bookmark record', exact: true })).toHaveCount(0);
+  await board.getByRole('heading', { name: 'Source comparison' }).scrollIntoViewIfNeeded();
+});
+
+visualTest('execution-board-narrow-coverage', 'execution board has honest partial and empty selection states at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 900 });
+  await visit(page, { view: 'codex', theme: 'dark' });
+  const board = await openExecutionBoard(page);
+  await expect(board.getByText(/partial coverage; unvisited records/)).toBeVisible();
+  await board.getByText('Select sessions (1/8)').click();
+  await board.getByRole('button', { name: 'Clear selection' }).click();
+  await expect(board.getByText(/Select sessions to compare/)).toBeVisible();
+  await board.getByRole('checkbox', { name: /Search cookbook/ }).check();
+  await expect(board.getByText('Parent relationship unresolved in selection')).toBeVisible();
+  await board.getByText('Select sessions (1/8)').click();
+  const bounds = await board.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
 });
 
 visualTest('sessions-filtered-empty', 'session filtered empty', async (page) => {
@@ -824,6 +904,179 @@ visualTest('handoff-retained-narrow', 'handoff labels missing source and stays u
   expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
   await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
   await handoff.getByRole('textbox', { name: /Exact handoff Markdown/ }).scrollIntoViewIfNeeded();
+});
+
+async function prepareCuratedPreview(page: Page): Promise<Locator> {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByRole('combobox', { name: /^Task outcome/ }).selectOption('accepted');
+  await editor.getByRole('button', { name: 'Save organization' }).click();
+  await editor.getByRole('button', { name: 'Curate reviewed example' }).click();
+  const dataset = page.getByRole('dialog', { name: 'Curated local examples' });
+  await dataset.getByRole('checkbox', { name: /Record 1/ }).check();
+  await dataset.getByLabel('Example name').fill('Synthetic greeting review');
+  await dataset.getByLabel('Optional review rubric').fill('Preserve the requested greeting and explain the change.');
+  await dataset.getByLabel('Also redact these exact phrases, one per line').fill('synthetic demo');
+  await dataset.getByRole('button', { name: 'Build exact minimized preview' }).click();
+  await expect(dataset.getByRole('region', { name: 'Exact curated example preview' })).toContainText('[review phrase redacted]');
+  return dataset;
+}
+
+visualTest('curated-example-preview', 'exact minimized example requires explicit review before local persistence', async (page) => {
+  await page.setViewportSize({ width: 1100, height: 1000 });
+  const dataset = await prepareCuratedPreview(page);
+  await expect(dataset.getByRole('button', { name: 'Add reviewed example' })).toBeDisabled();
+  await dataset.getByRole('region', { name: 'Exact curated example preview' }).scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
+visualTest('curated-example-removal-narrow', 'narrow reviewed removal preserves content-free version history', async (page) => {
+  await page.setViewportSize({ width: 500, height: 850 });
+  const dataset = await prepareCuratedPreview(page);
+  await dataset.getByRole('checkbox', { name: /I reviewed every included section/ }).check();
+  await dataset.getByRole('button', { name: 'Add reviewed example' }).click();
+  await dataset.locator('details summary').click();
+  await dataset.getByRole('button', { name: 'Review removal of example 1' }).click();
+  await dataset.getByRole('region', { name: 'Review example removal' }).scrollIntoViewIfNeeded();
+  const bounds = await dataset.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+  await page.mouse.move(0, 0);
+});
+
+visualTest('human-outcomes-summary', 'explicit human outcomes show coverage and user-reported effort', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  const editor = page.getByRole('region', { name: 'Private session organization' });
+  await editor.getByRole('button', { name: 'Edit organization' }).click();
+  await editor.getByRole('combobox', { name: /^Task outcome/ }).selectOption('accepted');
+  await editor.getByLabel('User-reported repair minutes (optional)').fill('12');
+  await editor.getByLabel('Accepted on first pass (explicit report)').selectOption('false');
+  await editor.getByRole('button', { name: 'Save organization' }).click();
+  await expect(editor.getByText(/Human: accepted/)).toBeVisible();
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const outcomes = page.getByLabel('Human task outcomes', { exact: true }).filter({ visible: true });
+  await outcomes.locator('summary').click();
+  await expect(outcomes).toContainText('0 / 1 explicitly reported');
+  await expect(outcomes).toContainText('12 minutes');
+  await outcomes.scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
+visualTest('human-outcomes-recovery', 'unrestored human ratings remain unavailable', async (page) => {
+  await page.setViewportSize({ width: 800, height: 900 });
+  await visit(page, { scenario: 'organization-recovered', view: 'codex' });
+  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  const outcomes = page.getByLabel('Human task outcomes', { exact: true }).filter({ visible: true });
+  await outcomes.locator('summary').click();
+  await expect(outcomes).toContainText('Unrestored ratings are unavailable, not unrated');
+  await outcomes.scrollIntoViewIfNeeded();
+  await page.mouse.move(0, 0);
+});
+
+visualPanelTest('workflow-measurement-desktop', 'workflow measurement shows before and after evidence with unavailable human outcomes', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  const panel = page.getByTestId('workflow-panel').filter({ visible: true });
+  await panel.locator('summary').first().click();
+  await expect(panel.getByText('Tool failure rate')).toBeVisible();
+  await expect(panel.getByText('User correction rate')).toBeVisible();
+  await expect(panel.getByText('Unavailable').first()).toBeVisible();
+  await expect(panel.getByText(/This is a scenario, not measured or causal savings/)).toBeVisible();
+  expect(await panel.locator('p').filter({ hasText: /Metrics v2/ }).textContent()).toContain('analyzer v2. Subagent');
+  expect(await panel.locator('p').filter({ hasText: /This is a scenario/ }).textContent()).toContain('savings. Token');
+  expect(await panel.getByRole('button', { name: /Review session evidence/ }).textContent()).toContain('evidence 1');
+  return panel;
+});
+
+visualPanelTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and comparison limits remain usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { view: 'codex' });
+  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  const panel = page.getByTestId('workflow-panel').filter({ visible: true });
+  await panel.locator('summary').first().click();
+  await expect(panel.getByText('Tool failure rate')).toBeVisible();
+  await panel.getByRole('button', { name: 'Record measurement' }).click();
+  await expect(panel.getByRole('button', { name: 'Suppress finding' })).toBeVisible();
+  await panel.getByRole('button', { name: 'Suppress finding' }).click();
+  await expect(panel.getByRole('button', { name: 'Unsuppress finding' })).toBeVisible();
+  await expect(panel.getByText(/observational comparison/)).toBeVisible();
+  return panel;
+});
+
+visualPanelTest('workflow-action-preview-narrow', 'workflow remediation stays a reviewed dry run at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { view: 'codex' });
+  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  const panel = page.getByTestId('workflow-panel').filter({ visible: true });
+  await panel.locator('summary').first().click();
+  await expect(panel.getByText('Tool failure rate')).toBeVisible();
+  await panel.getByRole('button', { name: 'Record measurement' }).click();
+  await panel.getByRole('button', { name: 'Preview future action' }).click();
+  await expect(panel.getByText('Dry run only', { exact: false })).toBeVisible();
+  await expect(panel.getByText(/Apply and undo are unavailable/)).toBeVisible();
+  return panel;
+});
+
+visualPanelTest('quota-guard-preview-narrow', 'quota guard stays a reviewed dry run at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { view: 'codex' });
+  const panel = await openQuotaPanel(page, 'quota-budgets-panel');
+  await panel.getByRole('button', { name: 'Add budget' }).click();
+  await panel.getByRole('button', { name: 'Save budget' }).click();
+  await panel.getByRole('button', { name: 'Preview future guard' }).click();
+  await expect(panel.getByText('Dry run only', { exact: false })).toBeVisible();
+  await expect(panel.getByText(/Apply and undo are unavailable/)).toBeVisible();
+  await panel.evaluate((element) => element.classList.add('bg-card'));
+  return panel;
+});
+
+async function prepareOfflinePreview(page: Page): Promise<Locator> {
+  const dataset=await prepareCuratedPreview(page);
+  await dataset.getByRole('checkbox',{name:/I reviewed every included section/}).check();
+  await dataset.getByRole('button',{name:'Add reviewed example'}).click();
+  await dataset.getByRole('button',{name:'Compare frozen offline runs'}).click();
+  const comparison=page.getByRole('dialog',{name:'Frozen offline comparisons'});
+  await comparison.getByLabel('Comparison name').fill('Synthetic greeting comparison');
+  await comparison.getByLabel('Outcome review rubric').fill('Human checks correctness and preserved greeting.');
+  for(const id of ['a','b']) {
+    await comparison.getByLabel(`Prompt identifier ${id}`,{exact:true}).fill(`greeting-${id}`);
+    await comparison.getByLabel(`Prompt version ${id}`,{exact:true}).fill('1');
+    await comparison.getByLabel(`Prompt text ${id}`,{exact:true}).fill(`Synthetic ${id}: preserve the requested greeting.`);
+  }
+  await comparison.getByRole('button',{name:'Build frozen comparison preview'}).click();
+  await expect(comparison.getByRole('region',{name:'Exact offline comparison preview'})).toContainText('imported_offline');
+  return comparison;
+}
+
+visualTest('offline-comparison-freeze-preview','frozen offline comparison requires review of minimized inputs and provenance',async(page)=>{
+  await page.setViewportSize({width:1100,height:1000});
+  const comparison=await prepareOfflinePreview(page);
+  await expect(comparison.getByRole('button',{name:'Save reviewed frozen comparison'})).toBeDisabled();
+  await comparison.getByRole('region',{name:'Exact offline comparison preview'}).scrollIntoViewIfNeeded();
+  await page.mouse.move(0,0);
+});
+
+visualTest('offline-comparison-report-narrow','narrow imported comparison keeps raw dimensions and missing evidence visible',async(page)=>{
+  await page.setViewportSize({width:500,height:900});
+  const comparison=await prepareOfflinePreview(page);
+  await comparison.getByRole('checkbox',{name:/I reviewed all included/}).check();
+  await comparison.getByRole('button',{name:'Save reviewed frozen comparison'}).click();
+  await comparison.getByLabel('Imported result JSON').fill(JSON.stringify([
+    {case_id:1,variant:'a',status:'completed',output:'Synthetic accepted greeting',elapsed_ms:120,actual_cost_usd:0.03,tokens:null,quality:'accepted'},
+    {case_id:1,variant:'b',status:'failed',output:'',elapsed_ms:80,actual_cost_usd:0.02,tokens:null,quality:null}
+  ]));
+  await comparison.getByRole('button',{name:'Build minimized import preview'}).click();
+  await comparison.getByRole('checkbox',{name:/I reviewed all included/}).check();
+  await comparison.getByRole('button',{name:'Save reviewed offline results'}).click();
+  await expect(comparison.getByRole('region',{name:'Offline comparison report'})).toContainText('1 completed; 0 failed; 0 missing / 1');
+  await expect(comparison.getByRole('region',{name:'Offline comparison report'})).toContainText('0 completed; 1 failed; 0 missing / 1');
+  await comparison.getByRole('region',{name:'Offline comparison report'}).scrollIntoViewIfNeeded();
+  await expect(comparison.getByRole('button',{name:'Close comparisons'})).toBeVisible();
+  const bounds=await comparison.boundingBox();expect(bounds!.x).toBeGreaterThanOrEqual(0);expect(bounds!.x+bounds!.width).toBeLessThanOrEqual(500);
+  await page.mouse.move(0,0);
 });
 
 visualTest('provider-status-opt-in', 'public provider status keeps incident and unavailable evidence separate', async (page) => {

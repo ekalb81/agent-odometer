@@ -32,7 +32,7 @@ export function mockOrganization(command: string, payload: Record<string, unknow
     case 'edit_session_annotation': {
       const edit = payload.edit as AnnotationEdit;
       if (edit.revision !== organizationSummary(edit.identity.session_key).revision) throw new Error('Organization changed; reload before saving');
-      const value = { summary: { identity: edit.identity, revision: edit.revision + 1, pinned: edit.pinned, has_note: !!edit.note, tags: edit.tags }, note: edit.note };
+      const value = { summary: { identity: edit.identity, revision: edit.revision + 1, pinned: edit.pinned, has_note: !!edit.note, tags: edit.tags, outcome: edit.outcome ?? organizationSummary(edit.identity.session_key).outcome }, note: edit.note };
       annotations.set(edit.identity.session_key, value); edit.tags.forEach(tag => tags.add(tag)); return value;
     }
     case 'list_organization_tags': return [...tags].sort();

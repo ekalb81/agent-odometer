@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { getQuotaBudgetStatuses, getQuotaConfig, resolveProjects, setQuotaConfig } from '../lib/ipc';
-  import type { BudgetUnit, ProjectInfo, QuotaAlert, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire } from '../lib/types';
+  import { getQuotaBudgetStatuses, getQuotaConfig, previewControlledAction, resolveProjects, setQuotaConfig } from '../lib/ipc';
+  import type { BudgetUnit, ControlledActionPreview, ProjectInfo, QuotaAlert, QuotaBudget, QuotaBudgetCheck, QuotaConfigWire } from '../lib/types';
   import type { ViewScope } from '../lib/sessionProjection';
   import { providersStore } from '../lib/stores/providers.svelte';
   import { historyStore } from '../lib/stores/history.svelte';
@@ -34,6 +34,8 @@
   let editorOpen = $state(false);
   let editingId = $state<string | null>(null);
   let projectLoading = $state(false);
+  let actionPreview = $state<{ budgetId: string; value: ControlledActionPreview } | null>(null);
+  let actionError = $state<{ budgetId: string; message: string } | null>(null);
   let draft = $state<BudgetDraft>({
     provider: 'codex',
     projectKey: '',
@@ -44,6 +46,7 @@
   });
   let lifecycleGeneration = 0;
   let reportGeneration = 0;
+  let actionGeneration = 0;
 
   const statusByBudget = $derived(new Map((report?.statuses ?? []).map((status) => [status.budget_id, status])));
   const availableProviders = $derived(providersStore.descriptors);
@@ -72,6 +75,9 @@
       if (lifecycleToken !== lifecycleGeneration || requestToken !== reportGeneration) return;
       config = nextConfig;
       report = nextReport;
+      actionGeneration++;
+      actionPreview = null;
+      actionError = null;
       loadError = null;
       // Crossings are persisted for every provider; notify even when another
       // harness is selected, or its crossing would be consumed silently.
@@ -96,6 +102,7 @@
       clearInterval(timer);
       lifecycleGeneration++;
       reportGeneration++;
+      actionGeneration++;
     };
   });
 
@@ -166,6 +173,9 @@
     // Invalidate any in-flight report captured before this edit. The next
     // scheduled check evaluates the returned revision and saved budgets.
     reportGeneration++;
+    actionGeneration++;
+    actionPreview = null;
+    actionError = null;
     try {
       config = await setQuotaConfig({ ...next, revision: config.revision ?? null });
       report = null;
@@ -222,6 +232,23 @@
     await save({ ...config, budgets });
   }
 
+  async function previewGuard(budget: QuotaBudget): Promise<void> {
+    if (!config?.revision || !budget.enabled) return;
+    const revision = config.revision;
+    const token = ++actionGeneration;
+    actionPreview = null;
+    actionError = null;
+    try {
+      const value = await previewControlledAction({ kind: 'budget_guard', draft: {
+        budget_id: budget.id, expected_config_revision: revision,
+      } });
+      if (token === actionGeneration && config?.revision === revision) actionPreview = { budgetId: budget.id, value };
+    } catch {
+      if (token === actionGeneration && config?.revision === revision) actionError = { budgetId: budget.id,
+        message: 'Guard preview is stale or unavailable. Refresh the budget.' };
+    }
+  }
+
   async function removeBudget(budgetId: string): Promise<void> {
     if (!config) return;
     if (await save({ ...config, budgets: config.budgets.filter((budget) => budget.id !== budgetId) }) && editingId === budgetId) {
@@ -265,9 +292,19 @@
             {status?.current_value != null ? `${formatValue(status.current_value, budget.unit)} now` : `Unavailable (${unavailableLabel(status?.unavailable)})`}
           </span>
           <button type="button" disabled={busy} class="text-accent hover:underline" onclick={() => beginEdit(budget)}>Edit</button>
+          {#if budget.enabled}<button type="button" disabled={busy || !config.revision} class="text-accent hover:underline disabled:opacity-50" onclick={() => void previewGuard(budget)}>Preview future guard</button>{/if}
           <button type="button" disabled={busy} class="text-ink-muted hover:text-ink" aria-label={`${budget.enabled ? 'Disable' : 'Enable'} budget`} onclick={() => toggleBudget(budget)}>{budget.enabled ? 'Enabled' : 'Disabled'}</button>
           <button type="button" disabled={busy} class="text-neg hover:underline" aria-label="Remove budget" onclick={() => removeBudget(budget.id)}>Remove</button>
         </div>
+        {#if actionPreview?.budgetId === budget.id}
+          <div class="space-y-1 rounded-sm border border-edge bg-panel p-2 text-[11px] text-ink-muted" role="status">
+            <p>Dry run only · {actionPreview.value.target_type.replaceAll('_', ' ')}</p>
+            <p>{actionPreview.value.proposed_change}</p>
+            <p>{actionPreview.value.backup_requirement}</p>
+            <p>{actionPreview.value.postcondition_requirement}</p>
+            <p>Apply and undo are unavailable pending a separate security review.</p>
+          </div>
+        {:else if actionError?.budgetId === budget.id}<p role="alert" class="text-[11px] text-neg">{actionError.message}</p>{/if}
       {/each}
       <div class="flex items-center gap-2">
         <button type="button" disabled={busy} class="text-accent hover:underline" onclick={beginAdd}>Add budget</button>

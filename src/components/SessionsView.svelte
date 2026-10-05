@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ExecutionBoard from './ExecutionBoard.svelte';
   import { onDestroy, onMount, untrack } from 'svelte';
   import { organizationStore } from '../lib/stores/organization.svelte';
   import { matchesOrganization } from '../lib/organization';
@@ -36,7 +37,9 @@
   import DetailPane from './DetailPane.svelte';
   import ConfigTimeline from './ConfigTimeline.svelte';
   import GitOutcomes from './GitOutcomes.svelte';
+  import HumanOutcomes from './HumanOutcomes.svelte';
   import ToolImpact from './ToolImpact.svelte';
+  import WorkflowIntelligence from './WorkflowIntelligence.svelte';
   import SpeedMonitor from './SpeedMonitor.svelte';
   import CalendarActivity from './CalendarActivity.svelte';
   import { calendarFilterValue, type ActivityDay } from '../lib/calendarActivity';
@@ -1562,6 +1565,8 @@
   }
 
   let sessionContextMenu = $state<SessionContextMenuState | null>(null);
+  let executionBoardInitialId = $state<string | null>(null);
+  $effect(() => { if (!active) executionBoardInitialId = null; });
   let sessionExportBusy = $state(false);
   let sessionExportError = $state<string | null>(null);
 
@@ -1969,6 +1974,8 @@
         {dimensionAvailability}
       />
 
+      <WorkflowIntelligence active={active && analyticsOpen} sessionIds={analyticsSessionIds} onReview={reviewFindingSession} />
+
       {#if harness === 'codex'}
         <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={speedOpen} data-testid="speed-panel">
           <summary class="cursor-pointer text-xs font-semibold text-ink">Codex speed</summary>
@@ -2035,6 +2042,7 @@
       </details>
 
       <ConfigTimeline active={active && analyticsOpen} events={configEvents} />
+      <HumanOutcomes sessions={filtered} />
       <GitOutcomes />
 
       <div class="flex items-center gap-2 text-xs">
@@ -2258,11 +2266,13 @@
     error={sessionExportError}
     onincludechange={setSessionExportDescendants}
     onexport={(format) => void exportSession(format)}
+    oncompare={() => { executionBoardInitialId = sessionContextMenu!.sessionId; sessionContextMenu = null; }}
     onclose={() => { if (!sessionExportBusy) sessionContextMenu = null; }}
   />
 {/if}
 
 <!-- Narrow layouts: the pane collapses back to an overlay drawer -->
+{#if executionBoardInitialId}<ExecutionBoard sessions={Array.from(sessionsStore.map.values())} initialId={executionBoardInitialId} onclose={() => { executionBoardInitialId = null; }} />{/if}
 {#if !isWide && selectedSessionId !== null}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div class="fixed inset-0 bg-black/50 z-40" onclick={deselect} aria-hidden="true"></div>
