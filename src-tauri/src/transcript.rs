@@ -103,6 +103,45 @@ fn empty(availability: TranscriptAvailability, issue: &str) -> TranscriptPage {
     }
 }
 
+pub fn edit_record_bookmark(
+    state: &AppState,
+    edit: crate::history_store::RecordBookmark,
+) -> Result<crate::history_store::RecordBookmark, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private bookmarks require ready durable history")?;
+    if edit.bookmarked {
+        let page = read_for_session(
+            state,
+            TranscriptRequest {
+                session_id: edit.identity.session_key.clone(),
+                record_id: Some(edit.identity.anchor.clone()),
+                max_records: Some(1),
+                max_bytes: Some(MAX_PAGE_BYTES),
+                ..Default::default()
+            },
+        );
+        if !matches!(
+            page.availability,
+            TranscriptAvailability::Available | TranscriptAvailability::Partial
+        ) || !page
+            .records
+            .iter()
+            .any(|record| record.id == edit.identity.anchor && record.raw_json.is_some())
+        {
+            return Err("Bookmark target is missing or changed; reload the source record".into());
+        }
+    }
+    history.edit_record_bookmark(&edit).map_err(|error| {
+        let message = error.to_string();
+        if message == "At most 500 record bookmarks are supported per session" {
+            message
+        } else {
+            "Bookmark target or revision changed; reload bookmarks".into()
+        }
+    })
+}
+
 /// Accept IDs, never caller-provided paths. Durable locations prevent a displaced
 /// transcript from being read through an older session's retained file_path.
 pub fn read_for_session(state: &AppState, request: TranscriptRequest) -> TranscriptPage {
@@ -725,6 +764,198 @@ fn read_page_inner(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(unix)]
+    #[test]
+    fn bookmarks_validate_exact_records_and_missing_sources_in_isolated_process() {
+        let Some(root) = std::env::var_os("ODOMETER_BOOKMARK_TEST_ROOT") else {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "transcript::tests::bookmarks_validate_exact_records_and_missing_sources_in_isolated_process", "--nocapture"])
+                .env("ODOMETER_BOOKMARK_TEST_ROOT", root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let sources = root.join("sources");
+        std::fs::create_dir_all(&sources).unwrap();
+        let mut config = Config::default().normalized();
+        config.config_version = crate::config::CONFIG_VERSION;
+        for settings in config.providers.values_mut() {
+            settings.live_roots.clear();
+            settings.archive_roots.clear();
+        }
+        config
+            .providers
+            .get_mut(&crate::provider::codex_provider_id())
+            .unwrap()
+            .live_roots = vec![sources.clone()];
+        config.save().unwrap();
+        let path = sources.join("bookmark.jsonl");
+        let raw = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"bookmark-synthetic\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"BOOKMARK_PRIVATE_BODY\"}]}}\n"
+        ).replace("BOOKMARK_PRIVATE_BODY", &format!("BOOKMARK_PRIVATE_BODY{}", "x".repeat(40 * 1024)));
+        std::fs::write(&path, &raw).unwrap();
+        let history = std::sync::Arc::new(
+            crate::history_store::HistoryStore::open(&root.join("history.sqlite")).unwrap(),
+        );
+        let session = crate::parser::parse_file(&path, false).unwrap().unwrap();
+        let key = history.observe(&path, &session, 1).unwrap().key;
+        let state = AppState::new();
+        state.set_history_ready(Some(history.clone()));
+        state.publish_watched_session(&path, session.clone());
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        let request = || TranscriptRequest {
+            session_id: key.clone(),
+            max_records: Some(1),
+            max_bytes: Some(131_072),
+            ..Default::default()
+        };
+        let first = read_for_session(&state, request());
+        assert!(
+            !first.records.is_empty(),
+            "{:?} {:?}",
+            first.availability,
+            first.issues
+        );
+        let second = read_for_session(
+            &state,
+            TranscriptRequest {
+                cursor: first.next_cursor,
+                ..request()
+            },
+        );
+        assert!(
+            !second.records.is_empty(),
+            "{:?} {:?}",
+            second.availability,
+            second.issues
+        );
+        let anchor = second.records[0].id.clone();
+        let list = history.record_bookmarks(&key).unwrap();
+        let edit = crate::history_store::RecordBookmark {
+            identity: crate::history_store::AnnotationIdentity {
+                anchor: anchor.clone(),
+                ..list.identity
+            },
+            revision: 0,
+            bookmarked: true,
+        };
+        let saved = edit_record_bookmark(&state, edit.clone()).unwrap();
+        assert!(edit_record_bookmark(
+            &state,
+            crate::history_store::RecordBookmark {
+                identity: crate::history_store::AnnotationIdentity {
+                    anchor: format!("{anchor}changed"),
+                    ..edit.identity.clone()
+                },
+                ..edit.clone()
+            }
+        )
+        .is_err());
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n").unwrap();
+        let appended = crate::parser::parse_file(&path, false).unwrap().unwrap();
+        history.observe(&path, &appended, 2).unwrap();
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        let landing = read_for_session(
+            &state,
+            TranscriptRequest {
+                record_id: Some(anchor.clone()),
+                ..request()
+            },
+        );
+        assert_eq!(landing.records[0].id, anchor);
+        assert!(landing.records[0]
+            .raw_json
+            .as_ref()
+            .unwrap()
+            .contains("BOOKMARK_PRIVATE_BODY"));
+        assert!(
+            !serde_json::to_string(&history.record_bookmarks(&key).unwrap())
+                .unwrap()
+                .contains("BOOKMARK_PRIVATE_BODY")
+        );
+        assert!(
+            !serde_json::to_string(&history.session_summaries().unwrap())
+                .unwrap()
+                .contains(&anchor)
+        );
+        // Keep the same inode, metadata and offset; only the record hash changes.
+        std::fs::write(
+            &path,
+            raw.replace("BOOKMARK_PRIVATE_BODY", "BOOKMARK_REPLACED_BODY"),
+        )
+        .unwrap();
+        let replaced = crate::parser::parse_file(&path, false).unwrap().unwrap();
+        history.observe(&path, &replaced, 3).unwrap();
+        state.record_transcript_observation(
+            state.current_scan_generation(),
+            &path,
+            source_generation(&path),
+        );
+        assert!(edit_record_bookmark(
+            &state,
+            crate::history_store::RecordBookmark {
+                revision: saved.revision,
+                ..edit.clone()
+            }
+        )
+        .is_err());
+        let changed = read_for_session(
+            &state,
+            TranscriptRequest {
+                record_id: Some(anchor),
+                ..request()
+            },
+        );
+        assert!(changed.records.is_empty());
+        std::fs::remove_file(&path).unwrap();
+        history.mark_path_missing(&path).unwrap();
+        assert!(edit_record_bookmark(
+            &state,
+            crate::history_store::RecordBookmark {
+                revision: saved.revision,
+                ..edit.clone()
+            }
+        )
+        .is_err());
+        assert!(
+            !edit_record_bookmark(
+                &state,
+                crate::history_store::RecordBookmark {
+                    bookmarked: false,
+                    ..saved
+                }
+            )
+            .unwrap()
+            .bookmarked
+        );
+        assert!(history
+            .record_bookmarks(&key)
+            .unwrap()
+            .bookmarks
+            .iter()
+            .all(|row| !row.bookmarked));
+    }
 
     /// Exercise production config loading in a child process. HOME/XDG roots
     /// are isolated without mutating the environment of parallel tests.

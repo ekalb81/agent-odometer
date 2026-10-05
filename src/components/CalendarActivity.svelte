@@ -7,9 +7,12 @@
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { MutationAccumulator, RangeDataCache } from '../lib/rangeData';
   import type { RangeTotals } from '../lib/types';
+  import { activitySummary } from '../lib/activitySummary';
+  import ActivitySummary from './ActivitySummary.svelte';
 
-  let { active = true, from = null, to = null, sessionIds, projects = [], projectLoaded = true, projectError = null, onbucket }: {
+  let { active = true, from = null, to = null, sessionIds, harness = null, projects = [], projectLoaded = true, projectError = null, onbucket }: {
     active?: boolean; from?: string | null; to?: string | null; sessionIds: string[]; onbucket: (day: ActivityDay) => void;
+    harness?: string | null;
     projects?: { key: string; label: string; sessionIds: string[] }[]; projectLoaded?: boolean; projectError?: string | null;
   } = $props();
   let zone = $state<CalendarZone>('local');
@@ -19,6 +22,8 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let retry = $state(0);
+  let summary = $state<{ svg: string; markdown: string } | null>(null);
+  let summaryError = $state('');
   let epoch = 0;
   let jobGeneration = 0;
   let layoutKey = '';
@@ -33,6 +38,18 @@
   const metricLabel = $derived(metric === 'tokens' ? 'tokens' : 'tool calls');
   const selectedProject = $derived(projects.find((project) => project.key === projectKey));
   const selectedIds = $derived(projectKey ? selectedProject?.sessionIds ?? [] : sessionIds);
+
+  $effect(() => {
+    void days; void loading; void error; void active; void from; void to;
+    void metric; void zone; void harness; void projectKey; void selectedIds; void evidence;
+    summary = null; summaryError = '';
+  });
+
+  function previewSummary(): void {
+    if (loading || error || !days.length || (evidence.state !== 'complete' && evidence.state !== 'partial')) return;
+    try { summary = activitySummary({ days, metric, zone, harness, selectedProject: !!projectKey, coverage: evidence.state }); }
+    catch (reason) { summaryError = String(reason).replace(/^Error: /, ''); }
+  }
 
   $effect(() => {
     const job = ++jobGeneration;
@@ -133,7 +150,9 @@
         {#each projects as project (project.key)}<option value={project.key}>{project.label}</option>{/each}
       </select>
     </label>
+    <button type="button" class="text-[11px] text-accent underline disabled:opacity-50" disabled={loading || !!error || !days.length || !active || evidence.state === 'pending' || evidence.state === 'unavailable'} onclick={previewSummary}>Preview summary card</button>
   </div>
+  {#if summaryError}<p role="alert" class="mt-1 text-[11px] text-neg">{summaryError}</p>{/if}
   <p class="mt-1 text-[10px] text-ink-faint">Uses the current provider and session filters · {selectedProject?.label ?? 'all projects'}. {from ? 'Selected date range' : 'Latest 90 calendar days'} · {zone === 'utc' ? 'UTC' : localZone}. Choose dates above to inspect up to 366 days. Click a day to show its event sessions.</p>
   {#if projectError}<p class="mt-1 text-[11px] text-neg">Project choices unavailable: {projectError}</p>{/if}
   <p class="mt-1 text-[11px] text-ink-muted" role="status">{evidence.message}</p>
@@ -171,6 +190,8 @@
     </div>
   {/if}
 </section>
+
+{#if summary}<ActivitySummary {...summary} onclose={() => summary = null} />{/if}
 
 <style>
   .calendar-controls label { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; min-width: 0; max-width: 100%; }

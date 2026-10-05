@@ -461,6 +461,8 @@ mockIPC((cmd, payload) => {
   switch (cmd) {
     case 'get_organization_recovery_state': return visualScenario === 'organization-recovered';
     case 'get_organization_summaries':
+    case 'get_record_bookmarks':
+    case 'edit_record_bookmark':
     case 'get_session_annotation':
     case 'edit_session_annotation':
     case 'list_organization_tags':
@@ -498,8 +500,12 @@ mockIPC((cmd, payload) => {
       return Object.fromEntries(visibleFixtures().filter(f => ids.has(summary(f).storage_id))
         .map(f => [summary(f).storage_id, mockSummaryPricing(pricingKey(f))]));
     }
-    case 'get_transcript_page':
-      return transcriptFixture((payload as { request: TranscriptRequest }).request);
+    case 'get_transcript_page': {
+      const page = transcriptFixture((payload as { request: TranscriptRequest }).request);
+      return visualScenario === 'content-search-retained'
+        ? { ...page, availability: 'missing', source_complete: false, records: [], next_cursor: null }
+        : page;
+    }
     case 'search_session_content':
       return contentSearchFixture((payload as { request: TranscriptSearchRequest }).request, visualScenario === 'content-search-retained');
     case 'resolve_retained_search_target':

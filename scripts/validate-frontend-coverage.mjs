@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const COVERAGE_SLICE = [
+  'src/components/ActivitySummary.svelte',
   'src/components/ConvertedCost.svelte',
   'src/components/DiagnosticsPanel.svelte',
   'src/components/FxSettings.svelte',
@@ -11,12 +12,14 @@ export const COVERAGE_SLICE = [
   'src/components/SessionGridControls.svelte',
   'src/components/SessionProjectEditor.svelte',
   'src/components/TranscriptExport.svelte',
+  'src/components/TranscriptHandoff.svelte',
   'src/components/SessionOrganizationEditor.svelte',
   'src/components/OrganizationToolbar.svelte',
   'src/lib/organization.ts',
   'src/lib/stores/organization.svelte.ts',
   'src/components/TranscriptSearch.svelte',
   'src/lib/configTimeline.ts',
+  'src/lib/activitySummary.ts',
   'src/lib/defenderStatus.ts',
   'src/lib/diagnosticsExport.ts',
   'src/lib/flushCadence.ts',
@@ -29,6 +32,7 @@ export const COVERAGE_SLICE = [
   'src/lib/stores/sessionGrid.svelte.ts',
   'src/lib/trayTotals.ts',
   'src/lib/transcriptExport.ts',
+  'src/lib/transcriptHandoff.ts',
 ];
 export const MINIMUM_LINE_COVERAGE = 90;
 

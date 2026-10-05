@@ -1903,6 +1903,7 @@
     <div class="mt-2 flex flex-col gap-2">
       <CalendarActivity
         active={active && analyticsOpen}
+        {harness}
         from={fromUtc}
         to={toUtc}
         sessionIds={analyticsSessionIds}

@@ -168,6 +168,32 @@ visualTest('calendar-partial-narrow', 'partial recorded history calendar at narr
   await calendar.scrollIntoViewIfNeeded();
 });
 
+visualTest('activity-summary-preview', 'local activity SVG and Markdown preview', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.clock.setFixedTime(FIXED_TIME);
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toBeVisible();
+  await calendar.getByRole('button', { name: 'Preview summary card' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByAltText('Exact local SVG activity summary preview')).toBeVisible();
+});
+
+visualTest('activity-summary-partial-narrow', 'partial activity summary keeps coverage at narrow width', async (page) => {
+  await page.setViewportSize({ width: 520, height: 900 });
+  await visit(page, { scenario: 'history-partial', view: 'codex' });
+  await page.clock.setFixedTime(FIXED_TIME);
+  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+  await analytics.locator('summary').first().click();
+  const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
+  await expect(calendar.getByTestId('calendar-total')).toContainText('partial history');
+  await calendar.getByLabel('Activity metric').selectOption('tool_calls');
+  await calendar.getByRole('button', { name: 'Preview summary card' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByLabel('Companion Markdown')).toHaveValue(/Partial recorded history/);
+});
+
 test.beforeEach(async ({ page }) => {
   await page.clock.install({ time: FIXED_TIME });
   page.on('pageerror', (error) => {
@@ -585,6 +611,26 @@ visualTest('transcript-narrow-anchor', 'inspector supports narrow anchor navigat
   await inspector.getByRole('button', { name: 'Expand user', exact: true }).click();
 });
 
+visualTest('transcript-bookmarks-narrow', 'private record bookmarks preserve exact keyboard navigation at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Inspect transcript', exact: true }).click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await inspector.getByRole('button', { name: 'Bookmark record', exact: true }).first().click();
+  await expect(inspector.getByText('Record bookmarks (1)', { exact: true })).toBeVisible();
+  await inspector.getByText('Record bookmarks (1)', { exact: true }).click();
+  await inspector.getByRole('button', { name: 'Next page', exact: true }).click();
+  const bookmark = inspector.getByRole('button', { name: 'Open bookmarked record 1', exact: true });
+  await bookmark.focus();
+  await page.keyboard.press('Enter');
+  await expect(inspector.locator('[id="transcript-synthetic:0"]')).toBeFocused();
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  const bounds = await inspector.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+});
+
 visualTest('transcript-export-preview', 'export previews conversation text before local save', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
@@ -708,6 +754,47 @@ test('content search lands on a source record and Escape returns to the search w
   await page.keyboard.press('Escape');
   await expect(search).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Search content', exact: true })).toBeVisible();
+});
+
+visualTest('handoff-reviewed-source', 'handoff selects source records and returns from exact inspection', async (page) => {
+  await visit(page, { view: 'codex' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Prepare handoff', exact: true }).click();
+  const handoff = page.getByRole('dialog', { name: 'Prepare handoff', exact: true });
+  await expect(handoff.getByRole('button', { name: 'Build handoff preview' })).toBeDisabled();
+  await handoff.getByRole('button', { name: 'Read source records' }).click();
+  await handoff.getByRole('button', { name: 'Inspect exact source' }).first().click();
+  const inspector = page.getByRole('dialog', { name: 'Transcript inspector' });
+  await expect(inspector.getByText('Update the greeting in the synthetic demo.', { exact: true })).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(inspector).toHaveCount(0);
+  await expect(handoff).toBeVisible();
+  await handoff.getByRole('checkbox', { name: /Source record at byte/ }).first().check();
+  await handoff.getByRole('textbox', { name: /User-written/ }).fill('Next: review the recorded greeting change.');
+  await handoff.getByRole('button', { name: 'Build handoff preview' }).click();
+  await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
+  const preview = page.frameLocator('iframe[title="Exact handoff HTML preview"]');
+  await expect(preview.locator('script,img,object,link,iframe,a')).toHaveCount(0);
+  await expect(preview.locator('pre')).toContainText('Update the greeting in the synthetic demo.');
+  await handoff.getByRole('checkbox', { name: /I reviewed every/ }).check();
+  await expect(handoff.getByRole('button', { name: 'Save reviewed handoff…' })).toBeEnabled();
+});
+
+visualTest('handoff-retained-narrow', 'handoff labels missing source and stays usable at narrow width', async (page) => {
+  await page.setViewportSize({ width: 500, height: 800 });
+  await visit(page, { scenario: 'content-search-retained', view: 'codex', theme: 'dark' });
+  await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
+  await page.getByRole('button', { name: 'Prepare handoff', exact: true }).click();
+  const handoff = page.getByRole('dialog', { name: 'Prepare handoff', exact: true });
+  await handoff.getByRole('button', { name: 'Read source records' }).click();
+  await expect(handoff.getByText(/Incomplete original source/)).toBeVisible();
+  await handoff.getByRole('checkbox', { name: /Retained turn.*user_message/ }).first().check();
+  await handoff.getByRole('button', { name: 'Build handoff preview' }).click();
+  const bounds = await handoff.boundingBox();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(500);
+  await expect(handoff.getByRole('button', { name: 'Copy reviewed handoff' })).toBeDisabled();
+  await handoff.getByRole('textbox', { name: /Exact handoff Markdown/ }).scrollIntoViewIfNeeded();
 });
 
 assertManifestCasesAreRegistered();

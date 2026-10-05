@@ -539,10 +539,14 @@ pub async fn write_export(
         "csv" => "csv",
         "json" => "json",
         "html" => "html",
-        _ => return Err("export format must be csv, json, or html".into()),
+        "svg" => "svg",
+        _ => return Err("export format must be csv, json, html, or svg".into()),
     };
     if extension == "html" && content.len() > 8 * 1024 * 1024 {
         return Err("HTML export exceeds the 8 MiB safety limit".into());
+    }
+    if extension == "svg" && content.len() > 1024 * 1024 {
+        return Err("SVG export exceeds the 1 MiB safety limit".into());
     }
     if content.len() > 128 * 1024 * 1024 {
         return Err("export exceeds the 128 MiB safety limit".into());
@@ -3511,6 +3515,10 @@ mod tests {
         let json = dir.path().join("empty.json");
         write_export_file(&json, "json", "[]\n").unwrap();
         assert_eq!(std::fs::read_to_string(json).unwrap(), "[]\n");
+        let svg = dir.path().join("activity.svg");
+        let preview = "<svg xmlns=\"http://www.w3.org/2000/svg\"><title>Activity Δ</title></svg>";
+        write_export_file(&svg, "svg", preview).unwrap();
+        assert_eq!(std::fs::read_to_string(svg).unwrap(), preview);
         let html = dir.path().join("transcript.html");
         let preview = "<!doctype html><meta charset=\"utf-8\"><p>Reviewed Δ text</p>";
         write_export_file(&html, "html", preview).unwrap();
@@ -4936,6 +4944,34 @@ pub fn change_quota_account(
 }
 
 // Private desktop organization: never exposed by headless/MCP projections.
+#[tauri::command]
+pub async fn get_record_bookmarks(
+    state: State<'_, Arc<AppState>>,
+    session_key: String,
+) -> Result<crate::history_store::RecordBookmarkList, String> {
+    let history = state
+        .history_ready()
+        .ok_or("Private bookmarks require ready durable history")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        history
+            .record_bookmarks(&session_key)
+            .map_err(|_| "Bookmark list unavailable; reload history".to_owned())
+    })
+    .await
+    .map_err(|_| "Bookmark list unavailable".to_owned())?
+}
+#[tauri::command]
+pub async fn edit_record_bookmark(
+    state: State<'_, Arc<AppState>>,
+    edit: crate::history_store::RecordBookmark,
+) -> Result<crate::history_store::RecordBookmark, String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::transcript::edit_record_bookmark(&state, edit)
+    })
+    .await
+    .map_err(|_| "Bookmark operation unavailable".to_owned())?
+}
 #[tauri::command]
 pub async fn get_organization_recovery_state(
     state: State<'_, Arc<AppState>>,

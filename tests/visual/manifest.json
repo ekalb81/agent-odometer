@@ -1,5 +1,7 @@
 {
   "snapshots": [
+    "handoff-reviewed-source",
+    "handoff-retained-narrow",
     "organization-saved-search",
     "organization-editor-narrow",
     "organization-recovery-unavailable",
@@ -27,6 +29,8 @@
     "tool-dimensions",
     "calendar-activity",
     "calendar-partial-narrow",
+    "activity-summary-preview",
+    "activity-summary-partial-narrow",
     "session-narrow-detail-overlay",
     "instructions-preview",
     "instructions-raw",
@@ -52,6 +56,7 @@
     "quota-live-off-and-lookup-error",
     "transcript-recorded-edit",
     "transcript-narrow-anchor",
+    "transcript-bookmarks-narrow",
     "transcript-export-preview",
     "transcript-export-narrow",
     "content-search-scopes",

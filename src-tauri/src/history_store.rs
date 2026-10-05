@@ -43,8 +43,8 @@ pub(crate) use search::RetainedSearchMessages;
 #[path = "history_organization.rs"]
 mod organization;
 pub use organization::{
-    AnnotationEdit, AnnotationIdentity, OrganizationSummary, SavedSearch, SavedSearchDefinition,
-    SessionAnnotation,
+    AnnotationEdit, AnnotationIdentity, OrganizationSummary, RecordBookmark, RecordBookmarkList,
+    SavedSearch, SavedSearchDefinition, SessionAnnotation,
 };
 
 const SCHEMA_VERSION: i64 = 12;
