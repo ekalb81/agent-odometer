@@ -1,0 +1,120 @@
+# CI image measurement (#78)
+
+The original `run_ci_image_probe` remains a local tar-load lower-bound probe.
+It cannot establish registry transfer cost or full-lane savings. The separate
+`Opt-in full CI image measurement` workflow is a bounded experiment. It changes
+no production lane, cache entry/key, capability or application setting.
+
+## Reviewed execution boundary
+
+Drafting and local validation do not publish or dispatch anything. Review the
+concrete workflow before its first registry publication and dispatch. Once
+reviewed and present on trusted `main`, dispatch with `confirm_probe=true`.
+Other repositories/refs and the default false input cannot run it. There is no
+arbitrary source SHA, image name, command, repetition or concurrency input.
+
+Only the publisher has `packages: write`; it can publish the fixed
+`ghcr.io/ekalb81/agent-odometer-ci-probe` package with a unique run/attempt/source
+tag. It records and distributes its immutable digest. Consumers have only
+`packages: read`. Tokens go to `docker login --password-stdin`, never command
+arguments, container environments or artifacts. Checkout persists no credential.
+The report has `actions: read` solely to read job timestamps and conclusions.
+No Codecov upload or OIDC permission is added to this experiment.
+
+## Design and budget
+
+| Stage | Jobs | Timeout/job | Maximum runner-minutes |
+|---|---:|---:|---:|
+| Build/publish/freeze tools | 1 | 20 min | 20 |
+| Warm independent lane snapshots | 3 | 15 min | 45 |
+| First apt/image pair in each lane | 6 | 15 min | 90 |
+| Identity/correctness gate | 1 | 5 min | 5 |
+| Repetitions 2–5, all lanes and arms | 24 | 15 min | 360 |
+| Full report | 1 | 5 min | 5 |
+| Total | 36 | | **525** |
+
+At most six measured jobs run concurrently; seed concurrency is three. A first
+pair failure, differing tool/dependency identity or missing exact verified snapshot
+prevents repetitions 2–5. Other first pairs finish to preserve their evidence.
+Registry pulls separately time out after 300 seconds; the immediate cached pull
+after 120 seconds. No automatic reruns hide failures. Cancel manually if the
+whole run needs to stop; the global concurrency group prevents simultaneous
+experiments. This cap measures runner time, not queue delay or wall-clock time.
+
+The planning estimate is roughly 100–140 runner-minutes, based on the historical
+full-lane samples documented in `ci.yml` plus publication and seed overhead.
+This is an estimate, not a promised current result. The 525-minute limit is the
+explicit worst case. No timing result exists until a reviewed run completes.
+
+The publisher freezes exact source SHA, Node 22 patch, stable Rust patch, declared
+MSRV (normalized to its zero patch where omitted), cargo-llvm-cov version,
+Dockerfile/base-image digest, installed image packages and recipe hashes. Each
+lane uses its own matching toolchain; coverage includes llvm-tools-preview.
+
+Seeds execute the complete apt-based lane once, pack Cargo registry/git/target
+and npm `_cacache` into an attempt-isolated immutable tar artifact, and record its
+SHA-256 plus ownership. Tar preserves permissions and symlinks; extraction rejects
+escaping paths/links. Both arms download the same exact per-lane artifact and
+verify its checksum before restoring. There is no Actions cache read/write, so
+experimental snapshots cannot evict production cache entries. Compressed artifact
+size is recorded; the three snapshots have 14-day artifact retention.
+The archive excludes npm logs, npmrc, Cargo credentials/configuration, tool
+binaries, Rustup and all other HOME paths. The report downloads only small
+observation/publisher artifacts, never the three seed tarballs again.
+These snapshots are a controlled warm-snapshot artifact-transfer sample, not the production Actions cache
+hit distribution and not a cold-Cargo apt/image comparison.
+
+The apt arm uses the existing retrying `linux-deps` action on Ubuntu 22.04.
+The image arm times an actual digest pull on each fresh hosted runner, then runs
+the same complete command list inside that image. Workspace/target paths,
+UID/HOME, Node toolcache and Rust/Cargo/npm homes are identical and mounted at
+their original paths. The container drops capabilities and receives no token.
+Required development-package versions, tool versions, pkg-config availability
+and path/UID identity must match in every first pair and in the final report.
+Unrelated host packages are not a parity requirement. Full compilation and
+tests additionally exercise library resolution; metadata presence alone is
+insufficient. A pinned SHA-256 of the full production ci.yml rejects any workflow drift,
+including extra commands or changed flags. Review the complete production recipes,
+update the copied command lists if needed, and deliberately update
+REVIEWED_CI_SHA256 before another experiment; never refresh that hash automatically.
+Recipe checks, reducer regressions and frozen-version validation run before push.
+
+The second immediate pull measures Docker's local layer reuse separately. The
+pre-pull Docker inventory and pull logs expose any already-cached base layers;
+“fresh hosted runner” does not mean every layer was cold. The full first-pull
+cost remains inside end-to-end image-job duration. No local image tar transfer is substituted for a registry pull. Exact
+RepoDigests, nonempty digest-bearing first/cached logs and nonnegative timings
+are required; absent or corrupt evidence makes the comparison inconclusive.
+
+## Evidence and decision
+
+Artifacts retain source/digest/tool/snapshot names/checksums, package versions, raw pull
+logs, per-command timings, complete job timestamps/conclusions and failures.
+End-to-end job start→completion includes checkout, setup, verified snapshot artifact transfer,
+dependencies or pull, execution and cleanup. Queue delay is excluded. Image
+jobs conservatively also include their extra cached-pull and identity probes.
+Completed failed-job time and publication/seed overhead remain in total runner
+minutes. Rounded per-job minutes are an estimate; they are not billing data.
+The report job is still running when it reads timestamps, so its remaining
+maximum is stated separately.
+
+Each arm/lane has five planned observations. Report p50 and nearest-rank sample
+p95; **at n=5, p95 is the maximum**. It does not estimate a stable population
+tail. Missing, failed, cancelled and timed-out observations remain in the planned
+denominator. Successful-only times cannot qualify an incomplete run for adoption.
+
+The sample adoption criteria require all observations and identity checks to
+pass, at least 10% **and** 15 seconds lower Check/Coverage median, no lane with
+over 5% median regression, no sample maximum over 10% worse, and lower aggregate
+observed image runner time after adding one publication job across this sample.
+The seed/gate/report overhead is separately charged to the experiment, not
+silently assigned to only one candidate. A passing sample is a candidate for
+review, never an automatic switch. Failure to improve supports non-adoption for
+this sample; incomplete or mismatched evidence is inconclusive.
+
+If adoption is later approved, publish a separately reviewed immutable version,
+pin its digest in consuming lanes, keep the current apt action as rollback,
+record its source/tool/package manifest, and repeat comparison after dependency
+or base-image updates. Reverting the consuming workflow to the existing apt
+action is the rollback; a moving tag is never a recovery strategy. Experimental
+package retention/deletion remains a separate repository-owner operation.

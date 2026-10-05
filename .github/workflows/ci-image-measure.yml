@@ -1,0 +1,217 @@
+name: Opt-in full CI image measurement
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_probe:
+        description: 'Publish one experimental GHCR image and run the bounded 525 runner-minute worst-case comparison.'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-image-measurement-78
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'ekalb81/agent-odometer' && github.ref == 'refs/heads/main' && inputs.confirm_probe
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.freeze.outputs.image }}
+      node: ${{ steps.freeze.outputs.node }}
+      rust: ${{ steps.freeze.outputs.rust }}
+      msrv: ${{ steps.freeze.outputs.msrv }}
+      llvm-cov: ${{ steps.freeze.outputs.llvm-cov }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Publish one immutable experimental image and freeze provenance
+        id: freeze
+        shell: bash
+        env:
+          PROBE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ci-image-report.py recipes
+          python3 -B scripts/ci-image-report-test.py
+          mkdir -p output/ci-image/publisher
+          node_version=$(node --version | sed 's/^v//')
+          rust_version=$(rustc --version | cut -d' ' -f2)
+          msrv=$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' src-tauri/Cargo.toml)
+          [[ "$msrv" =~ ^[0-9]+\.[0-9]+$ ]] && msrv="$msrv.0"
+          llvm_version=$(cargo llvm-cov --version | cut -d' ' -f2)
+          for version in "$node_version" "$rust_version" "$msrv" "$llvm_version"; do [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; done
+          tag="ghcr.io/ekalb81/agent-odometer-ci-probe:run-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${GITHUB_SHA}"
+          printf '%s' "$PROBE_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io' EXIT
+          docker build --pull --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -f .github/docker/ci-linux.Dockerfile -t "$tag" .
+          docker push "$tag" 2>&1 | tee output/ci-image/publisher/push.log
+          digest=$(docker image inspect "$tag" --format '{{index .RepoDigests 0}}')
+          [[ "$digest" =~ ^ghcr\.io/ekalb81/agent-odometer-ci-probe@sha256:[a-f0-9]{64}$ ]]
+          printf 'image=%s\nnode=%s\nrust=%s\nmsrv=%s\nllvm-cov=%s\n' \
+            "$digest" "$node_version" "$rust_version" "$msrv" "$llvm_version" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$tag" "$digest" "$node_version" "$rust_version" "$msrv" "$llvm_version" > output/ci-image/publisher/frozen.txt
+          git rev-parse HEAD > output/ci-image/publisher/source-sha.txt
+          sha256sum .github/docker/ci-linux.Dockerfile .github/workflows/ci.yml \
+            .github/actions/linux-deps/action.yml scripts/ci-image-lane.sh > output/ci-image/publisher/recipe-hashes.txt
+          docker image inspect "$digest" > output/ci-image/publisher/image.json
+          docker run --rm "$digest" dpkg-query -W > output/ci-image/publisher/dpkg.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ci-image-publisher
+          path: output/ci-image/publisher
+          retention-days: 14
+
+  seed:
+    needs: publish
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        lane: [check, msrv, coverage]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-image-measure
+        with:
+          lane: ${{ matrix.lane }}
+          arm: apt
+          seed: 'true'
+          image: ${{ needs.publish.outputs.image }}
+          node: ${{ needs.publish.outputs.node }}
+          rust: ${{ needs.publish.outputs.rust }}
+          msrv: ${{ needs.publish.outputs.msrv }}
+          llvm-cov: ${{ needs.publish.outputs.llvm-cov }}
+
+  first:
+    name: Measure first ${{ matrix.lane }} ${{ matrix.arm }}
+    needs: [publish, seed]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        lane: [check, msrv, coverage]
+        arm: [apt, image]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-image-measure
+        with:
+          lane: ${{ matrix.lane }}
+          arm: ${{ matrix.arm }}
+          repetition: '1'
+          image: ${{ needs.publish.outputs.image }}
+          node: ${{ needs.publish.outputs.node }}
+          rust: ${{ needs.publish.outputs.rust }}
+          msrv: ${{ needs.publish.outputs.msrv }}
+          llvm-cov: ${{ needs.publish.outputs.llvm-cov }}
+
+  parity:
+    needs: first
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: ci-image-measure-*-1
+          path: output/first
+      - name: Require all first pairs to pass and share exact identity/cache
+        run: python3 scripts/ci-image-report.py parity output/first
+
+  repeated:
+    name: Measure repeated ${{ matrix.lane }} ${{ matrix.arm }} ${{ matrix.repetition }}
+    needs: [publish, seed, parity]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        lane: [check, msrv, coverage]
+        arm: [apt, image]
+        repetition: [2, 3, 4, 5]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/ci-image-measure
+        with:
+          lane: ${{ matrix.lane }}
+          arm: ${{ matrix.arm }}
+          repetition: ${{ matrix.repetition }}
+          image: ${{ needs.publish.outputs.image }}
+          node: ${{ needs.publish.outputs.node }}
+          rust: ${{ needs.publish.outputs.rust }}
+          msrv: ${{ needs.publish.outputs.msrv }}
+          llvm-cov: ${{ needs.publish.outputs.llvm-cov }}
+
+  report:
+    if: always() && needs.publish.result != 'skipped'
+    needs: [publish, seed, first, parity, repeated]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: ci-image-measure-*
+          path: output/observations
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: ci-image-publisher
+          path: output/observations/publisher
+      - name: Fetch full job durations and report all denominators
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p output
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?per_page=100" --jq '.jobs[]' > output/jobs.jsonl
+          python3 scripts/ci-image-report.py report output/observations output/jobs.jsonl | tee output/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ci-image-full-report
+          path: |
+            output/report.md
+            output/jobs.jsonl
+          retention-days: 30

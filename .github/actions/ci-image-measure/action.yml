@@ -1,0 +1,137 @@
+name: Measure a frozen CI lane
+description: Opt-in only; immutable artifact snapshot or one apt/image observation.
+inputs:
+  lane:
+    description: Production lane command list
+    required: true
+  arm:
+    description: apt or image
+    required: true
+  seed:
+    description: Create the isolated immutable warm artifact snapshot
+    default: 'false'
+  repetition:
+    description: Fixed observation index
+    default: '0'
+  image:
+    description: Reviewed image digest
+    required: true
+  node:
+    description: Frozen exact Node version
+    required: true
+  rust:
+    description: Frozen exact stable Rust version
+    required: true
+  msrv:
+    description: Exact declared MSRV patch version
+    required: true
+  llvm-cov:
+    description: Frozen coverage tool version
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Freeze observation identity
+      shell: bash
+      env:
+        LANE: ${{ inputs.lane }}
+        ARM: ${{ inputs.arm }}
+        REP: ${{ inputs.repetition }}
+        SEED: ${{ inputs.seed }}
+      run: |
+        set -euo pipefail
+        [[ "$LANE" =~ ^(check|msrv|coverage)$ && "$ARM" =~ ^(apt|image)$ && "$REP" =~ ^[0-5]$ ]]
+        mkdir -p output/ci-image/observation
+        printf '%s\n' "${GITHUB_RUN_ID}/${LANE}/${ARM}/${REP}/${SEED}" > output/ci-image/observation/name.txt
+        echo "CI_IMAGE_SNAPSHOT=ci-image-snapshot-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${LANE}" >> "$GITHUB_ENV"
+        echo "CI_IMAGE_LANE=$LANE" >> "$GITHUB_ENV"
+        echo "CI_IMAGE_ARM=$ARM" >> "$GITHUB_ENV"
+        echo "CI_IMAGE_REPETITION=$REP" >> "$GITHUB_ENV"
+        test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+        python3 scripts/ci-image-report.py recipes
+    - name: Setup identical Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node }}
+    - name: Setup identical Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: ${{ inputs.lane == 'msrv' && inputs.msrv || inputs.rust }}
+        components: ${{ inputs.lane == 'coverage' && 'llvm-tools-preview' || inputs.lane == 'check' && 'clippy,rustfmt' || '' }}
+    - name: Install frozen coverage tool
+      if: inputs.lane == 'coverage'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-llvm-cov@${{ inputs.llvm-cov }}
+    - name: Download exact immutable seed artifact
+      if: inputs.seed != 'true'
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ env.CI_IMAGE_SNAPSHOT }}
+        path: ${{ runner.temp }}/ci-image-snapshot
+    - name: Verify checksum and restore permissions/symlinks
+      if: inputs.seed != 'true'
+      shell: bash
+      run: bash scripts/ci-image-snapshot.sh restore
+    - name: Verify restored snapshot and tools
+      shell: bash
+      env:
+        EXPECTED_NODE: ${{ inputs.node }}
+        EXPECTED_RUST: ${{ inputs.lane == 'msrv' && inputs.msrv || inputs.rust }}
+        IS_SEED: ${{ inputs.seed }}
+        CI_IMAGE_DIGEST: ${{ inputs.image }}
+      run: |
+        set -euo pipefail
+        test "$(node --version)" = "v$EXPECTED_NODE"
+        test "$(rustc --version | cut -d' ' -f2)" = "$EXPECTED_RUST"
+        export RUSTUP_TOOLCHAIN="$EXPECTED_RUST"
+        echo "RUSTUP_TOOLCHAIN=$EXPECTED_RUST" >> "$GITHUB_ENV"
+        python3 scripts/ci-image-report.py observation --seed "$IS_SEED"
+    - name: Install baseline dependencies with production retry policy
+      if: inputs.arm == 'apt'
+      uses: ./.github/actions/linux-deps
+    - name: Registry authentication for digest pull only
+      if: inputs.arm == 'image'
+      shell: bash
+      env:
+        PROBE_TOKEN: ${{ github.token }}
+      run: printf '%s' "$PROBE_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+    - name: Run complete lane
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+      run: bash scripts/ci-image-measure.sh "$CI_IMAGE_LANE" "$CI_IMAGE_ARM" "$GITHUB_WORKSPACE/output/ci-image/observation"
+    - name: Record immutable seed ownership
+      if: inputs.seed == 'true'
+      shell: bash
+      run: |
+        python3 scripts/ci-image-report.py snapshot
+    - name: Pack immutable snapshot with checksum
+      if: inputs.seed == 'true'
+      shell: bash
+      run: bash scripts/ci-image-snapshot.sh pack
+    - name: Save snapshot outside production cache store
+      if: inputs.seed == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ env.CI_IMAGE_SNAPSHOT }}
+        path: ${{ runner.temp }}/ci-image-snapshot
+        compression-level: 0
+        retention-days: 14
+    - name: Record observation result
+      if: always()
+      shell: bash
+      env:
+        OBSERVATION_STATUS: ${{ job.status }}
+      run: python3 scripts/ci-image-report.py finish
+    - name: Remove registry authentication
+      if: always() && inputs.arm == 'image'
+      shell: bash
+      run: docker logout ghcr.io
+    - name: Preserve raw observations including failures
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ci-image-${{ inputs.seed == 'true' && 'seed' || 'measure' }}-${{ inputs.lane }}-${{ inputs.arm }}-${{ inputs.repetition }}
+        path: output/ci-image/observation
+        retention-days: 14
