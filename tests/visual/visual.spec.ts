@@ -298,6 +298,40 @@ visualTest('session-selected-detail', 'session selected detail', async (page) =>
   await expectSessionRollup(page, 8);
 });
 
+test('session columns stay aligned while scrolling a large history beside details', async ({ page }) => {
+  await page.setViewportSize({ width: 1236, height: 852 });
+  await visit(page);
+  await page.goto('/?visualScenario=default&stress=550');
+  const grid = page.getByTestId('session-grid-region').filter({ visible: true });
+  const rows = grid.getByRole('button', { name: /^Select session / });
+  await expect(rows.first()).toBeVisible();
+  await rows.first().click();
+  await expect(page.locator('[aria-label="Session details"]:visible')).toBeVisible();
+  await page.clock.runFor(500);
+  const viewport = grid.getByRole('columnheader').first().locator('../..');
+  const geometry = () => viewport.evaluate(element => {
+    const header = element.querySelector('[role="row"]')!;
+    const row = element.querySelector('[aria-label^="Select session "]')!;
+    const cells = [...row.children].map(cell => cell.getBoundingClientRect());
+    const headings = [...header.children].map(cell => cell.getBoundingClientRect());
+    const totals = [...element.lastElementChild!.children].map(cell => cell.getBoundingClientRect());
+    return {
+      aligned: cells.every((cell, index) => Math.abs(cell.x - headings[index].x) < 1 && Math.abs(cell.x - totals[index].x) < 1),
+      separated: cells.every((cell, index) => index === 0 || cell.left >= cells[index - 1].right + 8),
+      sticky: Math.abs(header.getBoundingClientRect().top - element.getBoundingClientRect().top) < 1,
+      overflow: element.scrollWidth > element.clientWidth,
+      renderedRows: element.querySelectorAll('[aria-label^="Select session "]').length,
+    };
+  });
+  expect(await geometry()).toMatchObject({ aligned: true, separated: true, sticky: true, overflow: true });
+  expect((await geometry()).renderedRows).toBeLessThan(100);
+  const firstName = await rows.first().getAttribute('aria-label');
+  await viewport.evaluate(element => { element.scrollTop = 1500; element.scrollLeft = 320; });
+  await page.clock.runFor(100);
+  await expect(rows.first()).not.toHaveAttribute('aria-label', firstName!);
+  expect(await geometry()).toMatchObject({ aligned: true, separated: true, sticky: true, overflow: true });
+});
+
 visualTest('session-context-menu', 'session context menu', async (page) => {
   await visit(page, { view: 'codex' });
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click({ button: 'right' });

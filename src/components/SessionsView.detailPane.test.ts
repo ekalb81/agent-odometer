@@ -250,6 +250,50 @@ describe('SessionsView wide-layout detail pane', () => {
     expect(await screen.findByRole('button', { name: 'Hide details' })).toHaveAttribute('aria-expanded', 'true');
   });
 
+  it('distinguishes empty, loading, and failed detail states and retries the selected fetch', async () => {
+    let rejectDetails!: (error: Error) => void;
+    getSessionDetails.mockImplementationOnce(() => new Promise((_, reject) => { rejectDetails = reject; }));
+    getSessionDetails.mockResolvedValueOnce(fullSession('codex:thread:alpha', 'Fix login bug'));
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    renderView();
+    expect(screen.getByText('Select a session to see its details')).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Select session Fix login bug' }));
+    expect(await screen.findByText('Loading session details…')).toBeInTheDocument();
+    rejectDetails(new Error('synthetic detail failure'));
+    expect(await screen.findByText('Could not load session details.')).toBeInTheDocument();
+    expect(screen.queryByText('Loading session details…')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    const pane = document.getElementById('session-detail-pane')!;
+    await within(pane).findByText('Fix login bug');
+    expect(within(pane).queryByText('Could not load session details.')).not.toBeInTheDocument();
+    expect(errors).toHaveBeenCalledWith('get_session_details failed:', expect.any(Error));
+    errors.mockRestore();
+  });
+
+  it('keeps prior details visible and offers retry after a refresh failure', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    renderView();
+    await userEvent.click(await screen.findByRole('button', { name: 'Select session Fix login bug' }));
+    const pane = document.getElementById('session-detail-pane')!;
+    await within(pane).findByText('Fix login bug');
+
+    getSessionDetails.mockRejectedValueOnce(new Error('synthetic refresh failure'));
+    sessionsStore.applyMutations([summary('codex:thread:alpha', 'Fix login bug')], []);
+    await waitFor(() => expect(getSessionDetails).toHaveBeenCalledTimes(2), { timeout: 1500 });
+    const alert = await within(pane).findByText('Could not refresh session details. Showing previous details.');
+    expect(alert.closest('[role="alert"]')).not.toBeNull();
+    expect(within(pane).getByText('Fix login bug')).toBeInTheDocument();
+
+    getSessionDetails.mockResolvedValueOnce(fullSession('codex:thread:alpha', 'Fix login bug'));
+    await userEvent.click(within(pane).getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(getSessionDetails).toHaveBeenCalledTimes(3));
+    await waitFor(() => expect(within(pane).queryByText('Could not refresh session details. Showing previous details.')).not.toBeInTheDocument());
+    expect(errors).toHaveBeenCalledWith('get_session_details failed:', expect.any(Error));
+    errors.mockRestore();
+  });
+
   it('keeps the selection and its data when the pane collapses, and restores it on reopen', async () => {
     renderView();
     const row = await screen.findByRole('button', { name: /Select session Fix login bug/ });
@@ -322,10 +366,10 @@ describe('SessionsView range pricing refresh orchestration', () => {
     sessionsStore.replaceAll([]);
     vi.restoreAllMocks();
   });
-  function mountRangeView(harness: 'codex' | 'all' = 'codex') {
+  function mountRangeView(harness: 'codex' | 'all' = 'codex', search = '') {
     return render(SessionsView, { props: {
       harness, active: true,
-      filters: { ...defaultFilters(), dateFrom: '2026-07-31T00:00', dateTo: '2026-08-02T00:00' },
+      filters: { ...defaultFilters(), search, dateFrom: '2026-07-31T00:00', dateTo: '2026-08-02T00:00' },
       onfilterschange: () => {},
     } });
   }
@@ -336,6 +380,171 @@ describe('SessionsView range pricing refresh orchestration', () => {
     expect(calls.slice(-2).some(([ranges]) => ranges.length > 1)).toBe(true);
     return calls;
   }
+  it.each(['provider', 'filter'] as const)('retains usable proofs while revalidating sustained updates outside the %s scope', async (scope) => {
+    const base = summary(ids[0], ids[0]);
+    const total: RangeTotals = { tokens: { ...zeroTokens, total_tokens: 321 }, buckets: [], tool_metrics: base.tool_metrics,
+      tool_metrics_by_model: {}, optimization_findings_count: 0,
+      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } };
+    const pending: (() => void)[] = [];
+    ipcMocks.sessionsInRanges.mockImplementationOnce((ranges: unknown[]) => new Promise(resolve => {
+      pending.push(() => resolve(ranges.map(() => ({ [ids[0]]: total }))));
+    }));
+    ipcMocks.sessionsInRanges.mockImplementationOnce((ranges: unknown[]) => new Promise(resolve => {
+      pending.push(() => resolve(ranges.map(() => ({ [ids[0]]: total }))));
+    }));
+    ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => Promise.resolve(ranges.map(() => ({ [ids[0]]: total }))));
+    mountRangeView('codex', scope === 'filter' ? ids[0] : '');
+    await expectBothBatches(2);
+    const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
+    for (let update = 0; update < 4; update++) {
+      sessionsStore.applyMutations([{ ...summary('other', 'Other session'), harness: scope === 'provider' ? 'claude_code' : 'codex' }], []);
+      await new Promise(resolve => setTimeout(resolve, 30));
+    }
+    pending.forEach(resolve => resolve());
+    await waitFor(() => expect(row).toHaveTextContent('321'));
+    expect(screen.getByText(/^Tokens ·/).parentElement).toHaveTextContent('321');
+    for (let update = 0; update < 4; update++) {
+      sessionsStore.applyMutations([{ ...summary('other', 'Other session'), harness: scope === 'provider' ? 'claude_code' : 'codex' }], []);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(row).toHaveTextContent('321');
+      expect(screen.getByText(/^Tokens ·/).parentElement).toHaveTextContent('321');
+    }
+    await waitFor(() => expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument());
+    expect(ipcMocks.sessionsInRanges.mock.calls.length).toBeGreaterThan(2);
+    const calls = ipcMocks.sessionsInRanges.mock.calls as unknown as [unknown[], string[], string[]][];
+    expect(calls.slice(2).every(([, fetchedIds]) => fetchedIds.length === 0)).toBe(true);
+    expect(calls.every(([, , proofScope]) => proofScope.join() === (scope === 'filter' ? ids[0] : ids.join()))).toBe(true);
+  });
+  it.each(['startup', 'verified'] as const)('shows explicitly previous verified snapshots during a sustained 1100-session All scope stream with 350ms requests from %s', async (phase) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const corpus = Array.from({ length: 1100 }, (_, index) => summary(`synthetic:${index}`, `Session ${index}`));
+      sessionsStore.replaceAll(corpus);
+      const total: RangeTotals = { tokens: { ...zeroTokens, total_tokens: 321 }, buckets: [], tool_metrics: corpus[0].tool_metrics,
+        tool_metrics_by_model: {}, optimization_findings_count: 0,
+        pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } };
+      ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => phase === 'startup'
+        ? new Promise(resolve => setTimeout(() => resolve(ranges.map(() => ({ [corpus[0].id]: total }))), 350))
+        : Promise.resolve(ranges.map(() => ({ [corpus[0].id]: total }))));
+      mountRangeView('all');
+      await vi.advanceTimersByTimeAsync(0);
+      const row = screen.getByRole('button', { name: 'Select session Session 0' });
+      expect(row).toHaveTextContent(phase === 'startup' ? 'unavailable' : '321');
+      expect(ipcMocks.sessionsInRanges).toHaveBeenCalledTimes(2);
+      let currentTokens = 321;
+      ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => {
+        const captured = { ...total, tokens: { ...zeroTokens, total_tokens: currentTokens } };
+        return new Promise(resolve => setTimeout(() => resolve(ranges.map(() => ({ [corpus[0].id]: captured }))), 350));
+      });
+      for (let update = 0; update < 10; update++) {
+        currentTokens = 1000 + update;
+        sessionsStore.applyMutations([{ ...corpus[0], tokens_total: { ...zeroTokens, total_tokens: currentTokens } }], []);
+        await vi.advanceTimersByTimeAsync(100);
+        if (update === 2) expect(ipcMocks.sessionsInRanges).toHaveBeenCalledTimes(phase === 'startup' ? 2 : 4);
+        if (phase === 'startup' && update < 3) expect(row).toHaveTextContent('unavailable');
+        else {
+          expect(row).toHaveTextContent(/(?:321|1,00\d)/);
+          expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+        }
+      }
+      expect(ipcMocks.sessionsInRanges.mock.calls.length).toBeGreaterThanOrEqual(6);
+      expect(row).not.toHaveTextContent('321');
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(row).toHaveTextContent('1,009');
+      expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument();
+      expect(screen.getByText(/^Tokens ·/).parentElement).toHaveTextContent('1.0K');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it('verifies current All scope totals between continuous 100ms updates when requests take 80ms', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const corpus = Array.from({ length: 1100 }, (_, index) => summary(`synthetic:${index}`, `Session ${index}`));
+      sessionsStore.replaceAll(corpus);
+      let currentTokens = 1000;
+      ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => {
+        const total: RangeTotals = { tokens: { ...zeroTokens, total_tokens: currentTokens }, buckets: [], tool_metrics: corpus[0].tool_metrics,
+          tool_metrics_by_model: {}, optimization_findings_count: 0,
+          pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } };
+        return new Promise(resolve => setTimeout(() => resolve(ranges.map(() => ({ [corpus[0].id]: total }))), 80));
+      });
+      mountRangeView('all');
+      await vi.advanceTimersByTimeAsync(80);
+      const row = screen.getByRole('button', { name: 'Select session Session 0' });
+      expect(row).toHaveTextContent('1,000');
+      let verifiedDuringStream = 0;
+      for (let update = 1; update <= 10; update++) {
+        currentTokens = 1000 + update;
+        sessionsStore.applyMutations([{ ...corpus[0], tokens_total: { ...zeroTokens, total_tokens: currentTokens } }], []);
+        await vi.advanceTimersByTimeAsync(99);
+        if (!screen.queryByTestId('accounting-table-status')) {
+          verifiedDuringStream++;
+          expect(row).toHaveTextContent(new Intl.NumberFormat().format(currentTokens));
+          expect(screen.getByText(/^Tokens ·/).parentElement).toHaveTextContent('1.0K');
+        }
+        await vi.advanceTimersByTimeAsync(1);
+      }
+      expect(verifiedDuringStream).toBeGreaterThan(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it.each(['scope', 'date', 'history'] as const)('rejects earlier successes and failures after a hard %s change', async (change) => {
+    const base = summary(ids[0], ids[0]);
+    const total = (value: number): RangeTotals => ({ tokens: { ...zeroTokens, total_tokens: value }, buckets: [], tool_metrics: base.tool_metrics,
+      tool_metrics_by_model: {}, optimization_findings_count: 0,
+      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } });
+    const pending: { resolve: (value: Record<string, RangeTotals>[]) => void; reject: (error: Error) => void; ranges: unknown[] }[] = [];
+    const delayed = (ranges: unknown[]) => new Promise<Record<string, RangeTotals>[]>((resolve, reject) => pending.push({ resolve, reject, ranges }));
+    ipcMocks.sessionsInRanges.mockImplementationOnce(delayed).mockImplementationOnce(delayed);
+    ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[], fetchIds: string[] = []) => Promise.resolve(ranges.map(() => Object.fromEntries(fetchIds.map(id => [id, total(123)])))));
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const view = mountRangeView();
+    await expectBothBatches(2);
+    if (change === 'history') historyStore.set({ ...historyStore.status, status: 'ready' });
+    else await view.rerender({ harness: 'codex', active: true,
+      filters: { ...defaultFilters(), search: change === 'scope' ? ids[0] : '', dateFrom: change === 'date' ? '2026-07-30T00:00' : '2026-07-31T00:00', dateTo: '2026-08-02T00:00' },
+      onfilterschange: () => {},
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    pending[0].resolve(pending[0].ranges.map(() => ({ [ids[0]]: total(987654) })));
+    pending[1].reject(new Error('obsolete proof failed'));
+    await expectBothBatches(4);
+    const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
+    await waitFor(() => expect(row).toHaveTextContent('123'));
+    expect(row).not.toHaveTextContent('987,654');
+    expect(errors).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument());
+  });
+  it('labels previously verified table usage while analytics is pending or fails independently', async () => {
+    const pending: { resolve: (value: Record<string, RangeTotals>[]) => void; reject: (error: Error) => void; ranges: unknown[] }[] = [];
+    ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => new Promise((resolve, reject) => pending.push({ resolve, reject, ranges })));
+    const base = summary(ids[0], ids[0]);
+    const total: RangeTotals = { tokens: { ...zeroTokens, total_tokens: 901 }, buckets: [], tool_metrics: base.tool_metrics,
+      tool_metrics_by_model: {}, optimization_findings_count: 0,
+      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } };
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const view = mountRangeView();
+    await expectBothBatches(2);
+    sessionsStore.applyMutations([base], []);
+    const table = pending.find(request => request.ranges.length === 1)!;
+    const analytics = pending.find(request => request.ranges.length > 1)!;
+    table.resolve([{ [ids[0]]: total }]);
+    const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
+    await waitFor(() => expect(row).toHaveTextContent('901'));
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+    analytics.resolve(analytics.ranges.map(() => ({ [ids[0]]: total })));
+    await expectBothBatches(4);
+    const latestAnalytics = pending.slice(2).find(request => request.ranges.length > 1)!;
+    latestAnalytics.reject(new Error('current analytics proof failed'));
+    await waitFor(() => expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Analytics:'));
+    expect(row).toHaveTextContent('901');
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+    expect(errors).toHaveBeenCalled();
+    view.unmount();
+    pending.slice(2).find(request => request.ranges.length === 1)!.resolve([{}]);
+  });
   it.each(['unsupported', 'partial', 'fallback', 'purchased-primary', 'both-unsupported'] as const)('qualifies purchased estimates independently from API availability: %s', async (mode) => {
     const card = testRateCard();
     if (mode !== 'purchased-primary') card.api_models = card.models;
@@ -520,7 +729,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     const row = await screen.findByRole('button', { name: `Select session ${ids[0]}` });
     await waitFor(() => expect(row).toHaveTextContent('901'));
     expect(row.querySelector('.text-accent-cost')).toHaveTextContent('15.00');
-    expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument());
   });
   it('withholds raw footer and row totals after a cached sibling identity failure', async () => {
     const snapshot = (fetchIds: string[]) => Object.fromEntries(fetchIds.map(id => [id, {
@@ -541,16 +750,23 @@ describe('SessionsView range pricing refresh orchestration', () => {
     expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('ambiguous');
     expect(errors).toHaveBeenCalled();
   });
-  it('rejects same-epoch mutation results before applying an obsolete cumulative snapshot', async () => {
+  it('labels a same-scope in-flight cumulative snapshot as previously verified until the latest mutation is priced', async () => {
     let finish!: (value: unknown) => void;
+    let finishLatest!: (value: unknown) => void;
     ipcMocks.getSessionPricing.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    ipcMocks.getSessionPricing.mockImplementationOnce(() => new Promise(resolve => { finishLatest = resolve; }));
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
     await waitFor(() => expect(finish).toBeDefined());
     sessionsStore.applyMutations([summary(ids[0], ids[0])], []);
     finish(Object.fromEntries(ids.map(id => [id, { tokens: { ...zeroTokens, total_tokens: 998877 }, pricing: { plan: { total: 98989, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {} }])));
     await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(2));
-    expect(screen.getByRole('button', { name: `Select session ${ids[0]}` })).not.toHaveTextContent('998,877');
-    expect(ipcMocks.getSessionPricing.mock.calls.at(-1)).toEqual([ids, ids]);
+    const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
+    expect(row).toHaveTextContent('998,877');
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+    expect(ipcMocks.getSessionPricing.mock.calls.at(-1)).toEqual([[ids[0]], ids]);
+    finishLatest({ [ids[0]]: { tokens: { ...zeroTokens, total_tokens: 901 }, pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {} } });
+    await waitFor(() => expect(row).toHaveTextContent('901'));
+    await waitFor(() => expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument());
   });
   it('refuses an export whose backend cumulative snapshot is missing', async () => {
     ipcMocks.prepareSessionSummaryExport.mockRejectedValue('accounting_identity_unverified');

@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import DetailPane from './DetailPane.svelte';
 import { rates } from '../lib/stores/rates';
@@ -54,6 +54,34 @@ beforeEach(() => { rates.set({
 afterEach(() => { cleanup(); rates.set(null); });
 
 describe('DetailPane server pricing', () => {
+  it('rounds durations before splitting seconds, minutes, and hours', async () => {
+    const value = session();
+    value.started_at = '2026-01-01T00:00:00Z';
+    value.last_event_at = '2026-01-01T00:56:59.600Z';
+    value.turns[0].duration_ms = 3_599_600;
+    value.turns[0].time_to_first_token_ms = 1_250;
+    render(DetailPane, { session: value, onclose: () => {} });
+    await fireEvent.click(screen.getByRole('button', { name: /#1/ }));
+    expect(screen.getByText('57m 0s')).toBeInTheDocument();
+    expect(screen.getByText('1h 0m')).toBeInTheDocument();
+    expect(screen.getByText('1.3s')).toBeInTheDocument();
+  });
+
+  it('carries a sub-minute value that rounds to 60 seconds', async () => {
+    const value = session();
+    value.turns[0].duration_ms = 59_960;
+    render(DetailPane, { session: value, onclose: () => {} });
+    await fireEvent.click(screen.getByRole('button', { name: /#1/ }));
+    expect(screen.getAllByText('1m 0s')).toHaveLength(2);
+  });
+
+  it('shows a static empty state when no session is selected', () => {
+    const rendered = render(DetailPane, { session: null, onclose: () => {} });
+    expect(screen.getByText('Select a session to see its details')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Close session details' })).toBeInTheDocument();
+    expect(rendered.container.querySelector('svg')).toBeNull();
+  });
+
   it('keeps the original monetary estimate beside a backend FX restatement and its evidence', () => {
     const value = session();
     value.pricing!.flat_api!.converted = { from_currency: 'USD', target_currency: 'EUR', amount: 38.25, rate: .9, as_of: '2026-10-01T12:30:00Z', source: 'Synthetic offline quote' };

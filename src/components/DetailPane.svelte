@@ -25,12 +25,14 @@
     session: Session | null;
     /** Subagent sessions spawned by this one (for the "N subagents" pill). */
     childCount?: number;
+    detailState?: 'empty' | 'loading' | 'error' | 'ready';
+    onretry?: () => void;
     onclose: () => void;
     /** Stable source record target for search/bookmark navigation. */
     transcriptAnchor?: string | null;
   }
 
-  let { session, childCount = 0, onclose, transcriptAnchor = null }: Props = $props();
+  let { session, childCount = 0, detailState = 'empty', onretry = () => {}, onclose, transcriptAnchor = null }: Props = $props();
   let inspectorOpen = $state(false);
   let exportOpen = $state(false);
   let handoffOpen = $state(false);
@@ -83,12 +85,13 @@
   function fmtDurationMs(ms: number | null): string {
     if (ms == null) return '—';
     if (ms < 1000) return `${ms} ms`;
-    const s = ms / 1000;
-    if (s < 60) return `${s.toFixed(1)}s`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ${Math.round(s % 60)}s`;
-    const h = Math.floor(m / 60);
-    return `${h}h ${m % 60}m`;
+    const roundedTenths = Math.round(ms / 100);
+    if (roundedTenths < 600) return `${(roundedTenths / 10).toFixed(1)}s`;
+    const totalSeconds = Math.round(ms / 1000);
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    if (totalMinutes < 60) return `${totalMinutes}m ${totalSeconds % 60}s`;
+    const hours = Math.floor(totalMinutes / 60);
+    return `${hours}h ${totalMinutes % 60}m`;
   }
 
   const sessionDuration = $derived(
@@ -235,12 +238,17 @@
 
 <div class="flex flex-col h-full bg-panel overflow-hidden" aria-label="Session details">
   {#if !session}
-    <div class="flex-1 flex flex-col items-center justify-center gap-2 text-ink-faint text-xs p-6 text-center">
-      <svg width="28" height="28" viewBox="0 0 96 96" class="opacity-40" aria-hidden="true">
-        <circle cx="48" cy="48" r="38" fill="none" stroke="currentColor" stroke-width="14" stroke-dasharray="4.6 5.8"/>
-        <circle cx="48" cy="48" r="10" fill="currentColor"/>
-      </svg>
-      <p>Select a session to see its details</p>
+    <div class="flex-1 flex flex-col items-center justify-center gap-2 text-ink-faint text-xs p-6 text-center relative">
+      <button type="button" class="absolute right-3 top-3 p-1 text-ink-faint hover:text-ink" aria-label="Close session details" title="Close details" onclick={onclose}>×</button>
+      {#if detailState === 'loading'}
+        <div class="h-5 w-5 rounded-full border-2 border-ink-faint/30 border-t-ink-faint animate-spin" role="status" aria-label="Loading session details"></div>
+        <p>Loading session details…</p>
+      {:else if detailState === 'error'}
+        <p class="text-ink-muted" role="alert">Could not load session details.</p>
+        <button type="button" class="text-accent hover:underline" onclick={onretry}>Retry</button>
+      {:else}
+        <p>Select a session to see its details</p>
+      {/if}
     </div>
   {:else}
     <!-- Header -->
@@ -297,6 +305,12 @@
         {/if}
       </div>
     </div>
+    {#if detailState === 'error'}
+      <div class="px-5 py-2 flex items-center justify-between gap-3 border-b border-amber-500/30 bg-amber-500/5 text-xs" role="alert">
+        <span class="text-ink-muted">Could not refresh session details. Showing previous details.</span>
+        <button type="button" class="shrink-0 text-accent hover:underline" onclick={onretry}>Retry</button>
+      </div>
+    {/if}
 
     <div class="px-5 py-2 border-b border-edge shrink-0 space-x-4"><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contextAnchor = null; inspectorOpen = true; }}>Inspect transcript</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contentSearchOpen = true; }}>Search content</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { contextOpen = true; }}>Explain context</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => { exportOpen = true; }}>Export transcript</button><button type="button" class="text-xs text-accent hover:underline" onclick={() => handoffOpen = true}>Prepare handoff</button></div>
     {#if contextOpen}<ContextExplanation sessionId={session.storage_id} onclose={() => { contextOpen = false; }} oninspect={(anchor) => { contextOpen = false; contextAnchor = anchor; inspectorOpen = true; }} />{/if}
