@@ -5,8 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +15,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_TARGET_BYTES: u64 = 128 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 4096;
 const JOURNAL_VERSION: u32 = 1;
+const ACTION_VERSION: u32 = 1;
+const JOURNAL_SUFFIXES: [&str; 6] = [
+    "prepared",
+    "applied",
+    "aborted",
+    "conflict",
+    "undo-conflict",
+    "undone",
+];
 const PRODUCTION_WRITES_ENABLED: bool = false;
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -176,14 +186,8 @@ fn ensure_journal_dir(target: &ResolvedTarget) -> Result<(), ActionError> {
 
 fn read_target(target: &ResolvedTarget) -> Result<Vec<u8>, ActionError> {
     checked_target(target)?;
-    let mut bytes = Vec::new();
-    File::open(&target.file)?
-        .take(MAX_TARGET_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_TARGET_BYTES {
-        return Err(ActionError::UnsafeTarget);
-    }
-    Ok(bytes)
+    crate::harness_integration::read_bounded_regular_file(&target.file, MAX_TARGET_BYTES)
+        .map_err(|_| ActionError::UnsafeTarget)
 }
 
 fn valid_id(id: &str) -> bool {
@@ -226,12 +230,115 @@ fn private_new_file(path: &Path) -> Result<File, ActionError> {
     Ok(options.open(path)?)
 }
 
+fn canonical_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_event(
+    target: &ResolvedTarget,
+    id: &str,
+    suffix: &str,
+    record: &JournalRecord,
+) -> Result<(), ActionError> {
+    let expected = match suffix {
+        "prepared" => (JournalResult::Prepared, UndoState::NotApplied),
+        "applied" => (JournalResult::Applied, UndoState::Available),
+        "aborted" => (JournalResult::Aborted, UndoState::NotApplied),
+        "conflict" | "undo-conflict" => (JournalResult::Conflict, UndoState::BlockedExternalEdit),
+        "undone" => (JournalResult::Applied, UndoState::Undone),
+        _ => return Err(ActionError::InvalidJournal),
+    };
+    if record.version != JOURNAL_VERSION
+        || record.action_version != ACTION_VERSION
+        || record.action_id != id
+        || !valid_id(id)
+        || record.redacted_target != target.redacted_identity
+        || record.source_revision.is_empty()
+        || record.source_revision.len() > 128
+        || record.source_revision.chars().any(char::is_control)
+        || !canonical_hash(&record.before_sha256)
+        || !canonical_hash(&record.after_sha256)
+        || (record.result, record.undo_state) != expected
+    {
+        return Err(ActionError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn read_journal_events(
+    target: &ResolvedTarget,
+    id: &str,
+) -> Result<BTreeMap<String, JournalRecord>, ActionError> {
+    if !valid_id(id) {
+        return Err(ActionError::InvalidJournal);
+    }
+    let mut events = BTreeMap::new();
+    match fs::symlink_metadata(&target.journal) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(events),
+        Err(_) => return Err(ActionError::Io),
+        Ok(_) => {}
+    }
+    for suffix in JOURNAL_SUFFIXES {
+        if let Some(record) = read_event(target, id, suffix)? {
+            events.insert(suffix.to_owned(), record);
+        }
+    }
+    Ok(events)
+}
+
+fn validate_journal(events: &BTreeMap<String, JournalRecord>) -> Result<(), ActionError> {
+    let prepared = events.get("prepared").ok_or(ActionError::InvalidJournal)?;
+    if events.values().any(|record| {
+        record.version != prepared.version
+            || record.action_version != prepared.action_version
+            || record.action_id != prepared.action_id
+            || record.redacted_target != prepared.redacted_target
+            || record.source_revision != prepared.source_revision
+            || record.before_sha256 != prepared.before_sha256
+            || record.after_sha256 != prepared.after_sha256
+    }) {
+        return Err(ActionError::InvalidJournal);
+    }
+    let applied = events.contains_key("applied");
+    // A refused undo can later succeed once exact after-bytes are restored;
+    // keep that audit event alongside undone, preserving the existing retry.
+    if (events.contains_key("aborted") && events.contains_key("conflict"))
+        || (applied && (events.contains_key("aborted") || events.contains_key("conflict")))
+        || (!applied && (events.contains_key("undo-conflict") || events.contains_key("undone")))
+    {
+        return Err(ActionError::InvalidJournal);
+    }
+    Ok(())
+}
+
+fn read_validated_journal(
+    target: &ResolvedTarget,
+    id: &str,
+) -> Result<BTreeMap<String, JournalRecord>, ActionError> {
+    let events = read_journal_events(target, id)?;
+    validate_journal(&events)?;
+    Ok(events)
+}
+
 fn write_event(
     target: &ResolvedTarget,
     id: &str,
     suffix: &str,
     record: &JournalRecord,
 ) -> Result<(), ActionError> {
+    validate_event(target, id, suffix, record)?;
+    let mut events = read_journal_events(target, id)?;
+    if !events.is_empty() {
+        validate_journal(&events)?;
+    }
+    if events.contains_key(suffix) {
+        return Err(ActionError::Io);
+    }
+    events.insert(suffix.to_owned(), record.clone());
+    validate_journal(&events)?;
     let bytes = serde_json::to_vec(record).map_err(|_| ActionError::InvalidJournal)?;
     if bytes.len() as u64 > MAX_JOURNAL_BYTES {
         return Err(ActionError::InvalidJournal);
@@ -264,20 +371,11 @@ fn read_event(
     if !metadata.file_type().is_file() {
         return Err(ActionError::InvalidJournal);
     }
-    let file = File::open(&path)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_JOURNAL_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_JOURNAL_BYTES {
-        return Err(ActionError::InvalidJournal);
-    }
+    let bytes = crate::harness_integration::read_bounded_regular_file(&path, MAX_JOURNAL_BYTES)
+        .map_err(|_| ActionError::InvalidJournal)?;
     let record: JournalRecord =
         serde_json::from_slice(&bytes).map_err(|_| ActionError::InvalidJournal)?;
-    if record.version != JOURNAL_VERSION
-        || record.action_id != id
-        || record.redacted_target != target.redacted_identity
-    {
-        return Err(ActionError::InvalidJournal);
-    }
+    validate_event(target, id, suffix, &record)?;
     Ok(Some(record))
 }
 
@@ -288,10 +386,8 @@ fn read_backup(target: &ResolvedTarget, record: &JournalRecord) -> Result<Vec<u8
     if !metadata.file_type().is_file() || metadata.len() > MAX_TARGET_BYTES {
         return Err(ActionError::InvalidJournal);
     }
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_TARGET_BYTES + 1)
-        .read_to_end(&mut bytes)?;
+    let bytes = crate::harness_integration::read_bounded_regular_file(&path, MAX_TARGET_BYTES)
+        .map_err(|_| ActionError::InvalidJournal)?;
     if bytes.len() as u64 > MAX_TARGET_BYTES || sha256(&bytes) != record.before_sha256 {
         return Err(ActionError::InvalidJournal);
     }
@@ -393,12 +489,13 @@ fn apply_batch_using(
 }
 
 fn rollback_failed_attempt(target: &ResolvedTarget, id: &str) -> Result<(), ActionError> {
-    // Do not create a journal when validation failed before preparation.
-    match fs::symlink_metadata(journal_path(target, id, "prepared")?) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => return Err(ActionError::Io),
-        Ok(_) => {}
+    // A preparation-free failure has no markers. Orphan later events are
+    // an invalid transaction, not evidence that the attempt wrote nothing.
+    let events = read_journal_events(target, id)?;
+    if events.is_empty() {
+        return Ok(());
     }
+    validate_journal(&events)?;
     match recover_transaction(target, id)? {
         Recovery::Applied => undo_transaction(target, id),
         Recovery::Aborted | Recovery::Undone => Ok(()),
@@ -439,6 +536,7 @@ fn apply_transaction_with_id(
         || source_revision.len() > 128
         || source_revision.chars().any(char::is_control)
         || replacement.len() as u64 > MAX_TARGET_BYTES
+        || !canonical_hash(expected_before_sha256)
     {
         return Err(ActionError::UnsafeTarget);
     }
@@ -448,13 +546,19 @@ fn apply_transaction_with_id(
     }
     let id = id.to_owned();
     ensure_journal_dir(target)?;
+    // Refuse an existing transaction before creating a backup or any event.
+    let existing = read_journal_events(target, &id)?;
+    if !existing.is_empty() {
+        validate_journal(&existing)?;
+        return Err(ActionError::Conflict);
+    }
     let mut backup = private_new_file(&backup_path(target, &id)?)?;
     backup.write_all(&before)?;
     backup.sync_all()?;
     let record = JournalRecord {
         version: JOURNAL_VERSION,
         action_id: id.clone(),
-        action_version: 1,
+        action_version: ACTION_VERSION,
         redacted_target: target.redacted_identity.clone(),
         source_revision: source_revision.into(),
         before_sha256: expected_before_sha256.into(),
@@ -502,11 +606,12 @@ fn apply_transaction_with_id(
 }
 
 fn undo_transaction(target: &ResolvedTarget, id: &str) -> Result<(), ActionError> {
-    let prepared = read_event(target, id, "prepared")?.ok_or(ActionError::InvalidJournal)?;
-    if read_event(target, id, "undone")?.is_some() {
+    let journal = read_validated_journal(target, id)?;
+    let prepared = journal["prepared"].clone();
+    if journal.contains_key("undone") {
         return Err(ActionError::Conflict);
     }
-    if read_event(target, id, "applied")?.is_none() {
+    if !journal.contains_key("applied") {
         return Err(ActionError::InvalidJournal);
     }
     let backup = read_backup(target, &prepared)?;
@@ -541,20 +646,19 @@ fn undo_transaction(target: &ResolvedTarget, id: &str) -> Result<(), ActionError
 }
 
 fn recover_transaction(target: &ResolvedTarget, id: &str) -> Result<Recovery, ActionError> {
-    let prepared = read_event(target, id, "prepared")?.ok_or(ActionError::InvalidJournal)?;
+    let journal = read_validated_journal(target, id)?;
+    let prepared = journal["prepared"].clone();
     read_backup(target, &prepared)?;
-    if read_event(target, id, "undone")?.is_some() {
+    if journal.contains_key("undone") {
         return Ok(Recovery::Undone);
     }
-    if read_event(target, id, "conflict")?.is_some()
-        || read_event(target, id, "undo-conflict")?.is_some()
-    {
+    if journal.contains_key("conflict") || journal.contains_key("undo-conflict") {
         return Err(ActionError::Conflict);
     }
-    if read_event(target, id, "aborted")?.is_some() {
+    if journal.contains_key("aborted") {
         return Ok(Recovery::Aborted);
     }
-    let applied = read_event(target, id, "applied")?.is_some();
+    let applied = journal.contains_key("applied");
     let current = sha256(&read_target(target)?);
     if current == prepared.before_sha256 {
         if applied {
@@ -619,6 +723,254 @@ mod tests {
         };
         fs::write(&target.file, bytes).unwrap();
         target
+    }
+
+    fn bytes_on_disk(target: &ResolvedTarget) -> (Vec<u8>, BTreeMap<std::ffi::OsString, Vec<u8>>) {
+        let entries = if target.journal.exists() {
+            fs::read_dir(&target.journal)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), fs::read(entry.path()).unwrap())
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        (fs::read(&target.file).unwrap(), entries)
+    }
+
+    #[test]
+    fn malformed_action_inputs_and_unprepared_markers_create_no_journal() {
+        let oversized_revision = "r".repeat(129);
+        for (revision, expected) in [
+            ("", sha256(b"before")),
+            (oversized_revision.as_str(), sha256(b"before")),
+            ("bad\nrevision", sha256(b"before")),
+            ("revision", "A".repeat(64)),
+            ("revision", "0".repeat(63)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = fixture(&dir, "guard.json", b"before");
+            assert_eq!(
+                apply_transaction(&target, revision, &expected, b"after", InterruptAt::Never),
+                Err(ActionError::UnsafeTarget)
+            );
+            assert!(!target.journal.exists());
+            assert_eq!(fs::read(&target.file).unwrap(), b"before");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = fixture(&dir, "guard.json", b"before");
+        let id = action_id();
+        let record = JournalRecord {
+            version: JOURNAL_VERSION,
+            action_id: id.clone(),
+            action_version: ACTION_VERSION,
+            redacted_target: target.redacted_identity.clone(),
+            source_revision: "revision".into(),
+            before_sha256: sha256(b"before"),
+            after_sha256: sha256(b"after"),
+            result: JournalResult::Applied,
+            undo_state: UndoState::Available,
+        };
+        assert_eq!(
+            write_event(&target, &id, "applied", &record),
+            Err(ActionError::InvalidJournal)
+        );
+        assert!(!target.journal.exists());
+        assert_eq!(fs::read(&target.file).unwrap(), b"before");
+        assert_eq!(rollback_failed_attempt(&target, &id), Ok(()));
+        assert!(!target.journal.exists());
+    }
+
+    #[test]
+    fn tampered_events_cannot_recover_undo_or_rollback_and_leave_every_byte_unchanged() {
+        let changes = [
+            ("version", serde_json::json!(2)),
+            ("action_version", serde_json::json!(2)),
+            (
+                "source_revision",
+                serde_json::json!("another-valid-revision"),
+            ),
+            ("source_revision", serde_json::json!("")),
+            ("source_revision", serde_json::json!("r".repeat(129))),
+            ("source_revision", serde_json::json!("control\nrevision")),
+            ("before_sha256", serde_json::json!("0".repeat(64))),
+            ("after_sha256", serde_json::json!("0".repeat(64))),
+            ("after_sha256", serde_json::json!("A".repeat(64))),
+            ("before_sha256", serde_json::json!("short")),
+            ("result", serde_json::json!("aborted")),
+            ("undo_state", serde_json::json!("undone")),
+        ];
+        for (field, value) in changes {
+            let dir = tempfile::tempdir().unwrap();
+            let target = fixture(&dir, "guard.json", b"before");
+            let id = apply_transaction(
+                &target,
+                "revision",
+                &sha256(b"before"),
+                b"after",
+                InterruptAt::Never,
+            )
+            .unwrap();
+            let path = journal_path(&target, &id, "applied").unwrap();
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            record[field] = value;
+            fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let before = bytes_on_disk(&target);
+            assert_eq!(
+                recover_transaction(&target, &id),
+                Err(ActionError::InvalidJournal),
+                "{field}"
+            );
+            assert_eq!(
+                undo_transaction(&target, &id),
+                Err(ActionError::InvalidJournal),
+                "{field}"
+            );
+            assert_eq!(
+                rollback_failed_attempt(&target, &id),
+                Err(ActionError::InvalidJournal),
+                "{field}"
+            );
+            assert_eq!(bytes_on_disk(&target), before, "{field}");
+        }
+    }
+
+    #[test]
+    fn contradictory_terminal_chains_are_rejected_before_any_early_return_or_write() {
+        for suffixes in [
+            vec!["aborted"],
+            vec!["conflict"],
+            vec!["undone", "conflict"],
+            vec!["undone", "aborted"],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = fixture(&dir, "guard.json", b"before");
+            let id = apply_transaction(
+                &target,
+                "revision",
+                &sha256(b"before"),
+                b"after",
+                InterruptAt::Never,
+            )
+            .unwrap();
+            let prepared = read_event(&target, &id, "prepared").unwrap().unwrap();
+            for suffix in suffixes {
+                let (result, undo_state) = match suffix {
+                    "aborted" => (JournalResult::Aborted, UndoState::NotApplied),
+                    "undone" => (JournalResult::Applied, UndoState::Undone),
+                    _ => (JournalResult::Conflict, UndoState::BlockedExternalEdit),
+                };
+                let record = JournalRecord {
+                    result,
+                    undo_state,
+                    ..prepared.clone()
+                };
+                fs::write(
+                    journal_path(&target, &id, suffix).unwrap(),
+                    serde_json::to_vec(&record).unwrap(),
+                )
+                .unwrap();
+            }
+            let before = bytes_on_disk(&target);
+            assert_eq!(
+                recover_transaction(&target, &id),
+                Err(ActionError::InvalidJournal)
+            );
+            assert_eq!(
+                undo_transaction(&target, &id),
+                Err(ActionError::InvalidJournal)
+            );
+            assert_eq!(
+                rollback_failed_attempt(&target, &id),
+                Err(ActionError::InvalidJournal)
+            );
+            assert_eq!(bytes_on_disk(&target), before);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = fixture(&dir, "guard.json", b"before");
+        let id = apply_transaction(
+            &target,
+            "revision",
+            &sha256(b"before"),
+            b"after",
+            InterruptAt::Never,
+        )
+        .unwrap();
+        fs::remove_file(journal_path(&target, &id, "applied").unwrap()).unwrap();
+        let prepared = read_event(&target, &id, "prepared").unwrap().unwrap();
+        let undone = JournalRecord {
+            result: JournalResult::Applied,
+            undo_state: UndoState::Undone,
+            ..prepared
+        };
+        fs::write(
+            journal_path(&target, &id, "undone").unwrap(),
+            serde_json::to_vec(&undone).unwrap(),
+        )
+        .unwrap();
+        let before = bytes_on_disk(&target);
+        assert_eq!(
+            recover_transaction(&target, &id),
+            Err(ActionError::InvalidJournal)
+        );
+        assert_eq!(
+            undo_transaction(&target, &id),
+            Err(ActionError::InvalidJournal)
+        );
+        assert_eq!(bytes_on_disk(&target), before);
+    }
+
+    #[test]
+    fn an_orphan_event_refuses_new_preparation_before_creating_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = fixture(&dir, "guard.json", b"before");
+        ensure_journal_dir(&target).unwrap();
+        let id = action_id();
+        let record = JournalRecord {
+            version: JOURNAL_VERSION,
+            action_version: ACTION_VERSION,
+            action_id: id.clone(),
+            redacted_target: target.redacted_identity.clone(),
+            source_revision: "revision".into(),
+            before_sha256: sha256(b"before"),
+            after_sha256: sha256(b"after"),
+            result: JournalResult::Applied,
+            undo_state: UndoState::Available,
+        };
+        fs::write(
+            journal_path(&target, &id, "applied").unwrap(),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        let before = bytes_on_disk(&target);
+        assert_eq!(
+            recover_transaction(&target, &id),
+            Err(ActionError::InvalidJournal)
+        );
+        assert_eq!(
+            undo_transaction(&target, &id),
+            Err(ActionError::InvalidJournal)
+        );
+        assert_eq!(
+            rollback_failed_attempt(&target, &id),
+            Err(ActionError::InvalidJournal)
+        );
+        assert_eq!(
+            apply_transaction_with_id(
+                &target,
+                "revision",
+                &sha256(b"before"),
+                b"after",
+                InterruptAt::Never,
+                &id
+            ),
+            Err(ActionError::InvalidJournal)
+        );
+        assert_eq!(bytes_on_disk(&target), before);
+        assert!(!backup_path(&target, &id).unwrap().exists());
     }
 
     #[test]
