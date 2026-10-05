@@ -132,7 +132,15 @@ pub async fn preview_controlled_action(
                 let store = crate::quota_store::QuotaStoreFile::load_checked().map_err(|_| {
                     "Action source is unavailable; refresh before previewing.".to_owned()
                 })?;
-                crate::action_contract::preview_budget_guard(&draft, &store).map_err(str::to_owned)
+                let mut preview = crate::action_contract::preview_budget_guard(&draft, &store)
+                    .map_err(str::to_owned)?;
+                if store.budgets.iter().any(|budget| {
+                    budget.id == draft.budget_id
+                        && budget.provider == crate::provider::claude_code_provider_id()
+                }) {
+                    crate::action_guard_preflight::add_claude_guard_preflight(&mut preview);
+                }
+                Ok(preview)
             })
             .await
             .map_err(|_| "Action preview could not finish.".to_owned())?

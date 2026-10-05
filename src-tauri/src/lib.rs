@@ -7,6 +7,7 @@ static TEST_COMMON_CONTROLS: [u8; 168] = *b" \"/MANIFESTDEPENDENCY:type='win32' 
 
 pub mod action_contract;
 mod action_executor;
+mod action_guard_preflight;
 mod ambient;
 pub mod attention;
 pub mod claude_parser;
