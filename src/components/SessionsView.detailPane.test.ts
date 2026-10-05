@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sessionsStore } from '../lib/stores/sessions.svelte';
+import { historyStore } from '../lib/stores/history.svelte';
 import { sessionDetailPaneStore } from '../lib/stores/sessionDetailPane.svelte';
 import { projectStore } from '../lib/stores/projects.svelte';
 import { sessionGridStore } from '../lib/stores/sessionGrid.svelte';
@@ -101,6 +102,10 @@ const { ipcMocks, getSessionDetails } = vi.hoisted(() => {
       writeExport: vi.fn().mockResolvedValue(undefined),
       prepareSessionSummaryExport: vi.fn(),
       publishSessionSummaryExport: vi.fn(),
+      publishToolDimensionExport: vi.fn(),
+      listToolImpactTargets: vi.fn().mockResolvedValue([]),
+      getSubscriptionUsage: vi.fn().mockResolvedValue([]),
+      getQuotaSnapshots: vi.fn().mockResolvedValue([]),
       onConfigEvent: vi.fn().mockResolvedValue(() => {}),
     },
   };
@@ -300,6 +305,9 @@ describe('SessionsView range pricing refresh orchestration', () => {
     localStorage.clear();
     stubLayoutApis();
     rates.set(testRateCard());
+    historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: true });
+    ipcMocks.publishToolDimensionExport.mockReset().mockResolvedValue(true);
+    ipcMocks.listToolImpactTargets.mockReset().mockResolvedValue([]);
     sessionsStore.replaceAll(ids.map((id) => summary(id, id)));
     ipcMocks.getSessionPricing.mockReset().mockImplementation((fetchIds: string[]) => Promise.resolve(Object.fromEntries(fetchIds.map(id => [id, { tokens: zeroTokens, pricing: { plan: { total: 0, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {} }]))));
     ipcMocks.writeExport.mockClear();
@@ -368,6 +376,46 @@ describe('SessionsView range pricing refresh orchestration', () => {
     const delta = await expectBothBatches(6);
     expect(delta.slice(-2).every(([, fetchedIds]) => fetchedIds.join() === ids[0])).toBe(true);
     expect(delta.slice(-2).every(call => (call as unknown as [unknown, string[], string[]])[2].join() === ids.join())).toBe(true);
+  });
+  it.each(['history', 'retry'] as const)('refetches all same-ID table and analytics values after %s invalidates the proof', async (source) => {
+    const base = summary(ids[0], ids[0]);
+    const total = (value: number): RangeTotals => ({ tokens: { ...zeroTokens, total_tokens: value }, buckets: [], tool_metrics: base.tool_metrics, tool_metrics_by_model: {}, optimization_findings_count: 0,
+      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } });
+    let value = 123;
+    ipcMocks.sessionsInRanges.mockImplementation((bounds: unknown[], fetchIds: string[] = []) => Promise.resolve(bounds.map(() => Object.fromEntries(fetchIds.map(id => [id, total(value)])))));
+    mountRangeView();
+    await expectBothBatches(2);
+    const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
+    await waitFor(() => expect(row).toHaveTextContent('123'));
+    const mutation = sessionsStore.mutationLog.generation;
+    value = 456;
+    if (source === 'history') historyStore.set({ ...historyStore.status, status: 'ready' });
+    else await fireEvent.click(screen.getByRole('button', { name: 'Retry categories', hidden: true }));
+    const calls = await expectBothBatches(4);
+    expect(calls.slice(-2).every(([, fetchedIds]) => fetchedIds.join() === ids.join())).toBe(true);
+    expect(sessionsStore.mutationLog.generation).toBe(mutation);
+    await waitFor(() => expect(row).toHaveTextContent('456'));
+    expect(row).not.toHaveTextContent('123');
+  });
+
+  it.each(['none', 'to-only'] as const)('exports dimensions with the captured first analytics range under %s filter bounds', async (choice) => {
+    const base = summary(ids[0], ids[0]);
+    const total: RangeTotals = { tokens: { ...zeroTokens, total_tokens: 321 }, buckets: [], tool_metrics: base.tool_metrics, tool_metrics_by_model: {}, optimization_findings_count: 0,
+      tool_dimensions: { context_source: { conversation_cache: { calls: 0, failures: 0, output_bytes: 0, duration_ms: 0, tokens: 321 } } },
+      pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } };
+    ipcMocks.sessionsInRanges.mockImplementation((bounds: unknown[], fetchIds: string[] = []) => Promise.resolve(bounds.map(() => fetchIds.includes(ids[0]) ? { [ids[0]]: total } : {})));
+    render(SessionsView, { props: { harness: 'codex', active: true, filters: { ...defaultFilters(), dateTo: choice === 'to-only' ? '2026-08-02T00:00' : '' }, onfilterschange: () => {} } });
+    await waitFor(() => expect(screen.queryByText('Tool, MCP, shell & context attribution', { exact: false })).toBeTruthy());
+    await userEvent.click(screen.getByText(/Analytics & exports/));
+    const attribution = screen.getByText(/Tool, MCP, shell & context attribution/).closest('details')!;
+    await userEvent.click(within(attribution).getByText(/Tool, MCP, shell & context attribution/));
+    await fireEvent.click(within(attribution).getByRole('button', { name: 'Export CSV' }));
+    const request = ipcMocks.publishToolDimensionExport.mock.calls[0][0];
+    expect(request.session_ids).toEqual(ids);
+    expect(request.from).toBe('2026-08-01T00:00:00.000Z');
+    expect(request.to).not.toBeNull();
+    const captured = ipcMocks.sessionsInRanges.mock.calls.filter(([bounds]) => bounds.length > 1).map(([bounds]) => (bounds as { from: string; to: string }[])[0]);
+    expect(captured).toContainEqual({ from: request.from, to: request.to });
   });
   it('retains raw totals but hides stale backend prices while rate refresh is pending', async () => {
     const tokens = { ...zeroTokens, input_tokens: 1_000_000, total_tokens: 1_000_000 };

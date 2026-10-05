@@ -428,7 +428,7 @@
     if (rangeChanged) {
       rangeTotals = {};
     }
-    if (rangeChanged || ratesChanged) {
+    if (rangeChanged || ratesChanged || historyChanged || retryChanged) {
       tableReady = false;
       tableCache.invalidate();
       tableEpoch += 1;
@@ -925,6 +925,7 @@
   let analyticsBuckets = $state<DayBucket[]>([]);
   let analyticsPrev = $state<Record<string, RangeTotals> | null>(null);
   let analyticsCurrent = $state<Record<string, RangeTotals> | null>(null);
+  let analyticsCurrentBounds = $state<{ from: string; to: string } | null>(null);
   let analyticsTimer: ReturnType<typeof setTimeout> | null = null;
   let analyticsJobGeneration = 0;
 
@@ -1106,6 +1107,7 @@
         results = analyticsCache.applyDelta(plan.mode === 'delta' ? plan.fetchIds : [], drained.removedIds, fetched);
       }
       analyticsCurrent = results[0];
+      analyticsCurrentBounds = requestedRanges[0];
       analyticsReady = true; analyticsAccountingReady = true; analyticsError = null;
       analyticsPrev = includePrev ? results[1] : null;
       const days = results.slice(includePrev ? 2 : 1);
@@ -1114,7 +1116,7 @@
       if (epoch !== analyticsEpoch) return;
       if (generation !== analyticsJobGeneration || mutation !== sessionsStore.mutationLog.generation || rateCard !== $rates || history !== historyStore.status) { analyticsCache.invalidate(); return; }
       analyticsCache.invalidate();
-      analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsPrev = null; analyticsBuckets = [];
+      analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = [];
       analyticsError = accountingUnavailable(e);
       console.error('analytics sessions_in_ranges failed:', e);
     }
@@ -1138,7 +1140,7 @@
       analyticsAccountingReady = false; analyticsReady = false;
       analyticsBuckets = [];
       analyticsPrev = null;
-      analyticsCurrent = null;
+      analyticsCurrent = null; analyticsCurrentBounds = null;
       lastAnalyticsRange = null;
       analyticsCache.invalidate();
       analyticsJobGeneration += 1;
@@ -1152,14 +1154,14 @@
     if (rangeChanged) {
       analyticsBuckets = [];
       analyticsPrev = null;
-      analyticsCurrent = null;
+      analyticsCurrent = null; analyticsCurrentBounds = null;
     }
-    if (rangeChanged || ratesChanged) {
+    if (rangeChanged || ratesChanged || historyChanged || retryChanged) {
       analyticsReady = false;
       analyticsCache.invalidate();
       analyticsEpoch += 1;
     }
-    if (rangeChanged || dataChanged) { analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsPrev = null; analyticsBuckets = []; analyticsError = null; }
+    if (rangeChanged || dataChanged) { analyticsReady = false; analyticsAccountingReady = false; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = []; analyticsError = null; }
     lastAnalyticsRange = key;
     const requestEpoch = analyticsEpoch;
     if (analyticsTimer !== null) clearTimeout(analyticsTimer);
@@ -1565,7 +1567,7 @@
     tableEpoch++; analyticsEpoch++;
     tableCache.invalidate(); analyticsCache.invalidate();
     tableAccountingReady = false; tableReady = false; analyticsAccountingReady = false; analyticsReady = false;
-    rangeTotals = {}; summaryPricing = {}; analyticsCurrent = null; analyticsPrev = null; analyticsBuckets = [];
+    rangeTotals = {}; summaryPricing = {}; analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = [];
     tableError = accountingUnavailable(reason);
     accountingRetry++;
   }
@@ -2005,6 +2007,8 @@
         sessionIds={analyticsSessionIds}
         from={impactFrom}
         to={impactTo}
+        dimensionFrom={analyticsCurrentBounds?.from ?? null}
+        dimensionTo={analyticsCurrentBounds?.to ?? null}
         {windowLabel}
         {dimensionTotals}
         {dimensionAvailability}
