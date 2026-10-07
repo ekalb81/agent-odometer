@@ -990,6 +990,6 @@ mockIPC((cmd, payload) => {
       // e.g. plugin:updater|check — callers handle rejection gracefully.
       return Promise.reject(new Error(`dev-mock: unhandled command ${cmd}`));
   }
-});
+}, { shouldMockEvents: true });
 
 console.info(`[dev-mock] Tauri IPC mocked with ${visualScenario} fixture data (browser mode)`);

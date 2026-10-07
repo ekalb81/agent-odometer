@@ -1882,7 +1882,11 @@
   // Below ~1100px the fixed pane doesn't fit — fall back to an overlay drawer.
   const wideQuery = window.matchMedia('(min-width: 1100px)');
   let isWide = $state(wideQuery.matches);
-  const onWideChange = (e: MediaQueryListEvent) => (isWide = e.matches);
+  let overviewOpen = $state(wideQuery.matches);
+  const onWideChange = (e: MediaQueryListEvent) => {
+    isWide = e.matches;
+    overviewOpen = e.matches;
+  };
   wideQuery.addEventListener('change', onWideChange);
   onDestroy(() => wideQuery.removeEventListener('change', onWideChange));
 
@@ -1890,7 +1894,7 @@
   const gridCols = $derived(`grid-template-columns: ${visibleColumns.map((column) => column.width).join(' ')};`);
 </script>
 
-{#if tableError || analyticsError}<p data-testid="accounting-table-status" role="status" class="text-xs text-neg px-3 py-2">{tableError ?? `Analytics: ${analyticsError}`} {#if showingPreviousUsage}Showing previous verified usage; refreshing… {/if}<button type="button" class="underline" onclick={() => accountingRetry++}>Retry usage</button></p>{:else if active && showingPreviousUsage}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Showing previous verified usage; refreshing…</p>{:else if active && (!tableAccountingReady || !analyticsAccountingReady)}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Verifying complete usage scope…</p>{/if}
+{#if tableError || analyticsError}<p data-testid="accounting-table-status" role="status" class="text-xs text-neg px-3 py-2">{tableError ?? `Analytics: ${analyticsError}`} {#if showingPreviousUsage}Showing previous verified usage; refreshing… {/if}<button type="button" class="underline" onclick={() => accountingRetry++}>Retry usage</button></p>{:else if active && !showingPreviousUsage && (!tableAccountingReady || !analyticsAccountingReady)}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Verifying complete usage scope…</p>{/if}
 
 {#if organizationUnavailable}
   <div class="p-5 text-sm text-amber-500" role="alert">
@@ -1899,7 +1903,7 @@
     <p class="mt-2 text-ink-muted">Clear pin/tag filters in Organize to view ordinary session summaries.</p>
   </div>
 {:else}
-<div class="flex flex-col h-full overflow-hidden">
+<div class="sessions-view flex flex-col h-full overflow-hidden" class:analytics-open={analyticsOpen}>
   {#if calendarSelected}
     <div class="mx-4 mt-2 flex items-center gap-2 text-[11px] text-ink-muted" role="status">
       Calendar drill-down · {filtered.length} sessions with recorded events
@@ -1907,7 +1911,16 @@
     </div>
   {/if}
   <!-- Analytics band -->
-  <div class="grid gap-3.5 p-4 shrink-0" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
+  <div class="h-4 shrink-0">
+    {#if active && showingPreviousUsage && !tableError && !analyticsError}
+      <p data-testid="accounting-table-status" role="status" class="truncate px-4 text-xs leading-4 text-ink-muted">Showing previous verified usage; refreshing…</p>
+    {/if}
+  </div>
+  <details class="session-overview shrink-0 max-h-[50%] overflow-y-auto" bind:open={overviewOpen}>
+    <summary class="sticky top-0 z-10 mx-4 my-3 bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink" class:hidden={isWide}>
+      Overview · {windowLabel}
+    </summary>
+  <div class="grid gap-3.5 p-4" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
     <!-- Spend card -->
     <div class="bg-card border border-edge rounded-xl px-5 pt-4 pb-3 min-w-0">
       <div class="flex flex-wrap items-baseline gap-x-4 gap-y-2">
@@ -2027,12 +2040,14 @@
     </div>
   </div>
 
+  </details>
+
   <details
-    class="px-4 pb-3 min-h-0 max-h-[60vh] overflow-y-auto"
+    class="session-analytics px-4 pb-3 min-h-0 max-h-[60vh] overflow-y-auto shrink-0"
     bind:open={analyticsOpen}
     data-testid="analytics-panel"
   >
-    <summary class="bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink">
+    <summary class="sticky top-0 z-10 bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink">
       Analytics &amp; exports · {windowLabel}
     </summary>
     <div class="mt-2 flex flex-col gap-2">
@@ -2192,7 +2207,7 @@
   <SessionGridControls {isWide} />
 
   <!-- Main split: table + detail pane -->
-  <div class="flex-1 flex min-h-48 border-t border-edge" data-testid="session-grid-region">
+  <div class="flex-1 flex min-h-32 border-t border-edge" data-testid="session-grid-region">
     <div class="flex-1 min-w-0 flex flex-col bg-tablebg {isWide && sessionDetailPaneStore.open ? 'border-r border-edge' : ''}">
       {#if allSessions.length === 0}
         <div class="flex flex-col items-center justify-center h-full gap-3 text-ink-faint px-6 text-center">
@@ -2406,6 +2421,18 @@
     onclose={() => { if (!sessionExportBusy) sessionContextMenu = null; }}
   />
 {/if}
+
+<style>
+  .session-analytics[open] {
+    flex: 1 1 0;
+  }
+
+  @media (max-height: 700px) {
+    .sessions-view.analytics-open .session-overview {
+      display: none;
+    }
+  }
+</style>
 
 <!-- Narrow layouts: the pane collapses back to an overlay drawer -->
 {#if executionBoardInitialId}<ExecutionBoard sessions={Array.from(sessionsStore.map.values())} initialId={executionBoardInitialId} onclose={() => { executionBoardInitialId = null; }} />{/if}
