@@ -283,6 +283,7 @@ for (const { id: view, label } of primaryViews) {
       } else {
         const grid = page.locator('[data-testid="session-grid-region"]:visible');
         await expect(grid).toBeVisible();
+        await expect(grid.getByRole('columnheader', { name: /^(Est\.|Cost)/i })).toBeInViewport({ ratio: 1 });
         await expect(grid).toContainText(view === 'claude' ? 'Dark mode palette sweep' : 'Add dark mode toggle');
         await expectSessionRollup(page, view === 'all' ? 15 : view === 'codex' ? 8 : 7);
       }
@@ -407,6 +408,89 @@ visualTest('sessions-scanning', 'session scanning', async (page) => {
   await expect(page.getByText(/Scanning your sessions|Scanning sessions/).first()).toBeVisible();
 });
 
+test('accounting refresh status does not move dashboard or session grid', async ({ page }) => {
+  for (const width of [1200, 760]) {
+    await page.setViewportSize({ width, height: 900 });
+    await visit(page);
+    const grid = page.getByTestId('session-grid-region').filter({ visible: true });
+    await expect(grid.getByRole('button', { name: /^Select session / }).first()).toBeVisible();
+    await expect(page.getByTestId('accounting-table-status')).toHaveCount(0);
+    const overview = page.getByText('Overview · All time', { exact: true }).filter({ visible: true });
+    const overviewPanel = page.locator('details.session-overview').filter({ visible: true });
+    const overviewToggle = overviewPanel.locator(':scope > summary');
+    if (width < 800) {
+      if (!(await overviewPanel.evaluate((element: HTMLDetailsElement) => element.open))) await overviewToggle.click();
+      await expect(overviewPanel).toHaveAttribute('open', '');
+    }
+
+    const geometry = async () => {
+      const spendCard = page.getByText('Combined API estimate · All time', { exact: true }).filter({ visible: true }).locator('../../..');
+      const sessionsCard = page.getByText('Sessions · All time', { exact: true }).filter({ visible: true }).locator('../..');
+      const header = grid.getByRole('columnheader').first().locator('..');
+      const footer = grid.getByText('Totals · in view', { exact: true }).locator('..');
+      return Promise.all([spendCard, sessionsCard, header, footer].map(async locator => {
+        const box = await locator.boundingBox();
+        expect(box).not.toBeNull();
+        return { x: box!.x, y: box!.y, width: box!.width, height: box!.height };
+      }));
+    };
+    const before = await geometry();
+
+    await page.evaluate(() => {
+      const internals = (window as any).__TAURI_INTERNALS__;
+      const invoke = internals.invoke.bind(internals);
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      internals.invoke = (cmd: string, args: unknown, options: unknown) =>
+        cmd === 'sessions_in_ranges' ? gate.then(() => invoke(cmd, args, options)) : invoke(cmd, args, options);
+      (window as any).__releaseAccountingRefresh = release;
+    });
+
+    const summary = await page.evaluate(() => (window as any).__TAURI_INTERNALS__.invoke('list_sessions').then((rows: any[]) => rows[0]));
+    for (let update = 1; update <= 2; update++) {
+      await page.evaluate(async ({ session, update }) => {
+        await (window as any).__TAURI_INTERNALS__.invoke('plugin:event|emit', {
+          event: 'session-updated',
+          payload: { ...session, total_turns: session.total_turns + update },
+        });
+      }, { session: summary, update });
+      await expect(page.getByTestId('accounting-table-status')).toContainText('Showing previous verified usage; refreshing');
+      expect(await geometry()).toEqual(before);
+    }
+
+    const status = page.getByTestId('accounting-table-status');
+    const statusBox = await status.boundingBox();
+    const spendBox = await page.getByText('Combined API estimate · All time', { exact: true }).filter({ visible: true }).locator('../../..').boundingBox();
+    expect(statusBox).not.toBeNull();
+    expect(spendBox).not.toBeNull();
+    expect(statusBox!.y + statusBox!.height).toBeLessThanOrEqual(spendBox!.y + 0.5);
+
+    if (width < 800) {
+      if (await overviewPanel.evaluate((element: HTMLDetailsElement) => element.open)) await overviewToggle.click();
+      await expect(overviewPanel).not.toHaveAttribute('open', '');
+      const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
+      const analyticsToggle = analytics.locator(':scope > summary');
+      if (!(await analytics.evaluate((element: HTMLDetailsElement) => element.open))) await analyticsToggle.click();
+      await expect(analytics).toHaveAttribute('open', '');
+      await expect(status).toContainText('Showing previous verified usage; refreshing');
+      await expect(grid.getByRole('columnheader').first()).toBeVisible();
+      const closedOverviewGrid = await grid.boundingBox();
+      expect(closedOverviewGrid).not.toBeNull();
+      expect(closedOverviewGrid!.y).toBeGreaterThan(statusBox!.y + statusBox!.height);
+      if (await analytics.evaluate((element: HTMLDetailsElement) => element.open)) await analyticsToggle.click();
+      await expect(analytics).not.toHaveAttribute('open', '');
+      if (!(await overviewPanel.evaluate((element: HTMLDetailsElement) => element.open))) await overviewToggle.click();
+      await expect(overviewPanel).toHaveAttribute('open', '');
+      await expect(status).toBeVisible();
+      expect(await geometry()).toEqual(before);
+    }
+
+    await page.evaluate(() => (window as any).__releaseAccountingRefresh());
+    await expect(status).toHaveCount(0);
+    expect(await geometry()).toEqual(before);
+  }
+});
+
 visualTest('sessions-subagents-collapsed', 'session subagents collapsed', async (page) => {
   await visit(page, { view: 'codex' });
   const collapse = page.getByRole('button', { name: /Collapse subagent rows for Add dark mode toggle/ });
@@ -474,17 +558,62 @@ test.describe('narrow session drawer', () => {
     visualTest(`primary-${view}-narrow`, `primary ${view} narrow`, async (page) => {
       await visit(page, { view });
       await expect(page.locator('[data-testid="session-grid-region"]:visible')).toBeVisible();
+      const overview = page.getByText('Overview · All time', { exact: true }).filter({ visible: true });
+      await overview.click();
       await expectSessionRollup(page, view === 'all' ? 15 : view === 'codex' ? 8 : 7);
+      await overview.click();
     });
   }
 
   visualTest('session-narrow-detail-overlay', 'selected session is rendered in an overlay', async (page) => {
     await visit(page, { view: 'codex' });
+    const overview = page.getByText('Overview · All time', { exact: true }).filter({ visible: true });
+    await overview.click();
+    await expectSessionRollup(page, 8);
+    await overview.click();
     await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
     await page.clock.runFor(500);
     await expect(page.getByRole('dialog', { name: 'Session details' })).toBeVisible();
-    await expectSessionRollup(page, 8);
   });
+
+  for (const theme of ['light', 'dark'] as const) {
+    test(`session comparison and analytics stay usable in a short ${theme} window`, async ({ page }) => {
+      await visit(page, { theme });
+      const grid = page.locator('[data-testid="session-grid-region"]:visible');
+      for (const name of [/^Name/i, /^Est\. USD/i, /^Total tok/i]) {
+        await expect(grid.getByRole('columnheader', { name })).toBeInViewport({ ratio: 1 });
+      }
+      const contrast = await grid.getByRole('columnheader', { name: /^Name/i }).evaluate((element) => {
+        const foreground = getComputedStyle(element).color;
+        let surface: Element | null = element;
+        while (surface && getComputedStyle(surface).backgroundColor === 'rgba(0, 0, 0, 0)') surface = surface.parentElement;
+        const background = getComputedStyle(surface!).backgroundColor;
+        const luminance = (color: string) => {
+          const [r, g, b] = color.match(/[\d.]+/g)!.slice(0, 3).map(Number).map(channel => {
+            const value = channel / 255;
+            return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+          });
+          return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        };
+        const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+        return (values[0] + 0.05) / (values[1] + 0.05);
+      });
+      expect(contrast).toBeGreaterThanOrEqual(4.5);
+
+      const analytics = page.locator('[data-testid="analytics-panel"]:visible');
+      const toggle = analytics.locator(':scope > summary');
+      await toggle.press('Enter');
+      await expect(analytics).toHaveAttribute('open', '');
+      expect((await analytics.boundingBox())!.height).toBeGreaterThanOrEqual(200);
+      expect((await grid.boundingBox())!.height).toBeGreaterThanOrEqual(192);
+      await expect(toggle).toBeInViewport({ ratio: 1 });
+      await analytics.evaluate(element => { element.scrollTop = element.scrollHeight; });
+      await expect(toggle).toBeInViewport({ ratio: 1 });
+      await toggle.press('Enter');
+      await expect(analytics).not.toHaveAttribute('open', '');
+      await expect(grid.getByRole('columnheader', { name: /^Est\. USD/i })).toBeInViewport({ ratio: 1 });
+    });
+  }
 });
 
 visualTest('instructions-preview', 'instructions preview', async (page) => {

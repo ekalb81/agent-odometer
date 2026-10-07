@@ -17,17 +17,21 @@ describe('SessionGridControls', () => {
     render(SessionGridControls);
 
     await user.click(screen.getByText('Columns'));
+    await user.click(screen.getByRole('checkbox', { name: 'Cost' }));
     await user.click(screen.getByRole('checkbox', { name: 'Cached' }));
     await user.click(screen.getByRole('checkbox', { name: 'Group by repository' }));
     await user.click(screen.getByRole('checkbox', { name: 'Color by model provider' }));
 
-    expect(sessionGridStore.columnIds).not.toContain('cached');
+    expect(sessionGridStore.columnIds).not.toContain('cost');
+    expect(sessionGridStore.columnIds).toContain('cached');
+    expect(screen.getByRole('checkbox', { name: 'Cached' })).toBeChecked();
     expect(sessionGridStore.groupByRepository).toBe(true);
     expect(sessionGridStore.colorByModelProvider).toBe(true);
     expect(localStorage.getItem('sessionGridPreferences.v1')).toContain('groupByRepository');
 
     await user.click(screen.getByRole('button', { name: 'Reset grid columns to defaults' }));
-    expect(screen.getByRole('checkbox', { name: 'Cached' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Cost' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Cached' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Group by repository' })).not.toBeChecked();
     expect(screen.getByRole('checkbox', { name: 'Color by model provider' })).not.toBeChecked();
   });
@@ -37,11 +41,11 @@ describe('SessionGridControls', () => {
     const { container } = render(SessionGridControls);
     await user.click(screen.getByText('Columns'));
 
-    await user.click(screen.getByRole('button', { name: 'Move Repository left' }));
+    await user.click(screen.getByRole('button', { name: 'Move Model left' }));
 
     const order = [...container.querySelectorAll<HTMLElement>('[data-column-id]')]
       .map((element) => element.dataset.columnId);
-    expect(order.slice(0, 4)).toEqual(['name', 'repository', 'started', 'model']);
+    expect(order.slice(0, 4)).toEqual(['name', 'cost', 'model', 'total']);
   });
 
   describe('detail pane toggle', () => {

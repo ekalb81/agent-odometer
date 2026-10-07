@@ -41,20 +41,14 @@ export const SESSION_GRID_COLUMNS: readonly SessionGridColumn[] = [
 
 const STORAGE_KEY = 'sessionGridPreferences.v1';
 const ALL_COLUMN_IDS = SESSION_GRID_COLUMNS.map((column) => column.id);
-/// Columns shown before the user picks. The per-run detail columns
-/// (duration/agent/parent/turns/tools) are available in the picker but off by
-/// default: fourteen columns is a worse first view than nine, and stored
-/// preferences from before they existed stay valid either way.
+/// Compact first view; additional token detail stays available in the picker.
 export const DEFAULT_COLUMN_IDS: readonly SessionGridColumnId[] = [
   'name',
-  'started',
-  'repository',
-  'model',
-  'input',
-  'cached',
-  'output',
-  'total',
   'cost',
+  'total',
+  'model',
+  'repository',
+  'started',
 ];
 
 interface StoredPreferences {
