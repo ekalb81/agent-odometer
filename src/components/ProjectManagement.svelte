@@ -46,6 +46,7 @@
   /** Key of the project whose merge row is open, and the chosen target. */
   let mergingKey = $state<string | null>(null);
   let mergeTargetKey = $state('');
+  let search = $state('');
 
   async function reload(): Promise<void> {
     loading = true;
@@ -120,8 +121,75 @@
     return projects.filter((candidate) => candidate.project_key !== project.project_key);
   }
 
+  const filteredProjects = $derived.by(() => {
+    const query = search.trim().toLocaleLowerCase();
+    if (!query) return projects;
+    return projects.filter((project) =>
+      [project.label, project.project_key, PROVENANCE_LABEL[project.provenance]]
+        .some((value) => value.toLocaleLowerCase().includes(query)),
+    );
+  });
+  const identifiedProjects = $derived(filteredProjects.filter((project) => project.provenance !== 'fallback_path_identity'));
+  const pathProjects = $derived(filteredProjects.filter((project) => project.provenance === 'fallback_path_identity'));
+
   const fmt = new Intl.NumberFormat();
 </script>
+
+{#snippet projectRows(items: ProjectInfo[])}
+  {#each items as project (project.project_key)}
+    {@const merged = project.member_keys.length > 1}
+    {@const busy = busyKey === project.project_key}
+    <tr class="border-b border-edge/50 last:border-b-0 align-top">
+      <td class="px-4 py-2">
+        <span class="text-ink font-medium">{project.label}</span>
+        {#if merged}
+          <span class="ml-1 text-[10px] text-ink-faint cursor-help" title="{project.member_keys.length} auto-detected projects are folded into this one. Undo restores them.">
+            &middot; merged from {project.member_keys.length}
+          </span>
+        {/if}
+        <span class="block text-[10px] text-ink-faint font-mono mt-0.5 break-all">{project.project_key}</span>
+      </td>
+      <td class="px-4 py-2 text-ink-2">
+        <span class="cursor-help" title={PROVENANCE_HINT[project.provenance]}>{PROVENANCE_LABEL[project.provenance]}</span>
+      </td>
+      <td class="px-4 py-2 text-right text-ink-2 font-mono">{fmt.format(project.session_count)}</td>
+      <td class="px-4 py-2 text-right whitespace-nowrap">
+        <button class="text-accent hover:underline disabled:opacity-50 disabled:no-underline" disabled={busy} onclick={() => startRename(project)}>Rename</button>
+        <button class="ml-3 text-accent hover:underline disabled:opacity-50 disabled:no-underline" disabled={busy || projects.length < 2} title={projects.length < 2 ? 'Merging needs a second project to merge into.' : 'Fold this project into another one, for display only.'} onclick={() => startMerge(project)}>Merge&hellip;</button>
+        {#if merged}<button class="ml-3 text-accent hover:underline disabled:opacity-50 disabled:no-underline" disabled={busy} onclick={() => undoMerge(project)}>Undo merge</button>{/if}
+      </td>
+    </tr>
+    {#if renamingKey === project.project_key}
+      <tr class="border-b border-edge/50 bg-app/40">
+        <td colspan="4" class="px-4 py-3">
+          <div class="flex items-center gap-2 flex-wrap">
+            <label class="text-ink-2" for="project-alias-{project.project_key}">Local label</label>
+            <input id="project-alias-{project.project_key}" class="bg-card border border-edge rounded-sm px-2 py-1 text-ink min-w-64" bind:value={renameDraft} onkeydown={(event) => { if (event.key === 'Enter') void saveRename(project); if (event.key === 'Escape') renamingKey = null; }} />
+            <button class="text-accent hover:underline" onclick={() => void saveRename(project)}>Save</button>
+            <button class="text-ink-faint hover:underline" onclick={() => (renamingKey = null)}>Cancel</button>
+            <button class="ml-auto text-ink-faint hover:underline" title="Drop the local label and show the auto-detected one again." onclick={() => void clearAlias(project)}>Reset to detected name</button>
+          </div>
+        </td>
+      </tr>
+    {/if}
+    {#if mergingKey === project.project_key}
+      <tr class="border-b border-edge/50 bg-app/40">
+        <td colspan="4" class="px-4 py-3">
+          <div class="flex items-center gap-2 flex-wrap">
+            <label class="text-ink-2" for="project-merge-{project.project_key}">Show <span class="text-ink font-medium">{project.label}</span> under</label>
+            <select id="project-merge-{project.project_key}" class="bg-card border border-edge rounded-sm px-2 py-1 text-ink" bind:value={mergeTargetKey}>
+              <option value="">Choose a project&hellip;</option>
+              {#each mergeTargets(project) as target (target.project_key)}<option value={target.project_key}>{target.label}</option>{/each}
+            </select>
+            <button class="text-accent hover:underline disabled:opacity-50 disabled:no-underline" disabled={!mergeTargetKey} onclick={() => void confirmMerge(project)}>Merge</button>
+            <button class="text-ink-faint hover:underline" onclick={() => (mergingKey = null)}>Cancel</button>
+            <span class="basis-full text-[11px] text-ink-faint">Its sessions keep their own history and stay separately attributed underneath; only the grouping changes. Undo merge puts it back.</span>
+          </div>
+        </td>
+      </tr>
+    {/if}
+  {/each}
+{/snippet}
 
 <section>
   <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Projects</h2>
@@ -145,6 +213,14 @@
         No projects yet. One appears once a scanned session has a working directory.
       </p>
     {:else}
+      <div class="flex items-center gap-3 px-4 py-3 border-b border-edge">
+        <label class="sr-only" for="project-search">Search projects</label>
+        <input id="project-search" type="search" class="bg-card border border-edge rounded-sm px-2 py-1 text-ink min-w-0 flex-1" placeholder="Search projects" bind:value={search} />
+        <span class="text-ink-faint whitespace-nowrap" aria-live="polite">{filteredProjects.length} of {projects.length} projects</span>
+      </div>
+      {#if filteredProjects.length === 0}
+        <p class="text-xs text-ink-faint px-4 py-3">No projects match “{search}”.</p>
+      {:else}
       <table class="w-full text-xs">
         <thead>
           <tr class="text-ink-faint border-b border-edge">
@@ -155,134 +231,18 @@
           </tr>
         </thead>
         <tbody>
-          {#each projects as project (project.project_key)}
-            {@const merged = project.member_keys.length > 1}
-            {@const busy = busyKey === project.project_key}
-            <tr class="border-b border-edge/50 last:border-b-0 align-top">
-              <td class="px-4 py-2">
-                <span class="text-ink font-medium">{project.label}</span>
-                {#if merged}
-                  <span
-                    class="ml-1 text-[10px] text-ink-faint cursor-help"
-                    title="{project.member_keys.length} auto-detected projects are folded into this one. Undo restores them."
-                  >
-                    &middot; merged from {project.member_keys.length}
-                  </span>
-                {/if}
-                <span class="block text-[10px] text-ink-faint font-mono mt-0.5 break-all">
-                  {project.project_key}
-                </span>
-              </td>
-              <td class="px-4 py-2 text-ink-2">
-                <span class="cursor-help" title={PROVENANCE_HINT[project.provenance]}>
-                  {PROVENANCE_LABEL[project.provenance]}
-                </span>
-              </td>
-              <td class="px-4 py-2 text-right text-ink-2 font-mono">
-                {fmt.format(project.session_count)}
-              </td>
-              <td class="px-4 py-2 text-right whitespace-nowrap">
-                <button
-                  class="text-accent hover:underline disabled:opacity-50 disabled:no-underline"
-                  disabled={busy}
-                  onclick={() => startRename(project)}
-                >
-                  Rename
-                </button>
-                <button
-                  class="ml-3 text-accent hover:underline disabled:opacity-50 disabled:no-underline"
-                  disabled={busy || projects.length < 2}
-                  title={projects.length < 2
-                    ? 'Merging needs a second project to merge into.'
-                    : 'Fold this project into another one, for display only.'}
-                  onclick={() => startMerge(project)}
-                >
-                  Merge&hellip;
-                </button>
-                {#if merged}
-                  <button
-                    class="ml-3 text-accent hover:underline disabled:opacity-50 disabled:no-underline"
-                    disabled={busy}
-                    onclick={() => undoMerge(project)}
-                  >
-                    Undo merge
-                  </button>
-                {/if}
-              </td>
-            </tr>
-
-            {#if renamingKey === project.project_key}
-              <tr class="border-b border-edge/50 bg-app/40">
-                <td colspan="4" class="px-4 py-3">
-                  <div class="flex items-center gap-2 flex-wrap">
-                    <label class="text-ink-2" for="project-alias-{project.project_key}">
-                      Local label
-                    </label>
-                    <input
-                      id="project-alias-{project.project_key}"
-                      class="bg-card border border-edge rounded-sm px-2 py-1 text-ink min-w-64"
-                      bind:value={renameDraft}
-                      onkeydown={(event) => {
-                        if (event.key === 'Enter') void saveRename(project);
-                        if (event.key === 'Escape') renamingKey = null;
-                      }}
-                    />
-                    <button class="text-accent hover:underline" onclick={() => void saveRename(project)}>
-                      Save
-                    </button>
-                    <button class="text-ink-faint hover:underline" onclick={() => (renamingKey = null)}>
-                      Cancel
-                    </button>
-                    <button
-                      class="ml-auto text-ink-faint hover:underline"
-                      title="Drop the local label and show the auto-detected one again."
-                      onclick={() => void clearAlias(project)}
-                    >
-                      Reset to detected name
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            {/if}
-
-            {#if mergingKey === project.project_key}
-              <tr class="border-b border-edge/50 bg-app/40">
-                <td colspan="4" class="px-4 py-3">
-                  <div class="flex items-center gap-2 flex-wrap">
-                    <label class="text-ink-2" for="project-merge-{project.project_key}">
-                      Show <span class="text-ink font-medium">{project.label}</span> under
-                    </label>
-                    <select
-                      id="project-merge-{project.project_key}"
-                      class="bg-card border border-edge rounded-sm px-2 py-1 text-ink"
-                      bind:value={mergeTargetKey}
-                    >
-                      <option value="">Choose a project&hellip;</option>
-                      {#each mergeTargets(project) as target (target.project_key)}
-                        <option value={target.project_key}>{target.label}</option>
-                      {/each}
-                    </select>
-                    <button
-                      class="text-accent hover:underline disabled:opacity-50 disabled:no-underline"
-                      disabled={!mergeTargetKey}
-                      onclick={() => void confirmMerge(project)}
-                    >
-                      Merge
-                    </button>
-                    <button class="text-ink-faint hover:underline" onclick={() => (mergingKey = null)}>
-                      Cancel
-                    </button>
-                    <span class="basis-full text-[11px] text-ink-faint">
-                      Its sessions keep their own history and stay separately attributed underneath;
-                      only the grouping changes. Undo merge puts it back.
-                    </span>
-                  </div>
-                </td>
-              </tr>
-            {/if}
-          {/each}
+          {@render projectRows(identifiedProjects)}
+          {#if pathProjects.length > 0}
+            <tr><td colspan="4" class="p-0">
+              <details class="border-t border-edge" open={search.trim().length > 0 || undefined}>
+                <summary class="px-4 py-2 text-ink-2 cursor-pointer">Path identity <span class="text-ink-faint">({pathProjects.length})</span></summary>
+                <table class="w-full text-xs"><tbody>{@render projectRows(pathProjects)}</tbody></table>
+              </details>
+            </td></tr>
+          {/if}
         </tbody>
       </table>
+      {/if}
     {/if}
   </div>
 </section>

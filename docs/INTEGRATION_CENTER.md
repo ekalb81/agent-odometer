@@ -1,6 +1,6 @@
 # Integration Center
 
-Settings → Integration Center configures **local stdio MCP** for Codex and Claude Code. It does not configure HTTP, poll accounts, copy authentication, install packages, or change turn-receipt hooks. Generic clients use the displayed manual server command.
+Settings → Integrations → Integration Center configures **local stdio MCP** for Codex and Claude Code. It does not configure HTTP, poll accounts, copy authentication, install packages, or change turn-receipt hooks. Generic clients use the displayed manual server command.
 
 Choose user scope or an existing absolute project directory. User scope honors `CODEX_HOME` and `CLAUDE_CONFIG_DIR`; project scope uses `.codex/config.toml` or `.mcp.json`. Codex only loads trusted project configuration; Claude Code project MCP can require approval. Restart the client and create a fresh task after changes. A saved entry does not prove the client loaded it.
 

@@ -5,9 +5,10 @@ test('calendar scopes effective projects and opens exact bucket sessions without
   await page.setViewportSize({ width: 800, height: 800 });
   await page.goto('/');
   await page.getByRole('button', { name: 'Codex', exact: true }).click();
+  await page.getByRole('button', { name: 'Analytics', exact: true }).filter({ visible: true }).click();
+  await page.getByRole('button', { name: 'Usage', exact: true }).filter({ visible: true }).click();
   const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
   const previousWidth = await page.evaluate(() => document.documentElement.scrollWidth);
-  await analytics.locator('summary').first().click();
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
   await expect(calendar.getByTestId('calendar-total')).toBeVisible();
   await calendar.getByLabel('Calendar timezone').selectOption('utc');
@@ -21,13 +22,15 @@ test('calendar scopes effective projects and opens exact bucket sessions without
   await day.click();
   await expect(page.getByText(`Calendar drill-down · ${count} sessions with recorded events`)).toBeVisible();
   await expect(page.getByRole('button', { name: /^Select session / })).toHaveCount(count);
-  await expect(analytics).not.toHaveAttribute('open');
+  await expect(analytics).toBeHidden();
+  await expect(page.getByRole('button', { name: 'Sessions', exact: true }).filter({ visible: true })).toHaveAttribute('aria-pressed', 'true');
 });
 
 test('unavailable coverage never renders a zero calendar', async ({ page }) => {
   await page.goto('/?visualScenario=history-unavailable');
   await page.getByRole('button', { name: 'Codex', exact: true }).click();
-  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  await page.getByRole('button', { name: 'Analytics', exact: true }).filter({ visible: true }).click();
+  await page.getByRole('button', { name: 'Usage', exact: true }).filter({ visible: true }).click();
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
   await expect(calendar.getByText(/History coverage is unavailable/)).toBeVisible();
   await expect(calendar.getByTestId('calendar-total')).toHaveCount(0);

@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-07T13:47:41.447Z",
+  "title": "Design System: Odometer",
+  "extensions": {
+    "breakpoints": [
+      {
+        "name": "settings-selector",
+        "value": "800px"
+      },
+      {
+        "name": "session-detail-dialog",
+        "value": "1100px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Codex Active View Tab",
+      "kind": "nav",
+      "refersTo": "view-tab-codex-active",
+      "description": "Selected Codex view tab.",
+      "html": "<button class=\"ds-tab-active\">Codex</button>",
+      "css": ".ds-tab-active { padding: 5px 16px; border: 0; border-radius: 6px; background: var(--accent-tab, #2b58c9); color: #fff; font: 600 12px 'Spline Sans', system-ui, sans-serif; transition: color 150ms; }"
+    },
+    {
+      "name": "Claude Code Active View Tab",
+      "kind": "nav",
+      "refersTo": "view-tab-claude-active",
+      "description": "Selected Claude Code view tab.",
+      "html": "<button class=\"ds-tab-active\">Claude Code</button>",
+      "css": ".ds-tab-active { padding: 5px 16px; border: 0; border-radius: 6px; background: var(--accent-tab, #e8935a); color: #fff; font: 600 12px 'Spline Sans', system-ui, sans-serif; transition: color 150ms; }"
+    },
+    {
+      "name": "All Active View Tab",
+      "kind": "nav",
+      "refersTo": "view-tab-all-active",
+      "description": "Selected All view tab with inverted neutral colors.",
+      "html": "<button class=\"ds-tab-active\">All</button>",
+      "css": ".ds-tab-active { padding: 5px 16px; border: 0; border-radius: 6px; background: var(--text, #e8eaee); color: var(--bg, #17191e); font: 600 12px 'Spline Sans', system-ui, sans-serif; transition: color 150ms; }"
+    },
+    {
+      "name": "Session Search",
+      "kind": "input",
+      "refersTo": "search-input",
+      "description": "Compact toolbar field for searching sessions.",
+      "html": "<label class=\"ds-search-wrap\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M21 21l-4.35-4.35M17 11a6 6 0 1 1-12 0 6 6 0 0 1 12 0z\"/></svg><input class=\"ds-search\" type=\"search\" aria-label=\"Search sessions\" placeholder=\"Search sessions\"></label>",
+      "css": ".ds-search-wrap { position: relative; display: inline-flex; } .ds-search-wrap svg { position: absolute; left: 12px; top: 50%; width: 12px; height: 12px; transform: translateY(-50%); fill: none; stroke: var(--faint, #5f6673); stroke-width: 2; stroke-linecap: round; pointer-events: none; } .ds-search { width: 220px; padding: 6px 12px 6px 32px; border: 1px solid var(--border, #2a2e37); border-radius: 8px; background: var(--bg, #17191e); color: var(--text, #e8eaee); font: 400 12px 'Spline Sans', system-ui, sans-serif; } .ds-search::placeholder { color: var(--faint, #5f6673); } .ds-search:focus { outline: none; border-color: var(--accent, #4c8dff); box-shadow: 0 0 0 1px var(--accent, #4c8dff); }"
+    },
+    {
+      "name": "Settings section index",
+      "kind": "nav",
+      "description": "Six task-focused sections; native selector below 800px. Visited forms retain drafts.",
+      "html": "<nav class=\"ds-settings\" aria-label=\"Settings sections\"><button aria-current=\"page\">General &amp; sources</button><button>Projects &amp; history</button><button>Pricing</button><button>Integrations</button><button>Alerts &amp; widget</button><button>Diagnostics</button></nav>",
+      "css": ".ds-settings { display:flex; flex-direction:column; gap:4px; width:180px; padding:24px 12px; border-right:1px solid var(--border); } .ds-settings button { text-align:left; padding:8px 12px; border:0; border-radius:8px; background:transparent; color:var(--muted); font:400 13px Spline Sans, sans-serif; } .ds-settings button:hover,.ds-settings button[aria-current] { background:var(--card); color:var(--text); } .ds-settings button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Instrument Ledger",
+    "overview": "The stylesheet names the existing system “Instrument Ledger.” Odometer is a compact desktop interface for inspecting local agent usage. Its toolbar switches between combined and provider views; overview cards and a dense session table lead into session details. Values use a mono font where numeric scanning matters.",
+    "keyCharacteristics": [
+      "Compact 13px desktop interface",
+      "Theme-dependent dark and light surfaces",
+      "Provider-specific Codex blue and Claude Code orange accents",
+      "Dense session table with mono numeric values"
+    ],
+    "rules": [],
+    "dos": [
+      "Do keep the compact 13px interface scale and mono styling for numeric values.",
+      "Do preserve the distinct Codex blue and Claude Code orange accents across provider views.",
+      "Do retain the theme-dependent foreground and surface colors when adding controls.",
+      "Do keep scope visible across Sessions and Analytics and preserve drafts across Settings navigation.",
+      "Do disclose pricing evidence by model without hiding unavailable, stale, or unverified pricing warnings.",
+      "Do use the documented darker amber for warning text on light surfaces and at least 12px text for important qualifications."
+    ],
+    "donts": [
+      "Don't use the provider active fill for the All tab; it uses the inverted neutral treatment."
+    ]
+  }
+}

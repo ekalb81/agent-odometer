@@ -110,14 +110,14 @@ describe('SettingsView — Gemini CLI roots (issue #40)', () => {
         config_source: 'gemini_settings_json', config_path: '/synthetic/gemini/settings.json',
         detail: 'Gemini hook awaits its first receipt.', restart_recommended: true },
     });
-    render(SettingsView);
+    render(SettingsView, { request: { section: 'integrations', revision: 1 } });
     expect(await screen.findByText('Gemini hook awaits its first receipt.')).toBeInTheDocument();
     expect(screen.getByText('Gemini CLI user settings.json')).toBeInTheDocument();
     expect(screen.getByText('Start a fresh Gemini CLI session to load and verify it.')).toBeInTheDocument();
   });
 
   it('keeps Gemini receipts opt-in and saves Gemini-only setup', async () => {
-    render(SettingsView);
+    render(SettingsView, { request: { section: 'integrations', revision: 1 } });
     const gemini = await screen.findByRole('checkbox', { name: /^Gemini CLI$/ });
     expect(gemini).not.toBeChecked();
     expect(gemini).toBeDisabled();

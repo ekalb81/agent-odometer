@@ -70,8 +70,48 @@ describe('ProjectManagement (issue #41)', () => {
     // Provenance is shown rather than hidden: "Path identity" is the case a
     // user most needs to recognise, because it is the one that fragments
     // when a directory moves.
-    expect(screen.getByText('Path identity')).toBeInTheDocument();
+    expect(screen.getAllByText('Path identity').length).toBeGreaterThan(0);
     expect(screen.getByText('Repository root')).toBeInTheDocument();
+  });
+
+  it('searches projects while keeping merge targets from the complete list', async () => {
+    const other = project({ project_key: 'repo:other', label: 'Other repository' });
+    await renderWith(ODOMETER, SCRATCH, other);
+
+    const search = screen.getByRole('searchbox', { name: 'Search projects' });
+    expect(screen.getByText('3 of 3 projects')).toBeInTheDocument();
+    await userEvent.type(search, 'scratch');
+    expect(screen.getByText('1 of 3 projects')).toBeInTheDocument();
+    await userEvent.click(within(rowFor('scratch')).getByRole('button', { name: /Merge/ }));
+    expect(within(screen.getByLabelText(/Show/).closest('tr')!).getAllByRole('option')).toHaveLength(3);
+    expect(within(screen.getByLabelText(/Show/).closest('tr')!).getByRole('option', { name: 'agent-odometer' })).toBeInTheDocument();
+    expect(within(screen.getByLabelText(/Show/).closest('tr')!).getByRole('option', { name: 'Other repository' })).toBeInTheDocument();
+  });
+
+  it('retains rename and merge drafts when filtering or closing the path group', async () => {
+    await renderWith(ODOMETER, SCRATCH);
+    const details = document.querySelector('details')!;
+    await userEvent.click(details.querySelector('summary')!);
+    await userEvent.click(within(rowFor('scratch')).getByRole('button', { name: 'Rename' }));
+    await userEvent.clear(screen.getByLabelText('Local label'));
+    await userEvent.type(screen.getByLabelText('Local label'), 'Draft name');
+    await userEvent.type(screen.getByRole('searchbox', { name: 'Search projects' }), 'odometer');
+    await userEvent.clear(screen.getByRole('searchbox', { name: 'Search projects' }));
+    expect(screen.getByLabelText('Local label')).toHaveValue('Draft name');
+    await userEvent.click(details.querySelector('summary')!);
+    await userEvent.click(details.querySelector('summary')!);
+    expect(screen.getByLabelText('Local label')).toHaveValue('Draft name');
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await userEvent.clear(screen.getByRole('searchbox', { name: 'Search projects' }));
+    await userEvent.click(details.querySelector('summary')!);
+    await userEvent.click(within(rowFor('scratch')).getByRole('button', { name: /Merge/ }));
+    await userEvent.selectOptions(screen.getByLabelText(/Show/), 'repo:odometer');
+    await userEvent.type(screen.getByRole('searchbox', { name: 'Search projects' }), 'odometer');
+    await userEvent.clear(screen.getByRole('searchbox', { name: 'Search projects' }));
+    expect(screen.getByLabelText(/Show/)).toHaveValue('repo:odometer');
+    await userEvent.click(details.querySelector('summary')!);
+    await userEvent.click(details.querySelector('summary')!);
+    expect(screen.getByLabelText(/Show/)).toHaveValue('repo:odometer');
   });
 
   it('saves a renamed project as a local alias', async () => {

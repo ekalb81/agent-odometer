@@ -4,6 +4,7 @@
   import { getProviderServiceStatus, setProviderStatusEnabled } from '../lib/ipc';
   import type { ProviderServiceStatusSnapshot, ProviderStatusIndicator } from '../lib/types';
 
+  let { active = true }: { active?: boolean } = $props();
   let snapshot = $state<ProviderServiceStatusSnapshot | null>(null);
   let saving = $state(false), message = $state('');
   let generation = 0;
@@ -30,7 +31,7 @@
     const enabled = $config.provider_status_enabled === true;
     const request = ++generation;
     snapshot = null; message = '';
-    if (!enabled) return () => { generation++; };
+    if (!enabled || !active) return () => { generation++; };
     void refresh(request);
     // Memory snapshots refresh locally. Rust alone owns outbound cadence.
     const timer = setInterval(() => { void refresh(request); }, 15_000);

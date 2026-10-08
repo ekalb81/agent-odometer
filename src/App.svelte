@@ -38,11 +38,24 @@
 
   let activeView: AppView = $state('all');
   let trayProvider = $state('all');
+  let settingsVisited = $state(false);
+  let settingsRequest = $state<{ section: 'general' | 'integrations' | 'pricing' | 'projects' | 'alerts' | 'diagnostics'; target?: string; revision: number }>();
+  let analyticsRequest = $state<{ target: string; revision: number }>();
+  let navigationRevision = 0;
+  $effect(() => { if (activeView === 'settings') settingsVisited = true; });
+  function openSettings(section: NonNullable<typeof settingsRequest>['section'], target?: string): void {
+    settingsRequest = { section, target, revision: ++navigationRevision };
+    settingsVisited = true;
+    activeView = 'settings';
+  }
   function openAmbientEvidence(route: import('./lib/types').AmbientRoute): void {
-    activeView = route === 'budgets' || route === 'quota' ? 'all' : 'settings';
-    const targets = { budgets: '[data-testid=quota-budgets-panel]', quota: '[data-testid=quota-budgets-panel]', attention: '#attention-settings', provider_status: '#provider-status-settings', retention: '#history-retention-settings' };
-    const target = targets[route];
-    requestAnimationFrame(() => { const element = document.querySelector(target); if (element instanceof HTMLDetailsElement) element.open = true; element?.scrollIntoView?.({ block: 'center' }); });
+    if (route === 'budgets' || route === 'quota') {
+      analyticsRequest = { target: '[data-testid=quota-budgets-panel]', revision: ++navigationRevision };
+      activeView = 'all';
+      return;
+    }
+    const targets = { attention: '#attention-settings', provider_status: '#provider-status-settings', retention: '#history-retention-settings' };
+    openSettings(route === 'retention' ? 'projects' : 'alerts', targets[route]);
   }
   let appVersion = $state('');
   const appStarted = performance.now();
@@ -93,7 +106,7 @@
   $effect(() => {
     const current = $config;
     if (activeView === 'instructions' && (!current.instructions_enabled || !current.instructions_tab_visible)) {
-      activeView = 'settings';
+      openSettings('integrations');
     }
   });
 
@@ -535,7 +548,7 @@
           if (!disposed && ['all', 'codex', 'claude_code', 'gemini_cli'].includes(provider)) { trayProvider = provider; trayEpoch++; trayRefreshGeneration++; }
         })),
         attach('open-settings', onOpenSettings(() => {
-          if (!disposed) activeView = 'settings';
+          if (!disposed) openSettings('general');
         })),
       ]);
       if (disposed) return;
@@ -713,6 +726,7 @@
     <div class="h-full {activeView === 'all' ? '' : 'hidden'}">
       <SessionsView
         harness="all"
+        {analyticsRequest}
         active={activeView === 'all'}
         filters={filtersByScope.all}
         pinnedOnly={organizationFilters.all?.pinned ?? false}
@@ -735,8 +749,10 @@
     {#if activeView === 'instructions'}
       <InstructionsView onhide={hideInstructionsTab} />
     {/if}
-    {#if activeView === 'settings'}
-      <SettingsView onAmbientEvidence={openAmbientEvidence} onopeninstructions={() => (activeView = 'instructions')} />
+    {#if settingsVisited}
+      <div class="h-full" hidden={activeView !== 'settings'}>
+        <SettingsView active={activeView === 'settings'} request={settingsRequest} onAmbientEvidence={openAmbientEvidence} onopeninstructions={() => (activeView = 'instructions')} />
+      </div>
     {/if}
   </main>
 
@@ -751,7 +767,7 @@
         {historyLabel}
       </span>
     {:else if historyStore.status.status === 'unavailable' || historyStore.status.coverage_complete === false}
-      <button class="text-amber-500 hover:underline" onclick={() => (activeView = 'settings')}>
+      <button class="text-amber-500 hover:underline" onclick={() => openSettings('projects', '#history-retention-settings')}>
         {historyStore.status.status === 'unavailable' ? 'History unavailable — recovery settings' : 'Historical coverage incomplete — history settings'}
       </button>
     {:else if !scanStore.status.complete}

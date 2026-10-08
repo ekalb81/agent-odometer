@@ -82,23 +82,46 @@ function viewLabel(view: ViewId): string {
   }[view];
 }
 
+async function openAnalytics(page: Page, group = 'Usage'): Promise<void> {
+  await page.getByRole('button', { name: 'Analytics', exact: true }).filter({ visible: true }).click();
+  await page.getByRole('button', { name: group, exact: true }).filter({ visible: true }).click();
+}
+
+async function openSettingsSection(page: Page, section: string): Promise<void> {
+  const labels: Record<string, string> = { general: 'General & sources', projects: 'Projects & history', pricing: 'Pricing', integrations: 'Integrations', alerts: 'Alerts & widget', diagnostics: 'Diagnostics' };
+  const selector = page.getByLabel('Settings section', { exact: true });
+  await selector.or(page.getByRole('navigation', { name: 'Settings sections' })).filter({ visible: true }).first().waitFor();
+  if (await selector.isVisible()) await selector.selectOption(section);
+  else await page.getByRole('navigation', { name: 'Settings sections' }).getByRole('button', { name: labels[section], exact: true }).click();
+}
+
 async function expectVisualReady(page: Page): Promise<void> {
   await page.evaluate(async () => { await document.fonts.ready; });
   await expect(page.locator('body')).toBeVisible();
 }
 
 async function expectSessionRollup(page: Page, visible: number, total = visible): Promise<void> {
+  const compact = page.getByTestId('compact-summary').filter({ visible: true });
+  if (await compact.isVisible()) {
+    await expect(compact).toContainText(`Included in usage summary: ${visible}`);
+    await expect(compact).toContainText(`Available before filters: ${total}`);
+    return;
+  }
   const sessionKpi = page
     .getByText('Sessions · All time', { exact: true })
     .filter({ visible: true })
     .locator('..');
-  await expect(sessionKpi).toContainText(`${visible} of ${total}`);
+  await expect(sessionKpi).toContainText('Included in usage summary');
+  await expect(sessionKpi).toContainText(new RegExp(`Included in usage summary\\s*${visible}(?:\\s|$)`));
+  await expect(sessionKpi).toContainText(`Available before filters: ${total}`);
 }
 
 async function scrollHeadingToTop(page: Page, name: string): Promise<void> {
+  const settingsSections: Record<string, string> = { 'Watched roots': 'general', 'Retention and recovery': 'projects', 'Instruction inventory': 'integrations', 'Integration Center': 'integrations', 'Review install for Codex': 'integrations', 'Rate card': 'pricing', 'Windows scan performance': 'diagnostics' };
+  if (settingsSections[name]) await openSettingsSection(page, settingsSections[name]);
   const heading = page.getByRole('heading', { name, exact: true });
   await heading.evaluate((element) => element.scrollIntoView({ block: 'start' }));
-  await expect.poll(async () => (await heading.boundingBox())?.y ?? Number.POSITIVE_INFINITY).toBeLessThan(160);
+  await expect(heading).toBeInViewport();
 }
 
 async function capture(
@@ -202,14 +225,14 @@ visualTest('widget-empty-minimum', 'local widget empty usage at minimum size', a
 });
 visualTest('widget-settings-opt-in', 'local widget visibility settings remain opt-in', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'alerts');
   await page.getByRole('heading', { name: 'Compact local widget', exact: true }).scrollIntoViewIfNeeded();
   await expect(page.getByRole('checkbox', { name: /Show widget now/ })).not.toBeChecked();
 });
 
 visualTest('calendar-activity', 'calendar heatmap and daily trend', async (page) => {
   await visit(page, { view: 'codex' });
-  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
-  await analytics.locator('summary').first().click();
+  await openAnalytics(page);
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
   await expect(calendar.getByTestId('calendar-total')).toBeVisible();
   await calendar.scrollIntoViewIfNeeded();
@@ -218,8 +241,7 @@ visualTest('calendar-activity', 'calendar heatmap and daily trend', async (page)
 visualTest('calendar-partial-narrow', 'partial recorded history calendar at narrow width', async (page) => {
   await page.setViewportSize({ width: 520, height: 900 });
   await visit(page, { scenario: 'history-partial', view: 'codex' });
-  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
-  await analytics.locator('summary').first().click();
+  await openAnalytics(page);
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
   await expect(calendar.getByTestId('calendar-total')).toContainText('partial history');
   await calendar.scrollIntoViewIfNeeded();
@@ -228,8 +250,7 @@ visualTest('calendar-partial-narrow', 'partial recorded history calendar at narr
 visualTest('activity-summary-preview', 'local activity SVG and Markdown preview', async (page) => {
   await visit(page, { view: 'codex' });
   await page.clock.setFixedTime(FIXED_TIME);
-  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
-  await analytics.locator('summary').first().click();
+  await openAnalytics(page);
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
   await expect(calendar.getByTestId('calendar-total')).toBeVisible();
   await calendar.getByRole('button', { name: 'Preview summary card' }).click();
@@ -241,8 +262,7 @@ visualTest('activity-summary-partial-narrow', 'partial activity summary keeps co
   await page.setViewportSize({ width: 520, height: 900 });
   await visit(page, { scenario: 'history-partial', view: 'codex' });
   await page.clock.setFixedTime(FIXED_TIME);
-  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
-  await analytics.locator('summary').first().click();
+  await openAnalytics(page);
   const calendar = page.getByTestId('calendar-activity').filter({ visible: true });
   await expect(calendar.getByTestId('calendar-total')).toContainText('partial history');
   await calendar.getByLabel('Activity metric').selectOption('tool_calls');
@@ -454,7 +474,7 @@ test('accounting refresh status does not move dashboard or session grid', async 
           payload: { ...session, total_turns: session.total_turns + update },
         });
       }, { session: summary, update });
-      await expect(page.getByTestId('accounting-table-status')).toContainText('Showing previous verified usage; refreshing');
+      await expect(page.getByTestId('accounting-table-status')).toContainText(/Previous verified usage.*refreshing/);
       expect(await geometry()).toEqual(before);
     }
 
@@ -468,17 +488,12 @@ test('accounting refresh status does not move dashboard or session grid', async 
     if (width < 800) {
       if (await overviewPanel.evaluate((element: HTMLDetailsElement) => element.open)) await overviewToggle.click();
       await expect(overviewPanel).not.toHaveAttribute('open', '');
-      const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
-      const analyticsToggle = analytics.locator(':scope > summary');
-      if (!(await analytics.evaluate((element: HTMLDetailsElement) => element.open))) await analyticsToggle.click();
-      await expect(analytics).toHaveAttribute('open', '');
-      await expect(status).toContainText('Showing previous verified usage; refreshing');
+      await openAnalytics(page);
+      await expect(page.getByTestId('analytics-panel').filter({ visible: true })).toBeVisible();
+      await expect(grid).toBeHidden();
+      await page.getByRole('button', { name: 'Sessions', exact: true }).filter({ visible: true }).click();
+      await expect(status).toContainText(/Previous verified usage.*refreshing/);
       await expect(grid.getByRole('columnheader').first()).toBeVisible();
-      const closedOverviewGrid = await grid.boundingBox();
-      expect(closedOverviewGrid).not.toBeNull();
-      expect(closedOverviewGrid!.y).toBeGreaterThan(statusBox!.y + statusBox!.height);
-      if (await analytics.evaluate((element: HTMLDetailsElement) => element.open)) await analyticsToggle.click();
-      await expect(analytics).not.toHaveAttribute('open', '');
       if (!(await overviewPanel.evaluate((element: HTMLDetailsElement) => element.open))) await overviewToggle.click();
       await expect(overviewPanel).toHaveAttribute('open', '');
       await expect(status).toBeVisible();
@@ -512,8 +527,8 @@ visualTest('sessions-subagent-drilldown', 'session subagent drill-down with per-
 
 visualTest('sessions-availability-fallback', 'session availability, fallback, and unpriced indicators', async (page) => {
   await visit(page, { scenario: 'sessions-availability-fallback', view: 'codex' });
-  await expect(page.getByText(/^estimate · 1 unpriced model excluded$/i)).toBeVisible();
-  await expect(page.getByText(/^1 unpriced model excluded · 1 fallback rate used$/i)).toBeVisible();
+  await expect(page.getByText(/^estimate · 1 unpriced model excluded$/i).filter({ visible: true })).toBeVisible();
+  await expect(page.getByText(/^1 unpriced model excluded · 1 fallback rate used$/i).filter({ visible: true })).toBeVisible();
   await page.getByRole('button', { name: /Select session Add dark mode toggle/ }).click();
   await page.clock.runFor(500);
   await expect(page.locator('[aria-label="Session details"]:visible')).toContainText('source missing');
@@ -534,7 +549,7 @@ visualTest('tool-dimensions', 'issue #44 tool, MCP, shell, and context attributi
   // fixture-only fiction involved.
   await visit(page, { scenario: 'tool-dimensions' });
   await page.getByRole('button', { name: 'Gemini CLI', exact: true }).click();
-  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
+  await openAnalytics(page, 'Tools & context');
   const dimensionSummary = page
     .getByText('Tool, MCP, shell & context attribution', { exact: false })
     .filter({ visible: true });
@@ -600,17 +615,17 @@ test.describe('narrow session drawer', () => {
       });
       expect(contrast).toBeGreaterThanOrEqual(4.5);
 
-      const analytics = page.locator('[data-testid="analytics-panel"]:visible');
-      const toggle = analytics.locator(':scope > summary');
+      const toggle = page.getByRole('button', { name: 'Analytics', exact: true }).filter({ visible: true });
       await toggle.press('Enter');
-      await expect(analytics).toHaveAttribute('open', '');
+      const analytics = page.locator('[data-testid="analytics-panel"]:visible');
+      await expect(analytics).toBeVisible();
       expect((await analytics.boundingBox())!.height).toBeGreaterThanOrEqual(200);
-      expect((await grid.boundingBox())!.height).toBeGreaterThanOrEqual(192);
+      await expect(grid).toBeHidden();
       await expect(toggle).toBeInViewport({ ratio: 1 });
       await analytics.evaluate(element => { element.scrollTop = element.scrollHeight; });
       await expect(toggle).toBeInViewport({ ratio: 1 });
-      await toggle.press('Enter');
-      await expect(analytics).not.toHaveAttribute('open', '');
+      await page.getByRole('button', { name: 'Sessions', exact: true }).filter({ visible: true }).press('Enter');
+      await expect(analytics).toBeHidden();
       await expect(grid.getByRole('columnheader', { name: /^Est\. USD/i })).toBeInViewport({ ratio: 1 });
     });
   }
@@ -649,6 +664,7 @@ visualTest('instructions-content-error', 'instructions content error', async (pa
 
 visualTest('history-purge-review', 'history purge review requires confirmation', async (page) => {
   await visit(page, { scenario: 'history-purge', view: 'settings' });
+  await openSettingsSection(page, 'projects');
   await page.getByRole('button', { name: 'Review eligible history…' }).click();
   await expect(page.getByLabel('Purge confirmation')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Purge reviewed history' })).toBeDisabled();
@@ -658,6 +674,7 @@ visualTest('history-purge-review', 'history purge review requires confirmation',
 visualTest('history-recovery-review', 'history recovery review stays usable at narrow width', async (page) => {
   await page.setViewportSize({ width: 640, height: 900 });
   await visit(page, { scenario: 'history-recovery', view: 'settings' });
+  await openSettingsSection(page, 'projects');
   await page.getByRole('button', { name: 'Preserve and rebuild readable history…' }).click();
   await expect(page.getByLabel('Recovery confirmation')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Preserve and rebuild', exact: true })).toBeDisabled();
@@ -666,16 +683,19 @@ visualTest('history-recovery-review', 'history recovery review stays usable at n
 
 visualTest('settings-roots', 'settings roots', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'general');
   await scrollHeadingToTop(page, 'Watched roots');
 });
 
 visualTest('settings-instructions', 'settings instruction inventory', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'integrations');
   await scrollHeadingToTop(page, 'Instruction inventory');
 });
 
 visualTest('integration-dark', 'integration evidence states in dark theme', async (page) => {
   await visit(page, { view: 'settings', theme: 'dark' });
+  await openSettingsSection(page, 'integrations');
   await expect(page.getByRole('article', { name: 'Codex integration' })).toContainText('Not configured');
   await scrollHeadingToTop(page, 'Integration Center');
 });
@@ -683,6 +703,7 @@ visualTest('integration-dark', 'integration evidence states in dark theme', asyn
 visualTest('integration-narrow-preview', 'integration review remains usable in a narrow window', async (page) => {
   await page.setViewportSize({ width: 500, height: 800 });
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'integrations');
   const card = page.getByRole('article', { name: 'Codex integration' });
   await card.getByRole('button', { name: 'Preview setup', exact: true }).click();
   await scrollHeadingToTop(page, 'Review install for Codex');
@@ -699,11 +720,13 @@ visualTest('integration-narrow-preview', 'integration review remains usable in a
 
 visualTest('settings-rates', 'settings rates frame', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'pricing');
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();
 });
 
 test('offline FX draft survives keyboard input and saves backend delivery evidence', async ({ page }, testInfo) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'pricing');
   await page.getByLabel('Use a user-supplied FX rate').check();
   await page.getByLabel('Original money currency').selectOption('USD');
   await page.getByLabel('Display currency').selectOption('EUR');
@@ -728,6 +751,7 @@ test('offline FX draft survives keyboard input and saves backend delivery eviden
 
 visualTest('settings-rate-validation-error', 'settings rate validation error', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'pricing');
   await page.getByRole('heading', { name: 'Rate card', exact: true }).scrollIntoViewIfNeeded();
   const fallback = page.locator('#fallback-model');
   await fallback.selectOption('');
@@ -737,6 +761,7 @@ visualTest('settings-rate-validation-error', 'settings rate validation error', a
 
 visualTest('settings-save-error', 'settings save error', async (page) => {
   await visit(page, { scenario: 'settings-save-error', view: 'settings' });
+  await openSettingsSection(page, 'general');
   await page.getByRole('heading', { name: 'Watched roots', exact: true }).scrollIntoViewIfNeeded();
   await page.getByPlaceholder('/absolute/path/to/sessions').fill('/visual/failing-root');
   await page.getByRole('button', { name: 'Add', exact: true }).first().click();
@@ -759,6 +784,7 @@ visualTest('defender-error', 'defender error', async (page) => {
 
 test('Defender verification survives Settings remount and suppresses the slow-scan prompt', async ({ page }) => {
   await visit(page, { scenario: 'defender-slow', view: 'settings' });
+  await openSettingsSection(page, 'diagnostics');
   await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
   await page.getByRole('button', { name: 'Exclude session folders from Defender…', exact: true }).click();
   const verifiedStatus = page.getByRole('status').filter({ hasText: 'Last verified' });
@@ -768,6 +794,7 @@ test('Defender verification survives Settings remount and suppresses the slow-sc
   await expect(page.getByRole('button', { name: 'Add exclusions…', exact: true })).toHaveCount(0);
 
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await openSettingsSection(page, 'diagnostics');
   await page.getByRole('heading', { name: 'Windows scan performance', exact: true }).scrollIntoViewIfNeeded();
   await expect(page.getByRole('status').filter({ hasText: 'Last verified' })).toContainText('for 3 session folders.');
 });
@@ -815,8 +842,8 @@ test('project reassignment and restore stay usable in the narrow detail drawer',
 });
 
 async function openQuotaPanel(page: Page, id: string): Promise<ReturnType<Page['locator']>> {
+  await openAnalytics(page);
   const analytics = page.locator('[data-testid="analytics-panel"]:visible');
-  await analytics.locator(':scope > summary').click();
   const panel = analytics.getByTestId(id);
   await panel.locator(':scope > summary').click();
   await panel.scrollIntoViewIfNeeded();
@@ -1119,8 +1146,8 @@ visualTest('human-outcomes-summary', 'explicit human outcomes show coverage and 
   await editor.getByLabel('Accepted on first pass (explicit report)').selectOption('false');
   await editor.getByRole('button', { name: 'Save organization' }).click();
   await expect(editor.getByText(/Human: accepted/)).toBeVisible();
-  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
-  const outcomes = page.getByLabel('Human task outcomes', { exact: true }).filter({ visible: true });
+  await openAnalytics(page, 'Outcomes');
+  const outcomes = page.getByLabel('Recorded task outcomes', { exact: true }).filter({ visible: true });
   await outcomes.locator('summary').click();
   await expect(outcomes).toContainText('0 / 1 explicitly reported');
   await expect(outcomes).toContainText('12 minutes');
@@ -1131,8 +1158,8 @@ visualTest('human-outcomes-summary', 'explicit human outcomes show coverage and 
 visualTest('human-outcomes-recovery', 'unrestored human ratings remain unavailable', async (page) => {
   await page.setViewportSize({ width: 800, height: 900 });
   await visit(page, { scenario: 'organization-recovered', view: 'codex' });
-  await page.getByText('Analytics & exports', { exact: false }).filter({ visible: true }).click();
-  const outcomes = page.getByLabel('Human task outcomes', { exact: true }).filter({ visible: true });
+  await openAnalytics(page, 'Outcomes');
+  const outcomes = page.getByLabel('Recorded task outcomes', { exact: true }).filter({ visible: true });
   await outcomes.locator('summary').click();
   await expect(outcomes).toContainText('Unrestored ratings are unavailable, not unrated');
   await outcomes.scrollIntoViewIfNeeded();
@@ -1141,7 +1168,7 @@ visualTest('human-outcomes-recovery', 'unrestored human ratings remain unavailab
 
 visualPanelTest('workflow-measurement-desktop', 'workflow measurement shows before and after evidence with unavailable human outcomes', async (page) => {
   await visit(page, { view: 'codex' });
-  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  await openAnalytics(page, 'Changes & review');
   const panel = page.getByTestId('workflow-panel').filter({ visible: true });
   await panel.locator('summary').first().click();
   await expect(panel.getByText('Tool failure rate')).toBeVisible();
@@ -1157,7 +1184,7 @@ visualPanelTest('workflow-measurement-desktop', 'workflow measurement shows befo
 visualPanelTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and comparison limits remain usable at narrow width', async (page) => {
   await page.setViewportSize({ width: 520, height: 900 });
   await visit(page, { view: 'codex' });
-  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  await openAnalytics(page, 'Changes & review');
   const panel = page.getByTestId('workflow-panel').filter({ visible: true });
   await panel.locator('summary').first().click();
   await expect(panel.getByText('Tool failure rate')).toBeVisible();
@@ -1172,7 +1199,7 @@ visualPanelTest('workflow-lifecycle-narrow', 'workflow finding lifecycle and com
 visualPanelTest('workflow-action-preview-narrow', 'workflow remediation stays a reviewed dry run at narrow width', async (page) => {
   await page.setViewportSize({ width: 520, height: 900 });
   await visit(page, { view: 'codex' });
-  await page.getByTestId('analytics-panel').filter({ visible: true }).locator('summary').first().click();
+  await openAnalytics(page, 'Changes & review');
   const panel = page.getByTestId('workflow-panel').filter({ visible: true });
   await panel.locator('summary').first().click();
   await expect(panel.getByText('Tool failure rate')).toBeVisible();
@@ -1244,6 +1271,7 @@ visualTest('offline-comparison-report-narrow','narrow imported comparison keeps 
 
 visualTest('provider-status-opt-in', 'public provider status keeps incident and unavailable evidence separate', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'alerts');
   const section = page.getByRole('region', { name: 'Provider service status' });
   const consent = section.getByRole('checkbox', { name: 'Check public provider service status' });
   await expect(consent).not.toBeChecked();
@@ -1257,6 +1285,7 @@ visualTest('provider-status-opt-in', 'public provider status keeps incident and 
 visualTest('provider-status-narrow', 'public status opt-out remains usable at narrow width', async (page) => {
   await page.setViewportSize({ width: 500, height: 900 });
   await visit(page, { view: 'settings', theme: 'dark' });
+  await openSettingsSection(page, 'alerts');
   const section = page.getByRole('region', { name: 'Provider service status' });
   const consent = section.getByRole('checkbox', { name: 'Check public provider service status' });
   await consent.check();
@@ -1274,6 +1303,7 @@ visualTest('provider-status-narrow', 'public status opt-out remains usable at na
 
 visualTest('attention-observations', 'attention opt-in preserves unknown and source evidence', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'alerts');
   const section = page.getByRole('region', { name: 'Agent attention' });
   await expect(section.getByRole('checkbox', { name: 'Input requested' })).not.toBeChecked();
   await section.getByRole('checkbox', { name: 'Input requested' }).check();
@@ -1286,6 +1316,7 @@ visualTest('attention-observations', 'attention opt-in preserves unknown and sou
 visualTest('attention-narrow', 'attention matching and disabling remain usable at narrow width', async (page) => {
   await page.setViewportSize({ width: 500, height: 900 });
   await visit(page, { view: 'settings', theme: 'dark' });
+  await openSettingsSection(page, 'alerts');
   const section = page.getByRole('region', { name: 'Agent attention' });
   await section.getByRole('checkbox', { name: 'Tool failed' }).check();
   await section.getByLabel('Tool category').selectOption('command');
@@ -1301,6 +1332,7 @@ visualTest('attention-narrow', 'attention matching and disabling remain usable a
 
 visualTest('ambient-shared-policy', 'shared quiet hours and opt-in categories', async (page) => {
   await visit(page, { view: 'settings' });
+  await openSettingsSection(page, 'alerts');
   const section = page.getByRole('region', { name: 'Shared alerts' });
   await section.getByRole('checkbox', { name: 'Enable shared alerts', exact: true }).check();
   await section.getByRole('checkbox', { name: /Quiet hours/ }).check();
@@ -1311,6 +1343,7 @@ visualTest('ambient-shared-policy', 'shared quiet hours and opt-in categories', 
 visualTest('ambient-recent-narrow', 'bounded recent alerts and evidence at narrow width', async (page) => {
   await page.setViewportSize({ width: 500, height: 900 });
   await visit(page, { view: 'settings', scenario: 'ambient-recent', theme: 'dark' });
+  await openSettingsSection(page, 'alerts');
   const section = page.getByRole('region', { name: 'Shared alerts' });
   await expect(section.getByText(/Public provider incident observed/)).toBeVisible();
   await section.evaluate(element => element.scrollIntoView({ block: 'start' }));
@@ -1332,6 +1365,104 @@ visualPanelTest('live-account-alerts-narrow', 'exact approved account rules stay
 });
 
 assertManifestCasesAreRegistered();
+
+test('provider mode round trips preserve selection and analytics disclosure', async ({ page }) => {
+  await visit(page, { view: 'codex' });
+  const row = page.getByRole('button', { name: /Select session Add dark mode toggle/ });
+  await row.click();
+  await openAnalytics(page, 'Changes & review');
+  const workflow = page.getByTestId('workflow-panel').filter({ visible: true });
+  await workflow.locator(':scope > summary').click();
+  await expect(workflow).toHaveAttribute('open', '');
+  await page.getByRole('button', { name: 'Claude Code', exact: true }).click();
+  await expect(page.getByTestId('session-grid-region').filter({ visible: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(workflow).toBeVisible();
+  await expect(workflow).toHaveAttribute('open', '');
+  await page.getByRole('button', { name: 'Sessions', exact: true }).filter({ visible: true }).click();
+  await expect(page.locator('#session-detail-pane').filter({ visible: true })).toBeVisible();
+  await expect(page.locator('#session-detail-pane').filter({ visible: true })).toContainText('Add dark mode toggle');
+});
+
+test('short workspace retains actual grid, detail and analytics scrolling across navigation', async ({ page }) => {
+  await page.setViewportSize({ width: 1236, height: 500 });
+  await visit(page);
+  await page.goto('/?visualScenario=default&stress=550');
+  await page.getByRole('button', { name: 'Codex', exact: true }).click();
+  const grid = page.getByTestId('session-grid-region').filter({ visible: true });
+  await grid.getByRole('button', { name: /^Select session / }).first().click();
+  const viewport = grid.getByRole('columnheader').first().locator('../..');
+  const detail = page.locator('#session-detail-pane [aria-label="Session details"] > div.overflow-y-auto');
+  await expect(detail).toBeVisible();
+  await page.clock.runFor(500);
+  await viewport.evaluate(element => { element.scrollTop = 1200; });
+  await detail.evaluate(element => { element.scrollTop = 120; });
+  const gridScroll = await viewport.evaluate(element => element.scrollTop);
+  const detailScroll = await detail.evaluate(element => element.scrollTop);
+  expect(gridScroll).toBeGreaterThan(100);
+  expect(detailScroll).toBeGreaterThan(50);
+  await openAnalytics(page);
+  const analytics = page.locator('[data-analytics-group="usage"]').filter({ visible: true });
+  await page.clock.runFor(500);
+  await analytics.evaluate(element => { element.scrollTop = 180; });
+  const analyticsScroll = await analytics.evaluate(element => element.scrollTop);
+  expect(analyticsScroll).toBeGreaterThan(50);
+  await page.getByRole('button', { name: 'Claude Code', exact: true }).click();
+  await page.getByRole('button', { name: 'Codex', exact: true }).click();
+  await expect(analytics).toBeVisible();
+  await page.clock.runFor(500);
+  expect(await analytics.evaluate(element => element.scrollTop)).toBe(analyticsScroll);
+  await page.getByRole('button', { name: 'Sessions', exact: true }).filter({ visible: true }).click();
+  expect(await viewport.evaluate(element => element.scrollTop)).toBe(gridScroll);
+  expect(await detail.evaluate(element => element.scrollTop)).toBe(detailScroll);
+});
+
+test('large project inventory keeps hidden draft state and complete merge destinations', async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 500 });
+  await visit(page);
+  await page.goto('/?visualScenario=default&projectInventory=120');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await openSettingsSection(page, 'projects');
+  const search = page.getByRole('searchbox', { name: 'Search projects' });
+  await expect(page.getByText('120 of 120 projects', { exact: true })).toBeVisible();
+  await search.fill('Inventory 119');
+  await expect(page.getByText('1 of 120 projects', { exact: true })).toBeVisible();
+  const fallback = page.getByText('Inventory 119', { exact: true });
+  await expect(fallback).toBeVisible();
+  await fallback.locator('..').locator('..').getByRole('button', { name: 'Rename', exact: true }).click();
+  await page.getByLabel('Local label', { exact: true }).fill('Unsaved inventory label');
+  await search.fill('Inventory 000');
+  await expect(page.getByLabel('Local label', { exact: true })).toHaveCount(0);
+  await search.fill('Inventory 119');
+  await expect(page.getByLabel('Local label', { exact: true })).toHaveValue('Unsaved inventory label');
+  await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await fallback.locator('..').locator('..').getByRole('button', { name: 'Merge…', exact: true }).click();
+  const destination = page.getByRole('combobox', { name: 'Show Inventory 119 under' });
+  await expect(destination.locator('option')).toHaveCount(120);
+  await destination.selectOption('repo:inventory-0');
+  await search.fill('Inventory 000');
+  await search.fill('Inventory 119');
+  await expect(destination).toHaveValue('repo:inventory-0');
+  await expect(destination.locator('option')).toHaveCount(120);
+  await search.fill('');
+  const lastRepository = page.locator('span').filter({ hasText: /^Inventory 118$/ });
+  await lastRepository.scrollIntoViewIfNeeded();
+  await expect(lastRepository).toBeInViewport();
+});
+
+test('native narrow details close on Escape and return focus to the selected row', async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 600 });
+  await visit(page, { view: 'codex' });
+  const row = page.getByRole('button', { name: /Select session Add dark mode toggle/ });
+  await row.focus();
+  await row.press('Enter');
+  const dialog = page.getByRole('dialog', { name: 'Session details' });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('button', { name: /Close/ }).first()).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(row).toBeFocused();
+});
 
 test('visual manifest covers every registered top-level view in light and dark', () => {
   // Mirrors the dev-mock `list_providers` fixture (see src/dev-mock.ts) since

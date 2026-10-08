@@ -39,7 +39,7 @@ beforeEach(() => {
 afterEach(() => { cleanup(); rates.set(null); vi.unstubAllGlobals(); });
 
 it('preserves alias expiry and review metadata on save, removes edited-row evidence, and resets only after confirmation', async () => {
-  render(SettingsView);
+  render(SettingsView, { request: { section: 'pricing', revision: 1 } });
   expect(screen.getByText(/Retained custom or unverified entries/)).toHaveTextContent('floating_model_aliases/synthetic-latest');
   expect(screen.getByText(/^card reference/)).toHaveTextContent('2026-09-10');
   const row = screen.getByRole('cell', { name: /^synthetic-model/ }).closest('tr')!;
@@ -65,7 +65,7 @@ it('preserves alias expiry and review metadata on save, removes edited-row evide
 });
 
 it('requires explicit monetary FX evidence and preserves the credit card when saving or disabling it', async () => {
-  render(SettingsView);
+  render(SettingsView, { request: { section: 'pricing', revision: 1 } });
   const row = screen.getByRole('cell', { name: /^synthetic-model/ }).closest('tr')!;
   const save = within(row.closest('section')!).getByRole('button', { name: /^Save$/ });
   await fireEvent.click(screen.getByLabelText('Use a user-supplied FX rate'));
@@ -103,8 +103,84 @@ it('requires explicit monetary FX evidence and preserves the credit card when sa
 
 it('shows recovery evidence without claiming an independent card download', () => {
   rates.set({ ...structuredClone(card), delivery: { source: 'last_valid_fallback', app_version: '0.8.21', card_version: 12, last_failure_reason: 'Saved card is invalid; using last validated backup.' } });
-  render(SettingsView);
+  render(SettingsView, { request: { section: 'pricing', revision: 1 } });
   expect(screen.getByText(/last valid fallback/)).toBeInTheDocument();
   expect(screen.getByText(/Saved card is invalid; using last validated backup/)).toBeInTheDocument();
   expect(screen.getByText(/There is no independent card or FX download/)).toBeInTheDocument();
+});
+
+it('preserves a pricing draft across sections and requires reload on same-version replacement', async () => {
+  const view = render(SettingsView, { request: { section: 'pricing', revision: 1 } });
+  const row = screen.getByRole('cell', { name: /^synthetic-model/ }).closest('tr')!;
+  const input = row.querySelector('input')!;
+  await fireEvent.input(input, { target: { value: '7' } });
+  await fireEvent.click(screen.getByRole('button', { name: /^General & sources$/ }));
+  await fireEvent.click(screen.getByRole('button', { name: /^Pricing$/ }));
+  expect(input).toHaveValue(7);
+  await view.rerender({ active: false });
+  await view.rerender({ active: true });
+  expect(input).toHaveValue(7);
+  rates.set({ ...structuredClone(card), models: { 'synthetic-model': { ...card.models['synthetic-model'], input: 9 } } });
+  await screen.findByRole('alert');
+  expect(input).toHaveValue(7);
+  expect(within(row.closest('section')!).getByRole('button', { name: /^Save$/ })).toBeDisabled();
+  await fireEvent.click(screen.getByRole('button', { name: 'Reload current card' }));
+  await waitFor(() => expect(screen.getByRole('cell', { name: /^synthetic-model/ }).closest('tr')!.querySelector('input')).toHaveValue(9));
+  expect(mocks.setRates).not.toHaveBeenCalled();
+});
+
+it('loads only visited sections and filters pricing without deleting hidden rates', async () => {
+  render(SettingsView);
+  expect(screen.queryByLabelText('Search pricing models')).not.toBeInTheDocument();
+  await fireEvent.click(screen.getByRole('button', { name: /^Pricing$/ }));
+  await fireEvent.input(screen.getByLabelText('Search pricing models'), { target: { value: 'absent' } });
+  expect(screen.queryByRole('cell', { name: /^synthetic-model/ })).not.toBeInTheDocument();
+  await fireEvent.input(screen.getByLabelText('Search pricing models'), { target: { value: 'synthetic' } });
+  expect(screen.getByRole('cell', { name: /^synthetic-model/ })).toBeInTheDocument();
+});
+
+it('opens and focuses requested settings sections without enabling collection', async () => {
+  const view = render(SettingsView);
+  await view.rerender({ request: { section: 'integrations', target: '#settings-integrations', revision: 1 } });
+  await waitFor(() => expect(document.activeElement).toBe(document.querySelector('#settings-integrations')));
+  expect(screen.getByRole('button', { name: /^Integrations$/ })).toHaveAttribute('aria-current', 'page');
+  await fireEvent.click(screen.getByRole('button', { name: /^Pricing$/ }));
+  expect(screen.getByLabelText('Search pricing models')).toBeVisible();
+  await view.rerender({ request: { section: 'integrations', target: '#settings-integrations', revision: 2 } });
+  await waitFor(() => expect(document.activeElement).toBe(document.querySelector('#settings-integrations')));
+  expect(mocks.setRates).not.toHaveBeenCalled();
+});
+
+it('keeps dated pricing sources reachable behind searchable model disclosures', async () => {
+  rates.set({ ...structuredClone(card), pricing_catalog: { rate_periods: [{ id: 'synthetic-rule', model: 'synthetic-model', surface: 'openai_api_usd', from: '2026-01-01T00:00:00Z', to: null, rate: card.models['synthetic-model'], provenance: card.rate_provenance['models/synthetic-model'], label: 'Synthetic reference' }], conditional_modifiers: [], notes: [] } });
+  render(SettingsView, { request: { section: 'pricing', revision: 1 } });
+  const evidence = screen.getByText('Pricing evidence · 1 rules').closest('details')!;
+  expect(evidence).not.toHaveAttribute('open');
+  await fireEvent.click(screen.getByText('Pricing evidence · 1 rules'));
+  const model = within(evidence).getByText('synthetic-model', { selector: 'summary' });
+  await fireEvent.click(model);
+  expect(within(evidence).getByRole('link', { name: 'Synthetic reference · source' })).toHaveAttribute('href', 'https://example.test');
+  await fireEvent.input(screen.getByLabelText('Search pricing models'), { target: { value: 'absent' } });
+  expect(model.closest('details')).toHaveAttribute('hidden');
+  await fireEvent.input(screen.getByLabelText('Search pricing models'), { target: { value: '' } });
+  expect(model.closest('details')).toHaveAttribute('open');
+});
+
+it('freezes the submitted editor and accepts its own rate event before save completion', async () => {
+  let complete!: (value: RateCard) => void;
+  mocks.setRates.mockImplementation(() => new Promise<RateCard>(resolve => { complete = resolve; }));
+  render(SettingsView, { request: { section: 'pricing', revision: 1 } });
+  const row = screen.getByRole('cell', { name: /^synthetic-model/ }).closest('tr')!;
+  const input = row.querySelector('input')!;
+  await fireEvent.input(input, { target: { value: '7' } });
+  await fireEvent.click(within(row.closest('section')!).getByRole('button', { name: /^Save$/ }));
+  expect(input).toBeDisabled();
+  const saved = JSON.parse(JSON.stringify(mocks.setRates.mock.calls[0][0])) as RateCard;
+  rates.set(saved);
+  await screen.findByRole('alert');
+  complete(saved);
+  await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  expect(input).not.toBeDisabled();
+  expect(screen.getByRole('cell', { name: /^synthetic-model/ }).closest('tr')!.querySelector('input')).toHaveValue(7);
+  expect(within(row.closest('section')!).getByRole('button', { name: /^Save$/ })).toBeDisabled();
 });

@@ -39,50 +39,64 @@
   let telemetryOpen = $state(false);
   let liveStatus = $state<PerformanceLiveStatus | null>(null);
   let liveError = $state<string | null>(null);
+  let configGeneration = 0;
+  let liveGeneration = 0;
+  let liveRequest = 0;
 
-  async function loadConfig(): Promise<void> {
+  async function loadConfig(generation: number): Promise<void> {
     try {
-      config = await getConfig();
+      const result = await getConfig();
+      if (generation !== configGeneration || !active) return;
+      config = result;
       configError = null;
     } catch (e) {
-      configError = String(e);
+      if (generation === configGeneration && active) configError = String(e);
     }
   }
 
   $effect(() => {
-    if (!active) return;
-    void loadConfig();
+    const generation = ++configGeneration;
+    if (active) void loadConfig(generation);
+    return () => { configGeneration++; };
   });
 
   async function enableTracking(): Promise<void> {
     if (!config) return;
     enablingTracking = true;
+    const generation = ++configGeneration;
     try {
       const updated: Config = { ...config, performance_tracking_enabled: true };
       await setConfig(updated);
+      if (generation !== configGeneration || !active) return;
       config = updated;
       configError = null;
     } catch (e) {
-      configError = String(e);
+      if (generation === configGeneration && active) configError = String(e);
     } finally {
       enablingTracking = false;
     }
   }
 
-  async function refreshLiveStatus(): Promise<void> {
+  async function refreshLiveStatus(generation: number): Promise<void> {
+    const request = ++liveRequest;
     try {
-      liveStatus = await getPerformanceLiveStatus();
+      const result = await getPerformanceLiveStatus();
+      if (generation !== liveGeneration || request !== liveRequest || !active) return;
+      liveStatus = result;
       liveError = null;
     } catch (e) {
-      liveError = String(e);
+      if (generation === liveGeneration && request === liveRequest && active) liveError = String(e);
     }
   }
 
   $effect(() => {
-    if (!active || !telemetryOpen || !config?.performance_tracking_enabled) return;
-    void refreshLiveStatus();
-    const interval = setInterval(() => void refreshLiveStatus(), LIVE_POLL_MS);
-    return () => clearInterval(interval);
+    const generation = ++liveGeneration;
+    liveStatus = null;
+    liveError = null;
+    if (!active || !telemetryOpen || !config?.performance_tracking_enabled) return () => { liveGeneration++; };
+    void refreshLiveStatus(generation);
+    const interval = setInterval(() => void refreshLiveStatus(generation), LIVE_POLL_MS);
+    return () => { liveGeneration++; clearInterval(interval); };
   });
 
   /** Recent RSS samples reshaped for `Sparkline`, which plots a generic
