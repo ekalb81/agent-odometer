@@ -1750,11 +1750,39 @@
   // ---------------------------------------------------------------------------
   let selectedSessionId = $state<string | null>(null);
   let selectedSession = $state<Session | null>(null);
-  let selectedDetailState = $state<'empty' | 'loading' | 'error' | 'ready'>('empty');
+  let selectedDetailState = $state<'empty' | 'loading' | 'updating' | 'error' | 'ready'>('empty');
   let selectedDetailRetry = $state(0);
   let detailsFetchTimer: ReturnType<typeof setTimeout> | null = null;
   let detailsRequestGeneration = 0;
   let lastDetailsRates: RateCard | null = null;
+  let detailsInFlight = false;
+  let detailsPending = false;
+  let lastDetailsSummary: TrackedSession | null = null;
+
+  async function refreshSelectedDetails() {
+    if (detailsInFlight) { detailsPending = true; return; }
+    const id = selectedSessionId;
+    if (!active || id === null) return;
+    const generation = detailsRequestGeneration;
+    detailsInFlight = true;
+    detailsPending = false;
+    selectedDetailState = selectedSession ? 'updating' : 'loading';
+    try {
+      const result = await measureAsync('frontend.session_detail_fetch', () => getSessionDetails(id));
+      if (generation !== detailsRequestGeneration) return;
+      selectedSession = result;
+      selectedDetailState = detailsPending || detailsFetchTimer !== null ? 'updating' : 'ready';
+    } catch (error) {
+      if (generation !== detailsRequestGeneration) return;
+      console.error('get_session_details failed:', error);
+      selectedDetailState = 'error';
+    } finally {
+      if (generation === detailsRequestGeneration) {
+        detailsInFlight = false;
+        if (detailsPending) void refreshSelectedDetails();
+      }
+    }
+  }
 
   // Object identity changes only when this session's summary is upserted;
   // unrelated store updates leave the selected detail fetch alone.
@@ -1765,7 +1793,7 @@
   );
 
   $effect(() => {
-    const generation = ++detailsRequestGeneration;
+    ++detailsRequestGeneration;
     const ratesChanged = $rates !== lastDetailsRates;
     lastDetailsRates = $rates;
     if (ratesChanged) {
@@ -1774,57 +1802,45 @@
     void selectedDetailRetry;
     const id = selectedSessionId;
     if (!active) {
-      selectedSession = null;
-      selectedDetailState = 'empty';
+      detailsInFlight = false;
+      detailsPending = false;
       return;
     }
-    // Reactive dep: refetch details when this session's summary is replaced.
-    void selectedSummary;
     if (id === null) {
       selectedSession = null;
       selectedDetailState = 'empty';
       return;
     }
-    const hasCurrentDetails = untrack(() => selectedSession?.storage_id === id);
-    if (!hasCurrentDetails) {
-      selectedSession = null;
-      selectedDetailState = 'loading';
-    } else {
-      selectedDetailState = 'ready';
-    }
-    let cancelled = false;
-    const fetchDetails = () => {
-      measureAsync('frontend.session_detail_fetch', () => getSessionDetails(id))
-        .then((s) => {
-          if (!cancelled && active && generation === detailsRequestGeneration) {
-            selectedSession = s;
-            selectedDetailState = 'ready';
-          }
-        })
-        .catch((e) => {
-          if (!cancelled && generation === detailsRequestGeneration) {
-            console.error('get_session_details failed:', e);
-            selectedDetailState = 'error';
-          }
-        });
-    };
-    // Untracked: the fetch below assigns selectedSession, and tracking it
-    // here would turn every completed fetch into a rerun — a permanent
-    // ~400ms self-polling loop while a session is selected.
-    if (!ratesChanged && untrack(() => selectedSession?.storage_id) === id) {
-      // Refresh of an already-selected session: debounce.
-      detailsFetchTimer = setTimeout(fetchDetails, 400);
-    } else {
-      fetchDetails();
-    }
+    untrack(() => {
+      if (selectedSession?.storage_id !== id) selectedSession = null;
+      lastDetailsSummary = selectedSummary;
+      detailsInFlight = false;
+      detailsPending = false;
+      void refreshSelectedDetails();
+    });
     return () => {
-      cancelled = true;
-      if (generation === detailsRequestGeneration) detailsRequestGeneration += 1;
+      detailsRequestGeneration += 1;
       if (detailsFetchTimer !== null) {
         clearTimeout(detailsFetchTimer);
         detailsFetchTimer = null;
       }
     };
+  });
+
+  // Anchor the timer to the first update: continuous watcher traffic must
+  // not postpone delivery. At most one request and one pending refresh run.
+  $effect(() => {
+    const current = selectedSummary;
+    if (!active || selectedSessionId === null || current === lastDetailsSummary) return;
+    lastDetailsSummary = current;
+    untrack(() => {
+      if (selectedSession) selectedDetailState = 'updating';
+      if (detailsFetchTimer !== null || detailsPending) return;
+      detailsFetchTimer = setTimeout(() => {
+        detailsFetchTimer = null;
+        void refreshSelectedDetails();
+      }, 400);
+    });
   });
 
   function selectSession(id: string) {

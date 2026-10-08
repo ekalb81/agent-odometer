@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import DetailPane from './DetailPane.svelte';
 import { rates } from '../lib/stores/rates';
+import { providersStore } from '../lib/stores/providers.svelte';
 import { zeroTotals, zeroToolMetrics } from '../lib/sessionProjection';
 import type { RateCard, Session, PricedSurface } from '../lib/types';
 
@@ -54,6 +55,28 @@ beforeEach(() => { rates.set({
 afterEach(() => { cleanup(); rates.set(null); });
 
 describe('DetailPane server pricing', () => {
+  it('keeps an expanded turn and scroll position while the same session receives a snapshot', async () => {
+    const value = session();
+    const rendered = render(DetailPane, { session: value, onclose: () => {} });
+    await fireEvent.click(screen.getByRole('button', { name: /#1/ }));
+    const body = screen.getByLabelText('Session details').querySelector<HTMLElement>('.overflow-y-auto')!;
+    body.scrollTop = 120;
+    await rendered.rerender({ session: { ...value, last_event_at: '2026-01-01T00:02:00Z' }, detailState: 'updating', onclose: () => {} });
+    expect(screen.getByRole('button', { name: /#1/ })).toHaveAttribute('aria-expanded', 'true');
+    expect(body.scrollTop).toBe(120);
+  });
+  it('uses the common directory title fallback and identifies Gemini estimates', () => {
+    const displayName = vi.spyOn(providersStore, 'displayName').mockReturnValue('Gemini CLI');
+    const value = session();
+    value.first_user_message = null;
+    value.working_directory = 'C:\\synthetic\\Actual project';
+    value.harness = 'gemini_cli';
+    render(DetailPane, { session: value, detailState: 'updating', onclose: () => {} });
+    expect(screen.getByText('Actual project')).toBeInTheDocument();
+    expect(screen.getByText(/Gemini CLI API estimate/)).toBeInTheDocument();
+    expect(screen.getByText(/Updating session details/)).toBeInTheDocument();
+    displayName.mockRestore();
+  });
   it('rounds durations before splitting seconds, minutes, and hours', async () => {
     const value = session();
     value.started_at = '2026-01-01T00:00:00Z';

@@ -10,6 +10,7 @@ import { defaultFilters } from '../lib/sessionProjection';
 import { rates } from '../lib/stores/rates';
 import type { RateCard, RangeTotals, Session, SessionSummary, TokenTotals } from '../lib/types';
 import SessionsView from './SessionsView.svelte';
+import { tick } from 'svelte';
 
 // SessionsView is a large integration point (grid + analytics band + the
 // wide-layout detail pane it composes), so this file mocks every ipc.ts
@@ -272,6 +273,88 @@ describe('SessionsView wide-layout detail pane', () => {
     errors.mockRestore();
   });
 
+  it('delivers snapshots during continuous updates without parallel requests or postponed timers', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      let count = 0;
+      getSessionDetails.mockImplementation((id: string) => {
+        const value = fullSession(id, `Received snapshot ${++count}`);
+        return new Promise(resolve => setTimeout(() => resolve(value), 650));
+      });
+      renderView();
+      await tick();
+      await fireEvent.click(screen.getByRole('button', { name: 'Select session Fix login bug' }));
+      await tick();
+      expect(getSessionDetails).toHaveBeenCalledTimes(1);
+      for (let update = 0; update < 15; update++) {
+        sessionsStore.applyMutations([summary('codex:thread:alpha', 'Fix login bug')], []);
+        await tick();
+        await vi.advanceTimersByTimeAsync(100);
+        if (update === 6) {
+          expect(screen.getByText('Received snapshot 1')).toBeInTheDocument();
+          expect(screen.getByText(/Updating session details/)).toBeInTheDocument();
+        }
+      }
+      expect(screen.getByText('Received snapshot 2')).toBeInTheDocument();
+      expect(getSessionDetails).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(screen.queryByText(/Updating session details/)).not.toBeInTheDocument();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(['success', 'failure'] as const)('rejects obsolete detail %s after selection or same-version rate replacement', async (outcome) => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const pending: Array<{ resolve: (s: Session) => void; reject: (e: Error) => void }> = [];
+    getSessionDetails.mockImplementation(() => new Promise<Session>((resolve, reject) => pending.push({ resolve, reject })));
+    rates.set(testRateCard());
+    renderView();
+    await fireEvent.click(await screen.findByRole('button', { name: 'Select session Fix login bug' }));
+    await waitFor(() => expect(pending).toHaveLength(1));
+    rates.set(testRateCard());
+    await waitFor(() => expect(pending).toHaveLength(2));
+    pending[1].resolve(fullSession('codex:thread:alpha', 'Current snapshot'));
+    await screen.findByText('Current snapshot');
+    if (outcome === 'success') pending[0].resolve(fullSession('codex:thread:alpha', 'Obsolete snapshot'));
+    else pending[0].reject(new Error('obsolete failure'));
+    await tick();
+    expect(screen.getByText('Current snapshot')).toBeInTheDocument();
+    sessionsStore.applyMutations([summary('codex:thread:alpha', 'Fix login bug')], []);
+    await waitFor(() => expect(pending).toHaveLength(3));
+    await fireEvent.click(screen.getByRole('button', { name: 'Select session Refactor exporter' }));
+    await waitFor(() => expect(pending).toHaveLength(4));
+    pending[3].resolve(fullSession('codex:thread:beta', 'Selected beta'));
+    await screen.findByText('Selected beta');
+    if (outcome === 'success') pending[2].resolve(fullSession('codex:thread:alpha', 'Obsolete selection'));
+    else pending[2].reject(new Error('obsolete selection failure'));
+    await tick();
+    expect(screen.getByText('Selected beta')).toBeInTheDocument();
+    expect(screen.queryByText('Obsolete selection')).not.toBeInTheDocument();
+    expect(screen.queryByText('Obsolete snapshot')).not.toBeInTheDocument();
+    expect(errors).not.toHaveBeenCalledWith('get_session_details failed:', expect.any(Error));
+    errors.mockRestore();
+    rates.set(null);
+  });
+
+  it('retains raw details but strips prices immediately when the same-version rate card is replaced', async () => {
+    rates.set(testRateCard());
+    const value = fullSession('codex:thread:alpha', 'Priced snapshot');
+    value.tokens_total = { ...zeroTokens, total_tokens: 12345 };
+    value.pricing = { plan: { total: 31, by_model: [], missing_models: [], unpriced_models: [] }, flat_api: null, time_aware_api: null, turn_prices: {} };
+    getSessionDetails.mockResolvedValueOnce(value);
+    renderView();
+    await fireEvent.click(await screen.findByRole('button', { name: 'Select session Fix login bug' }));
+    await screen.findByText('Priced snapshot');
+    const pane = screen.getByLabelText('Session details');
+    expect(pane).toHaveTextContent('31.00');
+    getSessionDetails.mockImplementationOnce(() => new Promise(() => {}));
+    rates.set(testRateCard());
+    await tick();
+    expect(pane).toHaveTextContent('12,345');
+    expect(pane).not.toHaveTextContent('31.00');
+    expect(pane).toHaveTextContent('Pricing unavailable');
+    rates.set(null);
+  });
+
   it('keeps prior details visible and offers retry after a refresh failure', async () => {
     const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
     renderView();
@@ -300,7 +383,7 @@ describe('SessionsView wide-layout detail pane', () => {
     await userEvent.click(row);
     await waitFor(() => expect(getSessionDetails).toHaveBeenCalledTimes(1));
 
-    await userEvent.click(await screen.findByRole('button', { name: 'Hide details' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Close session details' }));
 
     // Collapsed: no second fetch, but the row is still the selected one.
     expect(sessionDetailPaneStore.open).toBe(false);

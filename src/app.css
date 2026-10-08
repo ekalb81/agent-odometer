@@ -147,6 +147,15 @@
   --provider-other-row: rgba(110, 83, 190, 0.09);
 }
 
+/* Warning text needs a darker amber on the light surfaces. Keep the existing
+   utility names so badges, inline qualifications, and recovery notices agree. */
+@layer utilities {
+  :root[data-theme='light'] .text-amber-500,
+  :root[data-theme='light'] .text-amber-600 {
+    color: #9a4d00;
+  }
+}
+
 /* ---------------------------------------------------------------------------
    Per-harness accents. Codex is blue, Claude Code is orange; each theme gets
    its own shades. Spec'd values: Codex dark + Claude light; the other two are
