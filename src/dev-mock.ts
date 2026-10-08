@@ -705,6 +705,17 @@ mockIPC((cmd, payload) => {
       ];
     case 'resolve_projects': {
       const projects = new Map<string, ProjectInfo>();
+      const inventorySize = Math.min(200, Math.max(0, Number(new URLSearchParams(location.search).get('projectInventory')) || 0));
+      if (inventorySize > 0) {
+        return Array.from({ length: inventorySize }, (_, index): ProjectInfo => ({
+          project_key: `${index % 2 === 0 ? 'repo' : 'path'}:inventory-${index}`,
+          label: `Inventory ${String(index).padStart(3, '0')}`,
+          provenance: index % 2 === 0 ? 'repository_root' : 'fallback_path_identity',
+          member_keys: [`${index % 2 === 0 ? 'repo' : 'path'}:inventory-${index}`],
+          session_count: index + 1,
+          overridden_session_keys: [],
+        }));
+      }
       for (const fixture of visibleFixtures()) {
         const session = summary(fixture);
         const override = projectAssignments.get(session.storage_id);

@@ -49,6 +49,23 @@ describe('SessionGridControls', () => {
   });
 
   describe('detail pane toggle', () => {
+    it('does not open an empty pane even when the open preference was saved', () => {
+      sessionDetailPaneStore.setOpen(true);
+      render(SessionGridControls, { props: { isWide: true, hasSelection: false } });
+      expect(screen.getByRole('button', { name: 'Show details' })).toBeDisabled();
+      expect(screen.getByRole('button', { name: 'Show details' })).toHaveAttribute('aria-expanded', 'false');
+    });
+
+    it('clamps and persists finite pane widths without losing the last good width', () => {
+      sessionDetailPaneStore.setWidth(20);
+      expect(sessionDetailPaneStore.width).toBe(410);
+      sessionDetailPaneStore.setWidth(900);
+      expect(sessionDetailPaneStore.width).toBe(800);
+      expect(localStorage.getItem('sessionDetailPaneWidth.v1')).toBe('800');
+      sessionDetailPaneStore.setWidth(NaN);
+      expect(sessionDetailPaneStore.width).toBe(800);
+      sessionDetailPaneStore.setWidth(560);
+    });
     it('is hidden in narrow layouts, where the collapse has nothing to control', () => {
       render(SessionGridControls, { props: { isWide: false } });
       expect(screen.queryByRole('button', { name: /details/i })).toBeNull();
@@ -56,7 +73,7 @@ describe('SessionGridControls', () => {
 
     it('starts closed, opens on click, and persists the choice', async () => {
       const user = userEvent.setup();
-      render(SessionGridControls, { props: { isWide: true } });
+      render(SessionGridControls, { props: { isWide: true, hasSelection: true } });
 
       const toggle = screen.getByRole('button', { name: 'Show details' });
       expect(toggle).toHaveAttribute('aria-expanded', 'false');
@@ -71,7 +88,7 @@ describe('SessionGridControls', () => {
 
     it('closes again on a second click without touching grid preferences', async () => {
       const user = userEvent.setup();
-      render(SessionGridControls, { props: { isWide: true } });
+      render(SessionGridControls, { props: { isWide: true, hasSelection: true } });
 
       await user.click(screen.getByRole('button', { name: 'Show details' }));
       await user.click(screen.getByRole('button', { name: 'Hide details' }));

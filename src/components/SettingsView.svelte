@@ -27,22 +27,38 @@
   import { isTauri } from '@tauri-apps/api/core';
   import { formatBytes } from '../lib/format';
   import { openUrl } from '@tauri-apps/plugin-opener';
-  import { onMount } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import type { RateCard, ModelRate, PerformanceStatus, InstructionRoot, HarnessIntegrationStatus, TurnReceiptIntegrationStatus, PricingCatalog, HistoryRebuildStatus } from '../lib/types';
   import { configurePerformanceTracking } from '../lib/performance';
   import { defenderReceiptStatus, isWindowsDefenderSurface } from '../lib/defenderStatus';
 
   const RELEASE_NOTES_URL = 'https://github.com/ekalb81/agent-odometer/releases';
 
-  interface Props { onopeninstructions?: () => void; onAmbientEvidence?: (route: import("../lib/types").AmbientRoute) => void; }
-  let { onopeninstructions = () => {}, onAmbientEvidence }: Props = $props();
+  type SettingsSection = 'general' | 'integrations' | 'pricing' | 'projects' | 'alerts' | 'diagnostics';
+  const sections: { id: SettingsSection; label: string }[] = [{ id: 'general', label: 'General & sources' }, { id: 'projects', label: 'Projects & history' }, { id: 'pricing', label: 'Pricing' }, { id: 'integrations', label: 'Integrations' }, { id: 'alerts', label: 'Alerts & widget' }, { id: 'diagnostics', label: 'Diagnostics' }];
+  interface Props { active?: boolean; request?: { section: SettingsSection; target?: string; revision: number }; onopeninstructions?: () => void; onAmbientEvidence?: (route: import("../lib/types").AmbientRoute) => void; }
+  let { active = true, request, onopeninstructions = () => {}, onAmbientEvidence }: Props = $props();
+  let selectedSection = $state<SettingsSection>('general');
+  let visited = $state<SettingsSection[]>(['general']);
+  async function selectSection(section: SettingsSection, target?: string) {
+    selectedSection = section;
+    if (!visited.includes(section)) visited = [...visited, section];
+    await tick();
+    if (!active || selectedSection !== section) return;
+    const element = document.querySelector(target ?? `#settings-${section}`);
+    if (element instanceof HTMLElement) { element.tabIndex = -1; element.focus({ preventScroll: true }); element.scrollIntoView?.({ block: 'start' }); }
+  }
+  $effect(() => { const next = request; if (next) void untrack(() => selectSection(next.section, next.target)); });
+  $effect(() => {
+    if (!active) return;
+    if (selectedSection === 'diagnostics') void untrack(refreshPerformanceStatus);
+    if (selectedSection === 'integrations') void untrack(refreshTurnReceiptStatus);
+  });
 
   let appVersion = $state('');
   let releaseNotesError = $state<string | null>(null);
   onMount(() => {
     void getVersion().then((v) => (appVersion = v)).catch(() => {});
-    void refreshPerformanceStatus();
-    void refreshTurnReceiptStatus();
   });
 
   async function handleReleaseNotes() {
@@ -675,6 +691,10 @@
 
   // UI state.
   let dirty = $state(false);
+  let ratesConflict = $state(false);
+  let loadedRates: RateCard | null = null;
+  let pricingSearch = $state('');
+  const pricingEvidenceModels = $derived([...new Set([...pricingCatalog.rate_periods, ...pricingCatalog.conditional_modifiers].map(rule => rule.model))].sort());
   let saving = $state(false);
   let savedAt = $state<string | null>(null);
   let saveError = $state<string | null>(null);
@@ -684,6 +704,9 @@
   $effect(() => {
     const r = $rates;
     if (!r) return;
+    if (untrack(() => dirty) && r !== loadedRates) { ratesConflict = true; return; }
+    loadedRates = r;
+    ratesConflict = false;
     rows = Object.entries(r.models).map(([name, rate]) => ({
       name,
       input: String(rate.input),
@@ -854,6 +877,7 @@
   }
 
   async function handleSave() {
+    if (ratesConflict) return;
     const card = buildRateCard();
     if (!card) return;
     saving = true;
@@ -861,8 +885,8 @@
     try {
       const saved = await setRates(card);
       // The command and event carry the same validated backend provenance.
-      rates.set(saved);
       dirty = false;
+      rates.set(saved);
       const now = new Date();
       savedAt = now.toLocaleTimeString();
     } catch (e) {
@@ -879,8 +903,8 @@
     try {
       const bundled = await getBundledRates();
       const saved = await setRates(bundled);
-      rates.set(saved);
       dirty = false;
+      rates.set(saved);
       const now = new Date();
       savedAt = now.toLocaleTimeString();
     } catch (e) {
@@ -936,7 +960,11 @@
   }
 </script>
 
-<div class="flex flex-col gap-6 p-6 overflow-auto h-full">
+<div class="settings-layout h-full">
+  <nav class="settings-index" aria-label="Settings sections">{#each sections as section}<button type="button" aria-current={selectedSection === section.id ? 'page' : undefined} onclick={() => void selectSection(section.id)}>{section.label}</button>{/each}</nav>
+  <label class="settings-select">Settings section<select aria-label="Settings section" value={selectedSection} onchange={(event) => void selectSection(event.currentTarget.value as SettingsSection)}>{#each sections as section}<option value={section.id}>{section.label}</option>{/each}</select></label>
+  <div class="settings-content overflow-auto min-h-0">
+  {#if visited.includes('general')}<div id="settings-general" tabindex="-1" class="settings-group" hidden={selectedSection !== 'general'}>
 
   <!-- About & updates -->
   <section>
@@ -1198,6 +1226,8 @@
   </section>
 
   <!-- Opt-in instruction inventory -->
+  </div>{/if}
+  {#if visited.includes('integrations')}<div id="settings-integrations" tabindex="-1" class="settings-group" hidden={selectedSection !== 'integrations'}>
   <section>
     <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Instruction inventory</h2>
     <p class="text-xs text-ink-faint mb-3 max-w-3xl">
@@ -1434,6 +1464,8 @@
   </section>
 
   <!-- Opt-in application performance tracking -->
+  </div>{/if}
+  {#if visited.includes('diagnostics')}<div id="settings-diagnostics" tabindex="-1" class="settings-group" hidden={selectedSection !== 'diagnostics'}>
   <section>
     <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Performance tracking</h2>
     <p class="text-xs text-ink-faint mb-3 max-w-3xl">
@@ -1572,9 +1604,13 @@
     </section>
   {/if}
 
+  <DiagnosticsPanel active={active && selectedSection === 'diagnostics'} />
   <!-- Rate card editor -->
+  </div>{/if}
+  {#if visited.includes('pricing')}<div id="settings-pricing" tabindex="-1" class="settings-group" hidden={selectedSection !== 'pricing'}>
   {#if $rates}
     <section>
+      <fieldset disabled={saving} class="min-w-0" aria-label="Rate card editor">
       <h2 class="text-sm font-semibold uppercase tracking-wider text-ink-muted mb-2">Rate card</h2>
 
       <!-- Metadata row -->
@@ -1597,7 +1633,7 @@
       <div class="flex items-center gap-3 mb-4 flex-wrap">
         <button
           onclick={handleSave}
-          disabled={!dirty || saving}
+          disabled={!dirty || saving || ratesConflict}
           class="px-3 py-1.5 text-xs font-medium rounded-sm bg-accent-tab hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed text-white transition-colors"
         >
           {saving ? 'Saving…' : 'Save'}
@@ -1644,6 +1680,8 @@
         </p>
       {/each}
 
+      {#if ratesConflict}<p role="alert" class="text-xs text-neg">The rate card changed while you were editing. Reload the current card before saving. <button class="underline" onclick={() => { dirty = false; ratesConflict = false; rates.set($rates); }}>Reload current card</button></p>{/if}
+      <label class="text-xs text-ink-muted">Search pricing models<input class="ml-3 bg-card border border-edge rounded-lg px-3 py-2 text-ink" type="search" bind:value={pricingSearch} /></label>
       <!-- Fallback model selector -->
       <div class="flex items-center gap-3 mb-4">
         <label for="fallback-model" class="text-xs text-ink-muted whitespace-nowrap">Fallback model</label>
@@ -1660,6 +1698,8 @@
         </select>
       </div>
 
+      <p class="text-xs text-ink-muted" aria-live="polite">{rows.filter(row => row.name.toLowerCase().includes(pricingSearch.trim().toLowerCase())).length} of {rows.length} base-rate models</p>
+      {#if pricingSearch.trim() && !rows.some(row => row.name.toLowerCase().includes(pricingSearch.trim().toLowerCase()))}<p class="text-xs text-ink-muted">No base-rate models match this search.</p>{/if}
       <!-- Rate table -->
       <div class="overflow-x-auto">
         <table class="w-full text-xs border-collapse bg-card rounded-lg overflow-hidden">
@@ -1676,7 +1716,7 @@
           </thead>
           <tbody>
             {#each rows as row, i (row.name + i)}
-              <tr class="border-b border-edgerow">
+              <tr class="border-b border-edgerow" hidden={!!pricingSearch.trim() && !row.name.toLowerCase().includes(pricingSearch.trim().toLowerCase())}>
                 <td class="px-3 py-1.5 font-mono text-ink-2">{row.name}
                   {#if upgradeReview.includes(`models/${row.name}`)}
                     <span class="block text-xs font-sans text-amber-600">Retained · review needed</span>
@@ -1827,7 +1867,8 @@
 
       <!-- Managed, read-only catalog. Rule provenance and stable IDs are
            deliberately not editable in the base rate editor. -->
-      <div class="mt-5 rounded-lg border border-edge bg-card px-4 py-3">
+      <details class="mt-5 rounded-lg border border-edge bg-card px-4 py-3">
+        <summary class="cursor-pointer text-xs font-semibold">Pricing evidence · {pricingCatalog.rate_periods.length + pricingCatalog.conditional_modifiers.length} rules</summary>
         <h3 class="text-xs font-semibold uppercase tracking-wider text-ink-muted">Effective-dated pricing catalog</h3>
         <p class="mt-1 text-[11px] text-ink-faint max-w-3xl">
           Read-only managed rules refresh by stable ID when a newer Odometer bundled card ships. “Reset to shipped defaults” reloads the currently shipped card; saving the base-rate editor preserves this catalog unchanged.
@@ -1836,9 +1877,12 @@
           <p class="mt-2 text-xs text-ink-faint">No effective-dated rules are available in this rate card.</p>
         {:else}
           <div class="mt-3 space-y-2">
-            {#each pricingCatalog.rate_periods as period (period.id)}
-              <div class="border-t border-edgerow pt-2 text-[11px] text-ink-2">
-                <div class="font-medium text-ink">Base rate · {period.model} · {fmtPricingSurface(period.surface)}</div>
+            {#each pricingEvidenceModels as model (model)}
+            <details class="border-t border-edgerow pt-2 text-xs" hidden={!!pricingSearch.trim() && !model.toLowerCase().includes(pricingSearch.trim().toLowerCase())}>
+              <summary class="cursor-pointer font-medium text-ink">{model}</summary>
+            {#each pricingCatalog.rate_periods.filter(rule => rule.model === model) as period (period.id)}
+              <div class="pt-2 text-[11px] text-ink-2">
+                <div class="font-medium text-ink">Base rate · {fmtPricingSurface(period.surface)}</div>
                 <div class="mt-0.5 font-mono text-ink-faint break-all">{period.id}</div>
                 <div class="mt-0.5 text-ink-faint">Applies {fmtPricingWindow(period.from, period.to)} · verified {period.provenance.verified_at.slice(0, 10)} UTC</div>
                 <div class="mt-0.5">
@@ -1849,14 +1893,16 @@
                 </div>
               </div>
             {/each}
-            {#each pricingCatalog.conditional_modifiers as modifier (modifier.id)}
-              <div class="border-t border-edgerow pt-2 text-[11px] text-ink-2">
-                <div class="font-medium text-ink">Conditional rule · {modifier.model} · {fmtPricingSurface(modifier.surface)}</div>
+            {#each pricingCatalog.conditional_modifiers.filter(rule => rule.model === model) as modifier (modifier.id)}
+              <div class="pt-2 text-[11px] text-ink-2">
+                <div class="font-medium text-ink">Conditional rule · {fmtPricingSurface(modifier.surface)}</div>
                 <div class="mt-0.5 font-mono text-ink-faint break-all">{modifier.id}</div>
                 <div class="mt-0.5 text-ink-faint">Applies {fmtPricingWindow(modifier.from, modifier.to)} · verified {modifier.provenance.verified_at.slice(0, 10)} UTC</div>
                 <div class="mt-0.5 text-ink-faint">{#if modifier.condition.kind === 'request_input_token_threshold'}When request input exceeds {modifier.condition.greater_than.toLocaleString()} tokens{:else}Service tier: {modifier.condition.tier}{/if} · input {modifier.multipliers.input}× · output {modifier.multipliers.output}×</div>
                 <div class="mt-0.5"><a class="text-accent hover:underline" href={modifier.provenance.source_url} target="_blank" rel="noreferrer">{modifier.label} · source</a></div>
               </div>
+            {/each}
+            </details>
             {/each}
           </div>
           {#if pricingCatalog.notes.length > 0}
@@ -1867,7 +1913,8 @@
             </div>
           {/if}
         {/if}
-      </div>
+      </details>
+      </fieldset>
     </section>
   {:else}
     <section>
@@ -1876,6 +1923,8 @@
     </section>
   {/if}
 
+  </div>{/if}
+  {#if visited.includes('projects')}<div id="settings-projects" tabindex="-1" class="settings-group" hidden={selectedSection !== 'projects'}>
   <!-- Issue #41: local alias/merge management for the project dimension -->
   <ProjectManagement />
 
@@ -1947,11 +1996,32 @@
     </div>
   </section>
 
+  </div>{/if}
+  {#if visited.includes('alerts')}<div id="settings-alerts" tabindex="-1" class="settings-group" hidden={selectedSection !== 'alerts'}>
   <AmbientSettings onOpen={onAmbientEvidence} />
-  <ProviderStatus />
+  <ProviderStatus active={active && selectedSection === 'alerts'} />
   <AttentionSettings />
   <WidgetSettings />
 
-  <DiagnosticsPanel />
-
+  </div>{/if}
+  </div>
 </div>
+<style>
+  .settings-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); }
+  .settings-index { display: flex; flex-direction: column; gap: 4px; padding: 24px 12px; border-right: 1px solid var(--border); }
+  .settings-index button { text-align: left; padding: 8px 12px; border-radius: 8px; color: var(--muted); }
+  .settings-index button:hover, .settings-index button[aria-current] { background: var(--card); color: var(--text); }
+  .settings-index button:focus-visible, .settings-select select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .settings-select { display: none; }
+  .settings-group { padding: 24px; }
+  .settings-group:not(#settings-pricing) { max-width: 58rem; }
+  .settings-group:not([hidden]) { display: flex; flex-direction: column; gap: 24px; }
+  .settings-group[hidden] { display: none; }
+  @media (max-width: 800px) {
+    .settings-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+    .settings-index { display: none; }
+    .settings-select { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border); }
+    .settings-select select { background: var(--card); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px; }
+    .settings-group { padding: 16px; }
+  }
+</style>

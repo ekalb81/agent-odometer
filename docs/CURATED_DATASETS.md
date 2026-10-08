@@ -1,6 +1,6 @@
 # Curated local evaluation examples
 
-Set an explicit **Accepted** or **Rejected** human outcome in session organization, then choose **Curate reviewed example**. Select one to four conversation records, name the example, optionally add a rubric and exact phrases to redact, and build a preview. Review the displayed text and check the review box before saving. Changing an input requires a new preview. **Analytics & exports → Human outcomes → Review local dataset** opens the saved collection.
+Set an explicit **Accepted** or **Rejected** human outcome in session organization, then choose **Curate reviewed example**. Select one to four conversation records, name the example, optionally add a rubric and exact phrases to redact, and build a preview. Review the displayed text and check the review box before saving. Changing an input requires a new preview. **Analytics → Outcomes → Human outcomes → Review local dataset** opens the saved collection.
 
 Rust produces both the preview and saved content. It keeps user/assistant text, excludes tools, reasoning, attachments and unknown records, applies the transcript export redaction policy and your exact phrases, then limits each selected record to 3,000 UTF-8 bytes. Truncation is labeled. Automatic redaction is heuristic: review the exact preview for private material it missed. Organization notes, tags, raw JSON and source paths are excluded. Limits are 64 examples, four records per example and 16 KiB per stored example. Previews expire after five minutes; only the latest eight remain available.
 

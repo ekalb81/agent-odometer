@@ -5,8 +5,8 @@ test('Codex speed report defaults to turn throughput and can switch to response 
   await page.setViewportSize({ width: 800, height: 700 });
   await page.goto('/');
   await page.getByRole('button', { name: 'Codex', exact: true }).click();
-  const analytics = page.getByTestId('analytics-panel').filter({ visible: true });
-  await analytics.locator('summary').first().click();
+  await page.getByRole('button', { name: 'Analytics', exact: true }).filter({ visible: true }).click();
+  await page.getByRole('button', { name: 'Usage', exact: true }).filter({ visible: true }).click();
   const existingScrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
   const panel = page.getByTestId('speed-panel').filter({ visible: true });
   await panel.locator('summary').click();

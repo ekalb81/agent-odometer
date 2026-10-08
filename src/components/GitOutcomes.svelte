@@ -6,6 +6,8 @@
   import { rates } from '../lib/stores/rates';
   import type { EventCorrelation, GitOutcome, GitOutcomeKind } from '../lib/types';
 
+  let { active = true }: { active?: boolean } = $props();
+
   let outcomes = $state<GitOutcome[]>([]);
   let busy = $state(false);
   let error = $state<string | null>(null);
@@ -17,6 +19,7 @@
   let generation = 0;
 
   $effect(() => {
+    if (!active) { generation++; busy = false; return; }
     void sessionsStore.mutationLog.generation;
     void historyStore.status;
     void $rates;
@@ -30,12 +33,13 @@
   });
 
   async function scan() {
+    if (!active) return;
     const request = ++generation;
     const mutation = sessionsStore.mutationLog.generation;
     const history = historyStore.status;
     const rateCard = $rates;
     const hours = postWindowHours;
-    const current = () => request === generation
+    const current = () => active && request === generation
       && mutation === sessionsStore.mutationLog.generation
       && history === historyStore.status && rateCard === $rates && hours === postWindowHours;
     busy = true; error = null; comparisonError = null; correlations = {};
@@ -74,8 +78,9 @@
 
 <details class="bg-card border border-edge rounded-lg px-3 py-2">
   <summary class="cursor-pointer text-xs font-semibold text-ink">Local git outcomes</summary>
+  <p class="mt-2 text-xs text-ink-muted">Local repository evaluation uses its own post-session window, independent of the workspace date filter. Commit observations do not establish accepted task quality or causal impact.</p>
   <div class="mt-2 flex items-center gap-2">
-    <button class="px-3 py-1.5 rounded-md border border-edge bg-panel hover:bg-app text-xs disabled:opacity-50" disabled={busy} onclick={scan}>{busy ? 'Scanning…' : 'Evaluate local repositories'}</button>
+    <button class="px-3 py-1.5 rounded-md border border-edge bg-panel hover:bg-app text-xs disabled:opacity-50" disabled={!active || busy} onclick={scan}>{busy ? 'Scanning…' : 'Evaluate local repositories'}</button>
     <label class="text-[11px] text-ink-muted">Post-session window
       <input class="ml-1 w-16 rounded-sm border border-edge bg-app px-1.5 py-1 font-mono" type="number" min="0" max="8760" step="1" bind:value={postWindowHours} disabled={busy} /> h
     </label>

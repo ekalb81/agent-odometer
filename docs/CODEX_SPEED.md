@@ -1,6 +1,6 @@
 # Codex speed
 
-Open **Codex → Analytics & exports → Codex speed**. The report supports
+Open **Codex → Analytics → Usage → Codex speed**. The report supports
 Today, Last 7 days, Last 14 days, model/reasoning filters, Fast/Standard
 groups, and CSV export of the selected measurement. It refreshes every 15 seconds
 while the panel, tab, and document are visible. Today starts at local midnight;

@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { PricedSurface, PricingBasis, Session } from '../lib/types';
-  import { costIsUnmeasured } from '../lib/sessionProjection';
+  import { costIsUnmeasured, sessionName } from '../lib/sessionProjection';
   import { rates } from '../lib/stores/rates';
   import { formatCredits, harnessCurrency } from '../lib/currency';
   import ConvertedCost from './ConvertedCost.svelte';
@@ -25,7 +25,7 @@
     session: Session | null;
     /** Subagent sessions spawned by this one (for the "N subagents" pill). */
     childCount?: number;
-    detailState?: 'empty' | 'loading' | 'error' | 'ready';
+    detailState?: 'empty' | 'loading' | 'updating' | 'error' | 'ready';
     onretry?: () => void;
     onclose: () => void;
     /** Stable source record target for search/bookmark navigation. */
@@ -201,8 +201,14 @@
     session?.harness === 'codex'
       ? (sessionApiCost ? { label: 'API base estimate', text: surfaceMoney(sessionApiCost, true) } :
          sessionCredits ? { label: 'Legacy credits', text: surfaceMoney(sessionCredits) } : null)
-      : (sessionCredits ? { label: 'Cost', text: surfaceMoney(sessionCredits) } : null),
+      : (sessionCredits ? { label: `${providersStore.displayName(session!.harness)} API estimate`, text: surfaceMoney(sessionCredits) } : null),
   );
+  const heroSurface = $derived(session?.harness === 'codex' ? sessionApiCost ?? sessionCredits : sessionCredits);
+  const priceQualifications = $derived(heroSurface ? [
+    heroSurface.unpriced_models.length ? `${heroSurface.unpriced_models.length} unpriced models excluded` : '',
+    heroSurface.missing_models.length ? `${heroSurface.missing_models.length} fallback rates used` : '',
+    ...new Set(heroSurface.by_model.filter(row => !row.unpriced && row.basis !== 'direct' && row.basis !== 'fallback').map(row => row.basis.replace(/_/g, ' '))),
+  ].filter(Boolean).join(' · ') : 'Pricing unavailable');
 
   // Per-turn costs, priced from the same table as the headline figure —
   // api_models when the pane is in API-USD mode, plan credits otherwise —
@@ -239,7 +245,7 @@
 <div class="flex flex-col h-full bg-panel overflow-hidden" aria-label="Session details">
   {#if !session}
     <div class="flex-1 flex flex-col items-center justify-center gap-2 text-ink-faint text-xs p-6 text-center relative">
-      <button type="button" class="absolute right-3 top-3 p-1 text-ink-faint hover:text-ink" aria-label="Close session details" title="Close details" onclick={onclose}>×</button>
+      <button type="button" class="absolute right-3 top-3 p-1 text-ink-muted hover:text-ink" aria-label="Close session details" title="Close details" onclick={onclose}>Close</button>
       {#if detailState === 'loading'}
         <div class="h-5 w-5 rounded-full border-2 border-ink-faint/30 border-t-ink-faint animate-spin" role="status" aria-label="Loading session details"></div>
         <p>Loading session details…</p>
@@ -254,18 +260,16 @@
     <!-- Header -->
     <div class="px-5 py-4 border-b border-edge shrink-0">
       <div class="flex items-start justify-between gap-2">
-        <div class="font-semibold text-[15px] text-ink min-w-0 truncate" title={session.thread_name ?? session.first_user_message ?? session.id}>
-          {session.thread_name ?? session.first_user_message?.slice(0, 60) ?? session.id.slice(0, 8)}
+        <div class="font-semibold text-[15px] text-ink min-w-0 truncate" title={sessionName(session)}>
+          {sessionName(session)}
         </div>
         <button
           onclick={onclose}
-          class="shrink-0 p-0.5 rounded-sm text-ink-faint hover:text-ink transition-colors"
-          aria-label="Deselect session"
-          title="Deselect (Esc)"
+          class="shrink-0 px-2 py-1 rounded-sm text-xs text-ink-muted hover:text-ink transition-colors"
+          aria-label="Close session details"
+          title="Close details"
         >
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
-          </svg>
+          Close
         </button>
       </div>
       <div class="flex items-center gap-2 mt-[5px] flex-wrap">
@@ -304,8 +308,14 @@
           </button>
         {/if}
       </div>
+      <p class="mt-2 text-xs text-ink-muted break-words">
+        {session.project_label ? `${session.project_label} · ` : ''}{fmtDatetime(session.started_at)}
+        {#if session.agent_nickname || session.agent_path} · {session.agent_nickname ?? session.agent_path}{/if}
+      </p>
     </div>
-    {#if detailState === 'error'}
+    {#if detailState === 'updating'}
+      <p class="px-5 py-2 border-b border-edge text-xs text-ink-muted" role="status">Updating session details · showing the latest received snapshot.</p>
+    {:else if detailState === 'error'}
       <div class="px-5 py-2 flex items-center justify-between gap-3 border-b border-amber-500/30 bg-amber-500/5 text-xs" role="alert">
         <span class="text-ink-muted">Could not refresh session details. Showing previous details.</span>
         <button type="button" class="shrink-0 text-accent hover:underline" onclick={onretry}>Retry</button>
@@ -323,6 +333,8 @@
       <TranscriptInspector sessionId={session.storage_id} recordId={contextAnchor ?? transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
     {/if}
 
+    <!-- Keep the stat grid in the body so short windows can still reach turns. -->
+    <div class="flex-1 overflow-y-auto min-h-0">
     <!-- 2×2 stat grid -->
     <div class="grid grid-cols-2 gap-px bg-edge border-b border-edge shrink-0">
       <div class="bg-panel px-5 py-2.5">
@@ -331,7 +343,8 @@
       </div>
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label" title={session.harness === 'codex' ? 'Current rate reference; excludes request-specific long-context premiums. Dated API scenarios appear in More details.' : undefined}>{heroCost?.label ?? 'Cost'}</div>
-        <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroCost?.text ?? 'Unavailable'}</div>
+        <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroSurface && !costIsUnmeasured(heroSurface.unpriced_models, heroSurface.total) ? (session.harness === 'codex' && sessionApiCost ? formatCredits(heroSurface.total, 'USD') : fmtCredit(heroSurface.total)) : 'Unavailable'}</div>
+        <p class="mt-1 text-xs text-ink-muted">{session.harness === 'codex' && !sessionApiCost ? 'Legacy credit reference; not a billed charge.' : 'API-rate estimate; not an invoice.'}{#if priceQualifications}{' '}{priceQualifications}.{/if}</p>
       </div>
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label">Turns</div>
@@ -343,8 +356,6 @@
       </div>
     </div>
 
-    <!-- Scrollable body -->
-    <div class="flex-1 overflow-y-auto min-h-0">
       {#key session.storage_id}
         <SessionProjectEditor {session} />
         <SessionOrganizationEditor sessionKey={session.storage_id} />

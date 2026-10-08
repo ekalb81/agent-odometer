@@ -28,6 +28,7 @@
   let epoch = 0;
   let jobGeneration = 0;
   let layoutKey = '';
+  let settledProof: unknown[] | null = null;
   let queue: Promise<void> = Promise.resolve();
   const cache = new RangeDataCache();
   const mutations = new MutationAccumulator();
@@ -40,9 +41,11 @@
   const selectedProject = $derived(projects.find((project) => project.key === projectKey));
   const selectedIds = $derived(projectKey ? selectedProject?.sessionIds ?? [] : sessionIds);
 
+  let summaryScope = '';
   $effect(() => {
-    void days; void loading; void error; void active; void from; void to;
-    void metric; void zone; void harness; void projectKey; void selectedIds; void evidence;
+    const key = JSON.stringify([days, error, from, to, metric, zone, harness, projectKey, selectedIds, evidence]);
+    if (key === summaryScope) return;
+    summaryScope = key;
     summary = null; summaryError = '';
   });
 
@@ -70,7 +73,8 @@
     void retry;
     const mutation = sessionsStore.mutationLog.generation;
     mutations.observe(sessionsStore.mutationLog);
-    if (!active || state === 'pending' || state === 'unavailable') {
+    if (!active) { loading = false; return; }
+    if (state === 'pending' || state === 'unavailable') {
       epoch++;
       days = []; loading = false; error = null; cache.invalidate(); layoutKey = '';
       return;
@@ -87,6 +91,8 @@
     // stable, and the established mutation cache fetches changed IDs only.
     const key = `${selectedZone}|${fromBound}|${toBound}|${bounds.map((day) => day.date).join(',')}|${ids.join(',')}`;
     if (key !== layoutKey) { epoch++; days = []; cache.invalidate(); layoutKey = key; }
+    const proof = [key, mutation, historyStore.status, scanComplete, retry];
+    if (settledProof?.every((value, index) => value === proof[index]) && untrack(() => days.length > 0)) return;
     const request = epoch;
     const delay = untrack(() => days.length ? 250 : 0);
     loading = true; error = null; days = [];
@@ -122,7 +128,7 @@
           const result = plan.mode === 'full' ? cache.applyFull(key, ids, fetched!)
             : plan.mode === 'delta' ? cache.applyDelta(plan.fetchIds, drained.removedIds, fetched) : cache.current();
           if (request !== epoch || job !== jobGeneration || mutation !== sessionsStore.mutationLog.generation) return;
-          days = activityDays(bounds, result!); loading = false;
+          days = activityDays(bounds, result!); loading = false; settledProof = proof;
         } catch (reason) {
           if (request !== epoch || job !== jobGeneration || mutation !== sessionsStore.mutationLog.generation) return;
           cache.invalidate(); days = []; loading = false;

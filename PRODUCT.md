@@ -47,11 +47,14 @@ activity behind it. Privacy and honest accounting are central to that value.
 - Start from All or a provider tab, then search, filter dates, group by project,
   or compare models. Open session details to inspect turns and parent/subagent
   relationships. Preserve the user's scope when moving between views.
-- Expand analytics to investigate tool use, estimated spend, quotas, budgets,
-  efficiency signals, and timing evidence. Export the selected projection for
-  further analysis.
-- Settings manages local roots, pricing, projects, theme, and optional features.
-  Instruction inventory, turn receipts, and performance recording are deliberate
+- Switch from Sessions to Analytics without changing provider or filter scope.
+  Choose Usage, Tools & context, Changes & review, or Outcomes to investigate
+  supporting evidence. Export the selected projection for further analysis.
+- Settings groups General & sources, Projects & history, Pricing, Integrations,
+  Alerts & widget, and Diagnostics. Visited forms retain drafts across section
+  and provider-tab navigation. Pricing evidence is searchable by model; changed
+  rate cards require a reload before a conflicting draft can be saved.
+  Instruction inventory, turn receipts, and performance recording remain explicit
   opt-ins. The tray supports quick checks outside the main window.
 
 ## Capabilities and Constraints

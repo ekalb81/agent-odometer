@@ -72,3 +72,19 @@ it('submits only the flag from an uninitialized store and retains authoritative 
   expect(get(config).session_roots).toEqual(['synthetic-preserved-root']);
   expect(get(config).performance_tracking_enabled).toBe(true);
 });
+
+it('pauses observations when hidden without changing consent and rejects a late response', async () => {
+  let resolve!: (value: ProviderServiceStatusSnapshot) => void;
+  config.set({ ...initial, provider_status_enabled: true });
+  mocks.getProviderServiceStatus.mockReturnValue(new Promise(done => { resolve = done; }));
+  const view = render(ProviderStatus, { active: false });
+  expect(mocks.getProviderServiceStatus).not.toHaveBeenCalled();
+  await view.rerender({ active: true });
+  await waitFor(() => expect(mocks.getProviderServiceStatus).toHaveBeenCalledOnce());
+  await view.rerender({ active: false });
+  resolve(result);
+  await Promise.resolve();
+  expect(screen.queryByText('Major incident')).not.toBeInTheDocument();
+  expect(get(config).provider_status_enabled).toBe(true);
+  expect(mocks.setProviderStatusEnabled).not.toHaveBeenCalled();
+});

@@ -302,3 +302,29 @@ describe('DiagnosticsPanel', () => {
     });
   });
 });
+
+it('rejects config and live responses from a hidden visit after reentry', async () => {
+  let oldConfig!: (value: Config) => void;
+  getConfig.mockReturnValueOnce(new Promise<Config>(resolve => { oldConfig = resolve; }));
+  getConfig.mockResolvedValue(config({ performance_tracking_enabled: true }));
+  const view = render(DiagnosticsPanel);
+  await waitFor(() => expect(getConfig).toHaveBeenCalledOnce());
+  await view.rerender({ active: false });
+  await view.rerender({ active: true });
+  await screen.findByText('Show live view');
+  oldConfig(config({ performance_tracking_enabled: false }));
+  await Promise.resolve();
+  expect(screen.queryByRole('button', { name: 'Enable performance tracking' })).not.toBeInTheDocument();
+  let oldLive!: (value: PerformanceLiveStatus) => void;
+  getPerformanceLiveStatus.mockReturnValueOnce(new Promise<PerformanceLiveStatus>(resolve => { oldLive = resolve; }));
+  getPerformanceLiveStatus.mockResolvedValue(liveStatus({ active_phase: 'current-phase' }));
+  await userEvent.click(screen.getByText('Show live view'));
+  await waitFor(() => expect(getPerformanceLiveStatus).toHaveBeenCalledOnce());
+  await view.rerender({ active: false });
+  await view.rerender({ active: true });
+  await waitFor(() => expect(screen.getByTestId('active-phase')).toHaveTextContent('current-phase'));
+  oldLive(liveStatus({ active_phase: 'obsolete-phase' }));
+  await Promise.resolve();
+  expect(screen.getByTestId('active-phase')).toHaveTextContent('current-phase');
+  expect(setConfig).not.toHaveBeenCalled();
+});

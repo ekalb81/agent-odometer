@@ -1,4 +1,5 @@
 const STORAGE_KEY = 'sessionDetailPaneOpen.v1';
+const WIDTH_KEY = 'sessionDetailPaneWidth.v1';
 
 function loadPreference(): boolean {
   return localStorage.getItem(STORAGE_KEY) === 'true';
@@ -18,6 +19,14 @@ function loadPreference(): boolean {
  */
 function createSessionDetailPaneStore() {
   let open = $state(loadPreference());
+  const savedWidth = Number(localStorage.getItem(WIDTH_KEY));
+  let width = $state(Number.isFinite(savedWidth) && savedWidth >= 410 ? Math.min(800, savedWidth) : 560);
+
+  function setWidth(next: number) {
+    if (!Number.isFinite(next)) return;
+    width = Math.round(Math.max(410, Math.min(800, next)));
+    localStorage.setItem(WIDTH_KEY, String(width));
+  }
 
   function setOpen(next: boolean) {
     open = next;
@@ -29,6 +38,8 @@ function createSessionDetailPaneStore() {
   }
 
   return {
+    get width() { return width; },
+    setWidth,
     get open() {
       return open;
     },

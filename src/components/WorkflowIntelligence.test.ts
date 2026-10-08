@@ -142,7 +142,7 @@ it('previews a recorded finding without offering an apply or undo path', async (
   previewControlledAction.mockResolvedValue({ target_type: 'agent_workflow_configuration',
     proposed_change: 'Future reviewed change', backup_requirement: 'Exact backup required',
     postcondition_requirement: 'Read-back required', apply_available: false, undo_available: false });
-  render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
+  const view = render(WorkflowIntelligence, { sessionIds: ['codex:one'] });
   await open();
   await screen.findByRole('button', { name: 'Preview future action' });
   await fireEvent.click(screen.getByRole('button', { name: 'Preview future action' }));
@@ -153,6 +153,11 @@ it('previews a recorded finding without offering an apply or undo path', async (
   } });
   expect(screen.getByText(/Apply and undo are unavailable/)).toBeTruthy();
   expect(screen.queryByRole('button', { name: /^Apply|^Undo/ })).toBeNull();
+  const calls = getWorkflowReport.mock.calls.length;
+  await view.rerender({ sessionIds: ['codex:one'], active: false });
+  await view.rerender({ sessionIds: ['codex:one'], active: true });
+  expect(screen.getByText('Future reviewed change')).toBeInTheDocument();
+  expect(getWorkflowReport).toHaveBeenCalledTimes(calls);
 });
 
 it('keeps the disclosure open but clears an old report on same-ID identity changes', async () => {

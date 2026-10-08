@@ -1,6 +1,6 @@
 # Public provider service status
 
-Settings → Provider service status is off by default. Enabling it allows public, unauthenticated reads while the panel is open. Historical usage, prices, quotas, and budget decisions continue to use their existing local authorities whether status checks are enabled, unavailable, or disabled.
+Settings → Alerts & widget → Provider service status is off by default. Enabling it allows public, unauthenticated reads while the panel is open. Historical usage, prices, quotas, and budget decisions continue to use their existing local authorities whether status checks are enabled, unavailable, or disabled.
 
 ## Sources and meaning
 

@@ -85,7 +85,7 @@ describe('SettingsView — history rebuild confirmation', () => {
     const confirm = vi.fn().mockReturnValue(false);
     vi.stubGlobal('confirm', confirm);
 
-    render(SettingsView, { props: {} });
+    render(SettingsView, { request: { section: 'projects', revision: 1 } });
     await clickRebuild();
 
     expect(confirm).toHaveBeenCalledTimes(1);
@@ -95,7 +95,7 @@ describe('SettingsView — history rebuild confirmation', () => {
   it('starts the rebuild only after the confirmation is accepted', async () => {
     vi.stubGlobal('confirm', vi.fn().mockReturnValue(true));
 
-    render(SettingsView, { props: {} });
+    render(SettingsView, { request: { section: 'projects', revision: 1 } });
     await clickRebuild();
 
     await waitFor(() => expect(rebuildHistory).toHaveBeenCalledTimes(1));
@@ -105,7 +105,7 @@ describe('SettingsView — history rebuild confirmation', () => {
     const confirm = vi.fn().mockReturnValue(false);
     vi.stubGlobal('confirm', confirm);
 
-    render(SettingsView, { props: {} });
+    render(SettingsView, { request: { section: 'projects', revision: 1 } });
     await clickRebuild();
 
     // The prompt is the user's only chance to understand the cost, so pin the

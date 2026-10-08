@@ -111,11 +111,12 @@
 
   let lastRefreshScope = '';
   $effect(() => {
-    const scope = `${active}|${harness}|${sessionIds.join('|')}`;
+    const scope = `${harness}|${sessionIds.join('|')}`;
     const scopeChanged = scope !== lastRefreshScope; lastRefreshScope = scope;
     void historyStore.status; void harness; void sessionIds; void sessionsStore.mutationLog.generation;
-    refreshGeneration++; trailingTokens = null; trailingError = null;
+    refreshGeneration++;
     if (!active) return;
+    trailingTokens = null; trailingError = null;
     if (scopeChanged) { entries = []; quotaSnapshots = []; loaded = false; }
     const timer = setTimeout(() => { void refresh(scopeChanged); }, scopeChanged ? 0 : 250);
     const interval = setInterval(() => void refresh(), REFRESH_INTERVAL_MS);
@@ -281,6 +282,7 @@
     </div>
   {/if}
 
+  <p class="text-xs text-ink-muted">Quota and budget windows use their own reset or trailing periods, independent of the workspace date filter.</p>
   <LiveQuotaAccounts {active} {harness} />
   <LiveAccountAlerts {active} {harness} />
   <QuotaBudgets {active} {harness} onAlerts={handleBudgetAlerts} />
