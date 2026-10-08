@@ -352,7 +352,13 @@
   let analyticsReady = $state(false);
   let analyticsAccountingReady = $state(false);
   let analyticsRefreshing = $state(false);
-  const showingPreviousUsage = $derived((tableAccountingReady && tableRefreshing) || (analyticsAccountingReady && analyticsRefreshing));
+  // A scan's intermediate index cannot prove complete usage. Wait for the
+  // startup authorities instead of alternating failed queries with loading.
+  const accountingPreparing = $derived(!scanStore.status.complete || historyStore.status.status === 'pending');
+  const showingPreviousUsage = $derived(
+    (!tableNeeded || tableAccountingReady) && (!usageNeeded || analyticsAccountingReady)
+    && ((tableNeeded && tableRefreshing) || (usageNeeded && analyticsRefreshing)),
+  );
   let rangeFetchTimer: ReturnType<typeof setTimeout> | null = null;
   // Debounce is only for coalescing live store flushes. A changed range is a
   // discrete user action (preset click, committed input) and fetches
@@ -493,8 +499,9 @@
     lastTableScope = new Set(sessionIds); lastTableMutation = sessionsStore.mutationLog.generation;
     const ratesChanged = $rates !== lastTableRates;
     lastTableRates = $rates;
-    if (!tableNeeded) {
+    if (!tableNeeded || accountingPreparing) {
       rangeTotals = {}; tableAccountingReady = false; tableReady = false; tableRefreshing = false; summaryPricing = {};
+      tableError = null; categoryError = null;
       lastTableRange = null;
       tableCache.invalidate();
       tableJobGeneration += 1;
@@ -520,7 +527,7 @@
       tableAccountingReady = false; tableReady = false; tableRefreshing = false;
       rangeTotals = {}; summaryPricing = {}; tableError = null; categoryError = null;
     } else if (dataChanged || ratesChanged) {
-      tableRefreshing = true; tableError = null;
+      tableRefreshing = true;
     }
     lastTableRange = key;
     const requestEpoch = tableEpoch;
@@ -1237,9 +1244,14 @@
   }
 
   $effect(() => {
-    if (!usageNeeded) {
+    if (!usageNeeded || accountingPreparing) {
       // Preserve the displayed snapshot and its scroll geometry while hidden.
       // Resume with a fresh query; mutations may have arrived while paused.
+      if (accountingPreparing) {
+        analyticsReady = false; analyticsAccountingReady = false; analyticsRefreshing = false;
+        analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = []; analyticsError = null;
+        lastAnalyticsRange = null;
+      }
       analyticsCache.invalidate();
       lastAnalyticsMutation = -1;
       analyticsJobGeneration += 1;
@@ -1283,7 +1295,7 @@
       analyticsReady = false; analyticsAccountingReady = false; analyticsRefreshing = false;
       analyticsCurrent = null; analyticsCurrentBounds = null; analyticsPrev = null; analyticsBuckets = []; analyticsError = null;
     } else if (dataChanged || ratesChanged || windowAdvanced) {
-      analyticsRefreshing = true; analyticsError = null;
+      analyticsRefreshing = true;
     }
     lastAnalyticsRange = key;
     const requestEpoch = analyticsEpoch;
