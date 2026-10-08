@@ -345,6 +345,9 @@
         <div class="section-label" title={session.harness === 'codex' ? 'Current rate reference; excludes request-specific long-context premiums. Dated API scenarios appear in More details.' : undefined}>{heroCost?.label ?? 'Cost'}</div>
         <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroSurface && !costIsUnmeasured(heroSurface.unpriced_models, heroSurface.total) ? (session.harness === 'codex' && sessionApiCost ? formatCredits(heroSurface.total, 'USD') : fmtCredit(heroSurface.total)) : 'Unavailable'}</div>
         <p class="mt-1 text-xs text-ink-muted">{session.harness === 'codex' && !sessionApiCost ? 'Legacy credit reference; not a billed charge.' : 'API-rate estimate; not an invoice.'}{#if priceQualifications}{' '}{priceQualifications}.{/if}</p>
+        {#if session.tokens_by_model['claude-haiku-5-5']}
+          <p class="mt-2 text-[13px] text-ink-muted">Haiku 5.5 base reference: up to 100k request tokens and 5-minute cache writes. Larger requests cost 5×. See More details for request-size pricing.</p>
+        {/if}
       </div>
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label">Turns</div>
@@ -509,7 +512,7 @@
                       {#if credit}
                         <span class="font-mono text-pos">{credit.unpriced && credit.cost === 0 ? 'Unavailable' : fmtMoney(credit.cost)}</span>
                         {#if credit.unpriced && turn.tokens.total_tokens > 0}
-                          <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
+                          <span class="text-amber-500" title="Excluded because the model, service tier, or pricing period has no supported rate">◇</span>
                         {:else if credit.basis === 'aliased' && turn.tokens.total_tokens > 0}
                           <span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match">↝</span>
                         {:else if credit.basis === 'floating_alias' && turn.tokens.total_tokens > 0}
@@ -615,7 +618,7 @@
                     <td class="py-1 pr-2 font-mono text-ink-2 max-w-[110px] truncate" title={modelName}>
                       {modelName}
                       {#if modelCredit?.unpriced}
-                        <span class="text-amber-500" title="Excluded because no published rate is available">◇</span>
+                        <span class="text-amber-500" title="Excluded because the model, service tier, or pricing period has no supported rate">◇</span>
                       {:else if modelCredit?.basis === 'aliased'}
                         <span class="text-sky-500" title="Priced via a model-id alias, not a direct rate-card match">↝</span>
                       {:else if modelCredit?.basis === 'floating_alias'}

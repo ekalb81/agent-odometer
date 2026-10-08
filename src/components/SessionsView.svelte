@@ -1616,12 +1616,18 @@
       ? `Fallback rate used for: ${windowTotals.fallbackModels.join(', ')}`
       : '',
     windowTotals.unpricedModels.length > 0
-      ? `Excluded because no published rate is available: ${windowTotals.unpricedModels.join(', ')}`
+      ? `Excluded because the model, service tier, or pricing period has no supported rate: ${windowTotals.unpricedModels.join(', ')}`
       : '',
-    harness === 'codex' && ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0
-      ? 'Aggregate buckets omit per-request timestamps and input context, so this view intentionally stays on the flat API reference. Open a session for its exact dated scenario when supported.'
+    windowTotals.unpricedModels.includes('codex-auto-review')
+      ? 'codex-auto-review is an opaque safety-review identifier with no published API-model price. Its token usage remains included.'
+      : '',
+    ($rates?.pricing_catalog.rate_periods.length ?? 0) > 0
+      ? 'Aggregate estimates use base-rate references. Open a session for dated and request-size pricing when recorded evidence supports it.'
       : '',
   ].filter(Boolean).join('\n'));
+  const haikuPricingNote = $derived(moneyIsUsd && windowStats.byModel.some(row => row.model === 'claude-haiku-5-5')
+    ? 'Haiku 5.5 uses a base-rate reference for requests up to 100k tokens and 5-minute cache writes. Larger requests cost 5×; open session details for request-size pricing.'
+    : '');
 
   const modelComparison = $derived(windowStats.byModel);
   const modelComparisonCostTotal = $derived(
@@ -2033,6 +2039,7 @@
         {/if}
         <span class="ml-auto text-[13px] text-ink-muted cursor-help" title={spendCardNoteTitle}>{spendCardNote}</span>
       </div>
+      {#if haikuPricingNote}<p class="mt-2 text-[13px] text-ink-muted">{haikuPricingNote}</p>{/if}
       <div class="mt-3 flex justify-between text-ink-muted"><span>{chartUnit} per bucket</span><span>Max {analyticsReady ? fmtMoney(chartMax) : 'refreshing'}</span></div>
       <svg width="100%" height="72" viewBox="0 0 700 72" preserveAspectRatio="none" class="mt-2 block" aria-hidden="true"
         onpointermove={(event) => { const rect = event.currentTarget.getBoundingClientRect(); chartHover = Math.max(0, Math.min(spendSeries.length - 1, Math.round((event.clientX - rect.left) / rect.width * (spendSeries.length - 1)))); }} onpointerleave={() => chartHover = null}>
@@ -2390,6 +2397,7 @@
         <span data-testid="usage-included-count">Included in usage summary: {analyticsAccountingReady ? windowStats.sessionCount : 'Preparing'}</span>
         <span data-testid="usage-available-count">Available before filters: {allSessions.length}</span>
         <span class="text-ink-muted" title={spendCardNoteTitle}>{spendCardNote}</span>
+        {#if haikuPricingNote}<span class="w-full text-ink-muted">{haikuPricingNote}</span>{/if}
       </div>
     {/if}
     <details hidden={detailShown} class="session-overview shrink-0 max-h-[50%] overflow-y-auto" bind:open={overviewOpen}>
