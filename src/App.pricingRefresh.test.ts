@@ -5,14 +5,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App.svelte';
 import { rates } from './lib/stores/rates';
 import { sessionsStore } from './lib/stores/sessions.svelte';
+import { scanStore } from './lib/stores/scan.svelte';
+import { config } from './lib/stores/config';
+import { get } from 'svelte/store';
 import { RangeDataCache } from './lib/rangeData';
 import { zeroToolMetrics } from './lib/sessionProjection';
-import type { RateCard, RangeTotals, SessionSummary } from './lib/types';
+import type { RateCard, RangeTotals, ScanStatus, SessionSummary } from './lib/types';
 
 const mocks = vi.hoisted(() => ({
   ranges: vi.fn(), quota: vi.fn(), tray: vi.fn(), compute: vi.fn(),
   ratesUpdated: null as null | ((card: RateCard) => void),
   trayProvider: null as null | ((provider: string) => void),
+  startupConfig: vi.fn(), list: vi.fn(), scan: vi.fn(),
+  sessionUpdated: null as null | ((session: SessionSummary) => void),
+  sessionRemoved: null as null | ((id: string) => void),
+  scanProgress: null as null | ((status: ScanStatus) => void),
 }));
 
 // Keep the real App lifecycle, effects, queue and cache; child views and
@@ -25,10 +32,15 @@ vi.mock('./lib/stores/theme.svelte', () => ({}));
 vi.mock('./lib/trayTotals', () => ({ computeScopedTrayTotals: mocks.compute }));
 vi.mock('./lib/ipc', async (importOriginal) => ({
   ...await importOriginal<typeof import('./lib/ipc')>(),
-  getConfig: () => new Promise(() => {}),
-  onSessionUpdated: async () => () => {},
-  onSessionRemoved: async () => () => {},
-  onScanProgress: async () => () => {},
+  getConfig: mocks.startupConfig,
+  listSessions: mocks.list,
+  getScanStatus: mocks.scan,
+  getHistoryStatus: () => new Promise(() => {}),
+  getRates: () => new Promise(() => {}),
+  listProviders: async () => [],
+  onSessionUpdated: async (callback: (session: SessionSummary) => void) => { mocks.sessionUpdated = callback; return () => { mocks.sessionUpdated = null; }; },
+  onSessionRemoved: async (callback: (id: string) => void) => { mocks.sessionRemoved = callback; return () => { mocks.sessionRemoved = null; }; },
+  onScanProgress: async (callback: (status: ScanStatus) => void) => { mocks.scanProgress = callback; return () => { mocks.scanProgress = null; }; },
   onHistoryProgress: async () => () => {},
   onInstructionScanProgress: async () => () => {},
   onConfigUpdated: async () => () => {},
@@ -68,6 +80,10 @@ async function flush() {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  mocks.startupConfig.mockImplementation(() => new Promise(() => {}));
+  mocks.list.mockResolvedValue([]);
+  mocks.scan.mockImplementation(() => new Promise(() => {}));
+  scanStore.set({ done: 0, total: 2, complete: false, elapsed_ms: null, cold_reason: null });
   mocks.ranges.mockResolvedValue(newResult);
   mocks.quota.mockResolvedValue([]);
   mocks.tray.mockResolvedValue(undefined);
@@ -218,4 +234,53 @@ describe('App tray pricing refresh', () => {
     expect(mocks.ranges.mock.lastCall?.[2]).toEqual(['synthetic']);
   });
 
+});
+
+describe('App scan completion', () => {
+  const complete: ScanStatus = { done: 2, total: 2, complete: true, elapsed_ms: 10, cold_reason: null };
+
+  it('applies the final ordered mutation batch before publishing scan completion', async () => {
+    const original = sessionsStore.map.get('synthetic')!;
+    mocks.startupConfig.mockResolvedValue(get(config));
+    mocks.list.mockResolvedValue([original]);
+    render(App); await flush();
+    mocks.sessionUpdated!({ ...original, thread_name: 'Final synthetic' });
+    mocks.sessionUpdated!({ ...original, storage_id: 'removed' });
+    mocks.sessionRemoved!('removed');
+    const published: string[] = [];
+    const set = scanStore.set.bind(scanStore);
+    vi.spyOn(scanStore, 'set').mockImplementation(status => {
+      if (status.complete) published.push(sessionsStore.map.get('synthetic')!.thread_name!);
+      set(status);
+    });
+    mocks.scanProgress!(complete);
+    expect(published).toEqual(['Final synthetic']);
+    expect(sessionsStore.map.has('removed')).toBe(false);
+    expect(scanStore.status.complete).toBe(true);
+  });
+
+  it.each([
+    { source: 'event', superseded: false },
+    { source: 'snapshot', superseded: false },
+    { source: 'event', superseded: true },
+    { source: 'snapshot', superseded: true },
+  ])('holds completed $source until snapshot replay (new scan: $superseded)', async ({ source, superseded }) => {
+    const original = sessionsStore.map.get('synthetic')!;
+    const snapshot = deferred<SessionSummary[]>();
+    mocks.startupConfig.mockResolvedValue(get(config));
+    mocks.list.mockReturnValue(snapshot.promise);
+    if (source === 'snapshot') mocks.scan.mockResolvedValue(complete);
+    render(App); await flush();
+    mocks.sessionUpdated!({ ...original, thread_name: 'Final synthetic' });
+    if (source === 'event') mocks.scanProgress!(complete);
+    await flush();
+    expect(scanStore.status.complete).toBe(false);
+    if (superseded) mocks.scanProgress!({ ...complete, done: 0, complete: false });
+    snapshot.resolve([original]); await flush();
+    expect(scanStore.status.complete).toBe(!superseded);
+    if (!superseded) expect(sessionsStore.map.get('synthetic')!.thread_name).toBe('Final synthetic');
+    mocks.scanProgress!(complete);
+    expect(scanStore.status.complete).toBe(true);
+    expect(sessionsStore.map.get('synthetic')!.thread_name).toBe('Final synthetic');
+  });
 });

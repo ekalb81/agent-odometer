@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { sessionsStore } from '../lib/stores/sessions.svelte';
 import { historyStore } from '../lib/stores/history.svelte';
+import { scanStore } from '../lib/stores/scan.svelte';
 import { sessionDetailPaneStore } from '../lib/stores/sessionDetailPane.svelte';
 import { projectStore } from '../lib/stores/projects.svelte';
 import { sessionGridStore } from '../lib/stores/sessionGrid.svelte';
@@ -155,6 +156,8 @@ async function exportProjection(format: 'CSV' | 'JSON') {
 
 describe('SessionsView wide-layout detail pane', () => {
   beforeEach(async () => {
+    scanStore.set({ ...scanStore.status, complete: true });
+    historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: true });
     localStorage.clear();
     sessionGridStore.reset();
     ipcMocks.resolveProjects.mockResolvedValue([]);
@@ -315,6 +318,7 @@ describe('SessionsView wide-layout detail pane', () => {
     const pending: Array<{ resolve: (s: Session) => void; reject: (e: Error) => void }> = [];
     getSessionDetails.mockImplementation(() => new Promise<Session>((resolve, reject) => pending.push({ resolve, reject })));
     rates.set(testRateCard());
+    scanStore.set({ ...scanStore.status, complete: true });
     renderView();
     await fireEvent.click(await screen.findByRole('button', { name: 'Select session Fix login bug' }));
     await waitFor(() => expect(pending).toHaveLength(1));
@@ -621,6 +625,73 @@ describe('SessionsView range pricing refresh orchestration', () => {
       vi.useRealTimers();
     }
   });
+  it.each(['history', 'scan'] as const)('keeps startup preparation steady when %s is ready first until a verified snapshot arrives', async (readyFirst) => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const corpus = Array.from({ length: 1100 }, (_, index) => summary(`synthetic:${index}`, `Session ${index}`));
+      sessionsStore.replaceAll(corpus);
+      scanStore.set({ ...scanStore.status, done: 0, total: 1100, complete: false });
+      historyStore.set({ ...historyStore.status, status: 'pending', coverage_complete: false });
+      const total: RangeTotals = { tokens: { ...zeroTokens, total_tokens: 321 }, buckets: [], tool_metrics: corpus[0].tool_metrics,
+        tool_metrics_by_model: {}, optimization_findings_count: 0,
+        pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } };
+      let verified = false;
+      ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => {
+        const ready = verified;
+        return new Promise((resolve, reject) => setTimeout(() => {
+          if (ready) resolve(ranges.map(() => ({ [corpus[0].id]: total })));
+          else reject('accounting_identity_unverified: cumulative snapshot incomplete');
+        }, ranges.length === 1 ? 350 : 600));
+      });
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      mountRangeView('all');
+      await vi.advanceTimersByTimeAsync(0);
+      const row = screen.getByRole('button', { name: 'Select session Session 0' });
+      const expectPreparing = () => {
+        expect(screen.getByTestId('accounting-table-status')).toHaveTextContent(/^Preparing complete usage…$/);
+        const spend = screen.getByText(/^Combined API estimate/).parentElement!;
+        expect(spend).toHaveTextContent('Preparing complete usage');
+        expect(spend).not.toHaveTextContent(/Unavailable|\$0\.00/);
+        expect(row.querySelector('.text-accent-cost')).toHaveTextContent('unavailable');
+        expect(row).toHaveTextContent('unavailable');
+        expect(row).not.toHaveTextContent(/321|1,00\d/);
+      };
+      expectPreparing();
+      expect(ipcMocks.sessionsInRanges).not.toHaveBeenCalled();
+      expect(ipcMocks.getSessionPricing).not.toHaveBeenCalled();
+      if (readyFirst === 'history') {
+        historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: true });
+        scanStore.set({ ...scanStore.status, done: 875 });
+      } else scanStore.set({ ...scanStore.status, done: 1100, complete: true });
+      await vi.advanceTimersByTimeAsync(350);
+      expectPreparing();
+      for (let update = 0; update < 10; update++) {
+        sessionsStore.applyMutations([{ ...corpus[0], tokens_total: { ...zeroTokens, total_tokens: 1000 + update } }], []);
+        await vi.advanceTimersByTimeAsync(100);
+        expectPreparing();
+        expect(ipcMocks.sessionsInRanges).not.toHaveBeenCalled();
+        expect(ipcMocks.getSessionPricing).not.toHaveBeenCalled();
+      }
+      verified = true;
+      if (readyFirst === 'history') scanStore.set({ ...scanStore.status, done: 1100, complete: true });
+      else historyStore.set({ ...historyStore.status, status: 'ready', coverage_complete: true });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ipcMocks.sessionsInRanges).toHaveBeenCalledTimes(2);
+      expectPreparing();
+      await vi.advanceTimersByTimeAsync(100);
+      sessionsStore.applyMutations([{ ...corpus[0], tokens_total: { ...zeroTokens, total_tokens: 1009 } }], []);
+      await vi.advanceTimersByTimeAsync(250);
+      expect(row).toHaveTextContent('321');
+      expect(screen.getByTestId('accounting-table-status')).toHaveTextContent(/^Preparing complete usage…$/);
+      expect(screen.getByText(/^Combined API estimate/).parentElement).toHaveTextContent('Preparing complete usage');
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(row).toHaveTextContent('321');
+      expect(screen.getByText(/^Tokens ·/).parentElement).toHaveTextContent('321');
+      expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
   it('verifies current All scope totals between continuous 100ms updates when requests take 80ms', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     try {
@@ -681,7 +752,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     expect(errors).not.toHaveBeenCalled();
     await waitFor(() => expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument());
   });
-  it('labels previously verified table usage while analytics is pending or fails independently', async () => {
+  it('retains verified table usage while preparing first analytics, refreshing both, or reporting an independent analytics failure', async () => {
     const pending: { resolve: (value: Record<string, RangeTotals>[]) => void; reject: (error: Error) => void; ranges: unknown[] }[] = [];
     ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => new Promise((resolve, reject) => pending.push({ resolve, reject, ranges })));
     const base = summary(ids[0], ids[0]);
@@ -697,14 +768,17 @@ describe('SessionsView range pricing refresh orchestration', () => {
     table.resolve([{ [ids[0]]: total }]);
     const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
     await waitFor(() => expect(row).toHaveTextContent('901'));
-    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Previous verified usage · refreshing');
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent(/^Preparing complete usage…$/);
     analytics.resolve(analytics.ranges.map(() => ({ [ids[0]]: total })));
     await expectBothBatches(4);
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Previous verified usage · refreshing');
     const latestAnalytics = pending.slice(2).find(request => request.ranges.length > 1)!;
     latestAnalytics.reject(new Error('current analytics proof failed'));
     await waitFor(() => expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Analytics:'));
     expect(row).toHaveTextContent('901');
-    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Previous verified usage · refreshing');
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('complete accounting scope could not be verified');
+    expect(screen.getByTestId('accounting-table-status')).not.toHaveTextContent('Previous verified usage');
+    expect(screen.getByRole('button', { name: 'Retry usage' })).toBeInTheDocument();
     expect(errors).toHaveBeenCalled();
     view.unmount();
     pending.slice(2).find(request => request.ranges.length === 1)!.resolve([{}]);
@@ -940,6 +1014,16 @@ describe('SessionsView range pricing refresh orchestration', () => {
     expect(ipcMocks.getSessionPricing.mock.calls.at(-1)).toEqual([[ids[0]], ids]);
     expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('ambiguous');
     expect(errors).toHaveBeenCalled();
+    let finish!: (value: ReturnType<typeof snapshot>) => void;
+    ipcMocks.getSessionPricing.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    sessionsStore.applyMutations([summary(ids[0], ids[0])], []);
+    await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(3));
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('ambiguous accounting identities');
+    expect(screen.getByRole('button', { name: 'Retry usage' })).toBeInTheDocument();
+    expect(row).toHaveTextContent('unavailable');
+    finish(snapshot(ids));
+    await waitFor(() => expect(row).toHaveTextContent('901'));
+    await waitFor(() => expect(screen.queryByTestId('accounting-table-status')).not.toBeInTheDocument());
   });
   it('labels a same-scope in-flight cumulative snapshot as previously verified until the latest mutation is priced', async () => {
     let finish!: (value: unknown) => void;

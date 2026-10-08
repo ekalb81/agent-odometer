@@ -22,7 +22,7 @@
   import { defenderActionStore } from './lib/stores/defender.svelte';
   import { defenderReceiptStatus, isWindowsDefenderSurface } from './lib/defenderStatus';
   import { getVersion } from '@tauri-apps/api/app';
-  import type { InstructionScanProgress, RateCard, SessionSummary } from './lib/types';
+  import type { InstructionScanProgress, RateCard, ScanStatus, SessionSummary } from './lib/types';
   import type { UnlistenFn } from '@tauri-apps/api/event';
   import { computeScopedTrayTotals } from './lib/trayTotals';
   import { ambientQuotaLabel } from './lib/ambientTray';
@@ -454,8 +454,25 @@
     let scanEventRevision = 0;
     let historyEventRevision = 0;
     let ratesEventRevision = 0;
+    let terminalScanStatus: ScanStatus | null = null;
     const unlisteners: UnlistenFn[] = [];
     sessionsReady = false;
+
+    function installScanStatus(status: ScanStatus) {
+      terminalScanStatus = null;
+      if (status.complete) {
+        if (!sessionsReady) {
+          terminalScanStatus = status;
+          return;
+        }
+        if (flushTimer !== null) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        flushMutations();
+      }
+      scanStore.set(status);
+    }
 
     async function attach(label: string, listener: Promise<UnlistenFn>): Promise<void> {
       try {
@@ -487,7 +504,8 @@
       } finally {
         if (!disposed && generation === reloadGeneration) {
           sessionsReady = true;
-          scheduleMutationFlush();
+          if (terminalScanStatus) installScanStatus(terminalScanStatus);
+          else scheduleMutationFlush();
         }
       }
     }
@@ -505,7 +523,7 @@
         attach('scan-progress', onScanProgress((status) => {
           if (disposed) return;
           scanEventRevision += 1;
-          scanStore.set(status);
+          installScanStatus(status);
         })),
         attach('history-progress', onHistoryProgress((status) => {
           if (disposed) return;
@@ -572,7 +590,7 @@
         reloadSessions('frontend.initial_list_sessions'),
         providersStore.init(),
         measureAsync('frontend.initial_scan_status', getScanStatus).then((status) => {
-          if (!disposed && scanRevision === scanEventRevision) scanStore.set(status);
+          if (!disposed && scanRevision === scanEventRevision) installScanStatus(status);
         }).catch((error) => console.error('getScanStatus failed:', error)),
         measureAsync('frontend.initial_history_status', getHistoryStatus).then((status) => {
           if (!disposed && historyRevision === historyEventRevision) historyStore.set(status);
