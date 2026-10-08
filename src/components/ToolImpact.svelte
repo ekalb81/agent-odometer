@@ -99,6 +99,8 @@
   let comparisonError = $state<string | null>(null);
   let targetRequestGeneration = 0;
   let comparisonRequestGeneration = 0;
+  let targetProof: unknown[] | null = null;
+  let comparisonProof: unknown[] | null = null;
   const targetId = (target: ToolImpactTarget) => `${target.kind}:${target.key}`;
   const providerTargets = $derived(targets.filter((target) => target.kind === 'provider'));
   const toolTargets = $derived(targets.filter((target) => target.kind === 'tool'));
@@ -111,7 +113,8 @@
     const ids = sessionIds;
     const rangeFrom = from;
     const rangeTo = to;
-    if (!active || ids.length === 0) {
+    if (!active) { loadingTargets = false; return; }
+    if (ids.length === 0) {
       targets = [];
       selectedTargetId = '';
       result = null;
@@ -119,6 +122,9 @@
       loadingTargets = false;
       return;
     }
+    const proof = [ids, rangeFrom, rangeTo];
+    if (targetProof?.every((value, index) => value === proof[index])) return;
+    targetProof = null; comparisonProof = null;
     targets = [];
     result = null;
     targetError = null;
@@ -128,7 +134,7 @@
     listToolImpactTargets(rangeFrom, rangeTo, ids)
       .then((value) => {
         if (!current()) return;
-        targets = value;
+        targets = value; targetProof = proof;
         targetError = null;
         const selectionStillExists = value.some(
           (target) => targetId(target) === selectedTargetId,
@@ -154,14 +160,18 @@
     const ids = sessionIds;
     const rangeFrom = from;
     const rangeTo = to;
-    if (!active || !target || ids.length === 0) {
+    if (!active) { loadingComparison = false; return; }
+    if (!target || ids.length === 0) {
       result = null;
       comparisonError = null;
       loadingComparison = false;
       return;
     }
+    const proof = [ids, rangeFrom, rangeTo, targetId(target)];
+    if (comparisonProof?.every((value, index) => value === proof[index])) return;
     // A report is authoritative only for this exact request. Keep the
     // selection and open panel, but withhold all previous numeric results.
+    comparisonProof = null;
     result = null;
     comparisonError = null;
     loadingComparison = true;
@@ -171,7 +181,7 @@
     compareToolImpact(target.kind, target.key, rangeFrom, rangeTo, ids)
       .then((value) => {
         if (current()) {
-          result = value;
+          result = value; comparisonProof = proof;
           comparisonError = null;
         }
       })
@@ -317,7 +327,7 @@
           Duration coverage: observed {assisted?.duration_sample_count ?? 0}/{assisted?.turn_count ?? 0} turns · not observed {baseline?.duration_sample_count ?? 0}/{baseline?.turn_count ?? 0}. Whole overlapping turns are compared; differences are observational, not proof that the selected tool or provider caused them.
         </p>
         {#if result.warnings.length > 0}
-          <p class="text-[10px] text-amber-500">{result.warnings.join(' · ')}</p>
+          <p class="text-xs text-amber-500">{result.warnings.join(' · ')}</p>
         {/if}
       {/if}
     {/if}

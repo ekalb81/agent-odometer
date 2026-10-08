@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { sessionsStore } from '../lib/stores/sessions.svelte';
   import { historyStore } from '../lib/stores/history.svelte';
   import { accountingUnavailable } from '../lib/accountingAvailability';
@@ -69,6 +69,7 @@
         from: previousWindow?.from ?? start.toISOString(), to: previousWindow?.to ?? end.toISOString() });
       if (!valid()) return;
       report = next;
+      settledProof = [selectionKey, period, mutation, history, rateCard, projects, refresh];
     } catch (reason) {
       if (!valid()) return;
       error = String(reason).includes('accounting_identity_') ? accountingUnavailable(reason) : 'Workflow analysis could not be loaded. Check history readiness, or select fewer sessions and retry.';
@@ -114,6 +115,7 @@
         message: 'This action preview is stale or unavailable. Refresh the measurement.' };
     }
   }
+  let settledProof: unknown[] | null = null;
   let lastMutation = -1;
   $effect(() => {
     const token = ++generation;
@@ -123,9 +125,11 @@
     const ids: string[] = JSON.parse(selectionKey);
     const days = Number(period);
     void refresh;
+    if (!active || !opened) { loading = false; return; }
+    const proof = [selectionKey, period, mutation, historyStore.status, $rates, projectStore.revision, refresh];
+    if (settledProof?.every((value, index) => value === proof[index]) && untrack(() => report !== null)) return;
     report = null; actionGeneration++; actionPreview = null; actionError = null; saving = false; error = null;
     loading = active && opened;
-    if (!active || !opened) return;
     const timer = setTimeout(() => { void load(ids, days, token); }, mutationChanged ? 250 : 0);
     return () => { clearTimeout(timer); if (generation === token) generation++; };
   });
@@ -135,7 +139,7 @@
 <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={opened} data-testid="workflow-panel">
   <summary class="cursor-pointer text-xs font-semibold text-ink">Workflow intelligence</summary>
   <div class="mt-3 flex flex-col gap-3 text-xs">
-    <p class="text-ink-muted">Local, versioned observations for the selected sessions. Tool success and speed do not establish accepted quality or causal savings.</p>
+    <p class="text-ink-muted">Local, versioned observations for the selected sessions. Comparison uses its own adjacent UTC periods, independent of the workspace date filter. Tool success and speed do not establish accepted quality or causal savings.</p>
     <div class="flex flex-wrap items-center gap-2">
       <label class="text-ink-muted" for="workflow-period">Compare adjacent UTC periods</label>
       <select id="workflow-period" bind:value={period} disabled={saving || loading} class="rounded-sm border border-edge bg-panel px-2 py-1 text-ink">
@@ -144,7 +148,7 @@
       <button type="button" onclick={() => refresh += 1} disabled={loading || saving} class="rounded-sm border border-edge px-2 py-1 text-ink disabled:opacity-50">Refresh measurements</button>
       <button type="button" onclick={() => void load(JSON.parse(selectionKey), Number(period), ++generation, true)} disabled={loading || saving || !report} class="rounded-sm border border-edge px-2 py-1 text-ink disabled:opacity-50">Record measurement</button>
     </div>
-    <p class="text-ink-faint">Viewing is read-only. Record measurement saves only finding states and observation times locally; it changes no agent configuration.</p>
+    <p class="text-ink-muted">Viewing is read-only. Record measurement saves only finding states and observation times locally; it changes no agent configuration.</p>
     {#if loading}
       <p data-testid="accounting-workflow-status" role="status" class="text-ink-muted">Measuring durable workflow evidence…</p>
     {:else if error}
@@ -156,7 +160,7 @@
         <p>Before {utcDate(report.before.from)}–{utcDate(report.before.to)} · after {utcDate(report.after.from)}–{utcDate(report.after.to)} · UTC</p>
       </div>
       <div class="overflow-x-auto">
-        <p class="mb-1 text-ink-faint sm:hidden">Scroll sideways for the evidence column.</p>
+        <p class="mb-1 text-ink-muted sm:hidden">Scroll sideways for the evidence column.</p>
         <details class="mb-2 rounded-sm border border-edge p-2">
           <summary class="cursor-pointer text-ink">Local setup health</summary>
           {#if report.setup_health}
@@ -190,7 +194,7 @@
           </tbody>
         </table>
       </div>
-      <p class="text-ink-faint">Metrics v{report.after.ledger_metrics.schema_version} · analyzer v{report.analyzer_version}. Subagent metadata is an observed subset; tool-free turns are excluded from tools-per-turn. Hover a measurement for its coverage rule.</p>
+      <p class="text-ink-muted">Metrics v{report.after.ledger_metrics.schema_version} · analyzer v{report.analyzer_version}. Subagent metadata is an observed subset; tool-free turns are excluded from tools-per-turn. Hover a measurement for its coverage rule.</p>
       <details class="rounded-sm border border-edge p-2">
         <summary class="cursor-pointer text-ink">Project, model and task category evidence</summary>
         <p class="mt-2 text-ink-muted">Current period counts. Project and model calls come from the ledger; categories count turns with the existing classifier. These dimensions have different denominators.</p>
@@ -204,7 +208,7 @@
           <option value="10">10%</option><option value="25">25%</option>
         </select>
         <p class="mt-1">{afterCalls} observed calls × {hypotheticalReduction}% = {Math.floor(afterCalls * Number(hypotheticalReduction) / 100)} hypothetical calls avoided over this period.</p>
-        <p class="text-ink-faint">This is a scenario, not measured or causal savings. Token, cost, quality and delivery effects are unknown.</p>
+        <p class="text-ink-muted">This is a scenario, not measured or causal savings. Token, cost, quality and delivery effects are unknown.</p>
       </div>
       {#if report.findings.length === 0}
         <p class="text-ink-muted">No findings in these periods. This is not a quality verdict.</p>
@@ -215,12 +219,12 @@
               <p class="font-medium text-ink">{findingRuleTitle(finding.rule_id)} · {finding.comparison.state.replaceAll('_', ' ')} · {finding.provider}</p>
               <p class="text-ink-muted">{finding.before.findings} → {finding.after.findings} observations · {finding.before.sessions} / {finding.after.sessions} session samples</p>
               {#if finding.lifecycle}
-                <p class="text-ink-faint">Recorded measurement observations: {utcDate(finding.lifecycle.first_observed_at)}–{utcDate(finding.lifecycle.last_observed_at)} UTC · revision {finding.lifecycle.revision}. These are not occurrence dates.</p>
+                <p class="text-ink-muted">Recorded measurement observations: {utcDate(finding.lifecycle.first_observed_at)}–{utcDate(finding.lifecycle.last_observed_at)} UTC · revision {finding.lifecycle.revision}. These are not occurrence dates.</p>
                 <button type="button" disabled={saving || loading} onclick={() => void suppression(finding)} class="mt-1 rounded-sm border border-edge px-2 py-1 text-ink disabled:opacity-50">{finding.lifecycle.suppressed ? 'Unsuppress finding' : 'Suppress finding'}</button>
                 {#if finding.rule_id === 'repeated-read' && finding.comparison.comparable && !finding.lifecycle.suppressed}
                   <button type="button" disabled={saving || loading} onclick={() => void previewAction(finding)} class="ml-2 mt-1 rounded-sm border border-edge px-2 py-1 text-ink disabled:opacity-50">Preview future action</button>
                 {/if}
-              {:else}<p class="text-ink-faint">Not recorded. Record a measurement before editing suppression.</p>{/if}
+              {:else}<p class="text-ink-muted">Not recorded. Record a measurement before editing suppression.</p>{/if}
               {#if actionPreview?.findingId === finding.id}
                 <div class="mt-2 space-y-1 rounded-sm border border-edge bg-panel p-2 text-ink-muted" role="status">
                   <p>Dry run only · {actionPreview.value.target_type.replaceAll('_', ' ')}</p>
@@ -231,13 +235,13 @@
                 </div>
               {:else if actionError?.findingId === finding.id}<p role="alert" class="text-amber-500">{actionError.message}</p>{/if}
               {#if finding.comparison.observed_change_per_100_calls !== null}<p class="text-ink-muted">Observed change: {finding.comparison.observed_change_per_100_calls.toFixed(1)} likely avoidable calls per 100 calls. This is not realized savings.</p>{/if}
-              <p class="text-ink-faint">{finding.comparison.limitations.map((reason) => reason.replaceAll('_', ' ')).join(' · ')}</p>
+              <p class="text-ink-muted">{finding.comparison.limitations.map((reason) => reason.replaceAll('_', ' ')).join(' · ')}</p>
               <div class="mt-1 flex flex-wrap gap-2">
                 {#each finding.evidence as evidence, index (`${evidence.session_id}:${evidence.turn_id}:${index}`)}
                   <button type="button" onclick={() => onReview(evidence.session_id)} class="rounded-sm border border-edge px-2 py-1 text-ink">Review session evidence {index + 1}</button>
                 {/each}
               </div>
-              {#if finding.evidence_truncated}<p class="text-ink-faint">First 20 evidence anchors shown.</p>{/if}
+              {#if finding.evidence_truncated}<p class="text-ink-muted">First 20 evidence anchors shown.</p>{/if}
             </li>
           {/each}
         </ul>
@@ -246,12 +250,12 @@
         <details class="rounded-sm border border-edge p-2">
           <summary class="cursor-pointer text-ink">Previously recorded findings outside this measurement ({report.historical_findings.length})</summary>
           <p class="mt-2 text-ink-muted">Different project scopes, missing rules and absent current observations do not prove resolution. Suppression stays with its original scope.</p>
-          <ul class="mt-2 text-ink-faint">{#each report.historical_findings as finding (finding.id)}
+          <ul class="mt-2 text-ink-muted">{#each report.historical_findings as finding (finding.id)}
             <li>{findingRuleTitle(finding.rule_id)} · {finding.provider} · {finding.lifecycle.state.replaceAll('_', ' ')} · last measured {utcDate(finding.lifecycle.last_observed_at)} UTC</li>
           {/each}</ul>
         </details>
       {/if}
-      {#if report.limitations.length > 0}<p class="text-ink-faint">{report.limitations.map((reason) => reason.replaceAll('_', ' ')).join(' · ')}</p>{/if}
+      {#if report.limitations.length > 0}<p class="text-ink-muted">{report.limitations.map((reason) => reason.replaceAll('_', ' ')).join(' · ')}</p>{/if}
     {/if}
   </div>
 </details>

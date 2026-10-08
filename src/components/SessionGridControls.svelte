@@ -7,9 +7,16 @@
      *  layouts fall back to an overlay drawer that isn't collapsible, so the
      *  toggle has nothing to control there and stays hidden. */
     isWide?: boolean;
+    hasSelection?: boolean;
+    groupByRepository?: boolean;
+    flattenSubagents?: boolean;
+    ongroupchange?: (value: boolean) => void;
+    onflatchange?: (value: boolean) => void;
   }
 
-  let { isWide = false }: Props = $props();
+  let { isWide = false, hasSelection = true, groupByRepository, flattenSubagents,
+    ongroupchange = sessionGridStore.setGroupByRepository,
+    onflatchange = sessionGridStore.setFlattenSubagents }: Props = $props();
 
   const controlColumns = $derived([
     ...sessionGridStore.columns,
@@ -17,12 +24,12 @@
   ]);
 </script>
 
-<div class="px-4 py-2 border-t border-edge flex items-center gap-3 text-xs bg-panel">
+<div class="px-4 py-2 border-t border-edge flex flex-wrap items-center gap-3 text-xs bg-panel">
   <label class="flex items-center gap-1.5 text-ink-muted">
     <input
       type="checkbox"
-      checked={sessionGridStore.groupByRepository}
-      onchange={(event) => sessionGridStore.setGroupByRepository(event.currentTarget.checked)}
+      checked={groupByRepository ?? sessionGridStore.groupByRepository}
+      onchange={(event) => ongroupchange(event.currentTarget.checked)}
     />
     Group by repository
   </label>
@@ -40,8 +47,8 @@
   >
     <input
       type="checkbox"
-      checked={sessionGridStore.flattenSubagents}
-      onchange={(event) => sessionGridStore.setFlattenSubagents(event.currentTarget.checked)}
+      checked={flattenSubagents ?? sessionGridStore.flattenSubagents}
+      onchange={(event) => onflatchange(event.currentTarget.checked)}
     />
     Flat list
   </label>
@@ -50,7 +57,7 @@
     <div class="absolute z-20 right-0 mt-1 w-64 rounded-lg border border-edge bg-card shadow-lg p-2 space-y-1">
       <div class="flex items-center justify-between pb-1 border-b border-edgerow">
         <span class="section-label">Session grid</span>
-        <button class="text-ink-faint hover:text-ink" onclick={() => sessionGridStore.reset()} title="Reset grid columns to defaults" aria-label="Reset grid columns to defaults">↺ Reset</button>
+        <button class="text-ink-faint hover:text-ink" onclick={() => { sessionGridStore.reset(); ongroupchange(false); onflatchange(false); }} title="Reset grid columns to defaults" aria-label="Reset grid columns to defaults">↺ Reset</button>
       </div>
       {#each controlColumns as column (column.id)}
         {@const visible = sessionGridStore.columnIds.includes(column.id)}
@@ -77,12 +84,13 @@
     <button
       type="button"
       class="ml-auto flex items-center gap-1.5 rounded-md border border-edge bg-card px-2 py-1 text-ink-muted hover:text-ink focus:outline-hidden focus:ring-1 focus:ring-accent"
-      aria-expanded={sessionDetailPaneStore.open}
+      aria-expanded={hasSelection && sessionDetailPaneStore.open}
+      disabled={!hasSelection}
       aria-controls="session-detail-pane"
       onclick={() => sessionDetailPaneStore.toggle()}
     >
-      <span aria-hidden="true">{sessionDetailPaneStore.open ? '◂' : '▸'}</span>
-      {sessionDetailPaneStore.open ? 'Hide details' : 'Show details'}
+      <span aria-hidden="true">{hasSelection && sessionDetailPaneStore.open ? '◂' : '▸'}</span>
+      {hasSelection && sessionDetailPaneStore.open ? 'Hide details' : 'Show details'}
     </button>
   {/if}
 </div>

@@ -333,6 +333,8 @@
       <TranscriptInspector sessionId={session.storage_id} recordId={contextAnchor ?? transcriptAnchor} onclose={() => { inspectorOpen = false; }} />
     {/if}
 
+    <!-- Keep the stat grid in the body so short windows can still reach turns. -->
+    <div class="flex-1 overflow-y-auto min-h-0">
     <!-- 2×2 stat grid -->
     <div class="grid grid-cols-2 gap-px bg-edge border-b border-edge shrink-0">
       <div class="bg-panel px-5 py-2.5">
@@ -342,7 +344,7 @@
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label" title={session.harness === 'codex' ? 'Current rate reference; excludes request-specific long-context premiums. Dated API scenarios appear in More details.' : undefined}>{heroCost?.label ?? 'Cost'}</div>
         <div class="font-mono font-semibold mt-0.5 text-accent-cost">{heroSurface && !costIsUnmeasured(heroSurface.unpriced_models, heroSurface.total) ? (session.harness === 'codex' && sessionApiCost ? formatCredits(heroSurface.total, 'USD') : fmtCredit(heroSurface.total)) : 'Unavailable'}</div>
-        <p class="mt-1 text-xs text-ink-muted">{session.harness === 'codex' && !sessionApiCost ? 'Legacy credit reference; not a billed charge.' : 'API-rate estimate; not an invoice.'}{#if priceQualifications} {priceQualifications}.{/if}</p>
+        <p class="mt-1 text-xs text-ink-muted">{session.harness === 'codex' && !sessionApiCost ? 'Legacy credit reference; not a billed charge.' : 'API-rate estimate; not an invoice.'}{#if priceQualifications}{' '}{priceQualifications}.{/if}</p>
       </div>
       <div class="bg-panel px-5 py-2.5">
         <div class="section-label">Turns</div>
@@ -354,8 +356,6 @@
       </div>
     </div>
 
-    <!-- Scrollable body -->
-    <div class="flex-1 overflow-y-auto min-h-0">
       {#key session.storage_id}
         <SessionProjectEditor {session} />
         <SessionOrganizationEditor sessionKey={session.storage_id} />

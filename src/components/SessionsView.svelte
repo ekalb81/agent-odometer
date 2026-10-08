@@ -1,7 +1,7 @@
 <script lang="ts">
   import { accountingUnavailable, hasVerifiedTokens, unavailableTokens } from '../lib/accountingAvailability';
   import ExecutionBoard from './ExecutionBoard.svelte';
-  import { onDestroy, onMount, untrack } from 'svelte';
+  import { onDestroy, onMount, tick, untrack } from 'svelte';
   import { organizationStore } from '../lib/stores/organization.svelte';
   import { matchesOrganization } from '../lib/organization';
   import { sessionsStore, type TrackedSession } from '../lib/stores/sessions.svelte';
@@ -61,13 +61,55 @@
   interface Props {
     harness?: ViewScope;
     active?: boolean;
+    analyticsRequest?: { target: string; revision: number };
     pinnedOnly?: boolean;
     organizationTags?: string[];
     filters: FilterState;
     onfilterschange: (f: FilterState) => void;
   }
 
-  let { harness = 'all', active = true, pinnedOnly = false, organizationTags = [], filters, onfilterschange }: Props = $props();
+  let { harness = 'all', active = true, analyticsRequest, pinnedOnly = false, organizationTags = [], filters, onfilterschange }: Props = $props();
+
+  let analyticsOpen = $state(false);
+  const analyticsGroups = [
+    { id: 'usage', label: 'Usage' },
+    { id: 'tools', label: 'Tools & context' },
+    { id: 'changes', label: 'Changes & review' },
+    { id: 'outcomes', label: 'Outcomes' },
+  ] as const;
+  type AnalyticsGroup = typeof analyticsGroups[number]['id'];
+  let analyticsGroup = $state<AnalyticsGroup>('usage');
+  let visitedAnalytics = $state(new Set<AnalyticsGroup>());
+  const sessionsVisible = $derived(active && !analyticsOpen);
+  const analyticsVisible = $derived(active && analyticsOpen);
+  const usageVisible = $derived(analyticsVisible && analyticsGroup === 'usage');
+  const toolsVisible = $derived(analyticsVisible && analyticsGroup === 'tools');
+  const changesVisible = $derived(analyticsVisible && analyticsGroup === 'changes');
+  const outcomesVisible = $derived(analyticsVisible && analyticsGroup === 'outcomes');
+  // The overview and compact strip share the same ledger projection as Analytics.
+  const usageNeeded = $derived(sessionsVisible || usageVisible || toolsVisible || changesVisible);
+  const tableNeeded = $derived(sessionsVisible || usageVisible);
+  let returnToAnalytics = $state(false);
+  let workspace = $state<HTMLDivElement>();
+  let lastAnalyticsRequest: Props['analyticsRequest'];
+  $effect(() => {
+    if (analyticsVisible && !visitedAnalytics.has(analyticsGroup)) {
+      visitedAnalytics = new Set([...visitedAnalytics, analyticsGroup]);
+    }
+  });
+  $effect(() => {
+    if (!active || !analyticsRequest || analyticsRequest === lastAnalyticsRequest) return;
+    lastAnalyticsRequest = analyticsRequest;
+    analyticsOpen = true;
+    analyticsGroup = 'usage';
+    const target = analyticsRequest.target;
+    void tick().then(() => {
+      const element = workspace?.querySelector<HTMLElement>(target);
+      if (element instanceof HTMLDetailsElement) element.open = true;
+      element?.scrollIntoView({ block: 'center' });
+      if (element) { element.tabIndex = -1; element.focus(); }
+    });
+  });
 
   const fmt = new Intl.NumberFormat();
   const fmt2 = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -133,6 +175,8 @@
 
   let sortKey = $state<SortKey>(null);
   let sortDir = $state<SortDir>('asc');
+  let groupByRepository = $state(untrack(() => sessionGridStore.groupByRepository));
+  let flattenSubagents = $state(untrack(() => sessionGridStore.flattenSubagents));
 
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
@@ -164,9 +208,10 @@
   // harness tab stays mounted (so its filters survive switching) but must
   // not re-filter/re-sort/re-price on every live update.
   // ---------------------------------------------------------------------------
-  const allSessions = $derived(
-    active ? filterSessions(sessionsStore.map.values(), harness, defaultFilters(), false) : [],
-  );
+  let allSessions = $state.raw<TrackedSession[]>([]);
+  $effect(() => {
+    if (active) allSessions = filterSessions(sessionsStore.map.values(), harness, defaultFilters(), false);
+  });
   // Provider ids are relationship identifiers, while storage ids are durable
   // UI and IPC keys. Keep this bridge local to the currently visible scope.
   const providerToStorageIds = $derived((() => {
@@ -448,7 +493,7 @@
     lastTableScope = new Set(sessionIds); lastTableMutation = sessionsStore.mutationLog.generation;
     const ratesChanged = $rates !== lastTableRates;
     lastTableRates = $rates;
-    if (!active) {
+    if (!tableNeeded) {
       rangeTotals = {}; tableAccountingReady = false; tableReady = false; tableRefreshing = false; summaryPricing = {};
       lastTableRange = null;
       tableCache.invalidate();
@@ -639,7 +684,7 @@
   // to its own start time rather than inheriting its parent's day group.
   // Drilling into one parent is inherently a flat question ("which of these
   // runs cost the most"), so the scope implies the flattening.
-  const flatMode = $derived(sessionGridStore.flattenSubagents || focusedParentId !== null);
+  const flatMode = $derived(flattenSubagents || focusedParentId !== null);
   const projectAnchors = $derived.by(() => {
     const byId = new Map(filtered.map((session) => [session.storage_id, session]));
     const anchors = new Map<string, TrackedSession>();
@@ -663,7 +708,7 @@
   }
   function displayParentStorageId(session: TrackedSession): string | null {
     const parentId = parentStorageId(session);
-    if (!sessionGridStore.groupByRepository || !parentId) return parentId;
+    if (!groupByRepository || !parentId) return parentId;
     const parent = projectAnchors.get(parentId);
     // Project reassignment changes display grouping, never actual lineage.
     // A collapse in one project must not withhold rows in another project.
@@ -803,7 +848,7 @@
   /// here only joins that key through `projectStore` for any local
   /// alias/merge; it never recomputes identity from `working_directory`
   /// itself, so this can never disagree with the grid's sort/filter/label.
-  function groupByRepository(sessions: TrackedSession[]): { label: string; sessions: TrackedSession[] }[] {
+  function groupSessionsByRepository(sessions: TrackedSession[]): { label: string; sessions: TrackedSession[] }[] {
     const groups = new Map<string, { label: string; sessions: TrackedSession[] }>();
     for (const session of sessions) {
       const anchor = projectAnchors.get(session.storage_id) ?? session;
@@ -818,8 +863,8 @@
   }
 
   const groups = $derived((() => {
-    if (sessionGridStore.groupByRepository) {
-      return groupByRepository(displayed);
+    if (groupByRepository) {
+      return groupSessionsByRepository(displayed);
     }
     if (sortKey !== null) return [{ label: null as string | null, sessions: displayed }];
     const out: { label: string | null; sessions: TrackedSession[] }[] = [];
@@ -922,14 +967,17 @@
     return () => clearRenderedSessionRows(harness);
   });
 
-  onMount(() => {
+  $effect(() => {
+    if (!listViewport) return;
     const resize = new ResizeObserver(([entry]) => {
-      listViewportHeight = entry.contentRect.height;
+      if (entry.contentRect.height > 0) listViewportHeight = entry.contentRect.height;
     });
-    if (listViewport) resize.observe(listViewport);
+    resize.observe(listViewport);
+    return () => resize.disconnect();
+  });
+  onMount(() => {
     // Fetch-once and shared across tabs; the store dedupes concurrent calls.
     void projectStore.load();
-    return () => resize.disconnect();
   });
 
   // Children per parent id → "N subagents" chips on parent rows.
@@ -959,6 +1007,8 @@
   // ---------------------------------------------------------------------------
   interface DayBucket {
     label: string;
+    from: number;
+    to: number;
     data: Record<string, RangeTotals>;
   }
   let analyticsBuckets = $state<DayBucket[]>([]);
@@ -1053,7 +1103,7 @@
   let configEventsGeneration = 0;
   $effect(() => {
     const generation = ++configEventsGeneration;
-    if (!active) return;
+    if (!usageNeeded) return;
     listExternalEvents()
       .then((events) => {
         if (active && generation === configEventsGeneration) {
@@ -1168,7 +1218,7 @@
       analyticsRefreshing = mutationChanged();
       analyticsPrev = includePrev ? results[1] : null;
       const days = results.slice(includePrev ? 2 : 1);
-      analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), data }));
+      analyticsBuckets = days.map((data, i) => ({ label: fmtMonthDay(bounds[i].from), ...bounds[i], data }));
     } catch (e) {
       if (epoch !== analyticsEpoch) return;
       if (!sameScope(analyticsSessionIds, scope) || rateCard !== $rates || history !== historyStore.status) return;
@@ -1187,6 +1237,17 @@
   }
 
   $effect(() => {
+    if (!usageNeeded) {
+      // Preserve the displayed snapshot and its scroll geometry while hidden.
+      // Resume with a fresh query; mutations may have arrived while paused.
+      analyticsCache.invalidate();
+      lastAnalyticsMutation = -1;
+      analyticsJobGeneration += 1;
+      analyticsEpoch += 1;
+      if (analyticsTimer !== null) { clearTimeout(analyticsTimer); analyticsTimer = null; }
+      pendingAnalyticsRefresh = null;
+      return;
+    }
     const { startMs, endMs } = windowBounds;
     const sessionIds = analyticsSessionIds;
     const includePrev = dateScoped;
@@ -1199,19 +1260,6 @@
     lastAnalyticsScope = new Set(sessionIds); lastAnalyticsMutation = sessionsStore.mutationLog.generation;
     const ratesChanged = $rates !== lastAnalyticsRates;
     lastAnalyticsRates = $rates;
-    if (!active) {
-      analyticsAccountingReady = false; analyticsReady = false; analyticsRefreshing = false;
-      analyticsBuckets = [];
-      analyticsPrev = null;
-      analyticsCurrent = null; analyticsCurrentBounds = null;
-      lastAnalyticsRange = null;
-      analyticsCache.invalidate();
-      analyticsJobGeneration += 1;
-      analyticsEpoch += 1;
-      if (analyticsTimer !== null) { clearTimeout(analyticsTimer); analyticsTimer = null; }
-      pendingAnalyticsRefresh = null;
-      return;
-    }
     const key = `${fromUtc}|${toUtc}`;
     const openEnded = !toUtc;
     const endMinute = Math.floor(endMs / 60_000);
@@ -1352,7 +1400,11 @@
     return out;
   }
 
-  const spendSeries = $derived(analyticsBuckets.map((b) => ({ label: b.label, ...priceRange(b.data) })));
+  const spendSeries = $derived(analyticsBuckets.map((b) => {
+    const value = priceRange(b.data);
+    return { label: b.label, from: b.from, to: b.to, ...value,
+      cost: (harness === 'all' && !allUsdAvailable) || costIsUnmeasured(value.unpricedModels, value.cost) ? Number.NaN : value.cost };
+  }));
   const windowTotals = $derived(priceRange(analyticsCurrent));
   const prevTotals = $derived(priceRange(analyticsPrev));
 
@@ -1522,7 +1574,7 @@
   // Both Codex cards retain their own surface's provenance, including in All.
   function estimateSummary(total: number, fallback: string[], unpriced: string[], usd: boolean, available = analyticsReady) {
     return {
-      value: !available || !Number.isFinite(total) || costIsUnmeasured(unpriced, total) ? 'Unavailable' : usd ? fmtUsd(total) : total > 0 ? fmtAmount(total) : '—',
+      value: !available || !Number.isFinite(total) || costIsUnmeasured(unpriced, total) ? 'Unavailable' : usd ? fmtUsd(total) : fmtAmount(total),
       note: [unpriced.length ? `${unpriced.length} unpriced model${unpriced.length === 1 ? '' : 's'} excluded` : '', fallback.length ? `${fallback.length} fallback rate${fallback.length === 1 ? '' : 's'} used` : ''].filter(Boolean).join(' · '),
       title: [...unpriced, ...fallback].join(', '),
     };
@@ -1545,7 +1597,7 @@
           ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
           : windowTotals.fallbackModels.length > 0
             ? `estimate · ${windowTotals.fallbackModels.length} fallback rate${windowTotals.fallbackModels.length === 1 ? '' : 's'} used`
-            : 'Codex + Claude USD'
+            : 'Combined provider API estimates · USD'
       : harness === 'codex'
       ? (windowTotals.unpricedModels.length > 0
           ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
@@ -1557,7 +1609,7 @@
         ? `estimate · ${windowTotals.unpricedModels.length} unpriced model${windowTotals.unpricedModels.length === 1 ? '' : 's'} excluded`
         : windowTotals.fallbackModels.length > 0
           ? `estimate · ${windowTotals.fallbackModels.length} fallback rate${windowTotals.fallbackModels.length === 1 ? '' : 's'} used`
-          : 'Anthropic API rates',
+          : `${providersStore.displayName(harness)} API rates · USD`,
   );
   const spendCardNoteTitle = $derived([
     windowTotals.fallbackModels.length > 0
@@ -1621,7 +1673,6 @@
   let exportBusy = $state(false);
   let exportError = $state<string | null>(null);
   let includeWorkingDirectory = $state(false);
-  let analyticsOpen = $state(false);
   let speedOpen = $state(false);
 
   function invalidateExportAccounting(reason: unknown): void {
@@ -1762,7 +1813,7 @@
   async function refreshSelectedDetails() {
     if (detailsInFlight) { detailsPending = true; return; }
     const id = selectedSessionId;
-    if (!active || id === null) return;
+    if (!sessionsVisible || id === null) return;
     const generation = detailsRequestGeneration;
     detailsInFlight = true;
     detailsPending = false;
@@ -1801,7 +1852,7 @@
     }
     void selectedDetailRetry;
     const id = selectedSessionId;
-    if (!active) {
+    if (!sessionsVisible) {
       detailsInFlight = false;
       detailsPending = false;
       return;
@@ -1831,7 +1882,7 @@
   // not postpone delivery. At most one request and one pending refresh run.
   $effect(() => {
     const current = selectedSummary;
-    if (!active || selectedSessionId === null || current === lastDetailsSummary) return;
+    if (!sessionsVisible || selectedSessionId === null || current === lastDetailsSummary) return;
     lastDetailsSummary = current;
     untrack(() => {
       if (selectedSession) selectedDetailState = 'updating';
@@ -1860,6 +1911,7 @@
 
   function reviewFindingSession(id: string) {
     selectSession(id);
+    returnToAnalytics = true;
     analyticsOpen = false;
   }
 
@@ -1867,6 +1919,7 @@
     const next = { ...filters, dateFrom: calendarFilterValue(day.from), dateTo: calendarFilterValue(day.to), utcBounds: { from: day.from, to: day.to } };
     calendarSelection = { scope: `${harness}|${JSON.stringify(next)}`, ids: day.sessionIds };
     focusedParentId = null;
+    returnToAnalytics = true;
     analyticsOpen = false;
     onfilterschange(next);
   }
@@ -1884,12 +1937,12 @@
 
   // Escape deselects (kept from the drawer flow).
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key !== 'Escape') return;
+    if (e.key !== 'Escape' || e.defaultPrevented || document.querySelector('dialog[open]')) return;
     if (sessionContextMenu !== null) sessionContextMenu = null;
     else if (selectedSessionId !== null) deselect();
   }
   $effect(() => {
-    if (active) {
+    if (sessionsVisible) {
       window.addEventListener('keydown', handleKeydown);
       return () => window.removeEventListener('keydown', handleKeydown);
     }
@@ -1901,49 +1954,76 @@
   let overviewOpen = $state(wideQuery.matches);
   const onWideChange = (e: MediaQueryListEvent) => {
     isWide = e.matches;
-    overviewOpen = e.matches;
   };
   wideQuery.addEventListener('change', onWideChange);
   onDestroy(() => wideQuery.removeEventListener('change', onWideChange));
+
+  const detailShown = $derived(selectedSessionId !== null && sessionDetailPaneStore.open);
+  let workspaceWidth = $state(window.innerWidth);
+  const maxDetailWidth = $derived(Math.max(410, Math.min(800, workspaceWidth - 488)));
+  const detailWidth = $derived(Math.min(sessionDetailPaneStore.width, maxDetailWidth));
+  let detailDialog = $state<HTMLDialogElement>();
+  let detailReturnFocus: HTMLElement | null = null;
+  let dragStart: { x: number; width: number } | null = null;
+  $effect(() => {
+    if (!workspace) return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry.contentRect.width > 0) workspaceWidth = entry.contentRect.width;
+    });
+    observer.observe(workspace);
+    return () => observer.disconnect();
+  });
+  $effect(() => {
+    const dialog = detailDialog;
+    if (!dialog) return;
+    if (sessionsVisible && detailShown && !isWide) {
+      if (!dialog.open) {
+        detailReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+        dialog.showModal();
+      }
+    } else if (dialog.open) dialog.close();
+  });
+  function closeDetails() {
+    sessionDetailPaneStore.setOpen(false);
+    if (!isWide) {
+      detailDialog?.close();
+      void tick().then(() => detailReturnFocus?.focus());
+    }
+  }
+  function resizeDetails(event: PointerEvent) {
+    if (!dragStart) return;
+    sessionDetailPaneStore.setWidth(Math.min(maxDetailWidth, dragStart.width + dragStart.x - event.clientX));
+  }
+  function resizeDetailsKey(event: KeyboardEvent) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    event.preventDefault();
+    const next = event.key === 'Home' ? 410 : event.key === 'End' ? maxDetailWidth : detailWidth + (event.key === 'ArrowLeft' ? 20 : -20);
+    sessionDetailPaneStore.setWidth(Math.min(maxDetailWidth, next));
+  }
+  let chartHover = $state<number | null>(null);
+  const chartMax = $derived.by(() => {
+    const values = spendSeries.filter(point => Number.isFinite(point.cost)).map(point => point.cost);
+    return values.length ? Math.max(...values) : Number.NaN;
+  });
+  const chartUnit = $derived(moneyIsUsd ? 'USD API estimate' : 'Purchased credits');
+  function chartInterval(point: { from: number; to: number }): string {
+    return `${new Date(point.from).toLocaleString()} – ${new Date(point.to).toLocaleString()}`;
+  }
+  const usageState = $derived(analyticsError ? 'Unavailable' : !analyticsAccountingReady ? 'Preparing complete usage' : !analyticsReady ? 'Refreshing prices' : analyticsRefreshing ? 'Previous verified usage · refreshing' : null);
 
   const visibleColumns = $derived(sessionGridStore.columns);
   const gridCols = $derived(`grid-template-columns: ${visibleColumns.map((column) => column.width).join(' ')};`);
 </script>
 
-{#if tableError || analyticsError}<p data-testid="accounting-table-status" role="status" class="text-xs text-neg px-3 py-2">{tableError ?? `Analytics: ${analyticsError}`} {#if showingPreviousUsage}Showing previous verified usage; refreshing… {/if}<button type="button" class="underline" onclick={() => accountingRetry++}>Retry usage</button></p>{:else if active && !showingPreviousUsage && (!tableAccountingReady || !analyticsAccountingReady)}<p data-testid="accounting-table-status" role="status" class="text-xs text-ink-muted px-3 py-2">Verifying complete usage scope…</p>{/if}
-
-{#if organizationUnavailable}
-  <div class="p-5 text-sm text-amber-500" role="alert">
-    Organization-filtered results are unavailable. {organizationStore.recoveryUnrestored ? 'Earlier organization remains in the recovery backup and was not restored.' : organizationStore.error ?? 'Organization is loading, or a selected tag was renamed or deleted.'}
-    <button class="ml-2 underline" onclick={() => void organizationStore.load(allSessions.map(session => session.storage_id))}>Retry organization</button>
-    <p class="mt-2 text-ink-muted">Clear pin/tag filters in Organize to view ordinary session summaries.</p>
-  </div>
-{:else}
-<div class="sessions-view flex flex-col h-full overflow-hidden" class:analytics-open={analyticsOpen}>
-  {#if calendarSelected}
-    <div class="mx-4 mt-2 flex items-center gap-2 text-[11px] text-ink-muted" role="status">
-      Calendar drill-down · {filtered.length} sessions with recorded events
-      <button type="button" class="text-accent underline" onclick={() => calendarSelection = null}>Show all overlapping sessions</button>
-    </div>
-  {/if}
-  <!-- Analytics band -->
-  <div class="h-4 shrink-0">
-    {#if active && showingPreviousUsage && !tableError && !analyticsError}
-      <p data-testid="accounting-table-status" role="status" class="truncate px-4 text-xs leading-4 text-ink-muted">Showing previous verified usage; refreshing…</p>
-    {/if}
-  </div>
-  <details class="session-overview shrink-0 max-h-[50%] overflow-y-auto" bind:open={overviewOpen}>
-    <summary class="sticky top-0 z-10 mx-4 my-3 bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink" class:hidden={isWide}>
-      Overview · {windowLabel}
-    </summary>
-  <div class="grid gap-3.5 p-4" style="grid-template-columns: 1.8fr 1fr 0.9fr;">
+{#snippet overviewCards()}
+  <div class="overview-grid grid gap-3.5 p-4">
     <!-- Spend card -->
     <div class="bg-card border border-edge rounded-xl px-5 pt-4 pb-3 min-w-0">
       <div class="flex flex-wrap items-baseline gap-x-4 gap-y-2">
         <div>
           <div class="text-xs text-ink-muted font-medium">{spendCardLabel}</div>
           <div class="text-[30px] font-bold tracking-[-0.03em] font-mono mt-0.5 {showApiCost ? 'text-accent-cost' : 'text-ink'}">
-            {(harness === 'all' && !allUsdAvailable) || costIsUnmeasured(windowTotals.unpricedModels, windowTotals.cost) ? 'Unavailable' : fmtMoney(windowTotals.cost)}
+            {usageState && !analyticsReady ? usageState : (harness === 'all' && !allUsdAvailable) || costIsUnmeasured(windowTotals.unpricedModels, windowTotals.cost) ? 'Unavailable' : fmtMoney(windowTotals.cost)}
           </div>
         </div>
         {#if costDelta !== null}
@@ -1951,9 +2031,11 @@
             {costDelta >= 0 ? '▲' : '▼'} {Math.abs(costDelta)}% vs previous {windowLabel === 'Last 7 days' ? 'week' : 'period'}
           </span>
         {/if}
-        <span class="ml-auto text-[11px] text-ink-faint whitespace-nowrap cursor-help" title={spendCardNoteTitle}>{spendCardNote}</span>
+        <span class="ml-auto text-[13px] text-ink-muted cursor-help" title={spendCardNoteTitle}>{spendCardNote}</span>
       </div>
-      <svg width="100%" height="72" viewBox="0 0 700 72" preserveAspectRatio="none" class="mt-2 block" aria-hidden="true">
+      <div class="mt-3 flex justify-between text-ink-muted"><span>{chartUnit} per bucket</span><span>Max {analyticsReady ? fmtMoney(chartMax) : 'refreshing'}</span></div>
+      <svg width="100%" height="72" viewBox="0 0 700 72" preserveAspectRatio="none" class="mt-2 block" aria-hidden="true"
+        onpointermove={(event) => { const rect = event.currentTarget.getBoundingClientRect(); chartHover = Math.max(0, Math.min(spendSeries.length - 1, Math.round((event.clientX - rect.left) / rect.width * (spendSeries.length - 1)))); }} onpointerleave={() => chartHover = null}>
         {#if chart.line}
           <polygon points={chart.area} fill="var(--accent-fill)" />
           <polyline points={chart.line} fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" />
@@ -1967,11 +2049,23 @@
           </line>
         {/each}
       </svg>
-      <div class="flex justify-between text-[10px] text-ink-faint mt-[5px] font-mono">
+      <div class="text-ink-muted">0 {moneyIsUsd ? 'USD' : 'credits'}</div>
+      <div class="flex justify-between text-xs text-ink-muted mt-[5px] font-mono">
         {#each chartLabels as label}
           <span>{label}</span>
         {/each}
       </div>
+      <p class="text-ink-muted mt-2 min-h-10">{#if chartHover !== null && spendSeries[chartHover]}{chartInterval(spendSeries[chartHover])}: {fmtMoney(spendSeries[chartHover].cost)}{:else}Buckets span the displayed intervals; long ranges combine multiple days. Hover for values or open the data table.{/if}</p>
+      <details class="mt-2">
+        <summary class="cursor-pointer text-ink-muted">Chart data · exact bucket intervals</summary>
+        <div class="overflow-x-auto">
+          <table class="w-full text-xs text-left">
+            <caption class="text-left py-2">Local times · inclusive bounds · {chartUnit}. Missing prices stay unavailable.</caption>
+            <thead><tr><th>From</th><th>Through</th><th class="text-right">{moneyIsUsd ? 'USD' : 'Credits'}</th><th class="text-right">Tokens</th></tr></thead>
+            <tbody>{#each spendSeries as point}<tr class="border-t border-edge"><td class="py-1 pr-2">{new Date(point.from).toLocaleString()}</td><td class="pr-2">{new Date(point.to).toLocaleString()}</td><td class="text-right font-mono">{fmtMoney(point.cost)}</td><td class="text-right font-mono">{fmt.format(point.tokens)}</td></tr>{/each}</tbody>
+          </table>
+        </div>
+      </details>
     </div>
 
     <!-- Cost by model -->
@@ -1982,7 +2076,7 @@
       {#if !Number.isFinite(windowTotals.cost)}
         <div class="text-[11px] text-ink-faint">Pricing unavailable</div>
       {:else if harness === 'all' && !allUsdAvailable}
-        <div class="text-[11px] text-ink-faint">Combined USD unavailable · configure USD rates for both harnesses</div>
+        <div class="text-[11px] text-ink-faint">Combined USD unavailable · configure USD rates for every provider</div>
       {:else if costByModel.rows.length === 0}
         <div class="text-[11px] text-ink-faint">No priced usage in this window</div>
       {:else}
@@ -2019,11 +2113,13 @@
     <div class="bg-card border border-edge rounded-xl px-5 py-4 flex flex-col justify-between gap-2 min-w-0">
       <div>
         <div class="text-xs text-ink-muted font-medium">Sessions · {windowLabel}</div>
+        <p class="text-ink-muted mt-1">Included in usage summary</p>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
           {analyticsAccountingReady ? windowStats.sessionCount : 'unavailable'}
-          <span class="text-[11px] text-ink-faint font-normal">of {allSessions.length}</span>
+          <span class="block text-[13px] text-ink-muted font-sans font-normal">Available before filters: {allSessions.length}</span>
         </div>
       </div>
+      <details class="text-ink-muted"><summary class="cursor-pointer">What counts as included?</summary><p class="mt-1">Sessions with non-zero verified usage in this window and an available pricing record. Zero-token and unavailable records are excluded. Subagents count as separate sessions when included by your filters. Available before filters is the provider inventory.</p></details>
       <div>
         <div class="text-xs text-ink-muted font-medium">Tokens · {windowLabel}</div>
         <div class="text-xl font-bold font-mono mt-0.5 text-ink">
@@ -2056,19 +2152,73 @@
     </div>
   </div>
 
-  </details>
+{/snippet}
 
-  <details
-    class="session-analytics px-4 pb-3 min-h-0 max-h-[60vh] overflow-y-auto shrink-0"
-    bind:open={analyticsOpen}
-    data-testid="analytics-panel"
-  >
-    <summary class="sticky top-0 z-10 bg-card border border-edge rounded-lg px-3 py-2 cursor-pointer text-xs font-semibold text-ink">
-      Analytics &amp; exports · {windowLabel}
-    </summary>
-    <div class="mt-2 flex flex-col gap-2">
+
+
+
+{#if organizationUnavailable}
+  <div class="p-5 text-sm text-amber-500" role="alert">
+    Organization-filtered results are unavailable. {organizationStore.recoveryUnrestored ? 'Earlier organization remains in the recovery backup and was not restored.' : organizationStore.error ?? 'Organization is loading, or a selected tag was renamed or deleted.'}
+    <button class="ml-2 underline" onclick={() => void organizationStore.load(allSessions.map(session => session.storage_id))}>Retry organization</button>
+    <p class="mt-2 text-ink-muted">Clear pin/tag filters in Organize to view ordinary session summaries.</p>
+  </div>
+{:else}
+<div class="sessions-view flex flex-col h-full overflow-hidden" bind:this={workspace}>
+  {#if calendarSelected}
+    <div class="mx-4 mt-2 flex items-center gap-2 text-[11px] text-ink-muted" role="status">
+      Calendar drill-down · {filtered.length} sessions with recorded events
+      <button type="button" class="text-accent underline" onclick={() => calendarSelection = null}>Show all overlapping sessions</button>
+    </div>
+  {/if}
+  <!-- Analytics band -->
+  <div class="h-6 shrink-0 px-4 text-ink-muted flex items-center">
+    {#if tableError || analyticsError}
+      <p data-testid="accounting-table-status" role="status" class="flex items-center gap-2 min-w-0 w-full">
+        <span class="truncate" title={tableError ?? analyticsError ?? undefined}>{tableError ?? `Analytics: ${analyticsError}`} {#if showingPreviousUsage}Previous verified usage · refreshing{/if}</span>
+        <button type="button" class="underline shrink-0" onclick={() => accountingRetry++}>Retry usage</button>
+      </p>
+    {:else if active && showingPreviousUsage}
+      <p data-testid="accounting-table-status" role="status" class="truncate">Previous verified usage · refreshing{#if !tableReady || !analyticsReady} · Refreshing prices{/if}</p>
+    {:else if active && ((tableNeeded && !tableAccountingReady) || (usageNeeded && !analyticsAccountingReady))}
+      <p data-testid="accounting-table-status" role="status">Preparing complete usage…</p>
+    {:else if active && ((tableNeeded && !tableReady) || (usageNeeded && !analyticsReady))}
+      <p data-testid="accounting-table-status" role="status">Refreshing prices…</p>
+    {/if}
+  </div>
+  <div class="workspace-toolbar shrink-0 flex flex-wrap items-center gap-3 border-b border-edge px-4 py-2">
+    <nav aria-label="Workspace mode" class="flex gap-1">
+      <button type="button" class="workspace-tab" aria-pressed={!analyticsOpen} onclick={() => analyticsOpen = false}>Sessions</button>
+      <button type="button" class="workspace-tab" aria-pressed={analyticsOpen} onclick={() => analyticsOpen = true}>Analytics</button>
+    </nav>
+    <span class="text-ink-muted">{harness === 'all' ? 'All providers' : providersStore.displayName(harness)} · {windowLabel} · {filtered.length} matching sessions</span>
+    {#if returnToAnalytics && !analyticsOpen}<button type="button" class="text-accent-chipfg underline" onclick={() => analyticsOpen = true}>Back to analytics</button>{/if}
+    <details class="ml-auto relative projection-export">
+      <summary class="cursor-pointer rounded-md border border-edge px-3 py-1">Export projection</summary>
+      <div class="absolute right-0 z-30 mt-1 w-80 max-w-[90vw] rounded-lg border border-edge bg-card p-3">
+      <div class="flex flex-wrap items-center gap-2 text-xs">
+        <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('csv')}>Export CSV</button>
+        <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('json')}>Export JSON</button>
+        <label class="flex items-center gap-1.5 text-ink-muted"><input type="checkbox" disabled={exportBusy} bind:checked={includeWorkingDirectory} /> Include working directories</label>
+        {#if exportError}<span class="text-neg ml-auto" role="alert">{exportError}</span>{/if}
+      </div>
+
+      </div>
+    </details>
+  </div>
+  <div hidden={!analyticsOpen} class="analytics-workspace flex flex-1 min-h-0" data-testid="analytics-panel">
+    <nav aria-label="Analytics sections" class="workspace-index shrink-0 p-3 border-r border-edge">
+      {#each analyticsGroups as group}
+        <button type="button" class="workspace-tab block w-full text-left" aria-current={analyticsGroup === group.id ? 'page' : undefined} onclick={() => analyticsGroup = group.id}>{group.label}</button>
+      {/each}
+    </nav>
+    <div class="min-w-0 flex-1 min-h-0 flex flex-col">
+      <p class="px-4 py-2 border-b border-edge text-ink-muted">Session filters apply. Quota windows, workflow periods, whole-session categories, whole-task outcomes, and local repository evaluation use the scope labelled in each report.</p>
+      {#if visitedAnalytics.has('usage')}
+        <div hidden={analyticsGroup !== 'usage'} class="analytics-content flex-1 min-h-0 overflow-y-auto p-4 space-y-3" data-analytics-group="usage">
+      {@render overviewCards()}
       <CalendarActivity
-        active={active && analyticsOpen}
+        active={usageVisible}
         {harness}
         from={fromUtc}
         to={toUtc}
@@ -2079,7 +2229,7 @@
         onbucket={selectCalendarDay}
       />
       <SubscriptionUsage
-        active={active && analyticsOpen}
+        active={usageVisible}
         {harness}
         sessionIds={analyticsSessionIds}
       />
@@ -2087,20 +2237,21 @@
       <div class="grid grid-cols-3 gap-2 text-xs">
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex purchased-credit estimate</span><div class="font-mono font-semibold">{purchasedCreditSummary.value}</div>{#if purchasedCreditSummary.note}<p title={purchasedCreditSummary.title}>{purchasedCreditSummary.note}</p>{/if}</div>
         <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Codex API base USD</span><div class="font-mono font-semibold">{codexApiSummary.value}</div>{#if codexApiSummary.note}<p title={codexApiSummary.title}>{codexApiSummary.note}</p>{/if}</div>
-        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Claude est. USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.claudeUsd) ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
+        <div class="bg-card border border-edge rounded-lg px-3 py-2"><span class="text-ink-muted">Other providers API estimate · USD</span><div class="font-mono font-semibold">{allUsdAvailable && analyticsReady && Number.isFinite(windowTotals.claudeUsd) ? fmtUsd(windowTotals.claudeUsd) : 'Unavailable'}</div></div>
       </div>
       {/if}
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
       <summary class="cursor-pointer text-xs font-semibold text-ink">Model comparison · {windowLabel} · {analyticsReady ? modelComparison.length : 'unavailable'} models</summary>
       {#if !analyticsAccountingReady}
-        <p class="text-xs text-ink-muted py-3">Model aggregates unavailable until the complete usage scope is verified.</p>
+        <p class="text-xs text-ink-muted py-3">Preparing complete usage for model aggregates.</p>
       {:else if harness === 'all' && !allUsdAvailable}
-        <p class="text-xs text-ink-faint py-3">Combined model shares are unavailable until both harnesses have USD rates.</p>
-      {:else if !analyticsReady}<p class="text-xs text-ink-muted py-3">Model comparison unavailable while prices are refreshing.</p>
+        <p class="text-xs text-ink-faint py-3">Combined model shares are unavailable until every provider has USD rates.</p>
+      {:else if !analyticsReady}<p class="text-xs text-ink-muted py-3">Refreshing prices for model comparison.</p>
       {:else if modelComparison.length === 0}
         <p class="text-xs text-ink-faint py-3">No model usage in this window.</p>
       {:else}
+        <p class="text-ink-muted mt-2">One-shot: mutations completed on the first attempt / mutation targets. Failure: failed calls / calls. Cost/call: API estimate / calls. Share: priced model cost / priced total. These observations do not establish cause or task quality.</p>
         <div class="overflow-x-auto mt-2">
           <table class="w-full text-xs font-mono [&_th]:px-2 [&_td]:px-2 [&_th]:py-2 [&_td]:py-2">
             <thead class="text-ink-muted"><tr><th class="text-left py-1">Harness / model</th><th class="text-right">Input</th><th class="text-right">Cached</th><th class="text-right">Output</th><th class="text-right">Reasoning</th><th class="text-right">Total</th><th class="text-right">Calls</th><th class="text-right">One-shot</th><th class="text-right">Retries</th><th class="text-right">Failure</th><th class="text-right">Cost/call</th><th class="text-right">Cost</th><th class="text-right">Share</th></tr></thead>
@@ -2128,24 +2279,10 @@
       {/if}
       </details>
 
-      {#if analyticsAccountingReady}<ToolImpact
-        active={active && analyticsOpen}
-        sessionIds={analyticsSessionIds}
-        from={impactFrom}
-        to={impactTo}
-        dimensionFrom={analyticsCurrentBounds?.from ?? null}
-        dimensionTo={analyticsCurrentBounds?.to ?? null}
-        {windowLabel}
-        {dimensionTotals}
-        {dimensionAvailability}
-      />{:else}<p role="status" class="text-xs text-ink-muted">Tool aggregates unavailable until the complete usage scope is verified.</p>{/if}
-
-      <WorkflowIntelligence active={active && analyticsOpen} sessionIds={analyticsSessionIds} onReview={reviewFindingSession} />
-
       {#if harness === 'codex'}
         <details class="bg-card border border-edge rounded-lg px-3 py-2" bind:open={speedOpen} data-testid="speed-panel">
           <summary class="cursor-pointer text-xs font-semibold text-ink">Codex speed</summary>
-          <SpeedMonitor active={active && analyticsOpen && speedOpen} />
+          <SpeedMonitor active={usageVisible && speedOpen} />
         </details>
       {/if}
 
@@ -2160,6 +2297,31 @@
           </div>
         {/if}
       </details>
+
+
+        </div>
+      {/if}
+      {#if visitedAnalytics.has('tools')}
+        <div hidden={analyticsGroup !== 'tools'} class="analytics-content flex-1 min-h-0 overflow-y-auto p-4 space-y-3" data-analytics-group="tools">
+      <ToolImpact
+        active={toolsVisible && analyticsAccountingReady}
+        sessionIds={analyticsSessionIds}
+        from={impactFrom}
+        to={impactTo}
+        dimensionFrom={analyticsCurrentBounds?.from ?? null}
+        dimensionTo={analyticsCurrentBounds?.to ?? null}
+        {windowLabel}
+        {dimensionTotals}
+        {dimensionAvailability}
+      />
+      {#if !analyticsAccountingReady}<p role="status" class="text-ink-muted">Preparing complete usage for tool aggregates.</p>{/if}
+
+
+        </div>
+      {/if}
+      {#if visitedAnalytics.has('changes')}
+        <div hidden={analyticsGroup !== 'changes'} class="analytics-content flex-1 min-h-0 overflow-y-auto p-4 space-y-3" data-analytics-group="changes">
+      <WorkflowIntelligence active={changesVisible} sessionIds={analyticsSessionIds} onReview={reviewFindingSession} />
 
       <details class="bg-card border border-edge rounded-lg px-3 py-2">
         <summary class="cursor-pointer text-xs font-semibold text-ink">
@@ -2207,24 +2369,41 @@
         {/if}
       </details>
 
-      <ConfigTimeline active={active && analyticsOpen} events={configEvents} />
+      <ConfigTimeline active={changesVisible} events={configEvents} />
+
+        </div>
+      {/if}
+      {#if visitedAnalytics.has('outcomes')}
+        <div hidden={analyticsGroup !== 'outcomes'} class="analytics-content flex-1 min-h-0 overflow-y-auto p-4 space-y-3" data-analytics-group="outcomes">
       <HumanOutcomes sessions={filtered} />
-      <GitOutcomes />
+      <GitOutcomes active={outcomesVisible} />
 
-      <div class="flex items-center gap-2 text-xs">
-        <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('csv')}>Export CSV</button>
-        <button class="px-3 py-1.5 rounded-md border border-edge bg-card hover:bg-panel disabled:opacity-50" disabled={exportBusy} onclick={() => exportView('json')}>Export JSON</button>
-        <label class="flex items-center gap-1.5 text-ink-muted"><input type="checkbox" disabled={exportBusy} bind:checked={includeWorkingDirectory} /> Include working directories</label>
-        {#if exportError}<span class="text-neg ml-auto" role="alert">{exportError}</span>{/if}
-      </div>
+        </div>
+      {/if}
     </div>
-  </details>
-
-  <SessionGridControls {isWide} />
+  </div>
+  <div hidden={analyticsOpen} class="sessions-workspace flex-1 flex flex-col min-h-0">
+    {#if detailShown}
+      <div class="compact-summary flex flex-wrap items-center gap-x-5 gap-y-1 px-4 py-2 border-b border-edge" data-testid="compact-summary">
+        <span>{windowLabel}</span><span class="font-mono">{fmtMoney(windowTotals.cost)} <span class="font-sans text-ink-muted">{chartUnit}</span></span>
+        <span class="font-mono">{formatCompactTokens(windowTotals.tokens)} <span class="font-sans text-ink-muted">tokens</span></span>
+        <span data-testid="usage-included-count">Included in usage summary: {analyticsAccountingReady ? windowStats.sessionCount : 'Preparing'}</span>
+        <span data-testid="usage-available-count">Available before filters: {allSessions.length}</span>
+        <span class="text-ink-muted" title={spendCardNoteTitle}>{spendCardNote}</span>
+      </div>
+    {/if}
+    <details hidden={detailShown} class="session-overview shrink-0 max-h-[50%] overflow-y-auto" bind:open={overviewOpen}>
+      <summary class="mx-4 my-2 cursor-pointer text-ink-muted">Overview · {windowLabel}</summary>
+      {@render overviewCards()}
+    </details>
+  <SessionGridControls {isWide} {groupByRepository} {flattenSubagents} hasSelection={selectedSessionId !== null}
+    ongroupchange={(value) => { groupByRepository = value; sessionGridStore.setGroupByRepository(value); }}
+    onflatchange={(value) => { flattenSubagents = value; sessionGridStore.setFlattenSubagents(value); }} />
+  {#if combinedUsage.size > 0}<p class="px-4 pb-1 text-ink-muted">Per-thread values are primary. Σ totals include visible descendants.</p>{/if}
 
   <!-- Main split: table + detail pane -->
   <div class="flex-1 flex min-h-32 border-t border-edge" data-testid="session-grid-region">
-    <div class="flex-1 min-w-0 flex flex-col bg-tablebg {isWide && sessionDetailPaneStore.open ? 'border-r border-edge' : ''}">
+    <div class="flex-1 min-w-0 flex flex-col bg-tablebg {isWide && detailShown ? 'border-r border-edge' : ''}">
       {#if allSessions.length === 0}
         <div class="flex flex-col items-center justify-center h-full gap-3 text-ink-faint px-6 text-center">
           {#if !scanStore.status.complete}
@@ -2270,7 +2449,7 @@
           class="flex-1 grid auto-rows-max content-start gap-x-4 overflow-auto min-h-0 relative"
           style={gridCols}
           bind:this={listViewport}
-          onscroll={(event) => { listScrollTop = event.currentTarget.scrollTop; }}
+          onscroll={(event) => { if (sessionsVisible) listScrollTop = event.currentTarget.scrollTop; }}
         >
           <!-- Column header -->
           <div
@@ -2310,9 +2489,10 @@
                          : isPulsing(session.lastUpdatedAt)
                            ? 'bg-accent-rowbg animate-pulse'
                            : 'hover:bg-(--row-hover)'}"
+                data-session-id={session.storage_id}
                 style:background-image={sessionGridStore.colorByModelProvider ? `linear-gradient(90deg, ${providerVisual.tint}, transparent 24%)` : undefined}
                 data-model-provider={providerVisual.key}
-                onclick={() => selectSession(session.storage_id)}
+                onclick={(event) => { event.currentTarget.focus(); selectSession(session.storage_id); }}
                 oncontextmenu={(event) => openSessionContextMenuFromPointer(event, session)}
                 onkeydown={(event) => handleSessionRowKeydown(event, session)}
                 aria-haspopup="menu"
@@ -2359,16 +2539,24 @@
                       <span class="truncate">{session.model ?? '—'}</span>
                     </span>
                   {:else if column.id === 'input'}
-                    <span class="text-right font-mono text-xs text-ink" title={rowTokens.input_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.input_tokens)}</span>
+                    <span class="text-right font-mono text-xs text-ink" >{rowTokens.input_tokens === 0 ? '0' : formatTokenCategory(rowTokens.input_tokens)}</span>
                   {:else if column.id === 'cached'}
-                    <span class="text-right font-mono text-xs text-ink" title={rowTokens.cached_input_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.cached_input_tokens)}</span>
+                    <span class="text-right font-mono text-xs text-ink" >{rowTokens.cached_input_tokens === 0 ? '0' : formatTokenCategory(rowTokens.cached_input_tokens)}</span>
                   {:else if column.id === 'output'}
-                    <span class="text-right font-mono text-xs text-ink" title={rowTokens.output_tokens === 0 ? 'Unavailable or not applicable' : undefined}>{formatTokenCategory(rowTokens.output_tokens)}</span>
+                    <span class="text-right font-mono text-xs text-ink" >{rowTokens.output_tokens === 0 ? '0' : formatTokenCategory(rowTokens.output_tokens)}</span>
                   {:else if column.id === 'total'}
-                    <span class="text-right font-mono text-xs text-ink">{Number.isFinite(rowTokens.total_tokens) ? fmt.format(rowTokens.total_tokens) : 'unavailable'}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="This session plus its subagent threads (in view)">Σ {Number.isFinite(combined.tokens) ? fmt.format(combined.tokens) : 'unavailable'}</span>{/if}</span>
+                    <span class="text-right font-mono text-xs text-ink">{Number.isFinite(rowTokens.total_tokens) ? fmt.format(rowTokens.total_tokens) : 'unavailable'}{#if combined !== undefined}<span class="block text-[10px] text-ink-faint font-normal cursor-help" title="Including visible descendants"><span class="sr-only">Including visible descendants: </span>Σ {Number.isFinite(combined.tokens) ? fmt.format(combined.tokens) : 'unavailable'}</span>{/if}</span>
                   {:else if column.id === 'cost'}
                     {@const unpricedOnly = costIsUnmeasured(display?.unpricedModels, costOf(session.storage_id))}
-                    <span class="text-right font-mono text-xs text-accent-cost {selected ? 'font-semibold' : ''}">{#if !allUsdAvailable}unavailable{:else if unpricedOnly}<span class="text-ink-faint cursor-help" title="Not measured: every model in this session is unpriced ({display?.unpricedModels.join(', ')}). This is not a zero cost.">—</span>{:else}{fmtAmount(costOf(session.storage_id))}{/if}{#if allUsdAvailable && display && display.unpricedModels.length > 0}<span class="text-amber-500 cursor-help" title="Excluded because no published rate is available: {display.unpricedModels.join(', ')}">&nbsp;◇</span>{:else if allUsdAvailable && display && display.missingModels.length > 0}<span class="text-amber-500 cursor-help" title="Fallback rate used for: {display.missingModels.join(', ')}">&nbsp;⚠</span>{/if}{#if allUsdAvailable && combined !== undefined}<div class="text-[10px] {combined.unpriced ? 'text-amber-500/80' : 'text-ink-faint'} font-normal cursor-help" title={combined.unpriced ? 'At least one thread in this subtree ran an unpriced model, so this is a floor, not a total.' : 'This session plus its subagent threads (in view)'}>Σ {fmtAmount(combined.cost)}{combined.unpriced ? '+' : ''}</div>{/if}</span>
+                    <span class="text-right font-mono text-xs leading-[13px] text-accent-cost {selected ? 'font-semibold' : ''}">
+                      {#if !allUsdAvailable || unpricedOnly}unavailable{:else}{fmtAmount(costOf(session.storage_id))}{/if}
+                      {#if allUsdAvailable && display && (display.unpricedModels.length > 0 || display.missingModels.length > 0)}
+                        <span class="block font-sans text-xs font-normal text-amber-500" title={`Excluded: ${display.unpricedModels.join(', ') || 'none'}; fallback rates: ${display.missingModels.join(', ') || 'none'}`}>
+                          {#if display.unpricedModels.length > 0}{display.unpricedModels.length} excluded{/if}{#if display.unpricedModels.length > 0 && display.missingModels.length > 0} · {/if}{#if display.missingModels.length > 0}{display.missingModels.length} fallback{/if}
+                        </span>
+                      {/if}
+                      {#if allUsdAvailable && combined !== undefined}<span class="block text-[10px] {combined.unpriced ? 'text-amber-500' : 'text-ink-muted'} font-normal cursor-help" title={combined.unpriced ? 'At least one thread in this subtree ran an unpriced model, so this is a floor, not a total.' : 'Including visible descendants'}><span class="sr-only">Including visible descendants: </span>Σ {fmtAmount(combined.cost)}{combined.unpriced ? '+' : ''}</span>{/if}
+                    </span>
                   {/if}
                 {/each}
               </div>
@@ -2394,31 +2582,26 @@
       {/if}
     </div>
 
-    <!-- Persistent detail pane (wide layouts). Collapsible, closed by default:
-         width itself animates (rather than e.g. a translateX slide) so the
-         table actually reclaims the 410px when the pane is shut. The inner
-         410px-wide layer stays a constant size and is only clipped by the
-         outer `overflow-hidden`, so DetailPane's own contents never reflow
-         during the transition — the table beside it is virtualized and
-         height-only, so this stays smooth even with a large session list. -->
     {#if isWide}
-      <div
-        id="session-detail-pane"
-        class="shrink-0 min-h-0 overflow-hidden transition-[width] duration-200 ease-out motion-reduce:transition-none"
-        style:width={sessionDetailPaneStore.open ? '410px' : '0px'}
-        inert={!sessionDetailPaneStore.open}
-      >
-        <div class="w-[410px] h-full">
-          <DetailPane
-            session={selectedSession}
-            detailState={selectedDetailState}
-            onretry={retrySelectedDetails}
-            childCount={selectedSessionId ? (childCounts.get(selectedSessionId) ?? 0) : 0}
-            onclose={() => sessionDetailPaneStore.setOpen(false)}
-          />
+      {#if detailShown}
+        <!-- The WAI-ARIA window splitter pattern makes this separator interactive. -->
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+        <div role="separator" tabindex="0" aria-label="Resize session details" aria-orientation="vertical"
+          aria-valuemin={410} aria-valuemax={maxDetailWidth} aria-valuenow={detailWidth}
+          class="detail-resizer shrink-0 bg-panel hover:bg-accent focus-visible:bg-accent"
+          onpointerdown={(event) => { dragStart = { x: event.clientX, width: detailWidth }; event.currentTarget.setPointerCapture(event.pointerId); }}
+          onpointermove={resizeDetails} onpointerup={() => dragStart = null} onpointercancel={() => dragStart = null}
+          onkeydown={resizeDetailsKey}></div>
+      {/if}
+      <div id="session-detail-pane" class="shrink-0 min-h-0 overflow-hidden" style:width={detailShown ? `${detailWidth}px` : '0px'} inert={!detailShown}>
+        <div class="h-full flex flex-col" style:width={`${detailWidth}px`}>
+          {#if selectedSessionId && !filteredIds.includes(selectedSessionId)}<p class="px-4 py-2 text-ink-muted border-b border-edge">Outside current filter</p>{/if}
+          <DetailPane session={selectedSession} detailState={selectedDetailState} onretry={retrySelectedDetails}
+            childCount={selectedSessionId ? (childCounts.get(selectedSessionId) ?? 0) : 0} onclose={closeDetails} />
         </div>
       </div>
     {/if}
+  </div>
   </div>
 </div>
 
@@ -2439,36 +2622,32 @@
 {/if}
 
 <style>
-  .session-analytics[open] {
-    flex: 1 1 0;
-  }
-
-  @media (max-height: 700px) {
-    .sessions-view.analytics-open .session-overview {
-      display: none;
-    }
+  .sessions-view [hidden] { display: none !important; }
+  .workspace-tab { padding: 0.45rem 0.75rem; border-radius: 6px; color: var(--muted); }
+  .workspace-tab:hover { background: var(--row-hover); color: var(--text); }
+  .workspace-tab[aria-pressed="true"], .workspace-tab[aria-current="page"] { color: var(--text); background: var(--accent-row-bg); font-weight: 600; }
+  .workspace-index { width: 180px; }
+  .overview-grid { grid-template-columns: minmax(0, 1.8fr) minmax(0, 1fr) minmax(0, 0.9fr); }
+  .analytics-content .overview-grid { padding: 0; }
+  .detail-resizer { width: 8px; cursor: col-resize; touch-action: none; }
+  .session-dialog { position: fixed; inset: 0; margin: 0; width: 100%; max-width: none; height: 100%; max-height: none; padding: 0; border: 0; color: var(--text); background: var(--bg); }
+  .session-dialog[open] { display: flex; flex-direction: column; }
+  .session-dialog::backdrop { background: rgb(0 0 0 / 0.5); }
+  @media (max-width: 1099px) {
+    .overview-grid { grid-template-columns: 1fr; }
+    .analytics-workspace { flex-direction: column; }
+    .workspace-index { width: auto; display: flex; overflow-x: auto; padding: 0.5rem; border-right: 0; border-bottom: 1px solid var(--border); }
+    .workspace-index .workspace-tab { width: auto; white-space: nowrap; }
   }
 </style>
 
-<!-- Narrow layouts: the pane collapses back to an overlay drawer -->
 {#if executionBoardInitialId}<ExecutionBoard sessions={Array.from(sessionsStore.map.values())} initialId={executionBoardInitialId} onclose={() => { executionBoardInitialId = null; }} />{/if}
-{#if !isWide && selectedSessionId !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="fixed inset-0 bg-black/50 z-40" onclick={deselect} aria-hidden="true"></div>
-  <div
-    class="fixed top-0 right-0 h-full w-[410px] max-w-full border-l border-edge shadow-2xl z-50"
-    role="dialog"
-    aria-modal="true"
-    aria-label="Session details"
-  >
-    <DetailPane
-      session={selectedSession}
-      detailState={selectedDetailState}
-      onretry={retrySelectedDetails}
-      childCount={childCounts.get(selectedSessionId) ?? 0}
-      onclose={deselect}
-    />
-  </div>
+{#if !isWide}
+  <dialog bind:this={detailDialog} class="session-dialog" aria-label="Session details" oncancel={(event) => { event.preventDefault(); closeDetails(); }}>
+    {#if selectedSessionId && !filteredIds.includes(selectedSessionId)}<p class="px-4 py-2 text-ink-muted border-b border-edge">Outside current filter</p>{/if}
+    <DetailPane session={selectedSession} detailState={selectedDetailState} onretry={retrySelectedDetails}
+      childCount={selectedSessionId ? (childCounts.get(selectedSessionId) ?? 0) : 0} onclose={closeDetails} />
+  </dialog>
 {/if}
 
 {/if}

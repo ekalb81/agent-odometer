@@ -33,16 +33,13 @@
     const history = historyStore.status;
     // Event descriptions remain inspectable; numeric correlations require a
     // fresh proof whenever their data, window, history or pricing changes.
+    if (!active) { loading = false; return; }
     correlations = [];
     error = null;
     const current = () => active && generation === requestGeneration
       && source === events && mutation === sessionsStore.mutationLog.generation
       && boundary === boundaryRefresh && rateCard === $rates
       && history === historyStore.status;
-    if (!active) {
-      loading = false;
-      return;
-    }
     loading = true;
     let boundaryTimer: ReturnType<typeof setTimeout> | null = null;
     const requestTimer = setTimeout(() => {

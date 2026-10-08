@@ -96,6 +96,23 @@ beforeEach(() => {
 });
 
 describe('ToolImpact', () => {
+  it('pauses hidden queries and restores the selected target when shown again', async () => {
+    listToolImpactTargets.mockResolvedValue([target('grep', 'grep'), target('read', 'read')]);
+    compareToolImpact.mockImplementation((_kind, key) => Promise.resolve(result(key, 2_000)));
+    const view = render(ToolImpact, BASE_PROPS);
+    const picker = await screen.findByRole('combobox', { name: 'Tool impact target' });
+    await fireEvent.change(picker, { target: { value: 'tool:read' } });
+    await waitFor(() => expect(compareToolImpact).toHaveBeenLastCalledWith('tool', 'read', BASE_PROPS.from, BASE_PROPS.to, BASE_PROPS.sessionIds));
+    await view.rerender({ ...BASE_PROPS, active: false });
+    const calls = listToolImpactTargets.mock.calls.length;
+    await view.rerender({ ...BASE_PROPS, active: false, to: '2026-08-08T00:00:00.000Z' });
+    expect(listToolImpactTargets).toHaveBeenCalledTimes(calls);
+    expect(picker).toHaveValue('tool:read');
+    await view.rerender({ ...BASE_PROPS, active: true });
+    await waitFor(() => expect(listToolImpactTargets).toHaveBeenCalledTimes(calls));
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Tool impact target' })).toHaveValue('tool:read'));
+  });
+
   it.each(['csv', 'json'] as const)('exports %s dimensions with the full scope and exact ledger bounds, including context tokens', async (format) => {
     listToolImpactTargets.mockResolvedValue([]);
     publishToolDimensionExport.mockResolvedValue(true);

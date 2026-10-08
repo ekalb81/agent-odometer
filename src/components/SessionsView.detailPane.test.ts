@@ -130,6 +130,7 @@ vi.mock('../lib/ipc', async (importOriginal) => {
 });
 
 function stubLayoutApis(): void {
+  vi.stubGlobal('innerWidth', 1440);
   // jsdom has neither. `isWide` and the virtual list's viewport height both
   // read from these once at setup and then follow their listeners, so a
   // fixed "always wide, fixed height" stub is enough for this file's needs.
@@ -146,6 +147,12 @@ function stubLayoutApis(): void {
   });
 }
 
+async function exportProjection(format: 'CSV' | 'JSON') {
+  const disclosure = screen.getByText('Export projection').closest('details')!;
+  if (!disclosure.open) await fireEvent.click(within(disclosure).getByText('Export projection'));
+  await fireEvent.click(within(disclosure).getByRole('button', { name: `Export ${format}` }));
+}
+
 describe('SessionsView wide-layout detail pane', () => {
   beforeEach(async () => {
     localStorage.clear();
@@ -154,6 +161,7 @@ describe('SessionsView wide-layout detail pane', () => {
     await projectStore.refresh();
     getSessionDetails.mockClear();
     sessionDetailPaneStore.setOpen(false);
+    sessionDetailPaneStore.setWidth(560);
     sessionsStore.replaceAll([
       summary('codex:thread:alpha', 'Fix login bug'),
       summary('codex:thread:beta', 'Refactor exporter'),
@@ -218,7 +226,7 @@ describe('SessionsView wide-layout detail pane', () => {
     expect(screen.getByRole('button', { name: 'Select session Parent task' })).toBeInTheDocument();
 
     // Ordinary lineage collapse still applies when project grouping is off.
-    sessionGridStore.setGroupByRepository(false);
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Group by repository' }));
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Select session Child task' })).not.toBeInTheDocument());
   });
 
@@ -246,7 +254,7 @@ describe('SessionsView wide-layout detail pane', () => {
     await waitFor(() => expect(getSessionDetails).toHaveBeenCalledWith('codex:thread:alpha'));
     expect(sessionDetailPaneStore.open).toBe(true);
     const pane = document.getElementById('session-detail-pane') as HTMLElement;
-    expect(pane).toHaveStyle({ width: '410px' });
+    expect(pane).toHaveStyle({ width: '560px' });
     expect(pane.inert).toBe(false);
     expect(await screen.findByRole('button', { name: 'Hide details' })).toHaveAttribute('aria-expanded', 'true');
   });
@@ -395,8 +403,80 @@ describe('SessionsView wide-layout detail pane', () => {
 
     // Reopened: same session reappears without an extra fetch.
     expect(sessionDetailPaneStore.open).toBe(true);
-    expect(document.getElementById('session-detail-pane')).toHaveStyle({ width: '410px' });
+    expect(document.getElementById('session-detail-pane')).toHaveStyle({ width: '560px' });
     expect(getSessionDetails).toHaveBeenCalledTimes(1);
+  });
+
+  it('resizes the investigation by keyboard within persisted width bounds', async () => {
+    renderView();
+    await fireEvent.click(await screen.findByRole('button', { name: 'Select session Fix login bug' }));
+    const resize = screen.getByRole('separator', { name: 'Resize session details' });
+    await fireEvent.keyDown(resize, { key: 'ArrowLeft' });
+    expect(resize).toHaveAttribute('aria-valuenow', '580');
+    await fireEvent.keyDown(resize, { key: 'ArrowRight' });
+    expect(resize).toHaveAttribute('aria-valuenow', '560');
+    await fireEvent.keyDown(resize, { key: 'Home' });
+    expect(resize).toHaveAttribute('aria-valuenow', '410');
+    await fireEvent.keyDown(resize, { key: 'End' });
+    expect(resize).toHaveAttribute('aria-valuenow', '800');
+    expect(localStorage.getItem('sessionDetailPaneWidth.v1')).toBe('800');
+  });
+
+  it('keeps projection exports and their privacy choice accessible in both workspace modes', async () => {
+    renderView();
+    const disclosure = screen.getByText('Export projection').closest('details')!;
+    await fireEvent.click(within(disclosure).getByText('Export projection'));
+    for (const mode of ['Sessions', 'Analytics']) {
+      await fireEvent.click(screen.getByRole('button', { name: mode }));
+      expect(within(disclosure).getByRole('button', { name: 'Export CSV' })).toBeVisible();
+      expect(within(disclosure).getByRole('button', { name: 'Export JSON' })).toBeVisible();
+      expect(within(disclosure).getByRole('checkbox', { name: 'Include working directories' })).not.toBeChecked();
+    }
+  });
+
+  it('retains selection, sort, filters and analytics disclosures through mode and provider round trips', async () => {
+    const props = { harness: 'all' as const, active: true, filters: { ...defaultFilters(), search: 'Fix login' }, onfilterschange: vi.fn() };
+    const rendered = render(SessionsView, { props });
+    const selected = await screen.findByRole('button', { name: 'Select session Fix login bug' });
+    expect(screen.queryByRole('button', { name: 'Select session Refactor exporter' })).not.toBeInTheDocument();
+    await fireEvent.click(selected);
+    await waitFor(() => expect(getSessionDetails).toHaveBeenCalledTimes(1));
+    await fireEvent.click(screen.getByRole('button', { name: /^Name/ }));
+    const sortBefore = screen.getByRole('button', { name: /^Name/ }).textContent;
+    await fireEvent.click(screen.getByRole('button', { name: 'Analytics' }));
+    const model = screen.getByText(/^Model comparison/).closest('details')!;
+    await fireEvent.click(within(model).getByText(/^Model comparison/));
+    const content = rendered.container.querySelector<HTMLElement>('.analytics-content')!;
+    content.scrollTop = 120;
+    await rendered.rerender({ ...props, active: false });
+    await rendered.rerender(props);
+    expect(screen.getByRole('button', { name: 'Analytics' })).toHaveAttribute('aria-pressed', 'true');
+    expect(model.open).toBe(true);
+    expect(content.scrollTop).toBe(120);
+    await fireEvent.click(screen.getByRole('button', { name: 'Sessions' }));
+    expect(screen.getByRole('button', { name: /^Name/ }).textContent).toBe(sortBefore);
+    expect(screen.getByRole('button', { name: 'Select session Fix login bug' }).className).toContain('bg-accent-rowbg');
+    expect(screen.queryByRole('button', { name: 'Select session Refactor exporter' })).not.toBeInTheDocument();
+    await waitFor(() => expect(getSessionDetails).toHaveBeenCalledTimes(2));
+    await within(screen.getByLabelText('Session details')).findByText('Fix login bug');
+    expect(props.onfilterschange).not.toHaveBeenCalled();
+  });
+
+  it('keeps each mounted provider grouping and tree mode independent', async () => {
+    sessionsStore.replaceAll([summary('codex:thread:alpha', 'Fix login bug'), { ...summary('claude:thread:beta', 'Refactor exporter'), harness: 'claude_code' }]);
+    const codexProps = { harness: 'codex' as const, active: true, filters: defaultFilters(), onfilterschange: () => {} };
+    const claudeProps = { ...codexProps, harness: 'claude_code' as const, active: false };
+    const codex = render(SessionsView, { props: codexProps });
+    const claude = render(SessionsView, { props: claudeProps });
+    await fireEvent.click(within(codex.container).getByRole('checkbox', { name: 'Group by repository' }));
+    await codex.rerender({ ...codexProps, active: false });
+    await claude.rerender({ ...claudeProps, active: true });
+    expect(within(claude.container).getByRole('checkbox', { name: 'Group by repository' })).not.toBeChecked();
+    await fireEvent.click(within(claude.container).getByRole('checkbox', { name: 'Flat list' }));
+    await claude.rerender(claudeProps);
+    await codex.rerender(codexProps);
+    expect(within(codex.container).getByRole('checkbox', { name: 'Group by repository' })).toBeChecked();
+    expect(within(codex.container).getByRole('checkbox', { name: 'Flat list' })).not.toBeChecked();
   });
 
   it('persists the open state across a remount, the same way sessionGridStore persists column choices', async () => {
@@ -410,7 +490,8 @@ describe('SessionsView wide-layout detail pane', () => {
 
     renderView();
     await screen.findByRole('button', { name: /Select session Fix login bug/ });
-    expect(document.getElementById('session-detail-pane')).toHaveStyle({ width: '410px' });
+    expect(document.getElementById('session-detail-pane')).toHaveStyle({ width: '0px' });
+    expect(screen.getByRole('button', { name: 'Show details' })).toBeDisabled();
   });
 });
 
@@ -527,7 +608,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
         if (phase === 'startup' && update < 3) expect(row).toHaveTextContent('unavailable');
         else {
           expect(row).toHaveTextContent(/(?:321|1,00\d)/);
-          expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+          expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Previous verified usage · refreshing');
         }
       }
       expect(ipcMocks.sessionsInRanges.mock.calls.length).toBeGreaterThanOrEqual(6);
@@ -616,18 +697,40 @@ describe('SessionsView range pricing refresh orchestration', () => {
     table.resolve([{ [ids[0]]: total }]);
     const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
     await waitFor(() => expect(row).toHaveTextContent('901'));
-    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Previous verified usage · refreshing');
     analytics.resolve(analytics.ranges.map(() => ({ [ids[0]]: total })));
     await expectBothBatches(4);
     const latestAnalytics = pending.slice(2).find(request => request.ranges.length > 1)!;
     latestAnalytics.reject(new Error('current analytics proof failed'));
     await waitFor(() => expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Analytics:'));
     expect(row).toHaveTextContent('901');
-    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Previous verified usage · refreshing');
     expect(errors).toHaveBeenCalled();
     view.unmount();
     pending.slice(2).find(request => request.ranges.length === 1)!.resolve([{}]);
   });
+  it.each(['known-zero', 'unpriced-zero'] as const)('keeps chart and purchased-credit zero states honest: %s', async (mode) => {
+    const card = testRateCard();
+    card.api_models = card.models;
+    rates.set(card);
+    const base = summary(ids[0], ids[0]);
+    sessionsStore.replaceAll([base]);
+    const price = { total: 0, by_model: [], missing_models: [], unpriced_models: mode === 'unpriced-zero' ? ['synthetic'] : [] };
+    const total: RangeTotals = { tokens: { ...zeroTokens, total_tokens: 100 }, buckets: [], tool_metrics: base.tool_metrics, tool_metrics_by_model: {}, optimization_findings_count: 0, pricing: { plan: price, api: price } };
+    ipcMocks.sessionsInRanges.mockImplementation((ranges: unknown[]) => Promise.resolve(ranges.map(() => ({ [ids[0]]: total }))));
+    mountRangeView();
+    await waitFor(() => expect(screen.getByText(/^Purchased-credit estimate/).parentElement).toHaveTextContent(mode === 'unpriced-zero' ? 'Unavailable' : '0.00'));
+    const data = screen.getByText('Chart data · exact bucket intervals').closest('details')!;
+    await fireEvent.click(within(data).getByText('Chart data · exact bucket intervals'));
+    await waitFor(() => expect(data.querySelectorAll('tbody tr').length).toBeGreaterThan(1));
+    const rows = data.querySelectorAll('tbody tr');
+    expect(rows.length).toBeGreaterThan(1);
+    for (const row of rows) expect(row.querySelectorAll('td')[2]).toHaveTextContent(mode === 'unpriced-zero' ? 'unavailable' : '$0.00');
+    expect(screen.getByText(/^Max /)).toHaveTextContent(mode === 'unpriced-zero' ? 'Max unavailable' : 'Max $0.00');
+    const plot = data.parentElement!.querySelector('svg')!;
+    expect(plot.querySelector('polyline') !== null).toBe(mode === 'known-zero');
+  });
+
   it.each(['unsupported', 'partial', 'fallback', 'purchased-primary', 'both-unsupported'] as const)('qualifies purchased estimates independently from API availability: %s', async (mode) => {
     const card = testRateCard();
     if (mode !== 'purchased-primary') card.api_models = card.models;
@@ -651,7 +754,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     });
     if (mode === 'purchased-primary') expect(screen.getAllByText('Unavailable').length).toBeGreaterThanOrEqual(2);
     else {
-      await fireEvent.click(screen.getByText(/^Analytics & exports/));
+      await fireEvent.click(screen.getByRole('button', { name: 'Analytics' }));
       expect(screen.getByText('Codex purchased-credit estimate').parentElement).toHaveTextContent(unavailable ? 'Unavailable' : '20.00');
       expect(screen.getByText('Codex purchased-credit estimate').parentElement).toHaveTextContent(mode === 'fallback' ? '1 fallback rate used' : '1 unpriced model excluded');
       expect(screen.getByText('Codex API base USD').parentElement).toHaveTextContent(mode === 'both-unsupported' ? 'Unavailable' : '$17.00');
@@ -682,7 +785,11 @@ describe('SessionsView range pricing refresh orchestration', () => {
     const mutation = sessionsStore.mutationLog.generation;
     value = 456;
     if (source === 'history') historyStore.set({ ...historyStore.status, status: 'ready' });
-    else await fireEvent.click(screen.getByRole('button', { name: 'Retry categories', hidden: true }));
+    else {
+      await fireEvent.click(screen.getByRole('button', { name: 'Analytics' }));
+      await fireEvent.click(screen.getByText(/^Task categories/));
+      await fireEvent.click(screen.getByRole('button', { name: 'Retry categories' }));
+    }
     const calls = await expectBothBatches(4);
     expect(calls.slice(-2).every(([, fetchedIds]) => fetchedIds.join() === ids.join())).toBe(true);
     expect(sessionsStore.mutationLog.generation).toBe(mutation);
@@ -697,8 +804,9 @@ describe('SessionsView range pricing refresh orchestration', () => {
       pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null } };
     ipcMocks.sessionsInRanges.mockImplementation((bounds: unknown[], fetchIds: string[] = []) => Promise.resolve(bounds.map(() => fetchIds.includes(ids[0]) ? { [ids[0]]: total } : {})));
     render(SessionsView, { props: { harness: 'codex', active: true, filters: { ...defaultFilters(), dateTo: choice === 'to-only' ? '2026-08-02T00:00' : '' }, onfilterschange: () => {} } });
+    await userEvent.click(screen.getByRole('button', { name: 'Analytics' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Tools & context' }));
     await waitFor(() => expect(screen.queryByText('Tool, MCP, shell & context attribution', { exact: false })).toBeTruthy());
-    await userEvent.click(screen.getByText(/Analytics & exports/));
     const attribution = screen.getByText(/Tool, MCP, shell & context attribution/).closest('details')!;
     await userEvent.click(within(attribution).getByText(/Tool, MCP, shell & context attribution/));
     await fireEvent.click(within(attribution).getByRole('button', { name: 'Export CSV' }));
@@ -745,7 +853,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     expect(ipcMocks.sessionsInRanges.mock.calls.every(([ranges]) => ranges.length > 1)).toBe(true);
     ipcMocks.getSessionPricing.mockClear();
     ipcMocks.prepareSessionSummaryExport.mockImplementation(request => Promise.resolve({ request, as_of: '2026-10-04T00:00:00Z', digest: 'synthetic', session_count: 2, content: JSON.stringify([{ codex_credits: 42.5, total_tokens: 777 }, { codex_credits: 42.5, total_tokens: 777 }]) }));
-    await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
+    await exportProjection('JSON');
     await waitFor(() => expect(ipcMocks.publishSessionSummaryExport).toHaveBeenCalledTimes(1));
     expect(ipcMocks.getSessionPricing).not.toHaveBeenCalled();
     expect(ipcMocks.prepareSessionSummaryExport).toHaveBeenCalledExactlyOnceWith({ session_ids: ids, from: null, to: null, format: 'json', include_working_directory: false });
@@ -762,7 +870,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(1));
     let finish!: (value: typeof summaries) => void;
     ipcMocks.prepareSessionSummaryExport.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
-    await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
+    await exportProjection('JSON');
     await waitFor(() => expect(finish).toBeDefined());
     rates.set(testRateCard());
     finish({ request: {}, as_of: '2026-10-04T00:00:00Z', digest: 'synthetic', content: '[]', session_count: 2 } as unknown as typeof summaries);
@@ -779,7 +887,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(1));
     let finish!: (value: typeof summaries) => void;
     ipcMocks.prepareSessionSummaryExport.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
-    await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
+    await exportProjection('JSON');
     await waitFor(() => expect(finish).toBeDefined());
     sessionsStore.applyMutations([{ ...summary(ids[0], ids[0]), tokens_total: { ...zeroTokens, input_tokens: 100, total_tokens: 100 } }], []);
     finish({ request: {}, as_of: '2026-10-04T00:00:00Z', digest: 'synthetic', content: '[]', session_count: 2 } as unknown as typeof summaries);
@@ -845,7 +953,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     await waitFor(() => expect(ipcMocks.getSessionPricing).toHaveBeenCalledTimes(2));
     const row = screen.getByRole('button', { name: `Select session ${ids[0]}` });
     expect(row).toHaveTextContent('998,877');
-    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Showing previous verified usage; refreshing');
+    expect(screen.getByTestId('accounting-table-status')).toHaveTextContent('Previous verified usage · refreshing');
     expect(ipcMocks.getSessionPricing.mock.calls.at(-1)).toEqual([[ids[0]], ids]);
     finishLatest({ [ids[0]]: { tokens: { ...zeroTokens, total_tokens: 901 }, pricing: { plan: { total: 12, by_model: [], missing_models: [], unpriced_models: [] }, api: null }, categories: {} } });
     await waitFor(() => expect(row).toHaveTextContent('901'));
@@ -855,7 +963,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     ipcMocks.prepareSessionSummaryExport.mockRejectedValue('accounting_identity_unverified');
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
     await screen.findByRole('button', { name: `Select session ${ids[0]}` });
-    await fireEvent.click(screen.getAllByText('Export JSON').find((element) => !(element as HTMLButtonElement).disabled)!);
+    await exportProjection('JSON');
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('accounting_identity_unverified'));
     expect(ipcMocks.writeExport).not.toHaveBeenCalled();
     expect(ipcMocks.publishSessionSummaryExport).not.toHaveBeenCalled();
@@ -864,7 +972,7 @@ describe('SessionsView range pricing refresh orchestration', () => {
     ipcMocks.publishSessionSummaryExport.mockRejectedValueOnce('accounting_identity_ambiguous');
     render(SessionsView, { props: { harness: 'codex', active: true, filters: defaultFilters(), onfilterschange: () => {} } });
     await screen.findByRole('button', { name: `Select session ${ids[0]}` });
-    await fireEvent.click(screen.getAllByText('Export JSON').find(element => !(element as HTMLButtonElement).disabled)!);
+    await exportProjection('JSON');
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('accounting_identity_ambiguous'));
     expect(ipcMocks.writeExport).not.toHaveBeenCalled();
     expect(ipcMocks.publishSessionSummaryExport).toHaveBeenCalledTimes(1);

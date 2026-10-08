@@ -41,6 +41,11 @@ describe('calendar activity', () => {
         { from: '2026-07-29T00:00:00.000Z', to: '2026-07-29T23:59:59.999Z', tokens: 0, tool_calls: 0 },
       ],
     }), 'odometer-activity.svg');
+    const queryCalls = mocks.query.mock.calls.length;
+    await view.rerender({ ...props, active: false });
+    await view.rerender({ ...props, active: true });
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(mocks.query).toHaveBeenCalledTimes(queryCalls);
     await view.rerender({ ...props, sessionIds: ['claude:other'] });
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
     setHistory('unavailable', false);
