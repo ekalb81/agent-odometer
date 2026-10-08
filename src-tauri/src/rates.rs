@@ -1541,6 +1541,105 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    #[test]
+    fn v13_upgrade_adds_haiku_and_sol_fast_rules_without_losing_custom_rates() {
+        let bundled = RateCard::load_bundled().unwrap();
+        assert_eq!(bundled.version, 14);
+        let mut saved: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v13.json")).unwrap();
+        saved.models.get_mut("gpt-5.6-sol").unwrap().input = 77.0;
+        saved.api_models.get_mut("gpt-5.6-sol").unwrap().input = 9.0;
+        saved.models.insert("my-model".into(), rate(3.0));
+        saved.pricing_catalog.conditional_modifiers[0]
+            .multipliers
+            .input = 7.0;
+        let custom_modifier = saved.pricing_catalog.conditional_modifiers[0].clone();
+        let merged = merge_older_override(saved, bundled);
+        merged.validate().unwrap();
+        assert_eq!(merged.version, 14);
+        assert_eq!(merged.models["gpt-5.6-sol"].input, 77.0);
+        assert_eq!(merged.api_models["gpt-5.6-sol"].input, 9.0);
+        assert_eq!(merged.models["my-model"], rate(3.0));
+        assert_eq!(
+            merged
+                .pricing_catalog
+                .conditional_modifiers
+                .iter()
+                .find(|modifier| modifier.id == custom_modifier.id),
+            Some(&custom_modifier)
+        );
+        assert_eq!(merged.model_aliases["gpt-5.6"], "gpt-5.6-sol");
+        let haiku = &merged.models["claude-haiku-5-5"];
+        assert_eq!(haiku.input, 0.10);
+        assert_eq!(haiku.cached_input, 0.01);
+        assert_eq!(haiku.cache_creation_input, Some(0.125));
+        assert_eq!(haiku.output, 0.50);
+        assert_eq!(haiku.reasoning, 0.50);
+        assert_eq!(&merged.api_models["claude-haiku-5-5"], haiku);
+        let launch = instant("2026-10-07T00:00:00Z");
+        assert!(merged
+            .pricing_catalog
+            .rate_at(
+                PricingSurface::AnthropicApiUsd,
+                "claude-haiku-5-5",
+                instant("2026-10-06T23:59:59Z"),
+            )
+            .is_none());
+        assert_eq!(
+            &merged
+                .pricing_catalog
+                .rate_at(PricingSurface::AnthropicApiUsd, "claude-haiku-5-5", launch)
+                .unwrap()
+                .rate,
+            haiku
+        );
+        assert!(merged
+            .pricing_catalog
+            .modifiers_for_request(
+                PricingSurface::AnthropicApiUsd,
+                "claude-haiku-5-5",
+                launch,
+                100_000
+            )
+            .is_empty());
+        let modifiers = merged.pricing_catalog.modifiers_for_request(
+            PricingSurface::AnthropicApiUsd,
+            "claude-haiku-5-5",
+            launch,
+            100_001,
+        );
+        assert_eq!(modifiers.len(), 1);
+        assert_eq!(modifiers[0].multipliers.input, 5.0);
+        assert_eq!(modifiers[0].multipliers.output, 5.0);
+        for (surface, multiplier) in [
+            (PricingSurface::CodexPurchasedCredits, 2.0),
+            (PricingSurface::CodexIncludedAllowance, 2.5),
+            (PricingSurface::OpenaiApiUsd, 2.0),
+        ] {
+            assert!(merged
+                .pricing_catalog
+                .modifier_for_tier(
+                    surface,
+                    "gpt-5.6-sol",
+                    instant("2026-10-07T23:59:59Z"),
+                    "fast",
+                )
+                .is_none());
+            let modifier = merged
+                .pricing_catalog
+                .modifier_for_tier(
+                    surface,
+                    "gpt-5.6-sol",
+                    instant("2026-10-08T00:00:00Z"),
+                    "fast",
+                )
+                .unwrap();
+            assert_eq!(modifier.multipliers.input, multiplier);
+            assert_eq!(modifier.multipliers.output, multiplier);
+        }
+        assert!(merged.unpriced_models.contains(&"codex-auto-review".into()));
+    }
+
     fn rate(value: f64) -> ModelRate {
         ModelRate {
             input: value,
@@ -2248,7 +2347,7 @@ mod tests {
         disk.model_aliases.remove("claude-opus-4-5");
         disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
         let merged = merge_older_override(disk, bundled);
-        assert_eq!(merged.version, 13);
+        assert_eq!(merged.version, 14);
         assert_eq!(merged.models["gpt-6-astra"].input, 250.0);
         assert_eq!(merged.api_models["gpt-6-astra"].input, 10.0);
         assert_eq!(merged.models["claude-fable-5-1"].cached_input, 0.25);

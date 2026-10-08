@@ -219,10 +219,25 @@ pub(crate) fn tier_multiplier(
     if matches!(table, RateTable::Plan | RateTable::Api) {
         return match tier {
             None | Some("default" | "standard") => Some(1.0),
-            Some("fast" | "priority")
-                if !fallback_used && matches!(resolved, "gpt-6-astra" | "gpt-5.5" | "gpt-5.4") =>
-            {
-                Some(service_tier_multiplier(resolved, tier, table))
+            Some("fast" | "priority") if !fallback_used => {
+                // The legacy credit reference follows included allowance (as
+                // with Astra). API prices require their own surface's evidence.
+                let surface = match table {
+                    RateTable::Plan => crate::rates::PricingSurface::CodexIncludedAllowance,
+                    _ => crate::rates::PricingSurface::OpenaiApiUsd,
+                };
+                (harness == codex_provider_id().as_str())
+                    .then(|| {
+                        rates
+                            .pricing_catalog
+                            .modifier_for_tier(surface, resolved, at, "fast")
+                    })
+                    .flatten()
+                    .map(|rule| rule.multipliers.input)
+                    .or_else(|| {
+                        matches!(resolved, "gpt-6-astra" | "gpt-5.5" | "gpt-5.4")
+                            .then(|| service_tier_multiplier(resolved, tier, table))
+                    })
             }
             _ => None,
         };

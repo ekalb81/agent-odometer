@@ -1,12 +1,30 @@
 {
-  "version": 13,
+  "version": 14,
   "currency": "credits",
   "unit": "per_1m_tokens",
   "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
   "fetched_at": "2026-10-04",
-  "_refresh_note": "Verified current Standard rows on 2026-10-04 independently from provider credit/API pages. Existing historical rows retain their prior evidence dates. Gemini 3.8 Flash paid text doubles on 2027-01-01: dated scenarios encode both periods; the promotional flat reference becomes unavailable at that UTC boundary until reviewed/reset. Opaque codex-auto-review historical rates are retained but excluded from current estimates because the current model cannot be established from that identifier.",
-  "_note": "Flat rows are current Standard paid-text reference estimates, not historical invoices. New October rows have independent credit/API provider evidence in rate_provenance; historical rows retain earlier dates and are not reverified. Claude cache reads and five-minute writes are disjoint input subsets; reasoning is included in output. Other service tiers, long context, modalities, cache storage and tools require separate evidence and remain estimated/unavailable (issue #248). Gemini 2.5 Pro and 3.1 Pro Preview are deliberately not given flat rows because prompt-size tiers cannot be represented here. Gemini 3.8 Flash doubles on January 1, 2027: the dated catalog encodes the change and the temporary flat reference expires. Daybreak mappings are bounded assumptions from the credit card; API aliases can depend on approved access and change, so they must be reviewed and expire. The opaque historical codex-auto-review id is excluded from current pricing rather than rewritten to the model currently used for auto review. Version-11 defaults are recognized only by equality with the archived bundle; indistinguishable identical user entries follow the default policy, differing values are preserved for review. Earlier unknown bundles retain existing values and dates. Reset replaces the full card after explicit confirmation. No provider fetch is performed.",
+  "_refresh_note": "Narrow 2026-10-08 update: added Claude Haiku 5.5 short-context reference and dated long-context rule, GPT-5.6 Sol Fast surface multipliers, and the documented gpt-5.6 alias. These additions carry their own evidence dates; other rows retain prior evidence and were not reverified. Gemini 3.8 Flash paid text doubles on 2027-01-01: dated scenarios encode both periods; the promotional flat reference becomes unavailable at that UTC boundary until reviewed/reset. Opaque codex-auto-review historical rates remain excluded because its current model identity is unestablished.",
+  "_note": "Flat rows are current Standard paid-text reference estimates, not historical invoices. Haiku 5.5 is a USD reference for up to 100K request input tokens with five-minute cache writes; its dated catalog covers the above-100K multiplier, while one-hour cache TTL charges remain unmodeled. The 2026-10-08 update adds only Haiku 5.5 and documented GPT-5.6 Sol Fast rules and alias; existing rows retain their evidence dates. New October rows have independent credit/API provider evidence in rate_provenance; historical rows retain earlier dates and are not reverified. Claude cache reads and five-minute writes are disjoint input subsets; reasoning is included in output. Other service tiers, long context, modalities, cache storage and tools require separate evidence and remain estimated/unavailable (issue #248). Gemini 2.5 Pro and 3.1 Pro Preview are deliberately not given flat rows because prompt-size tiers cannot be represented here. Gemini 3.8 Flash doubles on January 1, 2027: the dated catalog encodes the change and the temporary flat reference expires. Daybreak mappings are bounded assumptions from the credit card; API aliases can depend on approved access and change, so they must be reviewed and expire. The opaque historical codex-auto-review id is excluded from current pricing rather than rewritten to the model currently used for auto review. Version-11 defaults are recognized only by equality with the archived bundle; indistinguishable identical user entries follow the default policy, differing values are preserved for review. Earlier unknown bundles retain existing values and dates. Reset replaces the full card after explicit confirmation. No provider fetch is performed.",
   "rate_provenance": {
+    "models/claude-haiku-5-5": {
+      "evidence": "Published Haiku 5.5 Standard short-context pricing",
+      "source_url": "https://www.anthropic.com/claude-haiku-5-5",
+      "verified_at": "2026-10-08T00:00:00Z",
+      "note": "USD per million tokens for requests up to 100K input tokens; five-minute cache writes. One-hour cache TTL charges remain unmodeled."
+    },
+    "api_models/claude-haiku-5-5": {
+      "evidence": "Published Haiku 5.5 Standard short-context pricing",
+      "source_url": "https://www.anthropic.com/claude-haiku-5-5",
+      "verified_at": "2026-10-08T00:00:00Z",
+      "note": "USD per million tokens for requests up to 100K input tokens; five-minute cache writes. One-hour cache TTL charges remain unmodeled."
+    },
+    "model_aliases/gpt-5.6": {
+      "evidence": "Published model alias",
+      "source_url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+      "verified_at": "2026-10-08T00:00:00Z",
+      "note": "The documented gpt-5.6 alias resolves to GPT-5.6 Sol."
+    },
     "models/gpt-6-astra": {
       "evidence": "Retained legacy estimate; not reverified in this update",
       "source_url": "https://help.openai.com/en/articles/20001106-codex-rate-card",
@@ -351,6 +369,7 @@
     "codex-auto-review"
   ],
   "model_aliases": {
+    "gpt-5.6": "gpt-5.6-sol",
     "claude-opus-4-5": "claude-opus-4-5-20251101",
     "claude-sonnet-4-5": "claude-sonnet-4-5-20250929"
   },
@@ -382,6 +401,21 @@
       "2026-10-04 bounded harness evidence:50 of170 recent settings/context rows stored priority; one default. Fast and ultrafast were not observed in that sample. Codex protocol883af106 maps Fast to priority."
     ],
     "rate_periods": [
+      {
+        "id": "claude-haiku-5-5/anthropic_api_usd/standard-2026-10-07",
+        "surface": "anthropic_api_usd",
+        "model": "claude-haiku-5-5",
+        "from": "2026-10-07T00:00:00Z",
+        "to": null,
+        "rate": { "input": 0.10, "cached_input": 0.01, "cache_creation_input": 0.125, "output": 0.50, "reasoning": 0.50 },
+        "provenance": {
+          "evidence": "Published Haiku 5.5 launch and Standard short-context pricing",
+          "source_url": "https://www.anthropic.com/claude-haiku-5-5",
+          "verified_at": "2026-10-08T00:00:00Z",
+          "note": "Launch date is documented to day precision; the UTC day boundary is a conservative catalog boundary, not an exact launch instant. Base rates cover requests up to 100K input tokens and five-minute cache writes; one-hour cache TTL charges remain unmodeled."
+        },
+        "label": "Claude Haiku 5.5 Standard short-context paid text"
+      },
       {
         "id": "gpt-6.1-sol/codex_plan_credits/standard-2026-10-04",
         "surface": "codex_plan_credits",
@@ -922,6 +956,70 @@
       }
     ],
     "conditional_modifiers": [
+      {
+        "id": "claude-haiku-5-5/anthropic_api_usd/high-context-over-100k",
+        "surface": "anthropic_api_usd",
+        "model": "claude-haiku-5-5",
+        "from": "2026-10-07T00:00:00Z",
+        "to": null,
+        "condition": { "kind": "request_input_token_threshold", "greater_than": 100000 },
+        "multipliers": { "input": 5.0, "output": 5.0 },
+        "provenance": {
+          "evidence": "Published Haiku 5.5 pricing above 100K input tokens",
+          "source_url": "https://www.anthropic.com/claude-haiku-5-5",
+          "verified_at": "2026-10-08T00:00:00Z",
+          "note": "The source distinguishes up to 100K from over 100K request input tokens. Launch date has day precision; UTC day boundary is conservative. Five-minute cache writes follow the input multiplier; one-hour cache TTL charges remain unmodeled."
+        },
+        "label": "Claude Haiku 5.5 requests exceeding 100K input tokens"
+      },
+      {
+        "id": "gpt-5.6-sol/codex_purchased_credits/tier-fast-2026-10-08",
+        "surface": "codex_purchased_credits",
+        "model": "gpt-5.6-sol",
+        "from": "2026-10-08T00:00:00Z",
+        "to": null,
+        "condition": { "kind": "service_tier", "tier": "fast" },
+        "multipliers": { "input": 2.0, "output": 2.0 },
+        "provenance": {
+          "evidence": "Published GPT-5.6 Sol Fast purchased-credit multiplier",
+          "source_url": "https://developers.openai.com/codex/speed",
+          "verified_at": "2026-10-08T00:00:00Z",
+          "note": "Verification lower bound, not a claimed effective start. Applies to the purchased-credit scenario; priority is the verified Codex Fast spelling."
+        },
+        "label": "GPT-5.6 Sol Fast purchased credits"
+      },
+      {
+        "id": "gpt-5.6-sol/codex_included_allowance/tier-fast-2026-10-08",
+        "surface": "codex_included_allowance",
+        "model": "gpt-5.6-sol",
+        "from": "2026-10-08T00:00:00Z",
+        "to": null,
+        "condition": { "kind": "service_tier", "tier": "fast" },
+        "multipliers": { "input": 2.5, "output": 2.5 },
+        "provenance": {
+          "evidence": "Published GPT-5.6 Sol Fast included-allowance multiplier",
+          "source_url": "https://help.openai.com/en/articles/11481834-chatgpt-rate-card-business-enterpriseedu-credit-based-pricing",
+          "verified_at": "2026-10-08T00:00:00Z",
+          "note": "Verification lower bound, not a claimed effective start. Standard-credit equivalent scenario, not observed allowance allocation."
+        },
+        "label": "GPT-5.6 Sol Fast included allowance"
+      },
+      {
+        "id": "gpt-5.6-sol/openai_api_usd/tier-fast-2026-10-08",
+        "surface": "openai_api_usd",
+        "model": "gpt-5.6-sol",
+        "from": "2026-10-08T00:00:00Z",
+        "to": null,
+        "condition": { "kind": "service_tier", "tier": "fast" },
+        "multipliers": { "input": 2.0, "output": 2.0 },
+        "provenance": {
+          "evidence": "Published GPT-5.6 Sol API Fast multiplier",
+          "source_url": "https://developers.openai.com/api/docs/guides/fast-mode",
+          "verified_at": "2026-10-08T00:00:00Z",
+          "note": "Verification lower bound, not a claimed effective start. Applies only to the API USD scenario."
+        },
+        "label": "GPT-5.6 Sol Fast API"
+      },
       {
         "id": "openai/gpt-5.6-sol/api/high-context-over-272k",
         "surface": "openai_api_usd",
@@ -1711,6 +1809,7 @@
     ]
   },
   "models": {
+    "claude-haiku-5-5": { "input": 0.10, "cached_input": 0.01, "cache_creation_input": 0.125, "output": 0.50, "reasoning": 0.50 },
     "gpt-6.1-sol": {"input": 50, "cached_input": 2.5, "output": 250, "reasoning": 250},
     "gpt-6-sol": {"input": 50, "cached_input": 5, "output": 250, "reasoning": 250},
     "gpt-6-luna": {"input": 2.5, "cached_input": 0.25, "output": 12.5, "reasoning": 12.5},
@@ -1752,6 +1851,7 @@
     "gemini-2.5-flash":  { "input": 0.30, "cached_input": 0.03, "output": 2.50, "reasoning": 2.50 }
   },
   "api_models": {
+    "claude-haiku-5-5": { "input": 0.10, "cached_input": 0.01, "cache_creation_input": 0.125, "output": 0.50, "reasoning": 0.50 },
     "gpt-6.1-sol": {"input": 2, "cached_input": 0.1, "output": 10, "reasoning": 10, "cache_creation_input": 2.5},
     "gpt-6-sol": {"input": 2, "cached_input": 0.2, "output": 10, "reasoning": 10, "cache_creation_input": 2.5},
     "gpt-6-luna": {"input": 0.1, "cached_input": 0.01, "output": 0.5, "reasoning": 0.5, "cache_creation_input": 0.125},
