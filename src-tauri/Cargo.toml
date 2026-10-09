@@ -30,7 +30,7 @@ dashmap        = "6"
 anyhow         = "1"
 tracing        = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-dirs           = "6"
+dirs           = "7"
 walkdir        = "2"
 rayon          = "1"
 regex          = "1.12"  # escaped literal Unicode search; bounded compiled pattern
