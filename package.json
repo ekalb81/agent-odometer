@@ -29,7 +29,7 @@
     "@tauri-apps/plugin-opener": "^2.7.0",
     "@tauri-apps/plugin-process": "^2.4.0",
     "@tauri-apps/plugin-updater": "^2.13.1",
-    "dompurify": "^3.4.16",
+    "dompurify": "^3.4.17",
     "marked": "^18.0.14"
   },
   "devDependencies": {
