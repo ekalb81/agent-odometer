@@ -2,12 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-/**
- * Every manifest that must agree on the release version. The release workflow's
- * preflight compares package.json, Cargo.toml, and tauri.conf.json and refuses
- * to build on a mismatch; the two lockfiles are not checked there but drift
- * silently into the built artifacts if they are left behind.
- */
+/** Every manifest that must agree on the release version. */
 export const VERSIONED_MANIFESTS = [
   'package.json',
   'package-lock.json',
@@ -163,11 +158,12 @@ export function readCurrentVersion(rootDir) {
 /** Read back every manifest so a partial bump can never be reported as done. */
 export function readManifestVersions(rootDir) {
   const read = (relativePath) => fs.readFileSync(path.join(rootDir, relativePath), 'utf8');
-  const cargoToml = /^\s*\[package\][\s\S]*?^\s*version\s*=\s*"([^"]+)"/m.exec(
-    read('src-tauri/Cargo.toml'),
-  );
+  const packageTable = read('src-tauri/Cargo.toml')
+    .split(/^[ \t]*(?=\[)/m)
+    .find((table) => table.startsWith('[package]'));
+  const cargoToml = /^[ \t]*version[ \t]*=[ \t]*"([^"]+)"/m.exec(packageTable ?? '');
   const cargoLock = new RegExp(
-    `^name = "${CRATE_NAME}"\\nversion = "([^"]+)"`,
+    `^name = "${CRATE_NAME}"\\r?\\nversion = "([^"]+)"`,
     'm',
   ).exec(read('src-tauri/Cargo.lock'));
   const lock = JSON.parse(read('package-lock.json'));
@@ -180,6 +176,17 @@ export function readManifestVersions(rootDir) {
     'src-tauri/Cargo.lock': cargoLock?.[1],
     'src-tauri/tauri.conf.json': JSON.parse(read('src-tauri/tauri.conf.json')).version,
   };
+}
+
+export function verifyManifestVersions(rootDir, version = readCurrentVersion(rootDir)) {
+  parseVersion(version);
+  const observed = readManifestVersions(rootDir);
+  const mismatched = Object.entries(observed).filter(([, value]) => value !== version);
+  if (mismatched.length > 0) {
+    const detail = mismatched.map(([name, value]) => `${name}=${value ?? '<unreadable>'}`).join(', ');
+    throw new Error(`Expected version ${version} in every release manifest. Found ${detail}`);
+  }
+  return version;
 }
 
 export function bumpVersion(rootDir, spec) {
@@ -204,13 +211,7 @@ export function bumpVersion(rootDir, spec) {
     fs.writeFileSync(filePath, contents);
   }
 
-  const observed = readManifestVersions(rootDir);
-  const mismatched = Object.entries(observed).filter(([, value]) => value !== version);
-  if (mismatched.length > 0) {
-    const detail = mismatched.map(([name, value]) => `${name}=${value ?? '<unreadable>'}`).join(' ');
-    throw new Error(`Bump left manifests out of sync at ${version}: ${detail}`);
-  }
-
+  verifyManifestVersions(rootDir, version);
   return { current, version };
 }
 
@@ -218,7 +219,7 @@ function main(argv) {
   const spec = argv[0];
   if (!spec) {
     process.stderr.write(
-      'Usage: npm run version:bump -- <major|minor|patch|X.Y.Z>\n' +
+      'Usage: npm run version:bump -- <major|minor|patch|X.Y.Z|--check>\n' +
         '\nBumps every release manifest and verifies they agree:\n' +
         VERSIONED_MANIFESTS.map((name) => `  - ${name}\n`).join(''),
     );
@@ -227,6 +228,11 @@ function main(argv) {
   }
 
   const rootDir = process.cwd();
+  if (spec === '--check') {
+    process.stdout.write(`${verifyManifestVersions(rootDir)}\n`);
+    return;
+  }
+
   const { current, version } = bumpVersion(rootDir, spec);
   process.stdout.write(
     `Bumped ${current} -> ${version} in:\n` +
