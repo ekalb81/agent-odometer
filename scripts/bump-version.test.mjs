@@ -12,6 +12,7 @@ import {
   bumpVersion,
   readManifestVersions,
   resolveNextVersion,
+  verifyManifestVersions,
 } from './bump-version.mjs';
 
 const CARGO_TOML = `[package]
@@ -127,7 +128,31 @@ test('leaves every manifest untouched when the requested version is rejected', (
   });
 });
 
-test('reads the real repository manifests as a single agreed version', () => {
-  const versions = Object.values(readManifestVersions(process.cwd()));
-  assert.equal(new Set(versions).size, 1, `manifests disagree: ${JSON.stringify(versions)}`);
+test('rejects drift in either lockfile before a release build', () => {
+  withRepository((directory) => {
+    assert.equal(verifyManifestVersions(directory), '0.8.2');
+    const npmLock = path.join(directory, 'package-lock.json');
+    const original = fs.readFileSync(npmLock, 'utf8');
+    const lock = JSON.parse(original);
+    lock.packages[''].version = '0.8.1';
+    fs.writeFileSync(npmLock, JSON.stringify(lock));
+    assert.throws(() => verifyManifestVersions(directory), /package-lock\.json \(root package\)=0\.8\.1/);
+
+    fs.writeFileSync(npmLock, original);
+    fs.writeFileSync(path.join(directory, 'src-tauri/Cargo.lock'), bumpCargoLock(CARGO_LOCK, '0.8.1'));
+    assert.throws(() => verifyManifestVersions(directory), /Cargo\.lock=0\.8\.1/);
+  });
+});
+
+test('requires the version in the Cargo package table', () => {
+  withRepository((directory) => {
+    const otherTable = CARGO_TOML.replace('version = "0.8.2"\n', '')
+      .replace('not-the-package-version', '0.8.2');
+    fs.writeFileSync(path.join(directory, 'src-tauri/Cargo.toml'), otherTable);
+    assert.throws(() => verifyManifestVersions(directory), /Cargo\.toml=<unreadable>/);
+  });
+});
+
+test('verifies the repository manifests', () => {
+  assert.doesNotThrow(() => verifyManifestVersions(process.cwd()));
 });

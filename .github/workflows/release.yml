@@ -45,28 +45,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          package_version="$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync("package.json", "utf8")).version)')"
-          tauri_version="$(node -e 'const fs = require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")).version)')"
-          cargo_version="$(awk -F '=' '
-            /^\[package\][[:space:]]*$/ { in_package = 1; next }
-            /^\[/ { if (in_package) exit }
-            in_package && $1 ~ /^[[:space:]]*version[[:space:]]*$/ {
-              value = $2
-              gsub(/[[:space:]"]/, "", value)
-              print value
-              exit
-            }
-          ' src-tauri/Cargo.toml)"
-
-          if [[ -z "$package_version" || -z "$cargo_version" || -z "$tauri_version" ]]; then
-            echo "::error::Could not read all release versions"
-            exit 1
-          fi
-
-          if [[ "$package_version" != "$cargo_version" || "$package_version" != "$tauri_version" ]]; then
-            echo "::error::Version mismatch: package.json=$package_version Cargo.toml=$cargo_version tauri.conf.json=$tauri_version"
-            exit 1
-          fi
+          package_version="$(node scripts/bump-version.mjs --check)"
 
           if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
             expected_tag="v${package_version}"

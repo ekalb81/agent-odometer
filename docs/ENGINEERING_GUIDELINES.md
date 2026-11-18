@@ -252,9 +252,7 @@ received a superficial visual inspection.
   `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
   `src-tauri/tauri.conf.json`. Use `npm run version:bump -- <major|minor|patch|X.Y.Z>`
   rather than editing them by hand; it rewrites all five and fails if they end
-  up disagreeing. The release preflight only compares the first, third, and
-  fifth, so a partial hand-edit can pass review and still ship a mismatched
-  build — this is what burned the `v0.8.3` tag.
+  up disagreeing. Release preflight checks all five again before packaging.
 - Require successful exact-SHA CI before creating a signed tag. Use the
   mutable draft release for artifact assembly and validation; publish only
   after all platform artifacts, signatures, hashes, and `latest.json` are
