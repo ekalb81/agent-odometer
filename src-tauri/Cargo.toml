@@ -41,7 +41,7 @@ tauri-plugin-dialog = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 # Same crypto provider as the updater; status may run before its first check.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-gix = { version = "0.87", default-features = false, features = ["sha1"] }
+gix = { version = "0.88", default-features = false, features = ["sha1"] }
 rusqlite = { version = "0.40", default-features = false, features = ["bundled", "hooks"] }
 tauri-plugin-opener = "2"
 tempfile = "3"
