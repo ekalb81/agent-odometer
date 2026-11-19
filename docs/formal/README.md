@@ -1,6 +1,6 @@
 # Odometer formal model
 
-This TLA+ specification models the behavior of Odometer v0.8.30 at its accounting, concurrency, persistence, and trust boundaries. Each TLC configuration has a finite set of inputs so the checker can explore every reachable state within those bounds. [Architecture](../ARCHITECTURE.md)
+This TLA+ specification models the behavior of Odometer v0.8.31 at its accounting, concurrency, persistence, and trust boundaries. Each TLC configuration has a finite set of inputs so the checker can explore every reachable state within those bounds. [Architecture](../ARCHITECTURE.md)
 
 ## Run the checks
 
@@ -28,6 +28,7 @@ With no configuration names, the runner checks every `.cfg` alongside the specif
 | [Hydration](Hydration.tla) | Startup snapshot delivery, buffered events, and terminal scan status | [Desktop startup](../../src/App.svelte) |
 | [Ledger](Ledger.tla) | Durable facts, transactional changes, hourly rollups and partial-hour edges, and genuine unavailability | [SQLite history](../../src-tauri/src/history_store.rs), [IPC and frontend state](../ARCHITECTURE.md#ipc-and-frontend-state) |
 | [DurableWrites](DurableWrites.tla) | Rollups reflect inserted facts, an upgrade repairs stale totals, and a provisional session can keep its key only with a compatible prefix | [SQLite history](../../src-tauri/src/history_store.rs) |
+| [RetainedRepair](RetainedRepair.tla) | Repair from retained evidence with a missing transcript, covering snapshots, turns, rollups, and legacy keys | [SQLite history](../../src-tauri/src/history_store.rs) |
 | [Pricing](Pricing.tla) | Price evidence, token subsets, effective rates, billing surfaces, and card refresh | [Pricing catalog](../ARCHITECTURE.md#pricing-catalog-contract) |
 | [Access](Access.tla) | Revision-bound transcript pages, record anchors, and retained search targets | [Persistence and privacy](../ARCHITECTURE.md#persistence-and-privacy) |
 | [Private](Private.tla) | Revision-bound organization edits, reviewed curation and freezes, and deletion cascades | [Curated datasets](../CURATED_DATASETS.md), [private organization](../ARCHITECTURE.md#private-organization) |
@@ -48,6 +49,7 @@ Hydration and Odometer share the [startup gate](StartupGate.tla). They distingui
 | --- | --- |
 | Pre-model, last-only, or replayed Codex usage changes date-scoped totals | [Codex parser integration tests](../../src-tauri/tests/parser_tests.rs) |
 | Duplicate inserts inflate hourly totals or old rollups survive an upgrade | [SQLite store tests](../../src-tauri/src/history_store.rs) |
+| Upgrading with a missing transcript leaves a provably repairable session flagged and blocks the aggregate | [SQLite migration tests](../../src-tauri/src/history_store.rs) |
 | A third first-turn fingerprint collides, or a file replacement reuses the old last-only prefix | [SQLite identity tests](../../src-tauri/src/history_store.rs) |
 | A warm cache hides newer parser output | [Scanner upgrade test](../../src-tauri/tests/scan_cache_tests.rs) |
 | A failed session list lets empty totals reach the UI or tray | [App startup tests](../../src/App.pricingRefresh.test.ts) |
@@ -67,4 +69,4 @@ For important guarantees, check a healthy trace that reaches the consumer, an ad
 
 ## Verification record
 
-TLC 2.19 on Java 21 completed all 16 configurations. The runs explored 465,623 distinct states across their separate state spaces. Ledger was the largest configuration at 410,121 distinct states. TLC detected all 25 injected faults and found all 11 required reachable states.
+TLC 2.19 on Java 21 completed all 17 configurations. The runs explored 465,634 distinct states across their separate state spaces. Ledger was the largest configuration at 410,121 distinct states. TLC detected all 29 injected faults and found all 12 required reachable states.
