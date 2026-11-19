@@ -11356,7 +11356,13 @@ mod tests {
         let path = directory.path().join("history.sqlite3");
         let generation = store.begin_scan().unwrap();
         let mut keys = Vec::new();
-        for id in ["verified", "bad-fact", "bad-owner"] {
+        for id in [
+            "verified",
+            "bad-fact",
+            "bad-owner",
+            "mixed-tool",
+            "mixed-finding",
+        ] {
             let mut old = transcript(id, false);
             old.tokens_history = legacy_token_events(&old).map(Cow::into_owned).collect();
             let mut repeated = old.tokens_history[1].delta.clone();
@@ -11372,7 +11378,7 @@ mod tests {
             keys.push(store.observe(file, &old, generation).unwrap().key);
             store.mark_path_missing(file).unwrap();
         }
-        let [good, inconsistent, bad_owner] = keys.as_slice() else {
+        let [good, inconsistent, bad_owner, mixed_tool, mixed_finding] = keys.as_slice() else {
             unreachable!()
         };
         let fact_keys = |store: &HistoryStore, key: &str| -> Vec<String> {
@@ -11389,6 +11395,10 @@ mod tests {
             let c = store.connection().unwrap();
             c.execute("UPDATE durable_token_events SET cumulative_total_tokens=cumulative_total_tokens+1 WHERE session_key=?1 AND event_index=1",[inconsistent]).unwrap();
             c.execute("UPDATE source_artifacts SET first_event_fingerprint='wrong-owner' WHERE session_key=?1",[bad_owner]).unwrap();
+            c.execute("INSERT INTO durable_tool_events(session_key,timestamp_ms,kind,outcome,output_bytes) VALUES(?1,0,'read','success',0)",[mixed_tool]).unwrap();
+            c.execute("INSERT INTO durable_finding_events(session_key,timestamp_ms,rule_id,severity,avoidable_calls) VALUES(?1,0,'synthetic','low',1)",[mixed_finding]).unwrap();
+            // Historical serializers could omit zero-length telemetry arrays.
+            c.execute("UPDATE session_snapshots SET session_json=CAST(json_remove(CAST(session_json AS TEXT),'$.tool_observations','$.optimization_findings') AS BLOB) WHERE session_key=?1",[good]).unwrap();
             c.execute_batch("UPDATE durable_sessions SET ledger_dirty=1; UPDATE session_snapshots SET format_version=1;
                 UPDATE history_meta SET value='17' WHERE key='schema_version'; PRAGMA user_version=17;").unwrap();
         }
@@ -11397,7 +11407,12 @@ mod tests {
         let dirty: BTreeSet<_> = store.dirty_session_keys().unwrap().into_iter().collect();
         assert_eq!(
             dirty,
-            BTreeSet::from([inconsistent.clone(), bad_owner.clone()])
+            BTreeSet::from([
+                inconsistent.clone(),
+                bad_owner.clone(),
+                mixed_tool.clone(),
+                mixed_finding.clone()
+            ])
         );
         assert_eq!(fact_keys(&store, good), identities_before);
         let expected = transcript("verified", false);
@@ -11423,7 +11438,7 @@ mod tests {
                 .unwrap_or(0),
             0
         );
-        for bad in [inconsistent, bad_owner] {
+        for bad in [inconsistent, bad_owner, mixed_tool, mixed_finding] {
             let stored = load_one(&store.connection().unwrap(), bad).unwrap();
             assert_eq!(stored.session.tokens_history[1].delta.total_tokens, 100);
         }
@@ -11436,7 +11451,7 @@ mod tests {
             .range_totals_multi(std::slice::from_ref(good), &[(None, None)])
             .unwrap();
         assert_eq!(ranges[0][good].tokens, appended.tokens_total);
-        assert_eq!(store.session_keys().unwrap().len(), 3);
+        assert_eq!(store.session_keys().unwrap().len(), 5);
     }
 
     #[test]

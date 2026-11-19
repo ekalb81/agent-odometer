@@ -15,7 +15,8 @@ Old == <<First,Repeat,Second>>
 Repaired == <<First,Zero,Second>>
 LegacyKeys == <<"legacy-0","legacy-1","legacy-2">>
 Unavailable == -1
-Cases == {"verified","gap","wrong-subset","turn-mismatch","snapshot-mismatch"}
+ProjectionMismatch == {"turn-mismatch","snapshot-mismatch","non-token-mismatch"}
+Cases == {"verified","gap","wrong-subset"} \cup ProjectionMismatch
 Base(scenario) == IF scenario = "gap" THEN <<First,Repeat,WrongAdvance>> ELSE Old
 Reported(scenario) == IF scenario = "wrong-subset" THEN WrongCache ELSE Expected
 Prior(i) == IF i = 1 THEN 0 ELSE Cumulative[i-1]
@@ -43,7 +44,7 @@ Migrate ==
   /\ LET fresh == Normalize(ledger.facts)
          agrees == Total(fresh) = Reported(scenario)
          proved == StepsMatch(ledger.facts) /\ agrees
-                   /\ scenario \notin {"turn-mismatch","snapshot-mismatch"}
+                   /\ scenario \notin ProjectionMismatch
      IN ledger' = IF proved
           THEN [ledger EXCEPT !.schema = 18, !.dirty = FALSE, !.facts = fresh,
                     !.snapshot = fresh, !.turns = Turns(fresh), !.hours = Hours(fresh)]

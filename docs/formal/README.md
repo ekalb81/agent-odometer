@@ -69,4 +69,4 @@ For important guarantees, check a healthy trace that reaches the consumer, an ad
 
 ## Verification record
 
-TLC 2.19 on Java 21 completed all 17 configurations. The runs explored 465,634 distinct states across their separate state spaces. Ledger was the largest configuration at 410,121 distinct states. TLC detected all 29 injected faults and found all 12 required reachable states.
+TLC 2.19 on Java 21 completed all 17 configurations. The runs explored 465,636 distinct states across their separate state spaces. Ledger was the largest configuration at 410,121 distinct states. TLC detected all 29 injected faults and found all 12 required reachable states.

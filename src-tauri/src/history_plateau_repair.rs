@@ -34,6 +34,24 @@ pub(super) fn repair(tx: &Transaction<'_>) -> Result<()> {
                      AND json_type(CAST(s.session_json AS TEXT),'$.legacy_token_deltas') IS NULL
                     ELSE 0 END;
 
+         -- A metadata overlay can also mark the ledger dirty when it carries
+         -- additional tool observations or findings. This repair handles tokens only.
+         WITH findings AS (
+           SELECT f.session_key,COUNT(*) AS n FROM durable_finding_events f
+           JOIN plateau_sessions k USING(session_key) GROUP BY f.session_key
+         ), mismatches AS (
+           SELECT k.session_key FROM plateau_sessions k
+           JOIN durable_sessions d USING(session_key)
+           JOIN session_snapshots s ON s.session_key=k.session_key AND s.version=d.current_snapshot_version
+           LEFT JOIN findings f ON f.session_key=k.session_key
+           WHERE COALESCE(json_type(CAST(s.session_json AS TEXT),'$.tool_observations'),'array')!='array'
+              OR COALESCE(json_type(CAST(s.session_json AS TEXT),'$.optimization_findings'),'array')!='array'
+              OR COALESCE(json_array_length(CAST(s.session_json AS TEXT),'$.tool_observations'),0)
+                    != (SELECT COUNT(*) FROM durable_tool_events e WHERE e.session_key=k.session_key)
+              OR COALESCE(json_array_length(CAST(s.session_json AS TEXT),'$.optimization_findings'),0)!=COALESCE(f.n,0)
+         )
+         DELETE FROM plateau_sessions WHERE session_key IN (SELECT session_key FROM mismatches);
+
          CREATE TEMP TABLE plateau_events AS
          SELECT e.*,
                 LAG(cumulative_total_tokens,1,0) OVER (PARTITION BY e.session_key ORDER BY event_index) AS previous,
