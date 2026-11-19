@@ -4,6 +4,7 @@ use odometer_lib::provider::{
 };
 use odometer_lib::scan_cache::{self, ScanCache};
 use odometer_lib::scanner;
+use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -57,6 +58,73 @@ fn scan_reports_progress_and_writes_cache() {
 
     let cache = ScanCache::load(&cache_path);
     assert_eq!(cache.len(), 1);
+}
+
+#[test]
+fn version_five_cache_cannot_hide_recorded_codex_cache_writes_after_upgrade() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("sessions");
+    std::fs::create_dir(&root).unwrap();
+    let file = root.join("rollout-2026-11-18T12-00-00-01900000-0000-7000-8000-000000000001.jsonl");
+    let records = [
+        r#"{"timestamp":"2026-11-18T12:00:00Z","type":"session_meta","payload":{"id":"01900000-0000-7000-8000-000000000001","timestamp":"2026-11-18T12:00:00Z","cli_version":"0.170.0","source":"exec","model_provider":"openai"}}"#,
+        r#"{"timestamp":"2026-11-18T12:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-6.2-sol"}}"#,
+        r#"{"timestamp":"2026-11-18T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":15,"output_tokens":20,"total_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":15,"output_tokens":20,"total_tokens":120}}}}"#,
+    ];
+    std::fs::write(&file, records.join("\n") + "\n").unwrap();
+    let cache_path = temp.path().join("cache.sqlite3");
+    let sources = ProviderSourceSet::try_new([ProviderSource::new(
+        codex_provider_id(),
+        root,
+        ProviderSourceKind::Live,
+    )])
+    .unwrap();
+    let scan = || {
+        let writes = Mutex::new(Vec::new());
+        let report = scanner::scan_all(
+            &sources,
+            Some(ScanCache::load(&cache_path)),
+            |batch| {
+                writes.lock().unwrap().extend(
+                    batch
+                        .into_iter()
+                        .map(|(_, session)| session.tokens_total.cache_creation_input_tokens),
+                );
+            },
+            |_, _| {},
+        );
+        (report, writes.into_inner().unwrap())
+    };
+    assert_eq!(scan().1, [15]);
+
+    // Preserve the real cached file identity and stamps. Replay the row
+    // written by the previous parser, whose token totals lacked cache writes.
+    let connection = Connection::open(&cache_path).unwrap();
+    let cached: Vec<u8> = connection
+        .query_row("SELECT session_json FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    let old = String::from_utf8(cached).unwrap().replace(
+        "\"cache_creation_input_tokens\":15",
+        "\"cache_creation_input_tokens\":0",
+    );
+    connection
+        .execute("UPDATE sessions SET session_json = ?1", [old.as_bytes()])
+        .unwrap();
+    connection
+        .execute_batch(
+            "UPDATE cache_meta SET value='5' WHERE key='parse_version';
+             UPDATE cache_meta SET value='0.8.29' WHERE key='app_version';",
+        )
+        .unwrap();
+    drop(connection);
+
+    let (upgraded, writes) = scan();
+    assert_eq!(upgraded.cache_hits, 0);
+    assert_eq!(upgraded.parsed_files, 1);
+    assert_eq!(writes, [15]);
+    let (warm, writes) = scan();
+    assert_eq!(warm.cache_hits, 1);
+    assert_eq!(writes, [15]);
 }
 
 #[test]

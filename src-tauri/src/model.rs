@@ -413,6 +413,12 @@ impl std::ops::AddAssign<&TokenTotals> for TokenTotals {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LegacyTokenDelta {
+    pub model_was_missing: bool,
+    pub delta: TokenTotals,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TokenHistoryPoint {
     pub timestamp: chrono::DateTime<chrono::Utc>,
     /// Active model at the moment of this event (for per-period credit math).
@@ -426,7 +432,7 @@ pub struct TokenHistoryPoint {
     pub request_input_tokens: Option<u64>,
     /// Cumulative total_tokens at this event — drives the sparkline.
     pub total_tokens: u64,
-    /// last_token_usage for this event — the per-call delta. All zeros if absent.
+    /// Newly accounted usage at this event, including any first-observed carry-over.
     pub delta: TokenTotals,
 }
 
@@ -672,6 +678,10 @@ pub struct Session {
     pub tokens_total: TokenTotals,
     pub tokens_by_model: HashMap<String, TokenTotals>,
     pub tokens_history: Vec<TokenHistoryPoint>,
+    /// Sparse identity evidence for reconciling Codex transcripts parsed before schema 17.
+    /// A missing entry uses the current event. A null entry had no legacy event.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub legacy_token_deltas: BTreeMap<usize, Option<LegacyTokenDelta>>,
     /// Provider-reported account quota snapshots. Full sessions only: list
     /// summaries intentionally omit this history.
     #[serde(default)]
@@ -1208,6 +1218,7 @@ pub(crate) mod tests {
             first_user_message: None,
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
+            legacy_token_deltas: Default::default(),
             tokens_history: history,
             rate_limits_history: Vec::new(),
             turns: Vec::new(),
@@ -1625,6 +1636,7 @@ pub(crate) mod tests {
                 "gpt-5.1-codex".to_string(),
                 delta(1_800 * turn_count as u64),
             )]),
+            legacy_token_deltas: Default::default(),
             tokens_history,
             rate_limits_history: vec![RateLimitSnapshotPoint {
                 timestamp: base,

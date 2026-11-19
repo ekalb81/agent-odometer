@@ -547,9 +547,9 @@ fn codex_status(
         }
     };
     let source = preferred_codex_source(inspection);
-    let path = match source {
-        ConfigSource::CodexHooksJson => &json_path,
-        ConfigSource::CodexInlineToml => &inline_path,
+    let (path, other_path) = match source {
+        ConfigSource::CodexHooksJson => (&json_path, &inline_path),
+        ConfigSource::CodexInlineToml => (&inline_path, &json_path),
         ConfigSource::ClaudeSettingsJson | ConfigSource::GeminiSettingsJson => unreachable!(),
     };
     build_status(
@@ -562,7 +562,7 @@ fn codex_status(
             current_count: inspection.json.current_count + inspection.inline.current_count,
         },
         inspection.hooks_disabled,
-        &[path, &inline_path],
+        &[other_path],
     )
 }
 
@@ -635,7 +635,7 @@ fn json_status(
             path,
             inspection,
             hooks_disabled,
-            &[path],
+            &[],
         ),
         Err(error) => error_status(harness, requested, source, path, error),
     }
@@ -648,16 +648,18 @@ fn build_status(
     path: &Path,
     inspection: HookInspection,
     hooks_disabled: bool,
-    freshness_paths: &[&Path],
+    other_sources: &[&Path],
 ) -> HarnessIntegrationStatus {
+    let record = load_run_record(harness.clone());
+    let observation_is_current = observation_is_current(&record, path, other_sources);
     let HookRunRecord {
         last_run_at,
         success,
         last_receipt,
         detail: last_run_detail,
-    } = load_run_record(harness.clone());
+        ..
+    } = record;
     let configured = inspection.current();
-    let observation_is_current = observation_is_current(last_run_at, freshness_paths);
     let duplicate_or_stale = inspection.owned_count > 1
         || (inspection.owned_count > 0 && inspection.current_count < inspection.owned_count);
     let receipt_observed = requested
@@ -759,20 +761,21 @@ fn build_status(
     }
 }
 
-fn observation_is_current(
-    last_run_at: Option<chrono::DateTime<chrono::Utc>>,
-    freshness_paths: &[&Path],
-) -> bool {
-    let modified_at = freshness_paths
-        .iter()
-        .filter_map(|path| {
-            std::fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .map(chrono::DateTime::<chrono::Utc>::from)
+fn observation_is_current(record: &HookRunRecord, source: &Path, other_sources: &[&Path]) -> bool {
+    // A hook already running when configuration changes belongs to the old setup.
+    let Some(start) = record.started_at else {
+        return false;
+    };
+    let predates_run = |path: &Path| {
+        std::fs::metadata(path)?
+            .modified()
+            .map(|mtime| start > chrono::DateTime::<chrono::Utc>::from(mtime))
+    };
+    predates_run(source).unwrap_or(false)
+        && other_sources.iter().all(|path| match predates_run(path) {
+            Ok(unchanged) => unchanged,
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
         })
-        .max();
-    matches!((last_run_at, modified_at), (Some(run), Some(changed)) if run >= changed)
 }
 
 fn error_status(
@@ -787,6 +790,7 @@ fn error_status(
         success,
         last_receipt,
         detail: last_run_detail,
+        ..
     } = load_run_record(harness);
     HarnessIntegrationStatus {
         requested,
@@ -3390,12 +3394,23 @@ command = "odometer --integration-id odometer-turn-receipts-v\u0031"
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(control_changed))
             .unwrap();
-        let receipt_observed = Some(chrono::DateTime::<chrono::Utc>::from(receipt_observed));
+        let receipt = HookRunRecord {
+            started_at: Some(receipt_observed.into()),
+            last_run_at: Some(now.into()),
+            success: true,
+            ..Default::default()
+        };
 
-        assert!(observation_is_current(receipt_observed, &[&hooks_path]));
+        assert!(observation_is_current(&receipt, &hooks_path, &[]));
         assert!(!observation_is_current(
-            receipt_observed,
-            &[&hooks_path, &config_path]
+            &receipt,
+            &hooks_path,
+            &[&config_path]
         ));
+        let legacy = HookRunRecord {
+            started_at: None,
+            ..receipt
+        };
+        assert!(!observation_is_current(&legacy, &hooks_path, &[]));
     }
 }

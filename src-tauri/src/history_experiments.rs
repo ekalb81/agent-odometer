@@ -1362,7 +1362,13 @@ mod tests {
             }
         })
         .unwrap();
-        assert_eq!(steps, ["v15_to_v16_offline_comparisons"]);
+        assert_eq!(
+            steps,
+            [
+                "v15_to_v16_offline_comparisons",
+                "v16_to_v17_token_accounting"
+            ]
+        );
         assert_eq!(
             serde_json::to_string(&store.curated_dataset().unwrap()).unwrap(),
             before

@@ -669,6 +669,7 @@ fn build_session(
         first_user_message,
         tokens_total,
         tokens_by_model,
+        legacy_token_deltas: Default::default(),
         tokens_history,
         rate_limits_history: Vec::new(),
         turns,

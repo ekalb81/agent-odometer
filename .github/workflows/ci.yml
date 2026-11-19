@@ -51,6 +51,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  formal-model:
+    name: Formal model
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - name: Check TLA+ models
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download v1.7.4 --repo tlaplus/tlaplus \
+            --pattern tla2tools.jar --dir "$RUNNER_TEMP"
+          jar="$RUNNER_TEMP/tla2tools.jar"
+          printf '%s  %s\n' '936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88' "$jar" \
+            | sha256sum --check
+          node docs/formal/check.mjs "$jar"
+
   check:
     name: Check + test
     runs-on: ubuntu-22.04

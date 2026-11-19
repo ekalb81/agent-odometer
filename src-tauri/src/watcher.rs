@@ -16,6 +16,7 @@ use tauri::AppHandle;
 /// Opaque handle that keeps the debouncer alive. Dropping it stops the watcher.
 pub struct WatcherHandle {
     _inner: Box<dyn std::any::Any + Send + Sync>,
+    identity: Arc<()>,
 }
 
 /// A parser plus when it last saw activity. Each parser holds a full Session
@@ -62,225 +63,20 @@ pub fn start(
     sources: ProviderSourceSet,
     session_index_path: PathBuf,
 ) -> anyhow::Result<WatcherHandle> {
-    let parsers: Arc<DashMap<PathBuf, ParserSlot>> = Arc::new(DashMap::new());
-    let sources_arc = Arc::new(sources);
-    let session_index_path_arc: Arc<PathBuf> = Arc::new(session_index_path.clone());
-
-    let parsers_cb = parsers.clone();
-    let sources_cb = sources_arc.clone();
-    let session_index_path_cb = session_index_path_arc.clone();
-    // AppState owns the watcher handle; a strong capture here would create a
-    // self-cycle that prevents watcher and recorder teardown.
-    let state_cb = Arc::downgrade(&state);
-    let app_cb = app.clone();
-
-    let mut debouncer = new_debouncer(
-        Duration::from_millis(250),
-        None,
-        move |result: DebounceEventResult| {
-            let Some(state_cb) = state_cb.upgrade() else {
-                return;
-            };
-            let events = match result {
-                Ok(evts) => evts,
-                Err(errors) => {
-                    for e in errors {
-                        tracing::warn!("watcher error: {}", e);
-                    }
-                    return;
-                }
-            };
-
-            for event in events {
-                let kind = event.kind;
-                for path in &event.paths {
-                    // The session index lives next to the per-session files; handle it first
-                    // so we don't try to parse it as a rollout JSONL.
-                    // Use component-wise equality so mixed separators (notify on Windows
-                    // delivers backslash paths; PathBuf::join from a slash literal does not
-                    // normalize) still match.
-                    if paths_equivalent(path, session_index_path_cb.as_path()) {
-                        let started = Instant::now();
-                        let names = crate::session_index::read(path);
-                        let changed = crate::session_index::apply(&state_cb.sessions, &names);
-                        state_cb.performance.record_backend(
-                            "watcher.session_index_refresh",
-                            started,
-                            true,
-                            std::collections::BTreeMap::from([
-                                ("names".into(), names.len().to_string()),
-                                ("changed".into(), changed.len().to_string()),
-                            ]),
-                        );
-                        for id in changed {
-                            let Some(summary) = state_cb
-                                .sessions
-                                .get(&id)
-                                .map(|entry| entry.summary.clone())
-                            else {
-                                continue;
-                            };
-                            // Issue #141 field regression: this used to load
-                            // the full session (`full_session`, a ledger
-                            // read of turns/token histories/tool
-                            // observations) purely to hand it back to
-                            // `persist_session_metadata` for a one-field
-                            // change. `persist_thread_name_overlay_batch`
-                            // writes `thread_name` straight from the resident
-                            // summary instead — see the matching comment on
-                            // `commands::spawn_scan`'s session-index overlay
-                            // pass and `HistoryStore::overlay_thread_names`'s
-                            // doc comment for the investigation behind that.
-                            state_cb.persist_thread_name_overlay_batch(std::slice::from_ref(&(
-                                id.clone(),
-                                summary.thread_name.clone(),
-                            )));
-                            if let Err(e) =
-                                crate::commands::emit_session_summary(&app_cb, &state_cb, &summary)
-                            {
-                                tracing::warn!("emit session-updated failed: {}", e);
-                            }
-                        }
-                        continue;
-                    }
-
-                    let Some(source) = sources_cb.resolve(path) else {
-                        continue;
-                    };
-                    let provider_id = source.provider_id().clone();
-                    let source_kind = source.kind();
-                    let adapter = ProviderRegistry::builtin()
-                        .adapter(&provider_id)
-                        .expect("validated provider source has a registered adapter");
-                    if !adapter.accepts_path(path) {
-                        continue;
-                    }
-
-                    if is_remove(&kind) {
-                        // Bulk-scanned and idle-evicted files may not have a
-                        // parser slot, so path ownership in AppState is the
-                        // source of truth for removal.
-                        let _ = parsers_cb.remove(path);
-                        if let Some(summary) = state_cb.mark_source_missing(path) {
-                            if let Err(e) =
-                                crate::commands::emit_session_summary(&app_cb, &state_cb, &summary)
-                            {
-                                tracing::warn!("emit session-updated failed: {}", e);
-                            }
-                        }
-                    } else {
-                        // Create or Modify — parse incrementally.
-                        let transcript_before = crate::transcript::source_generation(path);
-                        let mut entry = match parsers_cb.entry(path.clone()).or_try_insert_with(
-                            || -> anyhow::Result<ParserSlot> {
-                                Ok(ParserSlot {
-                                    parser: adapter
-                                        .incremental_parser(path.clone(), source_kind)?,
-                                    last_touch: Instant::now(),
-                                    transcript_identity: transcript_before
-                                        .as_deref()
-                                        .map(crate::transcript::generation_identity)
-                                        .map(str::to_owned),
-                                })
-                            },
-                        ) {
-                            Ok(entry) => entry,
-                            Err(error) => {
-                                tracing::warn!(
-                                    "could not create '{}' parser for {:?}: {}",
-                                    provider_id,
-                                    path,
-                                    error
-                                );
-                                continue;
-                            }
-                        };
-                        if let Err(error) = entry.ensure_source_identity(
-                            adapter,
-                            path,
-                            source_kind,
-                            transcript_before.as_deref(),
-                        ) {
-                            state_cb.record_transcript_observation(
-                                state_cb.current_scan_generation(),
-                                path,
-                                None,
-                            );
-                            tracing::warn!("could not reset replaced source parser: {}", error);
-                            continue;
-                        }
-                        entry.last_touch = Instant::now();
-
-                        let parse_started = Instant::now();
-                        let parse_result = entry.parser.parse_to_end();
-                        let transcript_after = crate::transcript::source_generation(path);
-                        let transcript_stamp = transcript_before.filter(|before| {
-                            Some(before) == transcript_after.as_ref()
-                                && entry.transcript_identity.as_deref()
-                                    == Some(crate::transcript::generation_identity(before))
-                        });
-                        state_cb.record_transcript_observation(
-                            state_cb.current_scan_generation(),
-                            path,
-                            parse_result.as_ref().ok().and(transcript_stamp),
-                        );
-                        state_cb.performance.record_backend(
-                            "watcher.incremental_parse",
-                            parse_started,
-                            parse_result.is_ok(),
-                            std::collections::BTreeMap::from([
-                                ("harness".into(), provider_id.as_str().into()),
-                                // Corpus size makes cost-vs-corpus scaling
-                                // measurable inside a single recording.
-                                ("corpus".into(), state_cb.sessions.len().to_string()),
-                            ]),
-                        );
-                        match parse_result {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(e) => {
-                                tracing::warn!("parse error for {:?}: {}", path, e);
-                                continue;
-                            }
-                        }
-
-                        if let Some(session) = entry.parser.session() {
-                            let reconciled =
-                                state_cb.reconcile_observed_session(path, session.clone());
-                            let summary = SessionSummary::of(&reconciled.session);
-                            if !state_cb.publish_watched_session(path, reconciled.session) {
-                                continue;
-                            }
-                            if let Err(e) =
-                                crate::commands::emit_session_summary(&app_cb, &state_cb, &summary)
-                            {
-                                tracing::warn!("emit session-updated failed: {}", e);
-                            }
-                            if let Some(displaced) = reconciled.displaced {
-                                if let Err(e) = crate::commands::emit_session_summary(
-                                    &app_cb,
-                                    &state_cb,
-                                    &SessionSummary::of(&displaced),
-                                ) {
-                                    tracing::warn!("emit displaced session-updated failed: {}", e);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Sweep idle parsers so long-running apps don't hold a second
-            // copy of every session ever touched. AppState keeps the parsed
-            // session; only the incremental byte-offset state is lost.
-            parsers_cb.retain(|_, slot| slot.last_touch.elapsed() < PARSER_IDLE_TTL);
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("failed to create debouncer: {}", e))?;
+    let identity = Arc::new(());
+    let callback = event_handler(
+        Arc::downgrade(&state),
+        sources.clone(),
+        session_index_path.clone(),
+        identity.clone(),
+        move |state, summary| crate::commands::emit_session_summary(&app, state, summary),
+    );
+    let mut debouncer = new_debouncer(Duration::from_millis(250), None, callback)
+        .map_err(|e| anyhow::anyhow!("failed to create debouncer: {}", e))?;
 
     // Watch all roots recursively. Skip roots that don't exist yet — the user
     // may not have Codex installed, or the directory will be created later.
-    for source in sources_arc.iter() {
+    for source in sources.iter() {
         let root = source.root();
         if !root.exists() {
             tracing::info!("watch root {:?} does not exist yet, skipping", root);
@@ -308,7 +104,213 @@ pub fn start(
 
     Ok(WatcherHandle {
         _inner: Box::new(debouncer),
+        identity,
     })
+}
+
+fn event_handler(
+    state: std::sync::Weak<AppState>,
+    sources: ProviderSourceSet,
+    session_index_path: PathBuf,
+    identity: Arc<()>,
+    emit: impl Fn(&AppState, &SessionSummary) -> tauri::Result<()> + Send + 'static,
+) -> impl FnMut(DebounceEventResult) + Send {
+    let parsers: DashMap<PathBuf, ParserSlot> = DashMap::new();
+    move |result| {
+        let Some(state_cb) = state.upgrade() else {
+            return;
+        };
+        let events = match result {
+            Ok(evts) => evts,
+            Err(errors) => {
+                for e in errors {
+                    tracing::warn!("watcher error: {}", e);
+                }
+                return;
+            }
+        };
+
+        for event in events {
+            let kind = event.kind;
+            for path in &event.paths {
+                // Dropping a debouncer only signals shutdown. Serialize this path's
+                // observations, durable writes and events with source replacement.
+                let installed = state_cb.watcher.lock().unwrap();
+                if !installed
+                    .as_ref()
+                    .is_some_and(|handle| Arc::ptr_eq(&handle.identity, &identity))
+                {
+                    return;
+                }
+                // The session index lives next to the per-session files; handle it first
+                // so we don't try to parse it as a rollout JSONL.
+                // Use component-wise equality so mixed separators (notify on Windows
+                // delivers backslash paths; PathBuf::join from a slash literal does not
+                // normalize) still match.
+                if paths_equivalent(path, session_index_path.as_path()) {
+                    let started = Instant::now();
+                    let names = crate::session_index::read(path);
+                    let changed = crate::session_index::apply(&state_cb.sessions, &names);
+                    state_cb.performance.record_backend(
+                        "watcher.session_index_refresh",
+                        started,
+                        true,
+                        std::collections::BTreeMap::from([
+                            ("names".into(), names.len().to_string()),
+                            ("changed".into(), changed.len().to_string()),
+                        ]),
+                    );
+                    for id in changed {
+                        let Some(summary) = state_cb
+                            .sessions
+                            .get(&id)
+                            .map(|entry| entry.summary.clone())
+                        else {
+                            continue;
+                        };
+                        // Issue #141 field regression: this used to load
+                        // the full session (`full_session`, a ledger
+                        // read of turns/token histories/tool
+                        // observations) purely to hand it back to
+                        // `persist_session_metadata` for a one-field
+                        // change. `persist_thread_name_overlay_batch`
+                        // writes `thread_name` straight from the resident
+                        // summary instead — see the matching comment on
+                        // `commands::spawn_scan`'s session-index overlay
+                        // pass and `HistoryStore::overlay_thread_names`'s
+                        // doc comment for the investigation behind that.
+                        state_cb.persist_thread_name_overlay_batch(std::slice::from_ref(&(
+                            id.clone(),
+                            summary.thread_name.clone(),
+                        )));
+                        if let Err(e) = emit(&state_cb, &summary) {
+                            tracing::warn!("emit session-updated failed: {}", e);
+                        }
+                    }
+                    continue;
+                }
+
+                let Some(source) = sources.resolve(path) else {
+                    continue;
+                };
+                let provider_id = source.provider_id().clone();
+                let source_kind = source.kind();
+                let adapter = ProviderRegistry::builtin()
+                    .adapter(&provider_id)
+                    .expect("validated provider source has a registered adapter");
+                if !adapter.accepts_path(path) {
+                    continue;
+                }
+
+                if is_remove(&kind) {
+                    // Bulk-scanned and idle-evicted files may not have a
+                    // parser slot, so path ownership in AppState is the
+                    // source of truth for removal.
+                    let _ = parsers.remove(path);
+                    if let Some(summary) = state_cb.mark_source_missing(path) {
+                        if let Err(e) = emit(&state_cb, &summary) {
+                            tracing::warn!("emit session-updated failed: {}", e);
+                        }
+                    }
+                } else {
+                    // Create or Modify — parse incrementally.
+                    let transcript_before = crate::transcript::source_generation(path);
+                    let mut entry = match parsers.entry(path.clone()).or_try_insert_with(
+                        || -> anyhow::Result<ParserSlot> {
+                            Ok(ParserSlot {
+                                parser: adapter.incremental_parser(path.clone(), source_kind)?,
+                                last_touch: Instant::now(),
+                                transcript_identity: transcript_before
+                                    .as_deref()
+                                    .map(crate::transcript::generation_identity)
+                                    .map(str::to_owned),
+                            })
+                        },
+                    ) {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            tracing::warn!(
+                                "could not create '{}' parser for {:?}: {}",
+                                provider_id,
+                                path,
+                                error
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(error) = entry.ensure_source_identity(
+                        adapter,
+                        path,
+                        source_kind,
+                        transcript_before.as_deref(),
+                    ) {
+                        state_cb.record_transcript_observation(
+                            state_cb.current_scan_generation(),
+                            path,
+                            None,
+                        );
+                        tracing::warn!("could not reset replaced source parser: {}", error);
+                        continue;
+                    }
+                    entry.last_touch = Instant::now();
+
+                    let parse_started = Instant::now();
+                    let parse_result = entry.parser.parse_to_end();
+                    let transcript_after = crate::transcript::source_generation(path);
+                    let transcript_stamp = transcript_before.filter(|before| {
+                        Some(before) == transcript_after.as_ref()
+                            && entry.transcript_identity.as_deref()
+                                == Some(crate::transcript::generation_identity(before))
+                    });
+                    state_cb.record_transcript_observation(
+                        state_cb.current_scan_generation(),
+                        path,
+                        parse_result.as_ref().ok().and(transcript_stamp),
+                    );
+                    state_cb.performance.record_backend(
+                        "watcher.incremental_parse",
+                        parse_started,
+                        parse_result.is_ok(),
+                        std::collections::BTreeMap::from([
+                            ("harness".into(), provider_id.as_str().into()),
+                            // Corpus size makes cost-vs-corpus scaling
+                            // measurable inside a single recording.
+                            ("corpus".into(), state_cb.sessions.len().to_string()),
+                        ]),
+                    );
+                    match parse_result {
+                        Ok(true) => {}
+                        Ok(false) => continue,
+                        Err(e) => {
+                            tracing::warn!("parse error for {:?}: {}", path, e);
+                            continue;
+                        }
+                    }
+
+                    if let Some(session) = entry.parser.session() {
+                        let reconciled = state_cb.reconcile_observed_session(path, session.clone());
+                        let summary = SessionSummary::of(&reconciled.session);
+                        if !state_cb.publish_watched_session(path, reconciled.session) {
+                            continue;
+                        }
+                        if let Err(e) = emit(&state_cb, &summary) {
+                            tracing::warn!("emit session-updated failed: {}", e);
+                        }
+                        if let Some(displaced) = reconciled.displaced {
+                            if let Err(e) = emit(&state_cb, &SessionSummary::of(&displaced)) {
+                                tracing::warn!("emit displaced session-updated failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sweep idle parsers so long-running apps don't hold a second
+        // copy of every session ever touched. AppState keeps the parsed
+        // session; only the incremental byte-offset state is lost.
+        parsers.retain(|_, slot| slot.last_touch.elapsed() < PARSER_IDLE_TTL);
+    }
 }
 
 fn is_remove(kind: &EventKind) -> bool {
@@ -331,6 +333,82 @@ fn paths_equivalent(a: &std::path::Path, b: &std::path::Path) -> bool {
 mod tests {
     use super::paths_equivalent;
     use std::path::Path;
+
+    #[test]
+    fn retired_watcher_cannot_reconcile_publish_or_emit_after_source_reset() {
+        use super::*;
+        use crate::history_store::HistoryStore;
+        use crate::provider::{codex_provider_id, ProviderSource};
+        use notify_debouncer_full::DebouncedEvent;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-synthetic.jsonl");
+        std::fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"synthetic\",\"timestamp\":\"2026-01-01T00:00:00Z\"}}\n").unwrap();
+        let history = Arc::new(HistoryStore::open(&dir.path().join("ledger.sqlite")).unwrap());
+        let state = Arc::new(crate::store::isolated_test_state());
+        state.set_history_ready(Some(history.clone()));
+        let sources = ProviderSourceSet::try_new([ProviderSource::new(
+            codex_provider_id(),
+            dir.path().to_owned(),
+            ProviderSourceKind::Live,
+        )])
+        .unwrap();
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let watcher = || {
+            let identity = Arc::new(());
+            let events = emitted.clone();
+            let callback = event_handler(
+                Arc::downgrade(&state),
+                sources.clone(),
+                dir.path().join("index.jsonl"),
+                identity.clone(),
+                move |_, summary| {
+                    events.lock().unwrap().push(summary.source_availability);
+                    Ok(())
+                },
+            );
+            (
+                WatcherHandle {
+                    identity,
+                    _inner: Box::new(()),
+                },
+                callback,
+            )
+        };
+        let (old, mut retired) = watcher();
+        let (new, mut current) = watcher();
+        let event = |kind| {
+            Ok(vec![DebouncedEvent::new(
+                notify::Event::new(kind).add_path(path.clone()),
+                Instant::now(),
+            )])
+        };
+        let changed = EventKind::Modify(notify::event::ModifyKind::Any);
+        let removed = EventKind::Remove(notify::event::RemoveKind::Any);
+        *state.watcher.lock().unwrap() = Some(old);
+        current(event(changed)); // Staged but not yet committed.
+        state.replace_session_watcher(new);
+        retired(event(changed)); // Delivered after the original handle was dropped.
+        let key = "codex:thread:synthetic";
+        assert_eq!(history.stats().unwrap().sessions, 0);
+        assert!(state.sessions.is_empty());
+        assert!(emitted.lock().unwrap().is_empty());
+
+        current(event(changed));
+        retired(event(removed));
+        use crate::model::SourceAvailability::{Missing, Present};
+        assert_eq!(
+            history.load_one(key).unwrap().session.source_availability,
+            Present
+        );
+        assert_eq!(
+            state.sessions.get(key).unwrap().summary.source_availability,
+            Present
+        );
+        current(event(removed));
+        assert_eq!(*emitted.lock().unwrap(), [Present, Missing]);
+    }
 
     #[test]
     fn replaced_parser_slot_resets_same_size_and_larger_sources_without_remove() {

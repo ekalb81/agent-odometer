@@ -30,7 +30,7 @@ const LEGACY_CACHE_NAME: &str = "scan-cache.json";
 /// invalidate the cache — that was the old `APP_VERSION`-keyed behavior,
 /// and it turned every release into a full cold re-parse of every
 /// transcript.
-const PARSE_VERSION: u32 = 5;
+const PARSE_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CacheEntry {
@@ -660,6 +660,7 @@ mod tests {
             first_user_message: None,
             tokens_total: TokenTotals::default(),
             tokens_by_model: StdHashMap::new(),
+            legacy_token_deltas: Default::default(),
             tokens_history: Vec::new(),
             rate_limits_history: Vec::new(),
             turns: Vec::new(),
@@ -1075,6 +1076,13 @@ history_mode
 id
 last_event_at
 latest_context_tokens
+legacy_token_deltas.0.delta.cache_creation_input_tokens
+legacy_token_deltas.0.delta.cached_input_tokens
+legacy_token_deltas.0.delta.input_tokens
+legacy_token_deltas.0.delta.output_tokens
+legacy_token_deltas.0.delta.reasoning_output_tokens
+legacy_token_deltas.0.delta.total_tokens
+legacy_token_deltas.0.model_was_missing
 memory_mode
 model
 model_provider
@@ -1328,6 +1336,13 @@ working_directory"#;
             first_user_message: Some("hi".into()),
             tokens_total: totals.clone(),
             tokens_by_model: std::collections::HashMap::from([("m".to_string(), totals.clone())]),
+            legacy_token_deltas: std::collections::BTreeMap::from([(
+                0,
+                Some(crate::model::LegacyTokenDelta {
+                    model_was_missing: true,
+                    delta: totals.clone(),
+                }),
+            )]),
             tokens_history: vec![TokenHistoryPoint {
                 timestamp: now,
                 model: Some("m".into()),

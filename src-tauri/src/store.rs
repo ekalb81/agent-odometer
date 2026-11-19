@@ -809,6 +809,16 @@ impl AppState {
             == generation
     }
 
+    pub(crate) fn replace_session_watcher(&self, replacement: WatcherHandle) {
+        let previous = {
+            let mut installed = self.watcher.lock().unwrap();
+            self.advance_scan_generation();
+            self.clear_sessions();
+            installed.replace(replacement)
+        };
+        drop(previous);
+    }
+
     pub fn clear_sessions(&self) {
         self.session_paths.clear();
         self.transcript_observations.clear();
@@ -2258,12 +2268,63 @@ impl Default for AppState {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn isolated_test_state() -> AppState {
+    AppState {
+        sessions: DashMap::new(),
+        full_session_fallback: DashMap::new(),
+        history: Mutex::new(HistoryReadiness::Unavailable),
+        history_ready_cv: Condvar::new(),
+        last_history_step: Mutex::new(None),
+        history_failure: Mutex::new(None),
+        history_scan_generation: AtomicI64::new(0),
+        scanned: AtomicBool::new(false),
+        scan_done: AtomicUsize::new(0),
+        scan_total: AtomicUsize::new(0),
+        scan_elapsed_ms: AtomicU64::new(0),
+        cold_reason: Mutex::new(None),
+        durable_writers: Mutex::new(DurableWriters::default()),
+        durable_writers_cv: Condvar::new(),
+        rebuild_cancel_requested: AtomicBool::new(false),
+        rebuild_status: Mutex::new(HistoryRebuildSnapshot::default()),
+        scan_generation: AtomicU64::new(1),
+        instruction_scan_generation: AtomicU64::new(0),
+        config_transition: Mutex::new(()),
+        history_publication: Mutex::new(()),
+        history_exclusions: Mutex::new(crate::history_store::ExclusionCache::default()),
+        pending_purge: Mutex::new(None),
+        scan_write_lock: ScanWriteLockStats::default(),
+        watcher: Mutex::new(None),
+        config_watcher: Mutex::new(None),
+        instruction_paths: Mutex::new(HashSet::new()),
+        session_paths: DashMap::new(),
+        transcript_observations: DashMap::new(),
+        ledger_stale: DashMap::new(),
+        rollup_deferred_stale: DashMap::new(),
+        external_events: Mutex::new(ExternalEventStore::new(Vec::new())),
+        performance: crate::performance::PerformanceRecorder::default(),
+        tray: Mutex::new(None),
+        tray_available: AtomicBool::new(false),
+        last_scan_report: Mutex::new(None),
+        sessions_generation: AtomicU64::new(0),
+        quota_store_cache: Mutex::new(None),
+        quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
+        attention: crate::attention::AttentionService::default(),
+        ambient: Mutex::new(crate::ambient::Runtime::default()),
+        live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
+        provider_status: Arc::new(crate::provider_status::ProviderStatusService::default()),
+        quota_evaluation: Mutex::new(()),
+        quota_points_index: crate::quota::QuotaPointsIndex::new(),
+    }
+}
+
 // Constructing the full Tauri/Wry AppState in a Windows unit-test binary
 // eagerly links GUI entry points before the Rust test harness starts. CI runs
 // these platform-independent state-machine tests on Linux; Windows still
 // compiles the production paths and exercises parser/cache integration tests.
 #[cfg(all(test, not(windows)))]
 mod tests {
+    use super::isolated_test_state as state;
     use super::*;
     use crate::model::TokenTotals;
     use crate::provider::codex_provider_id;
@@ -2348,55 +2409,6 @@ mod tests {
                 state.registered_transcript_source(&id).unwrap().identity,
                 id
             );
-        }
-    }
-
-    fn state() -> AppState {
-        AppState {
-            sessions: DashMap::new(),
-            full_session_fallback: DashMap::new(),
-            history: Mutex::new(HistoryReadiness::Unavailable),
-            history_ready_cv: Condvar::new(),
-            last_history_step: Mutex::new(None),
-            history_failure: Mutex::new(None),
-            history_scan_generation: AtomicI64::new(0),
-            scanned: AtomicBool::new(false),
-            scan_done: AtomicUsize::new(0),
-            scan_total: AtomicUsize::new(0),
-            scan_elapsed_ms: AtomicU64::new(0),
-            cold_reason: Mutex::new(None),
-            durable_writers: Mutex::new(DurableWriters::default()),
-            durable_writers_cv: Condvar::new(),
-            rebuild_cancel_requested: AtomicBool::new(false),
-            rebuild_status: Mutex::new(HistoryRebuildSnapshot::default()),
-            scan_generation: AtomicU64::new(1),
-            instruction_scan_generation: AtomicU64::new(0),
-            config_transition: Mutex::new(()),
-            history_publication: Mutex::new(()),
-            history_exclusions: Mutex::new(crate::history_store::ExclusionCache::default()),
-            pending_purge: Mutex::new(None),
-            scan_write_lock: ScanWriteLockStats::default(),
-            watcher: Mutex::new(None),
-            config_watcher: Mutex::new(None),
-            instruction_paths: Mutex::new(HashSet::new()),
-            session_paths: DashMap::new(),
-            transcript_observations: DashMap::new(),
-            ledger_stale: DashMap::new(),
-            rollup_deferred_stale: DashMap::new(),
-            external_events: Mutex::new(ExternalEventStore::new(Vec::new())),
-            performance: crate::performance::PerformanceRecorder::default(),
-            tray: Mutex::new(None),
-            tray_available: AtomicBool::new(false),
-            last_scan_report: Mutex::new(None),
-            sessions_generation: AtomicU64::new(0),
-            quota_store_cache: Mutex::new(None),
-            quota_snapshot_cache: crate::quota::QuotaSnapshotCache::new(),
-            attention: crate::attention::AttentionService::default(),
-            ambient: Mutex::new(crate::ambient::Runtime::default()),
-            live_quota: Arc::new(crate::quota_accounts::LiveQuotaService::default()),
-            provider_status: Arc::new(crate::provider_status::ProviderStatusService::default()),
-            quota_evaluation: Mutex::new(()),
-            quota_points_index: crate::quota::QuotaPointsIndex::new(),
         }
     }
 
@@ -2627,6 +2639,7 @@ mod tests {
             first_user_message: None,
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
+            legacy_token_deltas: Default::default(),
             tokens_history: Vec::new(),
             rate_limits_history: Vec::new(),
             turns: Vec::new(),

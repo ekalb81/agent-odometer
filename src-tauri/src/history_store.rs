@@ -23,6 +23,7 @@ use chrono::TimeZone;
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -60,8 +61,8 @@ pub use organization::{
     RecordBookmarkList, SavedSearch, SavedSearchDefinition, SessionAnnotation,
 };
 
-const SCHEMA_VERSION: i64 = 16;
-const SNAPSHOT_FORMAT_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 17;
+const SNAPSHOT_FORMAT_VERSION: i64 = 2;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
 /// migration's SQL use identically so the two never disagree on bucketing.
@@ -3204,6 +3205,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 15 {
         steps += 1;
+        version = 16;
+    }
+    if version == 16 {
+        steps += 1;
     }
     steps
 }
@@ -4179,6 +4184,41 @@ fn migrate(
             started.elapsed(),
         ));
     }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 16 {
+        step_index += 1;
+        let label = "v16_to_v17_token_accounting";
+        on_progress(MigrationStepEvent::started(
+            label, step_index, step_total, 16, 17,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute("DELETE FROM rollup_token_totals", [])?;
+        transaction.execute_batch(&token_rollup_insert(""))?;
+        // Old Codex projections with demonstrable missing/excess usage need source evidence.
+        transaction.execute_batch(
+            "UPDATE durable_sessions SET ledger_dirty = 1 WHERE session_key IN (
+               SELECT s.session_key FROM session_summaries s
+               JOIN session_snapshots p USING(session_key)
+               WHERE p.format_version = 1 AND s.session_key GLOB 'codex:thread:*'
+                 AND (COALESCE((SELECT SUM(r.total_tokens) FROM rollup_token_totals r WHERE r.session_key=s.session_key),0)
+                       != json_extract(CAST(s.summary_json AS TEXT),'$.tokens_total.total_tokens')
+                   OR COALESCE((SELECT SUM(b.value ->> '$.tokens.total_tokens')
+                                  FROM json_each(CAST(s.summary_json AS TEXT),'$.buckets') b),0)
+                       != json_extract(CAST(s.summary_json AS TEXT),'$.tokens_total.total_tokens'))
+             );
+             UPDATE history_meta SET value='17' WHERE key='schema_version'; PRAGMA user_version=17;",
+        )?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            label,
+            step_index,
+            step_total,
+            16,
+            17,
+            started.elapsed(),
+        ));
+    }
     Ok(())
 }
 
@@ -4493,19 +4533,19 @@ fn reconcile_session(
     // first turn changes the fingerprint. This is the same source and the
     // same growing history, not a second provider session. Do not apply this
     // to a shorter/replaced transcript or a different source location.
-    let prior_from_path: Option<(String, Vec<u8>, String)> = transaction
+    let prior_from_path: Option<(String, Vec<u8>, String, i64)> = transaction
         .query_row(
-            "SELECT d.session_key, s.session_json, l.artifact_key
+            "SELECT d.session_key, s.session_json, l.artifact_key, s.format_version
              FROM source_locations l JOIN durable_sessions d ON d.session_key = l.session_key
              JOIN source_artifacts a ON a.artifact_key = l.artifact_key AND a.session_key = d.session_key
              JOIN session_snapshots s ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
              WHERE l.path = ?1 AND d.identity_key = ?2 AND d.fingerprint_is_final = 1
                AND d.first_event_fingerprint <> ?3",
             params![path, identity, fingerprint],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .optional()?;
-    if let Some((key, raw, bound_artifact)) = prior_from_path {
+    if let Some((key, raw, bound_artifact, format_version)) = prior_from_path {
         let stored: Session = serde_json::from_slice(&raw)
             .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
         let gaining_first_turn = stored.turns.is_empty()
@@ -4513,7 +4553,7 @@ fn reconcile_session(
             && !stored.tokens_history.is_empty()
             && incoming.tokens_history.len() >= stored.tokens_history.len()
             && provisional_metadata_matches(incoming, &stored)
-            && histories_share_lineage(&incoming.tokens_history, &stored.tokens_history);
+            && source_histories_match(incoming, &stored, format_version);
         if gaining_first_turn {
             transaction.execute(
                 "UPDATE durable_sessions SET first_event_fingerprint = ?2, last_seen_at_ms = ?3 WHERE session_key = ?1",
@@ -4537,7 +4577,7 @@ fn reconcile_session(
             && incoming.tokens_history.len() <= stored.tokens_history.len()
             && bound_artifact == incoming_artifact
             && provisional_metadata_matches(incoming, &stored)
-            && histories_share_lineage(&incoming.tokens_history, &stored.tokens_history)
+            && source_histories_match(incoming, &stored, format_version)
         {
             transaction.execute(
                 "UPDATE durable_sessions SET last_seen_at_ms = ?2 WHERE session_key = ?1",
@@ -4548,21 +4588,25 @@ fn reconcile_session(
     }
 
     let mut statement = transaction.prepare(
-        "SELECT d.session_key, s.session_json
+        "SELECT d.session_key, s.session_json, s.format_version
          FROM durable_sessions d JOIN session_snapshots s
            ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
          WHERE d.identity_key = ?1 AND d.first_event_fingerprint = ?2",
     )?;
     let candidates = statement
         .query_map(params![identity, fingerprint], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(statement);
-    for (key, raw) in candidates {
+    for (key, raw, format_version) in candidates {
         let stored: Session = serde_json::from_slice(&raw)
             .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
-        if histories_share_lineage(&incoming.tokens_history, &stored.tokens_history) {
+        if source_histories_match(incoming, &stored, format_version) {
             transaction.execute(
                 "UPDATE durable_sessions SET last_seen_at_ms = ?2 WHERE session_key = ?1",
                 params![key, now],
@@ -4668,7 +4712,10 @@ fn reconcile_session(
         )
         .optional()?;
     let key = if existing.is_some() {
-        format!("{base_key}:collision:{}", &history_lineage(incoming)[..12])
+        format!(
+            "{base_key}:collision:{fingerprint}:{}",
+            history_lineage(incoming.tokens_history.iter().map(Cow::Borrowed))
+        )
     } else {
         base_key
     };
@@ -4897,7 +4944,7 @@ fn observe_one_in_transaction(
     let path = source_path_key(source_path);
     let identity = provider_identity(session)?;
     let fingerprint = first_event_fingerprint(session);
-    let fingerprint_is_final = !session.tokens_history.is_empty();
+    let fingerprint_is_final = legacy_token_events(session).next().is_some();
     let now = now_ms();
     if lifecycle::is_excluded(transaction, session)? {
         return Err(PurgedSource.into());
@@ -4990,12 +5037,12 @@ fn observe_one_in_transaction(
     if rollups_deferred {
         mark_rollups_stale(transaction, &key)?;
     }
-    // A successful observe realigns snapshot and facts; any overlay-set
-    // dirty marking is resolved.
-    transaction.execute(
-        "UPDATE durable_sessions SET ledger_dirty = 0 WHERE session_key = ?1",
-        [key.as_str()],
-    )?;
+    if facts_changed {
+        transaction.execute(
+            "UPDATE durable_sessions SET ledger_dirty = 0 WHERE session_key = ?1",
+            [key.as_str()],
+        )?;
+    }
     refresh_collision_flags(transaction, &identity)?;
     let displaced_key = displaced_key.filter(|previous| previous != &key);
     Ok((key, displaced_key, rollups_deferred))
@@ -5070,7 +5117,7 @@ fn update_snapshot_in_transaction(
         SnapshotPolicy::MetadataOverlay,
     )?;
     transaction.execute(
-        "UPDATE durable_sessions SET last_seen_at_ms = ?2, ledger_dirty = ?3 WHERE session_key = ?1",
+        "UPDATE durable_sessions SET last_seen_at_ms = ?2, ledger_dirty = MAX(ledger_dirty, ?3) WHERE session_key = ?1",
         params![key, now, !history_matches_durable],
     )?;
     Ok(key)
@@ -5273,6 +5320,18 @@ enum RollupScope {
     DeferredSessions,
 }
 
+fn token_rollup_insert(filter: &str) -> String {
+    format!("INSERT INTO rollup_token_totals(
+           session_key, hour_bucket, model, service_tier,
+           input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+           cache_creation_input_tokens)
+         SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, ''),
+           SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
+           SUM(reasoning_output_tokens), SUM(total_tokens), SUM(cache_creation_input_tokens)
+         FROM durable_token_events {filter}
+         GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, '');")
+}
+
 fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>, scope: RollupScope) -> Result<()> {
     // The scope is spliced in as SQL text, not bound as parameters: it is one
     // of two compile-time constants, and expressing the deferred set as a
@@ -5285,6 +5344,7 @@ fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>, scope: RollupSc
             format!("AND session_key IN ({PENDING_ROLLUP_SESSIONS_SQL})"),
         ),
     };
+    let token_rollup = token_rollup_insert(&filter);
     transaction.execute_batch(&format!(
         "DELETE FROM rollup_token_totals {filter};
              DELETE FROM rollup_tool_metrics {filter};
@@ -5292,15 +5352,7 @@ fn rebuild_rollups_in_transaction(transaction: &Transaction<'_>, scope: RollupSc
              DELETE FROM rollup_tool_dimensions {filter};"
     ))?;
     transaction.execute_batch(&format!(
-        "INSERT INTO rollup_token_totals(
-           session_key, hour_bucket, model, service_tier,
-           input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-           cache_creation_input_tokens)
-         SELECT session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, ''),
-           SUM(input_tokens), SUM(cached_input_tokens), SUM(output_tokens),
-           SUM(reasoning_output_tokens), SUM(total_tokens), SUM(cache_creation_input_tokens)
-         FROM durable_token_events {filter}
-         GROUP BY session_key, timestamp_ms / 3600000, COALESCE(model, ''), COALESCE(service_tier, '');
+        "{token_rollup}
 
          INSERT INTO rollup_tool_metrics(
            session_key, hour_bucket, model, calls, reads, searches, mutations, commands, other,
@@ -5353,36 +5405,84 @@ fn store_snapshot(
     now: i64,
     policy: SnapshotPolicy,
 ) -> Result<bool> {
-    let current: Option<(i64, Option<String>, Option<Vec<u8>>)> = transaction
+    let current = transaction
         .query_row(
-            "SELECT d.current_snapshot_version, d.current_snapshot_hash, s.session_json
+            "SELECT d.current_snapshot_version, d.current_snapshot_hash, s.session_json, s.format_version
              FROM durable_sessions d LEFT JOIN session_snapshots s
                ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
              WHERE d.session_key = ?1",
             [key],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get::<_,i64>(0)?, row.get::<_,Option<String>>(1)?, row.get::<_,Option<Vec<u8>>>(2)?, row.get::<_,Option<i64>>(3)?)),
         )
         .optional()?;
-    let Some((version, current_hash, current_raw)) = current else {
+    let Some((version, current_hash, current_raw, prior_format)) = current else {
         bail!("missing durable session {key} while storing snapshot");
     };
     if current_hash.as_deref() == Some(snapshot_hash) {
+        if matches!(policy, SnapshotPolicy::Source) {
+            return Ok(transaction.query_row(
+                "SELECT ledger_dirty FROM durable_sessions WHERE session_key = ?1",
+                [key],
+                |row| row.get(0),
+            )?);
+        }
         return Ok(false);
     }
     if matches!(policy, SnapshotPolicy::Source) {
         if let Some(current_raw) = current_raw {
             let current: Session = serde_json::from_slice(&current_raw)
                 .with_context(|| format!("corrupt durable session snapshot for {key}"))?;
-            if !source_snapshot_is_monotonic(incoming, &current) {
+            if prior_format == Some(1) && !incoming.legacy_token_deltas.is_empty() {
+                // A shorter copy can have more events after a reparse adds last-only calls.
+                let legacy_keys: Vec<_> = legacy_token_events(incoming)
+                    .map(|point| token_event_key(&point))
+                    .collect();
+                if legacy_keys.len() < current.tokens_history.len()
+                    || incoming.last_event_at < current.last_event_at
+                    || (incoming.turns.is_empty() && !current.turns.is_empty())
+                {
+                    return Ok(false);
+                }
+                if !source_histories_match(incoming, &current, 1) {
+                    bail!("legacy token lineage changed while updating {key}");
+                }
+                // A legacy metadata overlay can be shorter than the facts it describes.
+                // Replace only facts whose indexed identity this source actually proves.
+                let mut facts = transaction.prepare(
+                    "SELECT event_index, event_key FROM durable_token_events WHERE session_key = ?1",
+                )?;
+                let mut rows = facts.query([key])?;
+                while let Some(row) = rows.next()? {
+                    let index = usize::try_from(row.get::<_, i64>(0)?)?;
+                    let event_key: String = row.get(1)?;
+                    if legacy_keys.get(index) != Some(&event_key) {
+                        bail!("source does not cover retained token facts for {key}");
+                    }
+                }
+                drop(rows);
+                drop(facts);
+                transaction.execute(
+                    "DELETE FROM durable_token_events WHERE session_key = ?1",
+                    [key],
+                )?;
+                transaction.execute(
+                    "DELETE FROM rollup_token_totals WHERE session_key = ?1",
+                    [key],
+                )?;
+            } else if !source_snapshot_is_monotonic(incoming, &current) {
                 return Ok(false);
             }
         }
     }
     let next_version = version + 1;
+    let format_version = match policy {
+        SnapshotPolicy::MetadataOverlay => prior_format.unwrap_or(SNAPSHOT_FORMAT_VERSION),
+        SnapshotPolicy::Source => SNAPSHOT_FORMAT_VERSION,
+    };
     transaction.execute(
         "INSERT INTO session_snapshots(session_key, version, format_version, snapshot_hash, captured_at_ms, session_json)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-        params![key, next_version, SNAPSHOT_FORMAT_VERSION, snapshot_hash, now, raw],
+        params![key, next_version, format_version, snapshot_hash, now, raw],
     )?;
     // Clearing the thread-name overlay is part of storing a snapshot (issue
     // #141). The overlay exists so the session-index pass can change one
@@ -5529,13 +5629,34 @@ fn store_token_events(
            cumulative_total_tokens, input_tokens, cached_input_tokens, output_tokens,
            reasoning_output_tokens, total_tokens, cache_creation_input_tokens)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-         ON CONFLICT(session_key, event_key) DO UPDATE SET
-           request_input_tokens = COALESCE(excluded.request_input_tokens, durable_token_events.request_input_tokens)",
+         ON CONFLICT(session_key, event_key) DO NOTHING",
     )?;
+    let mut update_evidence = transaction.prepare(
+        "UPDATE durable_token_events SET request_input_tokens = ?3
+         WHERE session_key = ?1 AND event_key = ?2",
+    )?;
+    // Only a newly inserted fact contributes to its hourly rollup.
+    let mut upsert = maintain_rollups.then(|| {
+        transaction.prepare(
+            "INSERT INTO rollup_token_totals(
+               session_key, hour_bucket, model, service_tier,
+               input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+               cache_creation_input_tokens)
+             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(session_key, hour_bucket, model, service_tier) DO UPDATE SET
+               input_tokens = input_tokens + excluded.input_tokens,
+               cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+               output_tokens = output_tokens + excluded.output_tokens,
+               reasoning_output_tokens = reasoning_output_tokens + excluded.reasoning_output_tokens,
+               total_tokens = total_tokens + excluded.total_tokens,
+               cache_creation_input_tokens = cache_creation_input_tokens + excluded.cache_creation_input_tokens",
+        )
+    }).transpose()?;
     for (index, event) in events.iter().enumerate().skip(next_event_index) {
-        statement.execute(params![
+        let event_key = token_event_key(event);
+        let inserted = statement.execute(params![
             key,
-            token_event_key(event),
+            event_key,
             i64::try_from(index).context("token event index exceeded SQLite integer range")?,
             event.timestamp.timestamp_millis(),
             event.model,
@@ -5549,31 +5670,11 @@ fn store_token_events(
             to_i64(event.delta.total_tokens)?,
             to_i64(event.delta.cache_creation_input_tokens)?,
         ])?;
-    }
-
-    // Maintain the #107 hour-bucket token rollup incrementally: token events
-    // are append-only (the same new-suffix slice inserted above), so each
-    // event needs to contribute its delta exactly once, additively, to keep
-    // read-path reconstruction exact. Skipped entirely in bulk-scan mode
-    // (issue #132) — `maintain_rollups` is false only for `observe_bulk`,
-    // whose caller runs `rebuild_rollups_if_stale` once after the scan
-    // instead of paying this per-session upsert cost thousands of times.
-    if maintain_rollups && next_event_index < events.len() {
-        let mut upsert = transaction.prepare(
-            "INSERT INTO rollup_token_totals(
-               session_key, hour_bucket, model, service_tier,
-               input_tokens, cached_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
-               cache_creation_input_tokens)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(session_key, hour_bucket, model, service_tier) DO UPDATE SET
-               input_tokens = input_tokens + excluded.input_tokens,
-               cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
-               output_tokens = output_tokens + excluded.output_tokens,
-               reasoning_output_tokens = reasoning_output_tokens + excluded.reasoning_output_tokens,
-               total_tokens = total_tokens + excluded.total_tokens,
-               cache_creation_input_tokens = cache_creation_input_tokens + excluded.cache_creation_input_tokens",
-        )?;
-        for event in events.iter().skip(next_event_index) {
+        if inserted == 0 {
+            if let Some(request_input) = event.request_input_tokens {
+                update_evidence.execute(params![key, event_key, to_i64(request_input)?])?;
+            }
+        } else if let Some(upsert) = &mut upsert {
             upsert.execute(params![
                 key,
                 hour_bucket(event.timestamp.timestamp_millis()),
@@ -6001,7 +6102,8 @@ fn provider_identity(session: &Session) -> Result<String> {
 
 fn first_event_fingerprint(session: &Session) -> String {
     let first_turn = session.turns.first();
-    let first_event = session.tokens_history.first();
+    let first = legacy_token_events(session).next();
+    let first_event = first.as_deref();
     let value = format!(
         "v1\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
         session.started_at.timestamp_millis(),
@@ -6035,6 +6137,37 @@ fn is_legacy_claude_subagent(session: &Session) -> bool {
             .parent_thread_id
             .as_deref()
             .is_some_and(|parent| !parent.trim().is_empty())
+}
+
+/// Reconstructs only the identity fields an older parser would have emitted.
+fn legacy_token_events(session: &Session) -> impl Iterator<Item = Cow<'_, TokenHistoryPoint>> {
+    session
+        .tokens_history
+        .iter()
+        .enumerate()
+        .filter_map(
+            |(index, event)| match session.legacy_token_deltas.get(&index) {
+                None => Some(Cow::Borrowed(event)),
+                Some(None) => None,
+                Some(Some(legacy)) => {
+                    let mut point = event.clone();
+                    if legacy.model_was_missing {
+                        point.model = None;
+                    }
+                    point.delta = legacy.delta.clone();
+                    Some(Cow::Owned(point))
+                }
+            },
+        )
+}
+
+fn source_histories_match(incoming: &Session, stored: &Session, stored_format: i64) -> bool {
+    if stored_format == 1 && !incoming.legacy_token_deltas.is_empty() {
+        return legacy_token_events(incoming)
+            .zip(&stored.tokens_history)
+            .all(|(left, right)| token_event_signature(&left) == token_event_signature(right));
+    }
+    histories_share_lineage(&incoming.tokens_history, &stored.tokens_history)
 }
 
 fn histories_share_lineage(left: &[TokenHistoryPoint], right: &[TokenHistoryPoint]) -> bool {
@@ -6071,10 +6204,10 @@ fn optional_metadata_matches<T: PartialEq>(left: &Option<T>, right: &Option<T>) 
     }
 }
 
-fn history_lineage(session: &Session) -> String {
+fn history_lineage<'a>(events: impl Iterator<Item = Cow<'a, TokenHistoryPoint>>) -> String {
     let mut value = String::new();
-    for event in &session.tokens_history {
-        value.push_str(&token_event_signature(event));
+    for event in events {
+        value.push_str(&token_event_signature(&event));
         value.push('\u{1e}');
     }
     // Include the empty history marker so provisional sessions do not share a
@@ -6096,7 +6229,7 @@ fn source_artifact_key(
     session: &Session,
     durable_key: &str,
 ) -> Result<String> {
-    let lineage = history_lineage(session);
+    let lineage = history_lineage(legacy_token_events(session));
     let base = format!(
         "artifact-{}",
         stable_hash(&format!("{identity}\u{1f}{lineage}"))
@@ -7053,6 +7186,7 @@ mod tests {
             first_user_message: None,
             tokens_total: first.delta.clone(),
             tokens_by_model: HashMap::new(),
+            legacy_token_deltas: Default::default(),
             tokens_history: vec![first],
             rate_limits_history: Vec::<RateLimitSnapshotPoint>::new(),
             turns: Vec::<TurnInfo>::new(),
@@ -10507,6 +10641,20 @@ mod tests {
         let second = store
             .observe(Path::new("beta.jsonl"), &beta, generation)
             .unwrap();
+        let mut gamma = alpha.clone();
+        gamma.turns[0].turn_id = "gamma".into();
+        let third = store
+            .observe(Path::new("gamma.jsonl"), &gamma, generation)
+            .unwrap();
+        assert_ne!(third.key, first.key);
+        assert_ne!(third.key, second.key);
+        assert_eq!(
+            store
+                .observe(Path::new("gamma-copy.jsonl"), &gamma, generation)
+                .unwrap()
+                .key,
+            third.key
+        );
         assert_ne!(first.key, second.key);
         assert_eq!(
             store
@@ -10516,19 +10664,20 @@ mod tests {
             second.key
         );
         let keys = store.session_keys().unwrap();
-        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.len(), 3);
         let ranges = store.range_totals_multi(&keys, &[(None, None)]).unwrap();
         assert_eq!(
             ranges[0]
                 .values()
                 .map(|range| range.tokens.total_tokens)
                 .sum::<u64>(),
-            alpha.tokens_total.total_tokens + beta.tokens_total.total_tokens
+            3 * alpha.tokens_total.total_tokens
         );
         let connection = store.connection().unwrap();
         for (path, key, expected_fingerprint) in [
             ("alpha.jsonl", &first.key, first_event_fingerprint(&alpha)),
             ("beta.jsonl", &second.key, first_event_fingerprint(&beta)),
+            ("gamma.jsonl", &third.key, first_event_fingerprint(&gamma)),
         ] {
             let (location_key, artifact_key, artifact_fingerprint): (String, String, String) =
                 connection
@@ -10554,7 +10703,7 @@ mod tests {
             !store
                 .has_ambiguous_accounting_identity(&keys, in_window.0, in_window.1, &control)
                 .unwrap(),
-            "two present collisions are separately accounted"
+            "present collisions are separately accounted"
         );
 
         {
@@ -10966,6 +11115,102 @@ mod tests {
     }
 
     #[test]
+    fn v16_repair_preserves_identity_and_waits_for_source_to_correct_usage() {
+        let (directory, store) = store();
+        let path = directory.path().join("history.sqlite3");
+        let generation = store.begin_scan().unwrap();
+        let mut original = session("v16-reparse", 3);
+        original.tokens_history[0].model = None;
+        append_event(&mut original, 2, "2026-01-01T00:00:02Z");
+        let mut corrected = original.clone();
+        corrected.tokens_history[0].model = Some("unknown".into());
+        let pre_model = original.tokens_history[0].delta.clone();
+        original.tokens_history[1].delta += &pre_model;
+        for (index, point) in original.tokens_history.iter().enumerate() {
+            corrected.legacy_token_deltas.insert(
+                index,
+                Some(crate::model::LegacyTokenDelta {
+                    model_was_missing: point.model.is_none(),
+                    delta: point.delta.clone(),
+                }),
+            );
+        }
+        let key = store
+            .observe(Path::new("old.jsonl"), &original, generation)
+            .unwrap()
+            .key;
+        let fingerprint = first_event_fingerprint(&original);
+        assert_eq!(first_event_fingerprint(&corrected), fingerprint);
+        {
+            let connection = store.connection().unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE session_snapshots SET format_version=1;
+                UPDATE rollup_token_totals SET total_tokens=900;
+                PRAGMA user_version=16;",
+                )
+                .unwrap();
+        }
+        drop(store);
+        let store = HistoryStore::open(&path).unwrap();
+        assert_eq!(
+            store.dirty_session_keys().unwrap(),
+            std::slice::from_ref(&key)
+        );
+        let rows: i64 = store
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT SUM(total_tokens) FROM rollup_token_totals",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows as u64,
+            original
+                .tokens_history
+                .iter()
+                .map(|point| point.delta.total_tokens)
+                .sum::<u64>()
+        );
+        // Observing an older source copy must not clear the unavailable state.
+        let mut short = corrected.clone();
+        short.tokens_history.truncate(1);
+        short.legacy_token_deltas.remove(&1);
+        short.last_event_at = short.tokens_history[0].timestamp;
+        store
+            .observe(Path::new("short.jsonl"), &short, generation)
+            .unwrap();
+        assert_eq!(
+            store.dirty_session_keys().unwrap(),
+            std::slice::from_ref(&key)
+        );
+        let stored = store
+            .observe(Path::new("old.jsonl"), &corrected, generation)
+            .unwrap();
+        assert_eq!(stored.key, key);
+        assert!(store.dirty_session_keys().unwrap().is_empty());
+        assert_eq!(store.session_keys().unwrap(), std::slice::from_ref(&key));
+        let result = store
+            .range_totals_multi(std::slice::from_ref(&key), &[(None, None)])
+            .unwrap();
+        assert_eq!(result[0][&key].tokens, corrected.tokens_total);
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO purged_sessions VALUES(?1,?1,?2,0)",
+                params![key, fingerprint],
+            )
+            .unwrap();
+        assert!(store
+            .observe(Path::new("copy.jsonl"), &corrected, generation)
+            .unwrap_err()
+            .is::<PurgedSource>());
+    }
+
+    #[test]
     fn repeated_event_signature_remains_idempotent_during_append() {
         let (_directory, store) = store();
         let generation = store.begin_scan().unwrap();
@@ -10978,6 +11223,20 @@ mod tests {
         appended
             .tokens_history
             .push(original.tokens_history[0].clone());
+        let path = Path::new("duplicate-event.jsonl");
+        for title in ["one", "two", "three"] {
+            appended.thread_name = Some(title.into());
+            let key = store.observe(path, &appended, generation).unwrap().key;
+            let read = || {
+                store
+                    .range_totals_multi(std::slice::from_ref(&key), &[(None, None)])
+                    .unwrap()[0][&key]
+                    .tokens
+                    .clone()
+            };
+            assert_eq!(read(), original.tokens_total);
+        }
+        store.rebuild_rollups().unwrap();
         append_event(&mut appended, 20, "2026-01-01T00:00:02Z");
         store
             .observe(Path::new("duplicate-event.jsonl"), &appended, generation)
@@ -11480,6 +11739,7 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                17 => "", // data-only token rollup repair
                 16 => "DROP TABLE offline_cases; DROP TABLE offline_experiments;",
                 15 => "DROP TABLE curated_cases; DROP TABLE curated_changes; DELETE FROM history_meta WHERE key='dataset_revision';",
                 14 => "ALTER TABLE session_annotations DROP COLUMN outcome_label; ALTER TABLE session_annotations DROP COLUMN repair_minutes; ALTER TABLE session_annotations DROP COLUMN first_pass_accepted;",
@@ -11721,6 +11981,7 @@ mod tests {
                 "v13_to_v14_human_outcomes",
                 "v14_to_v15_curated_dataset",
                 "v15_to_v16_offline_comparisons",
+                "v16_to_v17_token_accounting",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );

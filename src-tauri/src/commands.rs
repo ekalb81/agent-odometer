@@ -1525,13 +1525,7 @@ pub fn set_config(
     );
     crate::memory::configure_heap_tracking(config.memory_heap_tracking_enabled);
 
-    // Invalidate every prior scan before swapping watchers. Dropping the old
-    // handle waits out any in-flight callback; clearing then removes all data
-    // from the previous generation before the replacement scan begins.
-    state.advance_scan_generation();
-    let previous_watcher = state.watcher.lock().unwrap().replace(replacement);
-    drop(previous_watcher);
-    state.clear_sessions();
+    state.replace_session_watcher(replacement);
     state.scanned.store(false, Ordering::Release);
     state.scan_done.store(0, Ordering::Release);
     state.scan_total.store(0, Ordering::Release);
@@ -3943,6 +3937,7 @@ mod tests {
             first_user_message: None,
             tokens_total: TokenTotals::default(),
             tokens_by_model: Default::default(),
+            legacy_token_deltas: Default::default(),
             tokens_history: Vec::new(),
             rate_limits_history,
             turns: Vec::new(),

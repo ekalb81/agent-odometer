@@ -271,6 +271,8 @@ The workflow creates or validates one mutable draft release during preflight, th
 
 Issues and pull requests welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the pre-PR checklist, and the one hard rule: never include real session data. Security issues go through [private reporting](SECURITY.md).
 
+The [executable TLA+ model](docs/formal/README.md) specifies Odometer's accounting, concurrency, persistence, and trust boundaries.
+
 ## License
 
 [MIT](LICENSE)

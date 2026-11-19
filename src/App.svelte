@@ -61,7 +61,7 @@
   const appStarted = performance.now();
 
   $effect(() => {
-    void projectStore.observeScanComplete(scanStore.status.complete);
+    void projectStore.observeScanComplete(sessionsReady && scanStore.status.complete);
   });
 
   // Filter state lives here per view scope so the toolbar can drive the
@@ -141,7 +141,7 @@
     const ids = [...sessionsStore.map.values()].filter(s => provider === 'all' || s.harness === provider).map(s => s.storage_id);
     const mutation = sessionsStore.mutationLog.generation;
     const history = historyStore.status;
-    const valid = () => epoch === trayEpoch && generation === trayJobGeneration && mutation === sessionsStore.mutationLog.generation && provider === trayProvider && history === historyStore.status;
+    const valid = () => sessionsReady && epoch === trayEpoch && generation === trayJobGeneration && mutation === sessionsStore.mutationLog.generation && provider === trayProvider && history === historyStore.status;
     const drained = trayMutations.drain();
     const plan = trayCache.plan({
       rangesKey,
@@ -215,6 +215,15 @@
     void trayRefreshGeneration;
     void trayProvider;
     void $ambient?.recent;
+    if (!sessionsReady) {
+      trayProof = null;
+      trayCache.invalidate();
+      if (rateCard) {
+        const status = sessionListFailed ? 'unavailable' : 'verifying';
+        void setTrayTotals({ tokens: status, codex_credits: status, codex_api_usd: status, claude_usd: status, gemini_plan: status, quota: '', provider: trayProvider }).catch(() => {});
+      }
+      return;
+    }
     const ratesChanged = rateCard !== lastTrayRates;
     lastTrayRates = rateCard;
     let retainRaw = false;
@@ -311,7 +320,9 @@
     | { kind: 'remove' };
   let pendingMutations = new Map<string, PendingMutation>();
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
-  let sessionsReady = false;
+  let sessionsReady = $state(false);
+  let sessionListFailed = $state(false);
+  let retrySessionList = $state<() => void>();
   const flushHistory: number[] = [];
 
   function flushMutations() {
@@ -494,22 +505,27 @@
       // snapshot; only events arriving during this request are replayed onto it.
       if (sessionsReady) flushMutations();
       sessionsReady = false;
+      sessionListFailed = false;
+      if (scanStore.status.complete) {
+        terminalScanStatus = scanStore.status;
+        scanStore.set({ ...terminalScanStatus, complete: false, done: 0 });
+      }
       try {
         const sessions = await measureAsync(operation, listSessions);
-        if (!disposed && generation === reloadGeneration) sessionsStore.replaceAll(sessions);
+        if (disposed || generation !== reloadGeneration) return;
+        sessionsStore.replaceAll(sessions);
+        sessionsReady = true;
+        flushMutations();
+        if (terminalScanStatus) installScanStatus(terminalScanStatus);
       } catch (error) {
         if (!disposed && generation === reloadGeneration) {
+          sessionListFailed = true;
           console.error(`${operation} failed:`, error);
-        }
-      } finally {
-        if (!disposed && generation === reloadGeneration) {
-          sessionsReady = true;
-          if (terminalScanStatus) installScanStatus(terminalScanStatus);
-          else scheduleMutationFlush();
         }
       }
     }
 
+    retrySessionList = () => void reloadSessions('frontend.retry_list_sessions');
     void (async () => {
       // Establish event delivery before taking snapshots. Session mutations
       // remain buffered until the latest snapshot is installed.
@@ -548,11 +564,13 @@
             previous.archive_roots,
             previous.session_index_path,
             previous.claude_session_roots,
+            previous.providers,
           ]) !== JSON.stringify([
             newConfig.session_roots,
             newConfig.archive_roots,
             newConfig.session_index_path,
             newConfig.claude_session_roots,
+            newConfig.providers,
           ]);
           const instructionSourcesChanged =
             previous.instructions_enabled !== newConfig.instructions_enabled ||
@@ -741,11 +759,20 @@
 
   <!-- Main content. Harness views stay mounted so filters/sort survive tab switches. -->
   <main class="flex-1 overflow-hidden">
-    <div class="h-full {activeView === 'all' ? '' : 'hidden'}">
+    {#if !sessionsReady && activeScope}
+      <div class="p-5 text-sm">
+        {#if sessionListFailed}
+          <p role="alert">Session list unavailable. <button class="ml-2 underline" onclick={retrySessionList}>Retry session list</button></p>
+        {:else}
+          <p role="status">Loading session list…</p>
+        {/if}
+      </div>
+    {/if}
+    <div class="h-full {sessionsReady && activeView === 'all' ? '' : 'hidden'}">
       <SessionsView
         harness="all"
         {analyticsRequest}
-        active={activeView === 'all'}
+        active={sessionsReady && activeView === 'all'}
         filters={filtersByScope.all}
         pinnedOnly={organizationFilters.all?.pinned ?? false}
         organizationTags={organizationFilters.all?.tags ?? []}
@@ -753,10 +780,10 @@
       />
     </div>
     {#each providersStore.descriptors as descriptor (descriptor.id)}
-      <div class="h-full {providerAccent(descriptor.id).accentClass ?? ''} {activeScope === descriptor.id ? '' : 'hidden'}">
+      <div class="h-full {providerAccent(descriptor.id).accentClass ?? ''} {sessionsReady && activeScope === descriptor.id ? '' : 'hidden'}">
         <SessionsView
           harness={descriptor.id}
-          active={activeScope === descriptor.id}
+          active={sessionsReady && activeScope === descriptor.id}
           filters={filtersByScope[descriptor.id] ?? defaultFilters()}
           pinnedOnly={organizationFilters[descriptor.id]?.pinned ?? false}
           organizationTags={organizationFilters[descriptor.id]?.tags ?? []}
@@ -788,7 +815,9 @@
       <button class="text-amber-500 hover:underline" onclick={() => openSettings('projects', '#history-retention-settings')}>
         {historyStore.status.status === 'unavailable' ? 'History unavailable — recovery settings' : 'Historical coverage incomplete — history settings'}
       </button>
-    {:else if !scanStore.status.complete}
+    {:else if sessionListFailed}
+      <span>Session list unavailable</span>
+    {:else if !sessionsReady || !scanStore.status.complete}
       <span class="flex items-center gap-1.5" role="status">
         <svg class="w-3 h-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.25" stroke-width="4" />

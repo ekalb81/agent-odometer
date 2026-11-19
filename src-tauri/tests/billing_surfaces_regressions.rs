@@ -218,6 +218,43 @@ fn full_request_threshold_and_dates_do_not_cross_credit_allowance_surfaces() {
 }
 
 #[test]
+fn bundled_sol_dated_pricing_distinguishes_missing_zero_and_threshold_input() {
+    let rates = RateCard::load_bundled().unwrap();
+    let verified = at("2026-11-18T12:00:00Z");
+    for (request_input, usd, missing, applied) in [
+        (None, 6.62, 1, 0),
+        (Some(0), 6.62, 0, 0),
+        (Some(272_000), 6.62, 0, 0),
+        (Some(272_001), 10.74, 0, 1),
+    ] {
+        let mut fixture = session("gpt-6.2-sol", None, request_input);
+        fixture.tokens_history[0].timestamp = verified;
+        let pricing = price_session_details(fixture, &rates, verified).pricing;
+        let api = pricing.time_aware_api.unwrap();
+        close(api.pricing.total, usd);
+        assert_eq!(
+            api.conditional_evidence_missing.len(),
+            missing,
+            "{request_input:?}"
+        );
+        assert_eq!(api.applied_modifiers.len(), applied);
+        assert_eq!(api.applied_rate_periods.len(), 1);
+        assert!(api.rules.iter().all(|rule| {
+            rule.provenance.source_url
+                == "https://developers.openai.com/api/docs/models/gpt-6.2-sol"
+        }));
+        close(
+            pricing.dated_purchased_credits.unwrap().pricing.total,
+            165.5,
+        );
+        close(
+            pricing.dated_included_allowance.unwrap().pricing.total,
+            165.5,
+        );
+    }
+}
+
+#[test]
 fn cache_writes_never_charge_codex_credits_or_double_count_cached_or_reasoning_subsets() {
     let rates = RateCard::load_bundled().unwrap();
     let mut tokens = usage();
