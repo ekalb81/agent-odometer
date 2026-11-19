@@ -1994,6 +1994,7 @@ mod tests {
             first_user_message: None,
             tokens_total: crate::model::TokenTotals::default(),
             tokens_by_model: std::collections::HashMap::new(),
+            legacy_token_deltas: Default::default(),
             tokens_history: Vec::new(),
             rate_limits_history,
             turns: Vec::new(),

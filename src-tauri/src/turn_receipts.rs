@@ -20,6 +20,8 @@ struct HookInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HookRunRecord {
+    #[serde(default)]
+    pub started_at: Option<DateTime<Utc>>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub success: bool,
     pub last_receipt: Option<String>,
@@ -49,7 +51,8 @@ pub fn try_run_cli() -> bool {
         }
     };
 
-    let config = Config::load().unwrap_or_default();
+    let started_at = Some(Utc::now());
+    let config = Config::load_read_only().unwrap_or_default();
     let provider_enabled = if harness == codex_provider_id() {
         config.turn_receipts_codex
     } else if harness == claude_code_provider_id() {
@@ -74,6 +77,7 @@ pub fn try_run_cli() -> bool {
             save_run_record(
                 harness,
                 HookRunRecord {
+                    started_at,
                     last_run_at: Some(Utc::now()),
                     success: true,
                     last_receipt: Some(receipt.clone()),
@@ -87,6 +91,7 @@ pub fn try_run_cli() -> bool {
             save_run_record(
                 harness,
                 HookRunRecord {
+                    started_at,
                     last_run_at: Some(Utc::now()),
                     success: false,
                     last_receipt: None,
@@ -675,6 +680,7 @@ mod tests {
             first_user_message: None,
             tokens_total: tokens.clone(),
             tokens_by_model: HashMap::from([("gpt-test".into(), tokens)]),
+            legacy_token_deltas: Default::default(),
             tokens_history: Vec::new(),
             rate_limits_history: vec![
                 RateLimitSnapshotPoint {
@@ -1025,12 +1031,14 @@ mod tests {
     fn harness_health_records_use_independent_files() {
         let dir = tempfile::tempdir().unwrap();
         let codex_record = HookRunRecord {
+            started_at: None,
             last_run_at: Some("2026-07-25T12:00:00Z".parse().unwrap()),
             success: true,
             last_receipt: Some("codex receipt".into()),
             detail: None,
         };
         let claude_record = HookRunRecord {
+            started_at: None,
             last_run_at: Some("2026-07-25T12:00:01Z".parse().unwrap()),
             success: false,
             last_receipt: None,

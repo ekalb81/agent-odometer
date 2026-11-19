@@ -1,6 +1,6 @@
 use crate::model::{
-    storage_id_for_session, RateLimitSnapshotPoint, RateLimitWindow, Session, SourceAvailability,
-    TokenHistoryPoint, TokenTotals, TurnStatus,
+    storage_id_for_session, LegacyTokenDelta, RateLimitSnapshotPoint, RateLimitWindow, Session,
+    SourceAvailability, TokenHistoryPoint, TokenTotals, TurnStatus,
 };
 use crate::provider::codex_provider_id;
 use anyhow::Context;
@@ -19,6 +19,9 @@ pub struct SessionParser {
     pub file_path: PathBuf,
     pub archived: bool,
     seen_tool_ids: HashSet<String>,
+    // Only the historical identity calculation uses these pre-schema-17 counters.
+    legacy_reported: TokenTotals,
+    legacy_attributed: TokenTotals,
 }
 
 /// Max characters retained for per-turn prompt / agent-message previews.
@@ -35,6 +38,8 @@ impl SessionParser {
             file_path,
             archived,
             seen_tool_ids: HashSet::new(),
+            legacy_reported: TokenTotals::default(),
+            legacy_attributed: TokenTotals::default(),
         }
     }
 
@@ -97,6 +102,8 @@ impl SessionParser {
         self.current_service_tier = None;
         self.current_turn_id = None;
         self.seen_tool_ids.clear();
+        self.legacy_reported = TokenTotals::default();
+        self.legacy_attributed = TokenTotals::default();
     }
 
     pub fn apply_line(&mut self, line: &str) -> anyhow::Result<()> {
@@ -374,6 +381,7 @@ impl SessionParser {
             first_user_message: None,
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
+            legacy_token_deltas: Default::default(),
             tokens_history: Vec::new(),
             rate_limits_history: Vec::new(),
             turns: Vec::new(),
@@ -695,9 +703,11 @@ impl SessionParser {
         let info = payload.get("info").filter(|value| !value.is_null());
         let total_usage = info
             .and_then(|value| value.get("total_token_usage"))
+            .filter(|usage| usage.is_object())
             .map(parse_token_totals);
         let last_usage = info
             .and_then(|value| value.get("last_token_usage"))
+            .filter(|usage| usage.is_object())
             .map(parse_token_totals);
         let request_input_tokens = last_usage.as_ref().map(|usage| usage.input_tokens);
         let context_window = info
@@ -709,9 +719,6 @@ impl SessionParser {
         let turn_id = self.current_turn_id.clone();
 
         if let Some(s) = self.session.as_mut() {
-            if let Some(total) = &total_usage {
-                s.tokens_total = total.clone();
-            }
             if let Some(cw) = context_window {
                 s.context_window = Some(cw);
             }
@@ -721,54 +728,75 @@ impl SessionParser {
                 s.latest_context_tokens = Some(last.input_tokens + last.output_tokens);
             }
 
-            // Compute the per-event contribution once, then attribute it
-            // identically to the model bucket, the history point, and the
-            // current turn so all three stay consistent with tokens_total.
-            //
-            // Start from `last_token_usage` (the most recent API call's
-            // tokens). Then reconcile: enforce sum(tokens_by_model) ==
-            // tokens_total and fold any positive remainder (carry-over from a
-            // prior rollout file, or an early event before current_model was
-            // known) into the contribution. This converges for fresh, resumed,
-            // and mid-session model-switch cases.
-            let mut contribution = last_usage.clone().unwrap_or_default();
-            if let Some(model) = &model {
-                let entry = s.tokens_by_model.entry(model.clone()).or_default();
-                add_token_totals(entry, &contribution);
+            if total_usage.is_some() || last_usage.is_some() {
+                let last = last_usage.unwrap_or_default();
+                let mut contribution = match &total_usage {
+                    Some(total) => subtract_totals_saturating(total, &s.tokens_total),
+                    None => last.clone(),
+                };
+                // Delayed writes can only attach to uncached input beyond the direct call.
+                let available = contribution
+                    .input_tokens
+                    .saturating_sub(contribution.cached_input_tokens);
+                let direct = last.cache_creation_input_tokens.min(available);
+                let remainder = subtract_totals_saturating(&contribution, &last);
+                contribution.cache_creation_input_tokens = direct
+                    + remainder
+                        .cache_creation_input_tokens
+                        .min(
+                            remainder
+                                .input_tokens
+                                .saturating_sub(remainder.cached_input_tokens),
+                        )
+                        .min(available - direct);
+                s.tokens_total += &contribution;
+                let attributed_model = model.as_deref().unwrap_or("unknown");
+                *s.tokens_by_model
+                    .entry(attributed_model.to_owned())
+                    .or_default() += &contribution;
 
-                let bucket_sum = sum_bucket_totals(&s.tokens_by_model);
-                let mut remainder = subtract_totals_saturating(&s.tokens_total, &bucket_sum);
-                // A delayed cache-write count can only attach to unattributed uncached input.
-                remainder.cache_creation_input_tokens = remainder.cache_creation_input_tokens.min(
-                    remainder
-                        .input_tokens
-                        .saturating_sub(remainder.cached_input_tokens),
-                );
-                s.tokens_total.cache_creation_input_tokens =
-                    bucket_sum.cache_creation_input_tokens + remainder.cache_creation_input_tokens;
-                if totals_any_positive(&remainder) {
-                    let entry = s.tokens_by_model.entry(model.clone()).or_default();
-                    add_token_totals(entry, &remainder);
-                    add_token_totals(&mut contribution, &remainder);
+                let index = s.tokens_history.len();
+                if let Some(total) = &total_usage {
+                    self.legacy_reported = total.clone();
                 }
-            }
-
-            if let Some(total) = &total_usage {
+                let mut legacy = last;
+                if model.is_some() {
+                    self.legacy_attributed += &legacy;
+                    let remainder =
+                        subtract_totals_saturating(&self.legacy_reported, &self.legacy_attributed);
+                    self.legacy_attributed += &remainder;
+                    legacy += &remainder;
+                }
+                // Cache-write enrichment never participated in durable event identity.
+                legacy.cache_creation_input_tokens = contribution.cache_creation_input_tokens;
+                if total_usage.is_none() {
+                    s.legacy_token_deltas.insert(index, None);
+                } else if model.is_none() || legacy != contribution {
+                    s.legacy_token_deltas.insert(
+                        index,
+                        Some(LegacyTokenDelta {
+                            model_was_missing: model.is_none(),
+                            delta: legacy,
+                        }),
+                    );
+                }
                 s.tokens_history.push(TokenHistoryPoint {
                     timestamp: event_ts,
-                    model: model.clone(),
+                    model: Some(attributed_model.to_owned()),
                     service_tier: service_tier.clone(),
                     request_input_tokens,
-                    total_tokens: total.total_tokens,
+                    total_tokens: total_usage
+                        .as_ref()
+                        .map_or(s.tokens_total.total_tokens, |total| total.total_tokens),
                     delta: contribution.clone(),
                 });
-            }
 
-            if let Some(tid) = &turn_id {
-                if let Some(turn) = s.turns.iter_mut().find(|t| &t.turn_id == tid) {
-                    add_token_totals(&mut turn.tokens, &contribution);
-                    if service_tier.is_some() {
-                        turn.service_tier = service_tier;
+                if let Some(tid) = &turn_id {
+                    if let Some(turn) = s.turns.iter_mut().find(|t| &t.turn_id == tid) {
+                        add_token_totals(&mut turn.tokens, &contribution);
+                        if service_tier.is_some() {
+                            turn.service_tier = service_tier;
+                        }
                     }
                 }
             }
@@ -978,14 +1006,6 @@ fn add_token_totals(dst: &mut TokenTotals, src: &TokenTotals) {
     *dst += src;
 }
 
-fn sum_bucket_totals(buckets: &HashMap<String, TokenTotals>) -> TokenTotals {
-    let mut acc = TokenTotals::default();
-    for t in buckets.values() {
-        add_token_totals(&mut acc, t);
-    }
-    acc
-}
-
 fn subtract_totals_saturating(a: &TokenTotals, b: &TokenTotals) -> TokenTotals {
     TokenTotals {
         input_tokens: a.input_tokens.saturating_sub(b.input_tokens),
@@ -999,14 +1019,6 @@ fn subtract_totals_saturating(a: &TokenTotals, b: &TokenTotals) -> TokenTotals {
             .saturating_sub(b.reasoning_output_tokens),
         total_tokens: a.total_tokens.saturating_sub(b.total_tokens),
     }
-}
-
-fn totals_any_positive(t: &TokenTotals) -> bool {
-    t.input_tokens > 0
-        || t.cached_input_tokens > 0
-        || t.output_tokens > 0
-        || t.reasoning_output_tokens > 0
-        || t.total_tokens > 0
 }
 
 pub fn parse_file(path: &Path, archived: bool) -> anyhow::Result<Option<Session>> {

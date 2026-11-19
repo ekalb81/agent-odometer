@@ -433,6 +433,83 @@ fn populates_tokens_history_from_token_count_events() {
 }
 
 #[test]
+fn cumulative_and_last_only_events_conserve_usage_at_the_original_time() {
+    use serde_json::json;
+    let mut parser = parser::SessionParser::new("synthetic.jsonl".into(), false);
+    parser.apply_line(r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"synthetic-ledger","timestamp":"2026-01-01T00:00:00Z"}}"#).unwrap();
+    let usage = |n| json!({"input_tokens":n,"total_tokens":n});
+    let event = |second, info| {
+        json!({"timestamp":format!("2026-01-01T00:00:{second:02}Z"),"type":"event_msg","payload":{"type":"token_count","info":info}}).to_string()
+    };
+    parser
+        .apply_line(&event(
+            1,
+            json!({"total_token_usage":usage(3),"last_token_usage":usage(3)}),
+        ))
+        .unwrap();
+    parser.apply_line(r#"{"timestamp":"2026-01-01T00:00:02Z","type":"turn_context","payload":{"turn_id":"t","model":"gpt-test"}}"#).unwrap();
+    let known = event(
+        3,
+        json!({"total_token_usage":usage(5),"last_token_usage":usage(2)}),
+    );
+    parser.apply_line(&known).unwrap();
+    parser.apply_line(&known).unwrap();
+    parser
+        .apply_line(&event(4, json!({"last_token_usage":usage(5)})))
+        .unwrap();
+    parser
+        .apply_line(&event(
+            5,
+            json!({"total_token_usage":usage(17),"last_token_usage":usage(7)}),
+        ))
+        .unwrap();
+    let session = parser.session.unwrap();
+    assert_eq!(session.tokens_total.total_tokens, 17);
+    assert_eq!(session.tokens_by_model["unknown"].total_tokens, 3);
+    assert_eq!(session.tokens_by_model["gpt-test"].total_tokens, 14);
+    assert_eq!(session.turns[0].tokens.total_tokens, 14);
+    assert_eq!(
+        session
+            .tokens_history
+            .iter()
+            .map(|e| e.delta.total_tokens)
+            .collect::<Vec<_>>(),
+        [3, 2, 0, 5, 7]
+    );
+    assert!(
+        session.legacy_token_deltas[&0]
+            .as_ref()
+            .unwrap()
+            .model_was_missing
+    );
+    assert_eq!(
+        session.legacy_token_deltas[&1]
+            .as_ref()
+            .unwrap()
+            .delta
+            .total_tokens,
+        5
+    );
+    assert_eq!(
+        session.legacy_token_deltas[&2]
+            .as_ref()
+            .unwrap()
+            .delta
+            .total_tokens,
+        2
+    );
+    assert!(session.legacy_token_deltas[&3].is_none());
+    let at = session.tokens_history[3].timestamp;
+    let one = session.range_totals(Some(at), Some(at));
+    assert_eq!(one.tokens.total_tokens, 5);
+    assert_eq!(one.buckets[0].tokens.total_tokens, 5);
+    assert_eq!(
+        session.range_totals(None, None).tokens,
+        session.tokens_total
+    );
+}
+
+#[test]
 fn resumed_session_attributes_carryover_total_to_active_model() {
     // Simulate a Codex rollout file that resumed from a prior session: the
     // first non-null token_count event's `total_token_usage` already includes

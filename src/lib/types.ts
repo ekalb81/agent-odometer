@@ -208,6 +208,8 @@ export interface Session {
     total_tokens: number;
     delta: TokenTotals;
   }[];
+  /** Sparse prior-parser identity evidence for the local archive. */
+  legacy_token_deltas?: Record<string, { model_was_missing: boolean; delta: TokenTotals } | null>;
   rate_limits_history: RateLimitSnapshotPoint[];
   turns: TurnInfo[];
   tool_observations: ToolObservation[];

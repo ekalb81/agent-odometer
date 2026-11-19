@@ -1,5 +1,5 @@
 vi.mock('./lib/liveQuota', () => ({ getLiveQuotaStatus: async () => ({ accounts: [], busy: false, configuration_error: null }), liveQuotaTrayLabel: () => null, onLiveQuotaUpdated: async () => () => {} }));
-import { cleanup, render } from '@testing-library/svelte';
+import { cleanup, fireEvent, render, screen } from '@testing-library/svelte';
 import { tick } from 'svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from './App.svelte';
@@ -7,10 +7,11 @@ import { rates } from './lib/stores/rates';
 import { sessionsStore } from './lib/stores/sessions.svelte';
 import { scanStore } from './lib/stores/scan.svelte';
 import { config } from './lib/stores/config';
+import { historyStore } from './lib/stores/history.svelte';
 import { get } from 'svelte/store';
 import { RangeDataCache } from './lib/rangeData';
 import { zeroToolMetrics } from './lib/sessionProjection';
-import type { RateCard, RangeTotals, ScanStatus, SessionSummary } from './lib/types';
+import type { Config, HistoryStatus, RateCard, RangeTotals, ScanStatus, SessionSummary } from './lib/types';
 
 const mocks = vi.hoisted(() => ({
   ranges: vi.fn(), quota: vi.fn(), tray: vi.fn(), compute: vi.fn(),
@@ -19,6 +20,8 @@ const mocks = vi.hoisted(() => ({
   startupConfig: vi.fn(), list: vi.fn(), scan: vi.fn(),
   sessionUpdated: null as null | ((session: SessionSummary) => void),
   sessionRemoved: null as null | ((id: string) => void),
+  configUpdated: null as null | ((value: Config) => void),
+  historyProgress: null as null | ((value: HistoryStatus) => void),
   scanProgress: null as null | ((status: ScanStatus) => void),
 }));
 
@@ -41,9 +44,9 @@ vi.mock('./lib/ipc', async (importOriginal) => ({
   onSessionUpdated: async (callback: (session: SessionSummary) => void) => { mocks.sessionUpdated = callback; return () => { mocks.sessionUpdated = null; }; },
   onSessionRemoved: async (callback: (id: string) => void) => { mocks.sessionRemoved = callback; return () => { mocks.sessionRemoved = null; }; },
   onScanProgress: async (callback: (status: ScanStatus) => void) => { mocks.scanProgress = callback; return () => { mocks.scanProgress = null; }; },
-  onHistoryProgress: async () => () => {},
+  onHistoryProgress: async (callback: (value: HistoryStatus) => void) => { mocks.historyProgress = callback; return () => { mocks.historyProgress = null; }; },
   onInstructionScanProgress: async () => () => {},
-  onConfigUpdated: async () => () => {},
+  onConfigUpdated: async (callback: (value: Config) => void) => { mocks.configUpdated = callback; return () => { mocks.configUpdated = null; }; },
   onOpenSettings: async () => () => {},
   onQuotaPolicyUpdated: async () => () => {},
   onTrayProviderSelected: async (callback: (provider: string) => void) => { mocks.trayProvider = callback; return () => { mocks.trayProvider = null; }; },
@@ -105,6 +108,11 @@ afterEach(() => {
 });
 
 describe('App tray pricing refresh', () => {
+  beforeEach(() => {
+    mocks.startupConfig.mockResolvedValue(get(config));
+    mocks.list.mockResolvedValue([...sessionsStore.map.values()]);
+  });
+
   it('rejects an in-flight prior provider and publishes the explicit native tray selection', async () => {
     const pending = deferred<[]>();
     mocks.quota.mockReturnValueOnce(pending.promise);
@@ -238,6 +246,64 @@ describe('App tray pricing refresh', () => {
 
 describe('App scan completion', () => {
   const complete: ScanStatus = { done: 2, total: 2, complete: true, elapsed_ms: 10, cold_reason: null };
+
+  it('withholds completion and pricing after a list failure, then replays events on retry', async () => {
+    const original = sessionsStore.map.get('synthetic')!;
+    sessionsStore.replaceAll([]);
+    const retry = deferred<SessionSummary[]>();
+    mocks.startupConfig.mockResolvedValue(get(config));
+    mocks.scan.mockResolvedValue(complete);
+    mocks.list.mockRejectedValueOnce(new Error('synthetic list failure')).mockReturnValueOnce(retry.promise);
+    render(App); await flush();
+    mocks.sessionUpdated!({ ...original, thread_name: 'Updated during outage' });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(scanStore.status.complete).toBe(false);
+    expect(sessionsStore.map.size).toBe(0);
+    expect(mocks.ranges).not.toHaveBeenCalled();
+    expect(mocks.tray.mock.lastCall?.[0].tokens).toBe('unavailable');
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry session list' }));
+    mocks.sessionRemoved!('removed');
+    retry.resolve([original, { ...original, storage_id: 'removed' }]); await flush();
+    expect(scanStore.status.complete).toBe(true);
+    expect(sessionsStore.map.get('synthetic')?.thread_name).toBe('Updated during outage');
+    expect(sessionsStore.map.has('removed')).toBe(false);
+    expect(mocks.ranges.mock.lastCall?.[2]).toEqual(['synthetic']);
+  });
+
+  it('withholds prior data after a provider root change and ignores a retry superseded by history readiness', async () => {
+    const previousConfig = get(config);
+    const previousHistory = historyStore.status;
+    const original = sessionsStore.map.get('synthetic')!;
+    const retry = deferred<SessionSummary[]>();
+    mocks.startupConfig.mockResolvedValue(previousConfig);
+    mocks.scan.mockResolvedValue(complete);
+    mocks.list.mockResolvedValueOnce([original]).mockRejectedValueOnce(new Error('replacement unavailable'))
+      .mockReturnValueOnce(retry.promise).mockResolvedValueOnce([{ ...original, storage_id: 'restored' }]);
+    const view = render(App);
+    try {
+      await flush();
+      expect(scanStore.status.complete).toBe(true);
+      mocks.ranges.mockClear();
+      mocks.configUpdated!({ ...previousConfig, providers: { ...previousConfig.providers,
+        gemini_cli: { live_roots: ['replacement'], archive_roots: [], session_index_path: null },
+      } });
+      await flush(); await vi.advanceTimersByTimeAsync(500);
+      expect(scanStore.status.complete).toBe(false);
+      expect(sessionsStore.map.has('synthetic')).toBe(true);
+      expect(mocks.ranges).not.toHaveBeenCalled();
+      expect(mocks.tray.mock.lastCall?.[0].tokens).toBe('unavailable');
+      await fireEvent.click(screen.getByRole('button', { name: 'Retry session list' }));
+      mocks.historyProgress!({ ...previousHistory, status: 'ready' }); await flush();
+      retry.reject(new Error('superseded retry')); await flush();
+      expect(screen.queryByRole('button', { name: 'Retry session list' })).toBeNull();
+      expect(scanStore.status.complete).toBe(true);
+      expect([...sessionsStore.map.keys()]).toEqual(['restored']);
+    } finally {
+      view.unmount();
+      config.set(previousConfig);
+      historyStore.set(previousHistory);
+    }
+  });
 
   it('applies the final ordered mutation batch before publishing scan completion', async () => {
     const original = sessionsStore.map.get('synthetic')!;

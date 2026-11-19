@@ -310,6 +310,7 @@ mod tests {
             first_user_message: None,
             tokens_total: TokenTotals::default(),
             tokens_by_model: HashMap::new(),
+            legacy_token_deltas: Default::default(),
             tokens_history: Vec::new(),
             rate_limits_history: Vec::new(),
             turns: Vec::new(),
