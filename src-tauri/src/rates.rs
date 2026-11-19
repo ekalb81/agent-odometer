@@ -117,8 +117,8 @@ pub struct EffectiveRatePeriod {
     #[serde(default)]
     pub to: Option<DateTime<Utc>>,
     pub rate: ModelRate,
-    /// Cache-write multiplier over uncached input. Codex does not observe
-    /// cache writes; Claude records them separately through ModelRate.
+    /// Historical cache-write multiplier over uncached input, for periods
+    /// without a separate observed count priced through ModelRate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_input_multiplier: Option<f64>,
     pub provenance: PricingProvenance,
@@ -1132,6 +1132,7 @@ fn merge_older_override(mut disk: RateCard, bundled: RateCard) -> RateCard {
         11 => serde_json::from_str(include_str!("../rate-history/v11.json")).ok(),
         12 => serde_json::from_str(include_str!("../rate-history/v12.json")).ok(),
         13 => serde_json::from_str(include_str!("../rate-history/v13.json")).ok(),
+        14 => serde_json::from_str(include_str!("../rate-history/v14.json")).ok(),
         _ => None,
     };
     merge_default_entries(
@@ -1544,7 +1545,7 @@ mod tests {
     #[test]
     fn v13_upgrade_adds_haiku_and_sol_fast_rules_without_losing_custom_rates() {
         let bundled = RateCard::load_bundled().unwrap();
-        assert_eq!(bundled.version, 14);
+        assert_eq!(bundled.version, 15);
         let mut saved: RateCard =
             serde_json::from_str(include_str!("../rate-history/v13.json")).unwrap();
         saved.models.get_mut("gpt-5.6-sol").unwrap().input = 77.0;
@@ -1556,7 +1557,7 @@ mod tests {
         let custom_modifier = saved.pricing_catalog.conditional_modifiers[0].clone();
         let merged = merge_older_override(saved, bundled);
         merged.validate().unwrap();
-        assert_eq!(merged.version, 14);
+        assert_eq!(merged.version, 15);
         assert_eq!(merged.models["gpt-5.6-sol"].input, 77.0);
         assert_eq!(merged.api_models["gpt-5.6-sol"].input, 9.0);
         assert_eq!(merged.models["my-model"], rate(3.0));
@@ -1638,6 +1639,42 @@ mod tests {
             assert_eq!(modifier.multipliers.output, multiplier);
         }
         assert!(merged.unpriced_models.contains(&"codex-auto-review".into()));
+    }
+
+    #[test]
+    fn v14_upgrade_refreshes_sonnet_defaults_and_preserves_custom_rates() {
+        let saved: RateCard =
+            serde_json::from_str(include_str!("../rate-history/v14.json")).unwrap();
+        let bundled = RateCard::load_bundled().unwrap();
+        let merged = merge_older_override(saved.clone(), bundled.clone());
+        merged.validate().unwrap();
+        assert_eq!(merged.version, 15);
+        assert_eq!(merged.models["claude-sonnet-5-5"].cached_input, 0.1);
+        assert_eq!(merged.models["gpt-6.2-sol"].output, 250.0);
+        assert_eq!(merged.models["claude-fable-5-2"].output, 40.0);
+        for (date, cached_input) in [("2026-10-06T23:59:59Z", 0.2), ("2026-10-07T00:00:00Z", 0.1)] {
+            let period = merged
+                .pricing_catalog
+                .rate_at(
+                    PricingSurface::AnthropicApiUsd,
+                    "claude-sonnet-5-5",
+                    instant(date),
+                )
+                .unwrap();
+            assert_eq!(period.rate.cached_input, cached_input);
+        }
+        let mut customized = saved;
+        customized
+            .models
+            .get_mut("claude-sonnet-5-5")
+            .unwrap()
+            .cached_input = 0.17;
+        let kept = merge_older_override(customized, bundled);
+        kept.validate().unwrap();
+        assert_eq!(kept.models["claude-sonnet-5-5"].cached_input, 0.17);
+        assert!(kept
+            .upgrade_review
+            .contains(&"models/claude-sonnet-5-5".into()));
     }
 
     fn rate(value: f64) -> ModelRate {
@@ -2328,7 +2365,7 @@ mod tests {
     fn bundled_card_version_is_ahead_of_the_last_shipped_card() {
         let card = RateCard::load_bundled().expect("bundled rate card should parse");
         assert!(
-            card.version >= 11,
+            card.version >= 15,
             "adding models or aliases requires a version bump to propagate; got {}",
             card.version
         );
@@ -2347,7 +2384,7 @@ mod tests {
         disk.model_aliases.remove("claude-opus-4-5");
         disk.models.get_mut("gpt-5.5").unwrap().input = 123.0;
         let merged = merge_older_override(disk, bundled);
-        assert_eq!(merged.version, 14);
+        assert_eq!(merged.version, 15);
         assert_eq!(merged.models["gpt-6-astra"].input, 250.0);
         assert_eq!(merged.api_models["gpt-6-astra"].input, 10.0);
         assert_eq!(merged.models["claude-fable-5-1"].cached_input, 0.25);

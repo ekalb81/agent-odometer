@@ -23,7 +23,7 @@ use chrono::TimeZone;
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -4971,7 +4971,13 @@ fn observe_one_in_transaction(
         SnapshotPolicy::Source,
     )?;
     if facts_changed {
-        store_token_events(transaction, &key, &session.tokens_history, maintain_rollups)?;
+        store_token_events(
+            transaction,
+            &key,
+            &session.tokens_history,
+            session.harness == codex_provider_id(),
+            maintain_rollups,
+        )?;
         store_tool_events(
             transaction,
             &key,
@@ -5414,6 +5420,7 @@ fn store_token_events(
     transaction: &Transaction<'_>,
     key: &str,
     events: &[TokenHistoryPoint],
+    backfill_cache_creation: bool,
     maintain_rollups: bool,
 ) -> Result<()> {
     let next_event_index: usize = transaction
@@ -5448,6 +5455,68 @@ fn store_token_events(
                 token_event_key(event),
                 to_i64(request_input_tokens)?,
             ])?;
+        }
+    }
+
+    let mut enriched_prefix = events
+        .iter()
+        .take(next_event_index)
+        .filter(|event| event.delta.cache_creation_input_tokens > 0)
+        .peekable();
+    if backfill_cache_creation && enriched_prefix.peek().is_some() {
+        // Cache writes are outside event identity. Enrich each matched old
+        // fact once; batch key lookups so later appends don't issue one
+        // SQLite statement per previously enriched event.
+        let mut update_fact = transaction.prepare(
+            "UPDATE durable_token_events SET cache_creation_input_tokens = delta.value ->> 1
+             FROM json_each(?2) AS delta
+             WHERE session_key = ?1 AND event_key = delta.value ->> 0
+               AND cache_creation_input_tokens = 0
+               AND (delta.value ->> 1) <= input_tokens - cached_input_tokens
+             RETURNING timestamp_ms, model, service_tier",
+        )?;
+        let mut refresh_rollup = transaction.prepare(
+            "INSERT INTO rollup_token_totals(
+               session_key, hour_bucket, model, service_tier, input_tokens, cached_input_tokens,
+               output_tokens, reasoning_output_tokens, total_tokens, cache_creation_input_tokens)
+             SELECT ?1, ?2, ?3, ?4, SUM(input_tokens), SUM(cached_input_tokens),
+               SUM(output_tokens), SUM(reasoning_output_tokens), SUM(total_tokens),
+               SUM(cache_creation_input_tokens)
+             FROM durable_token_events
+             WHERE session_key = ?1
+               AND timestamp_ms BETWEEN (?2 - 1) * 3600000 + 1 AND (?2 + 1) * 3600000 - 1
+               AND timestamp_ms / 3600000 = ?2
+               AND COALESCE(model, '') = ?3 AND COALESCE(service_tier, '') = ?4
+             ON CONFLICT(session_key, hour_bucket, model, service_tier) DO UPDATE SET
+               input_tokens = excluded.input_tokens,
+               cached_input_tokens = excluded.cached_input_tokens,
+               output_tokens = excluded.output_tokens,
+               reasoning_output_tokens = excluded.reasoning_output_tokens,
+               total_tokens = excluded.total_tokens,
+               cache_creation_input_tokens = excluded.cache_creation_input_tokens",
+        )?;
+        while enriched_prefix.peek().is_some() {
+            let mut batch = BTreeMap::new();
+            for event in enriched_prefix.by_ref().take(256) {
+                batch
+                    .entry(token_event_key(event))
+                    .or_insert(to_i64(event.delta.cache_creation_input_tokens)?);
+            }
+            let encoded = serde_json::to_string(&batch.into_iter().collect::<Vec<_>>())?;
+            let mut updated = update_fact.query(params![key, encoded])?;
+            let mut touched_buckets = BTreeSet::new();
+            while let Some(row) = updated.next()? {
+                if !maintain_rollups {
+                    continue;
+                }
+                let bucket = hour_bucket(row.get(0)?);
+                let model = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+                let tier = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+                touched_buckets.insert((bucket, model, tier));
+            }
+            for (bucket, model, tier) in touched_buckets {
+                refresh_rollup.execute(params![key, bucket, model, tier])?;
+            }
         }
     }
 
@@ -8401,7 +8470,8 @@ mod tests {
         // exactly what a fact-table-only fix cannot get right.
         fixture.tokens_history = vec![
             event("2026-01-01T00:30:00Z", 40),
-            event("2026-01-01T01:15:00Z", 25),
+            event("2026-01-01T01:15:00Z", 15),
+            event("2026-01-01T01:45:00Z", 10),
             event("2026-01-01T02:45:00Z", 10),
         ];
         let mut total = TokenTotals::default();
@@ -8412,14 +8482,33 @@ mod tests {
         fixture.last_event_at = timestamp("2026-01-01T02:45:00Z");
 
         let generation = store.begin_scan().unwrap().max(1);
-        let key = store
-            .observe(
-                Path::new("cache-creation-golden.jsonl"),
-                &fixture,
-                generation,
-            )
+        let path = Path::new("cache-creation-golden.jsonl");
+        let mut previous = fixture.clone();
+        previous.tokens_history.truncate(3);
+        for point in &mut previous.tokens_history {
+            point.delta.cache_creation_input_tokens = 0;
+        }
+        previous.tokens_total =
+            previous
+                .tokens_history
+                .iter()
+                .fold(TokenTotals::default(), |mut total, point| {
+                    total += &point.delta;
+                    total
+                });
+        previous.last_event_at = previous.tokens_history[2].timestamp;
+        let key = store.observe(path, &previous, generation).unwrap().key;
+        store
+            .connection()
             .unwrap()
-            .key;
+            .execute(
+                "DELETE FROM rollup_token_totals WHERE session_key = ?1 AND hour_bucket = ?2",
+                params![key, hour_bucket(previous.last_event_at.timestamp_millis())],
+            )
+            .unwrap();
+        assert_eq!(store.observe(path, &fixture, generation).unwrap().key, key);
+        fixture.last_event_at = timestamp("2026-01-01T02:46:00Z");
+        assert_eq!(store.observe(path, &fixture, generation).unwrap().key, key);
 
         // Both bounds land inside a bucket (not on an hour boundary), so
         // this single call exercises a whole-bucket rollup read (bucket 1)

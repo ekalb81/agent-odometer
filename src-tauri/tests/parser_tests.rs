@@ -477,6 +477,48 @@ fn resumed_session_attributes_carryover_total_to_active_model() {
 }
 
 #[test]
+fn codex_cache_writes_reconcile_across_model_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("codex-cache-writes.jsonl");
+    let lines = [
+        r#"{"timestamp":"2026-11-18T12:00:00Z","type":"session_meta","payload":{"id":"synthetic-cache-writes","timestamp":"2026-11-18T12:00:00Z","cli_version":"0.170.0","source":"exec","model_provider":"openai"}}"#,
+        r#"{"timestamp":"2026-11-18T12:00:01Z","type":"turn_context","payload":{"turn_id":"turn-1","model":"gpt-6.1-sol"}}"#,
+        r#"{"timestamp":"2026-11-18T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":15,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":15,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120}}}}"#,
+        r#"{"timestamp":"2026-11-18T12:00:03Z","type":"session_meta","payload":{"id":"synthetic-cache-writes","timestamp":"2026-11-18T12:00:00Z","cli_version":"0.170.0","source":"exec","model_provider":"openai"}}"#,
+        r#"{"timestamp":"2026-11-18T12:00:04Z","type":"turn_context","payload":{"turn_id":"turn-2","model":"gpt-6-sol"}}"#,
+        // The cumulative input includes eight tokens that the last call did not report.
+        r#"{"timestamp":"2026-11-18T12:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":188,"cached_input_tokens":74,"cache_write_input_tokens":27,"output_tokens":30,"reasoning_output_tokens":8,"total_tokens":218},"last_token_usage":{"input_tokens":80,"cached_input_tokens":30,"cache_write_input_tokens":10,"output_tokens":10,"reasoning_output_tokens":3,"total_tokens":90}}}}"#,
+        r#"{"timestamp":"2026-11-18T12:00:06Z","type":"turn_context","payload":{"turn_id":"turn-3","model":"gpt-6-sol"}}"#,
+        // The last call and the entire increment in cumulative input are cache reads.
+        r#"{"timestamp":"2026-11-18T12:00:07Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":248,"cached_input_tokens":134,"cache_write_input_tokens":42,"output_tokens":30,"reasoning_output_tokens":8,"total_tokens":278},"last_token_usage":{"input_tokens":60,"cached_input_tokens":60,"cache_write_input_tokens":7,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":60}}}}"#,
+    ];
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+    let session = parser::parse_file(&path, false).unwrap().unwrap();
+
+    assert_eq!(session.tokens_total.total_tokens, 278);
+    assert_eq!(session.tokens_total.cache_creation_input_tokens, 27);
+    assert_eq!(
+        session.tokens_by_model["gpt-6.1-sol"].cache_creation_input_tokens,
+        15
+    );
+    assert_eq!(
+        session.tokens_by_model["gpt-6-sol"].cache_creation_input_tokens,
+        12
+    );
+    assert_eq!(
+        session.tokens_history[1].delta.cache_creation_input_tokens,
+        12
+    );
+    assert_eq!(session.turns[1].tokens, session.tokens_history[1].delta);
+    let fully_cached = &session.tokens_history[2].delta;
+    assert_eq!(fully_cached.input_tokens, 60);
+    assert_eq!(fully_cached.cached_input_tokens, 60);
+    assert_eq!(fully_cached.cache_creation_input_tokens, 0);
+    assert_eq!(&session.turns[2].tokens, fully_cached);
+}
+
+#[test]
 fn mid_session_model_switch_attributes_each_phase_correctly() {
     // Simulate a session that starts on gpt-5.4 for the bulk of the work,
     // then switches to gpt-5.5 for the final turns. Per-model buckets must

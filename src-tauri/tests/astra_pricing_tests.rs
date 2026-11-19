@@ -25,7 +25,10 @@ fn bundled_new_models_resolve_directly_with_published_dimensions() {
         ("gpt-5.6-terra", 2.0, 0.2, 12.0, 14.2),
         ("gpt-5.6-luna", 0.2, 0.02, 1.2, 1.42),
     ] {
-        for (table, multiplier) in [(RateTable::Api, 1.0), (RateTable::Plan, 25.0)] {
+        for (table, multiplier, cache_write_rate) in [
+            (RateTable::Api, 1.0, None),
+            (RateTable::Plan, 25.0, Some(0.0)),
+        ] {
             let row = match table {
                 RateTable::Api => &rates.api_models[model],
                 RateTable::Plan => &rates.models[model],
@@ -35,7 +38,7 @@ fn bundled_new_models_resolve_directly_with_published_dimensions() {
             assert_eq!(row.cached_input, cached * multiplier, "{model}");
             assert_eq!(row.output, output * multiplier, "{model}");
             assert_eq!(row.reasoning, output * multiplier, "{model}");
-            assert_eq!(row.cache_creation_input, None, "{model}");
+            assert_eq!(row.cache_creation_input, cache_write_rate, "{model}");
             let price = price_tokens(&rates, "codex", model, None, &tokens, table, now);
             assert_eq!(price.basis, PricingBasis::Direct, "{model}");
             assert_eq!(price.resolved_model, model);

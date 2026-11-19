@@ -460,7 +460,8 @@ pub fn time_aware_surface(
             .unwrap_or_default();
         let tier = match event.service_tier.as_deref() {
             None | Some("default" | "standard") => "standard",
-            Some("fast" | "priority") => "fast",
+            Some("fast") => "fast",
+            Some("priority") if session.harness == codex_provider_id() => "fast",
             Some("ultrafast") => "ultrafast",
             _ => return None,
         };

@@ -145,9 +145,8 @@ pub struct ProviderCapabilities {
     pub language_dimension: bool,
     /// Whether context-source breakdown (derived from `TokenTotals`, which
     /// every provider populates) is available. `true` for every current
-    /// provider; a provider without a cache-write concept (e.g. Codex,
-    /// Gemini CLI) simply always reports 0 for `newly_cached_context` — a
-    /// real zero, not "unavailable".
+    /// provider. Gemini CLI and older Codex records have no explicit
+    /// cache-write count and report 0 for `newly_cached_context`.
     pub context_dimension: bool,
 }
 
