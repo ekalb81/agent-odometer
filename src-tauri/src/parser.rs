@@ -737,7 +737,15 @@ impl SessionParser {
                 add_token_totals(entry, &contribution);
 
                 let bucket_sum = sum_bucket_totals(&s.tokens_by_model);
-                let remainder = subtract_totals_saturating(&s.tokens_total, &bucket_sum);
+                let mut remainder = subtract_totals_saturating(&s.tokens_total, &bucket_sum);
+                // A delayed cache-write count can only attach to unattributed uncached input.
+                remainder.cache_creation_input_tokens = remainder.cache_creation_input_tokens.min(
+                    remainder
+                        .input_tokens
+                        .saturating_sub(remainder.cached_input_tokens),
+                );
+                s.tokens_total.cache_creation_input_tokens =
+                    bucket_sum.cache_creation_input_tokens + remainder.cache_creation_input_tokens;
                 if totals_any_positive(&remainder) {
                     let entry = s.tokens_by_model.entry(model.clone()).or_default();
                     add_token_totals(entry, &remainder);
@@ -912,14 +920,19 @@ fn ensure_turn_index(s: &mut Session, turn_id: &str) -> usize {
 }
 
 fn parse_token_totals(v: &Value) -> TokenTotals {
+    let input_tokens = v.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let cached_input_tokens = v
+        .get("cached_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     TokenTotals {
-        input_tokens: v.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
-        cached_input_tokens: v
-            .get("cached_input_tokens")
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_input_tokens: v
+            .get("cache_write_input_tokens")
             .and_then(Value::as_u64)
-            .unwrap_or(0),
-        // Codex does not report a separate cache-write dimension.
-        cache_creation_input_tokens: 0,
+            .unwrap_or(0)
+            .min(input_tokens.saturating_sub(cached_input_tokens)),
         output_tokens: v.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
         reasoning_output_tokens: v
             .get("reasoning_output_tokens")

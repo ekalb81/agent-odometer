@@ -291,7 +291,7 @@ impl HistoryStore {
                 "codex_time_aware_api_usd":Value::Null,"codex_time_aware_api_status":if codex {time_status.clone()} else {Value::Null},
                 "time_aware_api_status":time_status,"pricing_catalog_available":catalog_available,
                 "rate_card_version":rates.version,"rate_card_fetched_at":rates.fetched_at,
-                "cache_write_pricing":if codex && catalog_available {json!("unmodeled_not_observed")} else {Value::Null},
+                "cache_write_pricing":if codex && catalog_available && tokens.cache_creation_input_tokens == 0 {json!("unmodeled_not_observed")} else {Value::Null},
                 "claude_estimated_usd":if provider=="claude_code" && plan.total.is_finite() {json!(plan.total)} else {Value::Null},
                 "display_currency":if use_api {"USD"} else if current.is_some() {"purchased credits"} else {rates.currencies.get(provider).map(String::as_str).unwrap_or(&rates.currency)},
                 "fallback_models":displayed.missing_models.join(";"),"unpriced_models":displayed.unpriced_models.join(";")

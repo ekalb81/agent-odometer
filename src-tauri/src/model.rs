@@ -383,9 +383,8 @@ impl OptimizationSummary {
 pub struct TokenTotals {
     pub input_tokens: u64,
     pub cached_input_tokens: u64,
-    /// Anthropic cache-creation ("cache write") tokens. A subset of
+    /// Reported cache-creation ("cache write") tokens. A subset of
     /// `input_tokens`, disjoint from `cached_input_tokens` (cache reads).
-    /// Always 0 for Codex, whose provider does not report this dimension.
     /// Defaulted for backward compatibility with durable/cached data written
     /// before this field existed.
     #[serde(default)]

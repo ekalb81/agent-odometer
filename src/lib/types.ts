@@ -10,10 +10,8 @@ export type Harness = string;
 export interface TokenTotals {
   input_tokens: number;
   cached_input_tokens: number;
-  /** Anthropic cache-creation ("cache write") tokens: a subset of
-   * input_tokens distinct from cached_input_tokens (cache reads). Always 0
-   * for Codex. See query.rs token_cost — never double-price this against
-   * cached_input_tokens or the plain input rate. */
+  /** Reported cache-creation ("cache write") tokens, a subset of input_tokens
+   * distinct from cached_input_tokens (cache reads). */
   cache_creation_input_tokens: number;
   output_tokens: number;
   reasoning_output_tokens: number;

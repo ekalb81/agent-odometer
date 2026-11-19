@@ -190,3 +190,70 @@ fn unsupported_speed_and_opaque_review_identity_remain_unavailable() {
     );
     assert!(details.pricing.time_aware_api.is_none());
 }
+
+#[test]
+fn claude_fable_and_mythos_52_price_directly_from_their_launch() {
+    let rates = RateCard::load_bundled().unwrap();
+    let launch = instant("2026-11-09T00:00:00Z");
+    for model in ["claude-fable-5-2", "claude-mythos-5-2"] {
+        for (tier, expected) in [(None, 26.64), (Some("fast"), 53.28)] {
+            let tokens = usage(true);
+            let direct = price_tokens(
+                &rates,
+                "claude_code",
+                model,
+                tier,
+                &tokens,
+                RateTable::Plan,
+                launch,
+            );
+            assert_eq!(direct.basis, PricingBasis::Direct);
+            assert_eq!(direct.resolved_model, model);
+            assert_amount(direct.amount, expected);
+
+            let mut raw = session(model, "claude_code", tier, tokens);
+            raw.tokens_history[0].timestamp = launch;
+            let details = price_session_details(raw.clone(), &rates, launch);
+            assert_amount(Some(details.pricing.plan.total), expected);
+            let dated = details.pricing.time_aware_api.unwrap();
+            assert_eq!(dated.pricing.by_model[0].basis, PricingBasis::Direct);
+            assert_amount(Some(dated.pricing.total), expected);
+
+            raw.tokens_history[0].timestamp = instant("2026-11-08T23:59:59Z");
+            assert!(price_session_details(raw, &rates, launch)
+                .pricing
+                .time_aware_api
+                .is_none());
+        }
+    }
+}
+
+#[test]
+fn claude_sonnet_55_cache_read_decrease_preserves_earlier_dated_pricing() {
+    let rates = RateCard::load_bundled().unwrap();
+    let change = instant("2026-10-07T00:00:00Z");
+    let model = "claude-sonnet-5-5";
+    let tokens = usage(true);
+    let direct = price_tokens(
+        &rates,
+        "claude_code",
+        model,
+        None,
+        &tokens,
+        RateTable::Plan,
+        change,
+    );
+    assert_eq!(direct.basis, PricingBasis::Direct);
+    assert_amount(direct.amount, 6.67);
+
+    let mut raw = session(model, "claude_code", None, tokens);
+    for (timestamp, expected) in [(instant("2026-10-06T23:59:59Z"), 6.69), (change, 6.67)] {
+        raw.tokens_history[0].timestamp = timestamp;
+        let dated = price_session_details(raw.clone(), &rates, change)
+            .pricing
+            .time_aware_api
+            .unwrap();
+        assert_eq!(dated.pricing.by_model[0].basis, PricingBasis::Direct);
+        assert_amount(Some(dated.pricing.total), expected);
+    }
+}

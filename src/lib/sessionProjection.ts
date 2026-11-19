@@ -451,7 +451,7 @@ export function exportRows<T extends SessionSummary>(
       pricing_catalog_available: pricingCatalogAvailable,
       rate_card_version: rateCardVersion,
       rate_card_fetched_at: rateCardFetchedAt,
-      cache_write_pricing: session.harness === 'codex' && pricingCatalogAvailable
+      cache_write_pricing: session.harness === 'codex' && pricingCatalogAvailable && tokens.cache_creation_input_tokens === 0
         ? 'unmodeled_not_observed'
         : null,
       claude_estimated_usd: session.harness === 'claude_code' && Number.isFinite(planCost) ? planCost : null,

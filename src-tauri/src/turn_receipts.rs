@@ -939,13 +939,18 @@ mod tests {
     /// the fold: unlike cache-creation and reasoning, a cache read is a
     /// genuine, intentional discount below the input rate, not a
     /// premium-or-fallback dimension, so it is not part of this invariant.
-    /// It stays distinguished — and identical — in both totals below, so it
-    /// cannot affect the comparison's direction.
+    /// It stays distinguished in both totals. Codex credit rates also
+    /// explicitly exempt cache writes, so exclude those tokens when folding.
     #[test]
     fn every_bundled_model_prices_added_dimensions_at_or_above_their_folded_cost() {
         let rates = RateCard::load_bundled().expect("bundled rates.json must load");
         let mut checked = 0;
-        for (model, rate) in rates.models.iter().chain(rates.api_models.iter()) {
+        let plan = rates.models.iter().map(|(model, rate)| (model, rate, true));
+        let api = rates
+            .api_models
+            .iter()
+            .map(|(model, rate)| (model, rate, false));
+        for (model, rate, is_plan) in plan.chain(api) {
             let full = TokenTotals {
                 input_tokens: 1_000_000,
                 cached_input_tokens: 200_000,
@@ -958,7 +963,14 @@ mod tests {
             // ordinary bucket, exactly as sessions were priced before those
             // dimensions existed. cached_input_tokens (and input_tokens /
             // output_tokens themselves) are left untouched.
+            let write_exempt =
+                is_plan && model.starts_with("gpt-") && rate.cache_creation_input == Some(0.0);
             let folded = TokenTotals {
+                input_tokens: if write_exempt {
+                    full.input_tokens - full.cache_creation_input_tokens
+                } else {
+                    full.input_tokens
+                },
                 cache_creation_input_tokens: 0,
                 reasoning_output_tokens: 0,
                 ..full.clone()

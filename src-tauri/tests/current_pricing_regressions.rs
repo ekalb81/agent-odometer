@@ -1,4 +1,4 @@
-//! Frozen Standard-price oracle from official provider cards verified 2026-10-04.
+//! Frozen pricing oracle from official provider cards.
 //! Expected amounts are deliberate constants; no fixture regeneration computes them.
 use chrono::{DateTime, Utc};
 use odometer_lib::model::{Session, TierBucket, TokenHistoryPoint, TokenTotals};
@@ -23,7 +23,7 @@ fn tokens(cache_write: bool) -> TokenTotals {
 #[test]
 fn current_standard_prices_cover_new_models_without_fallback_or_double_counting() {
     let rates = RateCard::load_bundled().unwrap();
-    let now = instant("2026-10-04T00:00:00Z");
+    let now = instant("2026-11-18T00:00:00Z");
     for (model, harness, table, writes, expected) in [
         ("gpt-6.1-sol", "codex", RateTable::Plan, false, 165.5),
         ("gpt-6-sol", "codex", RateTable::Plan, false, 166.0),
@@ -43,7 +43,7 @@ fn current_standard_prices_cover_new_models_without_fallback_or_double_counting(
             "claude_code",
             RateTable::Plan,
             true,
-            6.69,
+            6.67,
         ),
         (
             "gemini-3.8-flash",
@@ -94,6 +94,177 @@ fn current_standard_prices_cover_new_models_without_fallback_or_double_counting(
         )
         .amount,
         None
+    );
+}
+
+#[test]
+fn november_codex_models_charge_published_standard_and_fast_rates() {
+    let rates = RateCard::load_bundled().unwrap();
+    let now = instant("2026-11-18T00:00:00Z");
+    for (model, credits, api, fast_credits, fast_allowance, fast_api) in [
+        ("gpt-6.2-astra", 662.0, 26.68, 1324.0, 1324.0, 53.36),
+        ("gpt-6.2-sol", 165.5, 6.67, 331.0, 331.0, 13.34),
+        ("gpt-6.1-terra", 82.75, 3.335, 165.5, 206.875, 6.67),
+    ] {
+        for (table, tier, expected) in [
+            (RateTable::Plan, None, credits),
+            (RateTable::Api, None, api),
+            (RateTable::Plan, Some("priority"), fast_allowance),
+            (RateTable::Api, Some("priority"), fast_api),
+            (RateTable::PurchasedCredits, Some("priority"), fast_credits),
+            (
+                RateTable::IncludedAllowance,
+                Some("priority"),
+                fast_allowance,
+            ),
+            (RateTable::ApiEstimate, Some("priority"), fast_api),
+        ] {
+            let usage = tokens(matches!(table, RateTable::Api | RateTable::ApiEstimate));
+            let priced = price_tokens(&rates, "codex", model, tier, &usage, table, now);
+            assert_eq!(priced.basis, PricingBasis::Direct, "{model}");
+            let actual = priced.amount.unwrap();
+            assert!(
+                (actual - expected).abs() < 1e-10,
+                "{model}: {actual} != {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn november_codex_ultrafast_rolls_over_at_pacific_midnight() {
+    let rates = RateCard::load_bundled().unwrap();
+    let before = instant("2027-03-01T07:59:59Z");
+    let after = instant("2027-03-01T08:00:00Z");
+    for (model, table, before_amount, after_amount) in [
+        ("gpt-6.2-astra", RateTable::Plan, 3972.0, 3972.0),
+        ("gpt-6.2-astra", RateTable::Api, 80.04, 160.08),
+        ("gpt-6.2-astra", RateTable::PurchasedCredits, 1986.0, 3972.0),
+        (
+            "gpt-6.2-astra",
+            RateTable::IncludedAllowance,
+            3972.0,
+            3972.0,
+        ),
+        ("gpt-6.2-astra", RateTable::ApiEstimate, 80.04, 160.08),
+        ("gpt-6.2-sol", RateTable::PurchasedCredits, 496.5, 993.0),
+        ("gpt-6.2-sol", RateTable::IncludedAllowance, 993.0, 993.0),
+        ("gpt-6.2-sol", RateTable::ApiEstimate, 20.01, 40.02),
+    ] {
+        for (now, expected) in [(before, before_amount), (after, after_amount)] {
+            let usage = tokens(matches!(table, RateTable::Api | RateTable::ApiEstimate));
+            let actual = price_tokens(
+                &rates,
+                "codex",
+                model,
+                Some("ultrafast"),
+                &usage,
+                table,
+                now,
+            )
+            .amount
+            .unwrap();
+            assert!(
+                (actual - expected).abs() < 1e-10,
+                "{model}: {actual} != {expected}"
+            );
+        }
+    }
+    for table in [
+        RateTable::Plan,
+        RateTable::Api,
+        RateTable::PurchasedCredits,
+        RateTable::IncludedAllowance,
+        RateTable::ApiEstimate,
+    ] {
+        assert_eq!(
+            price_tokens(
+                &rates,
+                "codex",
+                "gpt-6.1-terra",
+                Some("ultrafast"),
+                &tokens(true),
+                table,
+                after
+            )
+            .amount,
+            None
+        );
+    }
+}
+
+#[test]
+fn november_codex_long_context_uplift_applies_only_to_dated_api() {
+    let rates = RateCard::load_bundled().unwrap();
+    let now = instant("2026-11-18T00:00:00Z");
+    assert_eq!(
+        price_tokens(
+            &rates,
+            "codex",
+            "gpt-6.2-astra",
+            None,
+            &tokens(true),
+            RateTable::Plan,
+            now
+        )
+        .amount,
+        Some(642.0)
+    );
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/conformance/detail-pricing-cases.json"
+    ))
+    .unwrap();
+    let mut session: Session = serde_json::from_value(fixture["base_session"].clone()).unwrap();
+    session.model = Some("gpt-6.2-astra".into());
+    session.tokens_history = vec![TokenHistoryPoint {
+        timestamp: now,
+        model: session.model.clone(),
+        service_tier: None,
+        request_input_tokens: Some(272_001),
+        total_tokens: 1_500_000,
+        delta: tokens(true),
+    }];
+    let pricing = price_session_details(session, &rates, now).pricing;
+    assert!((pricing.time_aware_api.unwrap().pricing.total - 43.36).abs() < 1e-10);
+    assert_eq!(
+        pricing.dated_purchased_credits.unwrap().pricing.total,
+        642.0
+    );
+    assert_eq!(
+        pricing.dated_included_allowance.unwrap().pricing.total,
+        642.0
+    );
+}
+
+#[test]
+fn november_codex_dated_credits_use_each_events_ultrafast_rate() {
+    let rates = RateCard::load_bundled().unwrap();
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tests/conformance/detail-pricing-cases.json"
+    ))
+    .unwrap();
+    let mut session: Session = serde_json::from_value(fixture["base_session"].clone()).unwrap();
+    session.model = Some("gpt-6.2-sol".into());
+    let now = instant("2027-03-01T08:00:00Z");
+    session.tokens_history = [instant("2027-03-01T07:59:59Z"), now]
+        .into_iter()
+        .map(|timestamp| TokenHistoryPoint {
+            timestamp,
+            model: session.model.clone(),
+            service_tier: Some("ultrafast".into()),
+            request_input_tokens: Some(272_000),
+            total_tokens: 1_500_000,
+            delta: tokens(false),
+        })
+        .collect();
+    let pricing = price_session_details(session, &rates, now).pricing;
+    assert_eq!(
+        pricing.dated_purchased_credits.unwrap().pricing.total,
+        1489.5
+    );
+    assert_eq!(
+        pricing.dated_included_allowance.unwrap().pricing.total,
+        1986.0
     );
 }
 

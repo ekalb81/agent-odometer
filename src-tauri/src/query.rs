@@ -26,11 +26,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::history_store::HistoryStore;
 use crate::model::{RangeTotals, TierBucket, TokenTotals};
-use crate::provider::{codex_provider_id, ProviderId, ProviderRegistry};
+use crate::provider::{claude_code_provider_id, codex_provider_id, ProviderId, ProviderRegistry};
 pub use crate::query_desktop::*;
 use crate::query_reports::least_confident_basis;
 pub use crate::query_reports::*;
-use crate::rates::{ModelRate, PricingBasis, RateCard};
+use crate::rates::{ModelRate, PricingBasis, PricingSurface, RateCard};
 
 /// Which rate table a query prices against.
 ///
@@ -144,7 +144,7 @@ pub fn price_tokens(
                 };
             };
             let mut rate = rate.clone();
-            // Codex never records cache writes. Credit scenarios have no write charge.
+            // Explicit Codex credit scenarios do not charge for cache writes.
             if matches!(
                 table,
                 RateTable::PurchasedCredits | RateTable::IncludedAllowance
@@ -216,48 +216,51 @@ pub(crate) fn tier_multiplier(
     table: RateTable,
     at: DateTime<Utc>,
 ) -> Option<f64> {
+    let codex = harness == codex_provider_id().as_str();
+    let tier = match tier {
+        None | Some("default" | "standard") => "standard",
+        Some("fast") => "fast",
+        Some("priority") if codex => "fast",
+        Some("ultrafast") => "ultrafast",
+        _ => return None,
+    };
     if matches!(table, RateTable::Plan | RateTable::Api) {
         return match tier {
-            None | Some("default" | "standard") => Some(1.0),
-            Some("fast" | "priority") if !fallback_used => {
-                // The legacy credit reference follows included allowance (as
-                // with Astra). API prices require their own surface's evidence.
-                let surface = match table {
-                    RateTable::Plan => crate::rates::PricingSurface::CodexIncludedAllowance,
-                    _ => crate::rates::PricingSurface::OpenaiApiUsd,
+            "standard" => Some(1.0),
+            "fast" | "ultrafast" if !fallback_used => {
+                // The legacy Codex credit reference follows included allowance.
+                let surface = match (codex, table) {
+                    (true, RateTable::Plan) => PricingSurface::CodexIncludedAllowance,
+                    (true, RateTable::Api) => PricingSurface::OpenaiApiUsd,
+                    (false, RateTable::Plan) if harness == claude_code_provider_id().as_str() => {
+                        PricingSurface::AnthropicApiUsd
+                    }
+                    _ => return None,
                 };
-                (harness == codex_provider_id().as_str())
-                    .then(|| {
-                        rates
-                            .pricing_catalog
-                            .modifier_for_tier(surface, resolved, at, "fast")
-                    })
-                    .flatten()
+                rates
+                    .pricing_catalog
+                    .modifier_for_tier(surface, resolved, at, tier)
                     .map(|rule| rule.multipliers.input)
                     .or_else(|| {
-                        matches!(resolved, "gpt-6-astra" | "gpt-5.5" | "gpt-5.4")
-                            .then(|| service_tier_multiplier(resolved, tier, table))
+                        (codex
+                            && tier == "fast"
+                            && matches!(resolved, "gpt-6-astra" | "gpt-5.5" | "gpt-5.4"))
+                        .then(|| service_tier_multiplier(resolved, Some(tier), table))
                     })
             }
             _ => None,
         };
     }
-    if harness != codex_provider_id().as_str() {
+    if !codex {
         return None;
     }
-    let tier = match tier {
-        None | Some("default" | "standard") => "standard",
-        Some("priority" | "fast") => "fast",
-        Some("ultrafast") => "ultrafast",
-        _ => return None,
-    };
     if fallback_used && tier != "standard" {
         return None;
     }
     let surface = match table {
-        RateTable::PurchasedCredits => crate::rates::PricingSurface::CodexPurchasedCredits,
-        RateTable::IncludedAllowance => crate::rates::PricingSurface::CodexIncludedAllowance,
-        RateTable::ApiEstimate => crate::rates::PricingSurface::OpenaiApiUsd,
+        RateTable::PurchasedCredits => PricingSurface::CodexPurchasedCredits,
+        RateTable::IncludedAllowance => PricingSurface::CodexIncludedAllowance,
+        RateTable::ApiEstimate => PricingSurface::OpenaiApiUsd,
         _ => unreachable!(),
     };
     let identity = resolved;
