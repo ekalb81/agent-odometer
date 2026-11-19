@@ -4565,13 +4565,13 @@ fn reconcile_session(
             )?;
             return Ok(key);
         }
-        // A stale copy may still lack the turn and later token events. Only
+        // A stale copy may still lack the first turn or cumulative report. Only
         // its *already bound* artifact proves that this exact shorter source
         // history was previously observed as this durable key. A new file
         // replacement/truncation has no such binding.
         let incoming_artifact = source_artifact_key(transaction, identity, incoming, &key)?;
-        if !stored.turns.is_empty()
-            && incoming.turns.is_empty()
+        let lacks_first_turn = !stored.turns.is_empty() && incoming.turns.is_empty();
+        if (lacks_first_turn || !fingerprint_is_final)
             && !stored.tokens_history.is_empty()
             && !incoming.tokens_history.is_empty()
             && incoming.tokens_history.len() <= stored.tokens_history.len()
@@ -4651,43 +4651,43 @@ fn reconcile_session(
         }
     }
 
-    // A short transcript can be observed before its first token event. If the
-    // same path later supplies that first event, finalize that provisional row
-    // rather than falsely reporting a collision with itself.
+    // A provisional fingerprint can already have last-only token facts.
+    // Finalize the path owner (or the sole moved candidate) only on a proven append.
     if fingerprint_is_final {
-        let provisional_from_path: Option<String> = transaction
-            .query_row(
-                "SELECT d.session_key FROM source_locations l JOIN durable_sessions d ON d.session_key = l.session_key
-                 WHERE l.path = ?1 AND d.identity_key = ?2 AND d.fingerprint_is_final = 0",
-                params![path, identity],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let provisional = match provisional_from_path {
-            Some(key) => Some(key),
-            None => {
-                let mut statement = transaction.prepare(
-                    "SELECT d.session_key, s.session_json
-                     FROM durable_sessions d JOIN session_snapshots s
-                       ON s.session_key = d.session_key AND s.version = d.current_snapshot_version
-                     WHERE d.identity_key = ?1 AND d.fingerprint_is_final = 0",
-                )?;
-                let candidates = statement
-                    .query_map([identity], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                drop(statement);
-                if let [(key, raw)] = candidates.as_slice() {
-                    let stored: Session = serde_json::from_slice(raw).with_context(|| {
-                        format!("corrupt provisional durable session snapshot for {key}")
-                    })?;
-                    provisional_metadata_matches(incoming, &stored).then_some(key.clone())
+        let mut statement = transaction.prepare(
+            "SELECT d.session_key, s.session_json, s.format_version,
+                    EXISTS(SELECT 1 FROM source_locations l WHERE l.path=?2 AND l.session_key=d.session_key) AS bound
+             FROM durable_sessions d JOIN session_snapshots s
+               ON s.session_key=d.session_key AND s.version=d.current_snapshot_version
+             WHERE d.identity_key=?1 AND d.fingerprint_is_final=0 ORDER BY bound DESC LIMIT 2",
+        )?;
+        let mut rows = statement.query(params![identity, path])?;
+        let provisional = if let Some(row) = rows.next()? {
+            let key: String = row.get(0)?;
+            let raw: Vec<u8> = row.get(1)?;
+            let format: i64 = row.get(2)?;
+            let bound: bool = row.get(3)?;
+            if bound || rows.next()?.is_none() {
+                let stored: Session = serde_json::from_slice(&raw).with_context(|| {
+                    format!("corrupt provisional durable session snapshot for {key}")
+                })?;
+                let incoming_count = if format == 1 {
+                    legacy_token_events(incoming).count()
                 } else {
-                    None
-                }
+                    incoming.tokens_history.len()
+                };
+                (provisional_metadata_matches(incoming, &stored)
+                    && stored.tokens_history.len() <= incoming_count
+                    && source_histories_match(incoming, &stored, format))
+                .then_some(key)
+            } else {
+                None
             }
+        } else {
+            None
         };
+        drop(rows);
+        drop(statement);
         if let Some(key) = provisional {
             transaction.execute(
                 "UPDATE durable_sessions SET first_event_fingerprint = ?2, fingerprint_is_final = 1, last_seen_at_ms = ?3 WHERE session_key = ?1",
@@ -5995,7 +5995,9 @@ fn token_event_key(event: &TokenHistoryPoint) -> String {
 
 fn refresh_collision_flags(transaction: &Transaction<'_>, identity: &str) -> Result<()> {
     let count: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM durable_sessions WHERE identity_key = ?1 AND fingerprint_is_final = 1",
+        "SELECT COUNT(*) FROM durable_sessions d
+         WHERE identity_key = ?1 AND (fingerprint_is_final = 1 OR EXISTS (
+           SELECT 1 FROM durable_token_events e WHERE e.session_key=d.session_key))",
         [identity],
         |row| row.get(0),
     )?;
@@ -11112,6 +11114,66 @@ mod tests {
         assert_eq!(original.key, finalized.key);
         assert_eq!(store.load_sessions().unwrap().len(), 1);
         assert_eq!(finalized.locations.len(), 2);
+    }
+
+    #[test]
+    fn last_only_provisional_requires_a_matching_prefix_before_finalization() {
+        let parse = |last: i64, finish: bool| {
+            let mut parser = crate::parser::SessionParser::new("synthetic.jsonl".into(), false);
+            parser.apply_line(r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"provisional","timestamp":"2026-01-01T00:00:00Z"}}"#).unwrap();
+            parser.apply_line(r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-test","turn_id":"turn"}}"#).unwrap();
+            let count = |n| serde_json::json!({"input_tokens":n,"total_tokens":n});
+            parser.apply_line(&serde_json::json!({"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":count(last)}}}).to_string()).unwrap();
+            if finish {
+                parser.apply_line(&serde_json::json!({"timestamp":"2026-01-01T00:00:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":count(1),"total_token_usage":count(last+1)}}}).to_string()).unwrap();
+            }
+            parser.session.unwrap()
+        };
+        for path in ["first.jsonl", "moved.jsonl"] {
+            for first_usage in [3, 9] {
+                let (_directory, store) = store();
+                let generation = store.begin_scan().unwrap();
+                let initial = store
+                    .observe(Path::new("first.jsonl"), &parse(3, false), generation)
+                    .unwrap();
+                let observed = store
+                    .observe(Path::new(path), &parse(first_usage, true), generation)
+                    .unwrap();
+                if first_usage == 3 && path == "moved.jsonl" {
+                    let stale = store
+                        .observe(Path::new("first.jsonl"), &parse(3, false), generation)
+                        .unwrap();
+                    assert_eq!(stale.key, initial.key);
+                    assert_eq!(stale.session.tokens_total.total_tokens, 4);
+                    assert_eq!(store.session_keys().unwrap().len(), 1);
+                }
+                if first_usage != 3 {
+                    assert!(
+                        observed.collision,
+                        "last-only tokens prove the sibling has usage"
+                    );
+                }
+                let connection = store.connection().unwrap();
+                for table in ["durable_token_events", "rollup_token_totals"] {
+                    let sum = |key: &str| {
+                        connection
+                            .query_row(
+                                &format!(
+                                    "SELECT SUM(total_tokens) FROM {table} WHERE session_key=?1"
+                                ),
+                                [key],
+                                |row| row.get::<_, i64>(0),
+                            )
+                            .unwrap()
+                    };
+                    assert_eq!(sum(&observed.key), first_usage + 1, "{table} at {path}");
+                    if first_usage != 3 {
+                        assert_eq!(sum(&initial.key), 3);
+                    }
+                }
+                assert_eq!(initial.key == observed.key, first_usage == 3, "{path}");
+            }
+        }
     }
 
     #[test]

@@ -9,12 +9,22 @@ Base == <<"provider/session","base",Lineage>>
 Collision(fingerprint) == <<"provider/session",fingerprint,Lineage>>
 Keys == {Base} \cup {Collision(f): f \in Turns}
 NoRow == "unused"
-VARIABLES scenario, owners, observed, bindings, cursor, facts, hours, metadata
-vars == <<scenario,owners,observed,bindings,cursor,facts,hours,metadata>>
+VARIABLES promotion, scenario, owners, observed, bindings, cursor, facts, hours, metadata
+vars == <<promotion,scenario,owners,observed,bindings,cursor,facts,hours,metadata>>
+(* Version 17 can retain last-only facts before a final fingerprint exists.
+   These fixtures hold the provider ID constant; integers stand for full
+   canonical event signatures, including timestamp and usage. *)
+Provisional == <<3,2>>
+PromotionInputs == [continued |-> <<3,2,10>>, divergent |-> <<3,9,10>>, shorter |-> <<10>>]
+SiblingInputs == [saved |-> Provisional, changed |-> <<3,9>>]
+BoundArtifact == "bound-prefix-copy"
+NoReplay == [kind |-> "none", artifact |-> "none", metadataMatches |-> FALSE, owner |-> "none"]
+PendingPromotion == [kind |-> "pending", path |-> "same", metadataMatches |-> TRUE,
+                     owner |-> "original", original |-> Provisional, replacement |-> <<>>, replay |-> NoReplay]
 Init ==
-  /\ scenario \in {"identity","events"} /\ owners = [k \in Keys |-> NoRow]
+  /\ scenario \in {"identity","events","promotion"} /\ owners = [k \in Keys |-> NoRow]
   /\ observed = {} /\ bindings = {} /\ cursor = 0 /\ facts = {} /\ hours = <<0,0,0>>
-  /\ metadata = {}
+  /\ metadata = {} /\ promotion = PendingPromotion
 Observe(input) ==
   /\ scenario = "identity"
   /\ LET f == input[1]
@@ -60,6 +70,48 @@ FactKeyAccounting ==
          (IF cursor >= 1 /\ w[1] <= 1 /\ 1 <= w[2] THEN 3 ELSE 0) +
          (IF cursor >= 2 /\ w[1] <= 2 /\ 2 <= w[2] THEN 5 ELSE 0) +
          (IF cursor >= 4 /\ w[1] <= 4 /\ 4 <= w[2] THEN 7 ELSE 0)
-Next == (\E i \in Inputs: Observe(i)) \/ Store \/ UNCHANGED vars
+Promote(kind,path,metadataMatches) ==
+  /\ scenario = "promotion" /\ promotion.kind = "pending"
+  /\ LET incoming == PromotionInputs[kind]
+         retained == promotion.original
+         prefixMatches == Len(retained) <= Len(incoming)
+                          /\ SubSeq(incoming,1,Len(retained)) = retained
+         reuse == metadataMatches /\ prefixMatches
+         key == IF reuse THEN "original" ELSE "replacement"
+         prior == promotion[key]
+         suffix == SubSeq(incoming,Len(prior)+1,Len(incoming))
+     IN promotion' = [promotion EXCEPT !.kind = kind, !.path = path,
+           !.metadataMatches = metadataMatches, !.owner = key, ![key] = prior \o suffix]
+  /\ UNCHANGED <<scenario,owners,observed,bindings,cursor,facts,hours,metadata>>
+PromotionAccounting ==
+  promotion.kind # "pending" /\ promotion.replay = NoReplay =>
+    LET incoming == PromotionInputs[promotion.kind]
+    IN IF promotion.kind = "continued" /\ promotion.metadataMatches
+       THEN promotion.owner = "original" /\ promotion.original = incoming /\ promotion.replacement = <<>>
+       ELSE promotion.owner = "replacement" /\ promotion.original = Provisional /\ promotion.replacement = incoming
+(* Before promotion the original and its copy both belonged to one row.
+   After the original finalizes, a rescan may still supply the shorter copy. *)
+ReplaySibling(kind,artifact,metadataMatches) ==
+  /\ scenario = "promotion" /\ promotion.kind = "continued" /\ promotion.owner = "original"
+  /\ promotion.replay = NoReplay
+  /\ LET incoming == SiblingInputs[kind]
+         samePrefix == SubSeq(promotion.original,1,Len(incoming)) = incoming
+         reuseBound == artifact = BoundArtifact /\ metadataMatches /\ samePrefix
+         key == IF reuseBound THEN "original" ELSE "replacement"
+     IN promotion' = [promotion EXCEPT
+         !.replay = [kind |-> kind, artifact |-> artifact, metadataMatches |-> metadataMatches, owner |-> key],
+         !.replacement = IF reuseBound THEN @ ELSE incoming]
+  /\ UNCHANGED <<scenario,owners,observed,bindings,cursor,facts,hours,metadata>>
+SiblingAccounting ==
+  LET replay == promotion.replay
+  IN replay # NoReplay =>
+       /\ promotion.original = PromotionInputs.continued
+       /\ IF replay.kind = "saved" /\ replay.artifact = BoundArtifact /\ replay.metadataMatches
+          THEN replay.owner = "original" /\ promotion.replacement = <<>>
+          ELSE replay.owner = "replacement" /\ promotion.replacement = SiblingInputs[replay.kind]
+Next == \/ ((\E i \in Inputs: Observe(i)) \/ Store) /\ UNCHANGED promotion
+        \/ \E kind \in DOMAIN PromotionInputs, path \in {"same","moved"}, m \in BOOLEAN: Promote(kind,path,m)
+        \/ \E k \in DOMAIN SiblingInputs, a \in {BoundArtifact,"other"}, m \in BOOLEAN: ReplaySibling(k,a,m)
+        \/ UNCHANGED vars
 Spec == Init /\ [][Next]_vars
 =============================================================================

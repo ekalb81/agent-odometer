@@ -27,7 +27,7 @@ With no configuration names, the runner checks every `.cfg` alongside the specif
 | [Watcher](Watcher.tla) | Bulk scans, live observations, path removal, root changes, and stale callbacks | [Startup and live-update flow](../ARCHITECTURE.md#startup-and-live-update-flow) |
 | [Hydration](Hydration.tla) | Startup snapshot delivery, buffered events, and terminal scan status | [Desktop startup](../../src/App.svelte) |
 | [Ledger](Ledger.tla) | Durable facts, transactional changes, hourly rollups and partial-hour edges, and genuine unavailability | [SQLite history](../../src-tauri/src/history_store.rs), [IPC and frontend state](../ARCHITECTURE.md#ipc-and-frontend-state) |
-| [DurableWrites](DurableWrites.tla) | Rollups reflect inserted facts, and a database upgrade repairs stale totals from those facts | [SQLite history](../../src-tauri/src/history_store.rs) |
+| [DurableWrites](DurableWrites.tla) | Rollups reflect inserted facts, an upgrade repairs stale totals, and a provisional session can keep its key only with a compatible prefix | [SQLite history](../../src-tauri/src/history_store.rs) |
 | [Pricing](Pricing.tla) | Price evidence, token subsets, effective rates, billing surfaces, and card refresh | [Pricing catalog](../ARCHITECTURE.md#pricing-catalog-contract) |
 | [Access](Access.tla) | Revision-bound transcript pages, record anchors, and retained search targets | [Persistence and privacy](../ARCHITECTURE.md#persistence-and-privacy) |
 | [Private](Private.tla) | Revision-bound organization edits, reviewed curation and freezes, and deletion cascades | [Curated datasets](../CURATED_DATASETS.md), [private organization](../ARCHITECTURE.md#private-organization) |
@@ -48,7 +48,7 @@ Hydration and Odometer share the [startup gate](StartupGate.tla). They distingui
 | --- | --- |
 | Pre-model, last-only, or replayed Codex usage changes date-scoped totals | [Codex parser integration tests](../../src-tauri/tests/parser_tests.rs) |
 | Duplicate inserts inflate hourly totals or old rollups survive an upgrade | [SQLite store tests](../../src-tauri/src/history_store.rs) |
-| A third first-turn fingerprint with identical token events collides | [SQLite identity tests](../../src-tauri/src/history_store.rs) |
+| A third first-turn fingerprint collides, or a file replacement reuses the old last-only prefix | [SQLite identity tests](../../src-tauri/src/history_store.rs) |
 | A warm cache hides newer parser output | [Scanner upgrade test](../../src-tauri/tests/scan_cache_tests.rs) |
 | A failed session list lets empty totals reach the UI or tray | [App startup tests](../../src/App.pricingRefresh.test.ts) |
 | A callback from a replaced watcher writes to the current ledger | [Native watcher tests](../../src-tauri/src/watcher.rs) |
@@ -61,8 +61,10 @@ Several safety properties described what a result must look like if one appeared
 
 The initial ledger model built rollups from an already deduplicated event sequence. It skipped the distinction between an attempted insert and an inserted row, and its lineage examples varied token history when production can distinguish sessions by first-turn evidence alone. The cache model followed the architecture guide's old application-version rule. The code had moved to an independent parser version, so an app release did not invalidate cached parse output.
 
+Release review found an interaction between two fixes. A last-only Codex record now supplies a real token fact before the session has a cumulative fingerprint. When a different file replaces that path, the new record must prove it extends the old prefix before it can keep the old key. An already-bound shorter copy can still resolve to the same session after another copy supplies that fingerprint. The regressions cover replacement, normal append, and moved or replayed sources.
+
 For important guarantees, check a healthy trace that reaches the consumer, an adverse trace that exercises the guard, and a production regression that replays the same scenario with synthetic inputs. Record the true origin of a callback separately from the dispatcher's label, so a relabelled callback cannot pass its own check. Verify compatibility and identity fields against the source. Check handoffs for the same failure states before treating separate model results as end-to-end evidence. When a model uses synthetic billing values, pair it with the Rust pricing tests that exercise the bundled rate card.
 
 ## Verification record
 
-TLC 2.19 on Java 21 completed all 16 configurations. The runs explored 465,594 distinct states across their separate state spaces. Ledger was the largest configuration at 410,121 distinct states. TLC detected all 23 injected faults and found all 10 required reachable states.
+TLC 2.19 on Java 21 completed all 16 configurations. The runs explored 465,623 distinct states across their separate state spaces. Ledger was the largest configuration at 410,121 distinct states. TLC detected all 25 injected faults and found all 11 required reachable states.
