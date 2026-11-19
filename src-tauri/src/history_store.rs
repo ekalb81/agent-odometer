@@ -43,6 +43,10 @@ mod search;
 pub(crate) use search::RetainedSearchMessages;
 #[path = "history_integrity.rs"]
 mod integrity;
+#[path = "history_plateau_projection.rs"]
+mod plateau_projection;
+#[path = "history_plateau_repair.rs"]
+mod plateau_repair;
 #[path = "history_workflow.rs"]
 mod workflow;
 pub use integrity::AccountingIntegrityError;
@@ -61,7 +65,7 @@ pub use organization::{
     RecordBookmarkList, SavedSearch, SavedSearchDefinition, SessionAnnotation,
 };
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const SNAPSHOT_FORMAT_VERSION: i64 = 2;
 /// Rollup grain for the durable-ledger read path (#107): every hour bucket
 /// is `floor(timestamp_ms / HOUR_MS)`, an integer that both Rust and the
@@ -3209,6 +3213,10 @@ fn migration_step_count(from_version: i64) -> u32 {
     }
     if version == 16 {
         steps += 1;
+        version = 17;
+    }
+    if version == 17 {
+        steps += 1;
     }
     steps
 }
@@ -4216,6 +4224,27 @@ fn migrate(
             step_total,
             16,
             17,
+            started.elapsed(),
+        ));
+    }
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current == 17 {
+        step_index += 1;
+        let label = "v17_to_v18_retained_token_plateaus";
+        on_progress(MigrationStepEvent::started(
+            label, step_index, step_total, 17, 18,
+        ));
+        let started = Instant::now();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        plateau_repair::repair(&transaction)?;
+        transaction.execute_batch("UPDATE history_meta SET value='18' WHERE key='schema_version'; PRAGMA user_version=18;")?;
+        transaction.commit()?;
+        on_progress(MigrationStepEvent::finished(
+            label,
+            step_index,
+            step_total,
+            17,
+            18,
             started.elapsed(),
         ));
     }
@@ -6164,10 +6193,12 @@ fn legacy_token_events(session: &Session) -> impl Iterator<Item = Cow<'_, TokenH
 }
 
 fn source_histories_match(incoming: &Session, stored: &Session, stored_format: i64) -> bool {
-    if stored_format == 1 && !incoming.legacy_token_deltas.is_empty() {
+    if stored_format == 1
+        && (!incoming.legacy_token_deltas.is_empty() || !stored.legacy_token_deltas.is_empty())
+    {
         return legacy_token_events(incoming)
-            .zip(&stored.tokens_history)
-            .all(|(left, right)| token_event_signature(&left) == token_event_signature(right));
+            .zip(legacy_token_events(stored))
+            .all(|(left, right)| token_event_signature(&left) == token_event_signature(&right));
     }
     histories_share_lineage(&incoming.tokens_history, &stored.tokens_history)
 }
@@ -11273,6 +11304,157 @@ mod tests {
     }
 
     #[test]
+    fn v18_repairs_proven_retained_plateaus_and_reconciles_a_returning_source() {
+        fn transcript(id: &str, append: bool) -> Session {
+            use serde_json::json;
+            let mut parser = crate::parser::SessionParser::new("synthetic.jsonl".into(), false);
+            let mut line = |at, kind, payload| {
+                parser.apply_line(&json!({
+                "timestamp": format!("2026-01-01T00:00:{at:02}Z"), "type": kind, "payload": payload,
+            }).to_string()).unwrap()
+            };
+            line(
+                0,
+                "session_meta",
+                json!({"id":id,"timestamp":"2026-01-01T00:00:00Z"}),
+            );
+            line(
+                1,
+                "event_msg",
+                json!({"type":"task_started","turn_id":"turn"}),
+            );
+            line(
+                2,
+                "turn_context",
+                json!({"turn_id":"turn","model":"gpt-test"}),
+            );
+            let usage = |n: i64| {
+                json!({"input_tokens":8*n,"cached_input_tokens":2*n,
+                "cache_write_input_tokens":n,"output_tokens":2*n,"reasoning_output_tokens":n,
+                "total_tokens":10*n})
+            };
+            let mut counts = vec![(3, 10, 10), (4, 10, 10), (5, 15, 5)];
+            if append {
+                counts.push((6, 18, 3));
+            }
+            for (at, cumulative, last) in counts {
+                line(
+                    at,
+                    "event_msg",
+                    json!({"type":"token_count","info":{
+                    "total_token_usage":usage(cumulative), "last_token_usage":usage(last)}}),
+                );
+            }
+            line(
+                7,
+                "event_msg",
+                json!({"type":"task_complete","turn_id":"turn"}),
+            );
+            parser.session.unwrap()
+        }
+        let (directory, store) = store();
+        let path = directory.path().join("history.sqlite3");
+        let generation = store.begin_scan().unwrap();
+        let mut keys = Vec::new();
+        for id in [
+            "verified",
+            "bad-fact",
+            "bad-owner",
+            "mixed-tool",
+            "mixed-finding",
+        ] {
+            let mut old = transcript(id, false);
+            old.tokens_history = legacy_token_events(&old).map(Cow::into_owned).collect();
+            let mut repeated = old.tokens_history[1].delta.clone();
+            // The old parser retained the repeated cache-write count too.
+            repeated.cache_creation_input_tokens =
+                old.tokens_history[0].delta.cache_creation_input_tokens;
+            old.tokens_history[1].delta = repeated.clone();
+            old.legacy_token_deltas.clear();
+            *old.tokens_by_model.get_mut("gpt-test").unwrap() += &repeated;
+            old.turns[0].tokens += &repeated;
+            crate::telemetry::refresh_session(&mut old);
+            let file = Path::new(id);
+            keys.push(store.observe(file, &old, generation).unwrap().key);
+            store.mark_path_missing(file).unwrap();
+        }
+        let [good, inconsistent, bad_owner, mixed_tool, mixed_finding] = keys.as_slice() else {
+            unreachable!()
+        };
+        let fact_keys = |store: &HistoryStore, key: &str| -> Vec<String> {
+            let connection = store.connection().unwrap();
+            let mut query=connection.prepare("SELECT event_key FROM durable_token_events WHERE session_key=?1 ORDER BY event_index").unwrap();
+            query
+                .query_map([key], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let identities_before = fact_keys(&store, good);
+        {
+            let c = store.connection().unwrap();
+            c.execute("UPDATE durable_token_events SET cumulative_total_tokens=cumulative_total_tokens+1 WHERE session_key=?1 AND event_index=1",[inconsistent]).unwrap();
+            c.execute("UPDATE source_artifacts SET first_event_fingerprint='wrong-owner' WHERE session_key=?1",[bad_owner]).unwrap();
+            c.execute("INSERT INTO durable_tool_events(session_key,timestamp_ms,kind,outcome,output_bytes) VALUES(?1,0,'read','success',0)",[mixed_tool]).unwrap();
+            c.execute("INSERT INTO durable_finding_events(session_key,timestamp_ms,rule_id,severity,avoidable_calls) VALUES(?1,0,'synthetic','low',1)",[mixed_finding]).unwrap();
+            // Historical serializers could omit zero-length telemetry arrays.
+            c.execute("UPDATE session_snapshots SET session_json=CAST(json_remove(CAST(session_json AS TEXT),'$.tool_observations','$.optimization_findings') AS BLOB) WHERE session_key=?1",[good]).unwrap();
+            c.execute_batch("UPDATE durable_sessions SET ledger_dirty=1; UPDATE session_snapshots SET format_version=1;
+                UPDATE history_meta SET value='17' WHERE key='schema_version'; PRAGMA user_version=17;").unwrap();
+        }
+        drop(store);
+        let store = HistoryStore::open(&path).unwrap();
+        let dirty: BTreeSet<_> = store.dirty_session_keys().unwrap().into_iter().collect();
+        assert_eq!(
+            dirty,
+            BTreeSet::from([
+                inconsistent.clone(),
+                bad_owner.clone(),
+                mixed_tool.clone(),
+                mixed_finding.clone()
+            ])
+        );
+        assert_eq!(fact_keys(&store, good), identities_before);
+        let expected = transcript("verified", false);
+        let archived = load_one(&store.connection().unwrap(), good).unwrap();
+        assert_eq!(
+            archived.first_event_fingerprint,
+            first_event_fingerprint(&expected)
+        );
+        assert_eq!(archived.session.tokens_history, expected.tokens_history);
+        assert_eq!(archived.session.tokens_by_model, expected.tokens_by_model);
+        assert_eq!(archived.session.turns[0].tokens, expected.turns[0].tokens);
+        assert_eq!(archived.session.category_totals, expected.category_totals);
+        let at = expected.tokens_history[1].timestamp;
+        let windows = [(None, None), (Some(at), Some(at))];
+        let ranges = store
+            .range_totals_multi(std::slice::from_ref(good), &windows)
+            .unwrap();
+        assert_eq!(ranges[0][good].tokens, expected.tokens_total);
+        assert_eq!(
+            ranges[1]
+                .get(good)
+                .map(|r| r.tokens.total_tokens)
+                .unwrap_or(0),
+            0
+        );
+        for bad in [inconsistent, bad_owner, mixed_tool, mixed_finding] {
+            let stored = load_one(&store.connection().unwrap(), bad).unwrap();
+            assert_eq!(stored.session.tokens_history[1].delta.total_tokens, 100);
+        }
+        let appended = transcript("verified", true);
+        let fresh = store
+            .observe(Path::new("returned.jsonl"), &appended, generation)
+            .unwrap();
+        assert_eq!(&fresh.key, good);
+        let ranges = store
+            .range_totals_multi(std::slice::from_ref(good), &[(None, None)])
+            .unwrap();
+        assert_eq!(ranges[0][good].tokens, appended.tokens_total);
+        assert_eq!(store.session_keys().unwrap().len(), 5);
+    }
+
+    #[test]
     fn repeated_event_signature_remains_idempotent_during_append() {
         let (_directory, store) = store();
         let generation = store.begin_scan().unwrap();
@@ -11801,6 +11983,7 @@ mod tests {
         );
         while version > target_version {
             let sql = match version {
+                18 => "", // data-only verified retained-usage repair
                 17 => "", // data-only token rollup repair
                 16 => "DROP TABLE offline_cases; DROP TABLE offline_experiments;",
                 15 => "DROP TABLE curated_cases; DROP TABLE curated_changes; DELETE FROM history_meta WHERE key='dataset_revision';",
@@ -12044,6 +12227,7 @@ mod tests {
                 "v14_to_v15_curated_dataset",
                 "v15_to_v16_offline_comparisons",
                 "v16_to_v17_token_accounting",
+                "v17_to_v18_retained_token_plateaus",
             ],
             "resuming must run exactly the remaining steps, never re-running v3->v4"
         );

@@ -46,6 +46,8 @@ The durable archive provides normalized session facts and hourly rollups for dat
 
 Schema 17 rebuilds the hourly token rollups directly from the retained SQLite facts. It marks legacy Codex sessions with inconsistent totals for repair. A reparse that covers the retained evidence can repair their facts while keeping the session ID and honoring any purge. When the source is gone, missing usage cannot be reconstructed, and accounting that depends on a flagged session stays unavailable.
 
+Schema 18 can repair a retained Codex session from the ledger when the old parser charged usage without a change in the cumulative counter. Before clearing the flag, it verifies the remaining events against all six cumulative counters and confirms that the archived snapshot and each turn agree with the original facts. It then corrects events, turn and model totals, categories, and hourly rollups in one transaction, keeping legacy identity evidence for a source that returns. A session with conflicting or missing evidence stays flagged.
+
 ## Opt-in turn-receipt flow
 
 Turn receipts are a separate, default-off freshness path; they do not replace the watcher:

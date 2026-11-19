@@ -944,7 +944,8 @@ mod tests {
                 "v13_to_v14_human_outcomes",
                 "v14_to_v15_curated_dataset",
                 "v15_to_v16_offline_comparisons",
-                "v16_to_v17_token_accounting"
+                "v16_to_v17_token_accounting",
+                "v17_to_v18_retained_token_plateaus"
             ]
         );
         let restored = store.get_annotation(&initial.identity).unwrap();
